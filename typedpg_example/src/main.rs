@@ -84,7 +84,7 @@ async fn example_queries(pool: &deadpool_postgres::Pool) -> Result<(), typedpg::
         "SELECT u.id, u.name, COUNT(p.id) as post_count
          FROM users u
          LEFT JOIN posts p ON p.user_id = u.id
-         GROUP BY u.id, u.name"
+         GROUP BY u.id"
     )
     .fetch_all()
     .await?;

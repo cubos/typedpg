@@ -2,171 +2,83 @@
 
 A `WITH` query that nothing in the statement references.
 
-| | |
-|---|---|
-| Default level | warning |
-| Applies to | queries |
-| Fix | yes (`--fix`): removes the `WITH` item (and the `WITH` keyword when it was the only one) |
+| Level | Applies to | Fix |
+|---|---|---|
+| warning | queries | removes the `WITH` item |
 
-## Why
-
-PostgreSQL never runs a `SELECT` (or `VALUES`) `WITH` query that no part of
-the statement reads: the planner drops it. The text is dead. More often than
-not it is a bug rather than leftover code: the query was meant to read the
-CTE and reads the base table instead. `WITH recent AS (…) SELECT … FROM posts`
-looks like it returns recent posts, but it returns all of them.
-
-A data-modifying `WITH` query (`INSERT`, `UPDATE`, `DELETE`, `MERGE`) is
-different: PostgreSQL runs it exactly once whether or not anything reads its
-`RETURNING` rows, so writing one that nothing references is a legitimate way
-to chain writes. The rule leaves those alone.
-
-## What it reports
-
-A `WITH` item whose body is a `SELECT` (including `VALUES` and set
-operations) and whose name appears nowhere in the statement as an
-unqualified table reference. Every `WITH` clause is checked, including ones
-nested in subqueries.
-
-Any table reference with that name anywhere in the statement counts as a
-use: a recursive query's reference to itself, a reference inside another
-CTE, a reference a nested `WITH` of the same name may answer. Only a name
-that appears nowhere is reported. The finding is placed on the CTE's name.
-
-## Examples
+## Example
 
 ```sql
-CREATE TABLE users (
-    id bigint PRIMARY KEY,
-    email text NOT NULL UNIQUE,
-    name text,
-    created_at timestamptz NOT NULL
-);
+CREATE TABLE users (id bigint PRIMARY KEY);
+CREATE TABLE posts (id bigint PRIMARY KEY, title text NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL);
 
-CREATE TABLE posts (
-    id bigint PRIMARY KEY,
-    user_id bigint NOT NULL REFERENCES users,
-    title text NOT NULL,
-    status text NOT NULL CHECK (status IN ('draft', 'published', 'archived')),
-    created_at timestamptz NOT NULL
-);
-```
-
-### Bad
-
-```sql
-WITH recent AS (
-  SELECT id FROM posts WHERE created_at > now() - interval '1 day'
-)
+WITH recent AS (SELECT id FROM posts WHERE created_at > now() - interval '1 day')
 SELECT id, title FROM posts;
+
+WITH r AS (SELECT random() AS x), s AS (SELECT 1 AS y)
+SELECT id FROM users;
 ```
 
 ```
 warning[unused_cte]: WITH query recent is never referenced
-   ╭─[queries.sql:1:6]
- 1 │ WITH recent AS (
+   ╭─[queries.sql:2:6]
+ 2 │ WITH recent AS (SELECT id FROM posts WHERE created_at > now() - interval '1 day')
    ·      ──────
    ╰────
   help: remove it, or read it where it was meant to be
 ```
 
-`--fix` rewrites it to `SELECT id, title FROM posts;`.
+`--fix` gives `SELECT id, title FROM posts` and
+`WITH r AS (SELECT random() AS x) SELECT id FROM users`: `r` and `s` are
+both reported, but `r` calls a volatile function (see below).
 
-A body that calls a volatile function is still reported, but without a fix
-(see [Fix](#fix)):
+## Why
 
-```sql
-WITH r AS (SELECT random() AS x)
-SELECT id FROM users;
-```
+PostgreSQL never runs a `SELECT` CTE nobody reads, so the text is dead. More
+often it is a bug: `WITH recent AS (…) SELECT … FROM posts` looks like it
+returns recent posts but returns all of them.
 
-```
-warning[unused_cte]: WITH query r is never referenced
-   ╭─[queries.sql:1:6]
- 1 │ WITH r AS (SELECT random() AS x)
-   ·      ─
-   ╰────
-  help: remove it, or read it where it was meant to be
-```
+## Reported when
 
-### Good
+A `WITH` item whose body is a `SELECT`, `VALUES` or set operation, and whose
+name appears nowhere in the statement as a table reference. Nested `WITH`
+clauses are checked too.
 
-```sql
--- The CTE is read.
-WITH recent AS (
-  SELECT id FROM posts WHERE created_at > now() - interval '1 day'
-)
-SELECT id, title FROM posts WHERE id IN (SELECT id FROM recent);
+## Not reported
 
--- A data-modifying WITH query runs whether or not it is read: not reported.
-WITH archived AS (
-  UPDATE posts SET status = 'archived'
-  WHERE created_at < now() - interval '1 year'
-  RETURNING id
-)
-SELECT count(*) FROM users;
-```
+- Data-modifying CTEs (`INSERT`, `UPDATE`, `DELETE`, `MERGE`): they run
+  whether or not they are read.
+  `WITH archived AS (UPDATE posts SET status = 'archived' … RETURNING id) SELECT count(*) AS n FROM users`.
+- A name referenced anywhere, even where a nested CTE of the same name may
+  be the one read, or by the recursive CTE itself.
 
-## Fix
+## Fix not offered
 
-`--fix` deletes the item from its name through the `)` closing its body,
-together with its separating comma. When it is the only item, the whole
-`WITH [RECURSIVE] … AS (…)` prefix goes, up to the statement that follows.
+When the body:
 
-Removing a `SELECT` CTE nobody reads cannot change what runs, but the fix is
-withheld (the finding stays) when the body:
-
-- binds a parameter (`WITH x AS (SELECT $n::int) …`): removing it would
-  change the statement's parameters, and the generated types with them;
-- calls a function any overload of which is volatile (`random()`,
-  `nextval()`, …), or a function typedpg cannot find;
+- uses a parameter (`WITH x AS (SELECT $n::int AS v) …`): removing it would
+  change the query's parameters;
+- calls a function that may be volatile (`random()`, `nextval()`) or that
+  typedpg can't find;
 - has a `SEARCH` or `CYCLE` clause.
-
-Like every fix, it is checked once more before it is offered: the edited
-query must analyze to the same result columns (names, types, nullability and
-value refinements) and the same parameters. A fix that fails that check is a
-typedpg bug; it is withheld and reported as an `internal_error` warning.
-
-## When it stays silent
-
-- The CTE is data-modifying (`INSERT`, `UPDATE`, `DELETE`, `MERGE`).
-- Its name appears as an unqualified table reference anywhere in the
-  statement, even in a place where another, nested CTE of the same name is
-  the one actually read. The check is by name, so it never reports a CTE
-  that may be used.
 
 ## Configuration
 
-Change its level or turn it off in `Cargo.toml`:
-
 ```toml
+# Cargo.toml
 [package.metadata.typedpg.lint]
-unused_cte = "error"      # "error", "warning", "info" or "off"
-fail_on = "warning"       # the severity that fails the run (default "error")
-ignore = ["tests/**"]     # files whose query findings are not reported
+unused_cte = "error"   # error | warning | info | off
 ```
-
-or in `typedpg.config.json` for the TypeScript CLI:
-
 ```json
-{
-  "lint": {
-    "unusedCte": "error",
-    "failOn": "warning",
-    "ignore": ["tests/**"]
-  }
-}
+// typedpg.config.json
+{ "lint": { "unusedCte": "error" } }
 ```
 
-To silence it for one statement, put an allow comment in the query:
+Allow one query with `-- typedpg-lint: allow(unused_cte)` in its text. See
+[Configuring rules](README.md#configuring-rules).
 
-```sql
--- typedpg-lint: allow(unused_cte)
-WITH recent AS (SELECT id FROM posts) SELECT id, title FROM posts;
-```
+## Related
 
-## Related rules
-
-- [`outer_reference_in_subquery`](outer_reference_in_subquery.md): another
-  query that reads something other than what it looks like it reads.
 - [`redundant_join`](redundant_join.md): a joined table nothing reads.
+- [`outer_reference_in_subquery`](outer_reference_in_subquery.md): a
+  subquery reading an outer column it doesn't look like it reads.

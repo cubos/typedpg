@@ -717,6 +717,95 @@ fn check_constraint_returning_bool_expression_is_accepted() {
     .expect("boolean CHECK expressions must be accepted");
 }
 
+// coerce_to_boolean coerces a condition to boolean on assignment: a domain
+// over boolean is accepted wherever a boolean is (CHECK, a partial index's
+// WHERE, a policy, a trigger's WHEN, a rule's WHERE, a publication's
+// WHERE), and so is a type with an assignment cast to boolean.
+
+#[test]
+fn check_constraint_over_a_boolean_domain_is_accepted() {
+    try_apply(&[
+        (
+            "0001.sql",
+            "CREATE DOMAIN dbool AS boolean;
+             CREATE TABLE t (
+                 id INT PRIMARY KEY,
+                 b  dbool CHECK (b),
+                 c  dbool,
+                 CHECK (c)
+             );
+             ALTER TABLE t ADD CONSTRAINT t_b_or_c CHECK ((b OR c)::dbool);
+             CREATE DOMAIN positive AS int CHECK ((VALUE > 0)::dbool);",
+        ),
+        // ALTER COLUMN TYPE checks the CHECKs and partial indexes reading
+        // the column again.
+        (
+            "0002.sql",
+            "CREATE TABLE u (id INT PRIMARY KEY, b boolean CHECK (b));
+             CREATE INDEX u_b ON u (id) WHERE b;
+             ALTER TABLE u ALTER COLUMN b TYPE dbool;",
+        ),
+    ])
+    .expect("a domain over boolean is a CHECK's boolean");
+}
+
+#[test]
+fn conditions_over_a_boolean_domain_are_accepted() {
+    try_apply(&[(
+        "0001.sql",
+        "CREATE DOMAIN dbool AS boolean;
+         CREATE TABLE t (id INT PRIMARY KEY, b dbool NOT NULL);
+         CREATE INDEX t_b ON t (id) WHERE b;
+         ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY t_p ON t USING (b) WITH CHECK (b);
+         CREATE FUNCTION t_trg() RETURNS trigger LANGUAGE plpgsql
+             AS $$ BEGIN RETURN NEW; END $$;
+         CREATE TRIGGER t_tr BEFORE UPDATE ON t
+             FOR EACH ROW WHEN (NEW.b) EXECUTE FUNCTION t_trg();
+         CREATE TABLE t_log (id INT);
+         CREATE RULE t_r AS ON UPDATE TO t WHERE NEW.b DO ALSO INSERT INTO t_log VALUES (NEW.id);",
+    )])
+    .expect("a domain over boolean is a condition's boolean");
+    // A publication's WHERE coerces it too, then refuses the user-defined
+    // type.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE DOMAIN dbool AS boolean;
+             CREATE TABLE t (id INT PRIMARY KEY, b dbool NOT NULL);
+             CREATE PUBLICATION t_pub FOR TABLE t WHERE (b) WITH (publish = 'insert');",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "invalid publication WHERE expression (User-defined types are not allowed.)",
+    );
+}
+
+#[test]
+fn check_constraint_with_an_assignment_cast_to_boolean_is_accepted() {
+    try_apply(&[(
+        "0001.sql",
+        "CREATE TYPE flag AS ENUM ('no', 'yes');
+         CREATE FUNCTION flag_bool(flag) RETURNS boolean LANGUAGE sql IMMUTABLE
+             AS $$ SELECT $1 = 'yes' $$;
+         CREATE CAST (flag AS boolean) WITH FUNCTION flag_bool(flag) AS ASSIGNMENT;
+         CREATE TABLE t (id INT PRIMARY KEY, f flag CHECK (f));",
+    )])
+    .expect("an assignment cast to boolean is a CHECK's boolean");
+}
+
+#[test]
+fn check_constraint_over_a_domain_over_int_is_rejected() {
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE DOMAIN dint AS int;
+             CREATE TABLE t (id INT PRIMARY KEY, n dint CHECK (n));",
+        )]),
+        DdlError::UnsupportedDdl(_),
+        "argument of CHECK must be type boolean, not type dint (CHECK constraint on t.n)",
+    );
+}
+
 #[test]
 fn alter_table_add_check_returning_int_is_rejected() {
     assert_ddl_err!(

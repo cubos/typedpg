@@ -899,7 +899,8 @@ fn literals_conditionals_and_aggregates_carry_bounds() {
         &[("e", Some("[7305, 11322]")), ("g", Some("[7305, 14610]"))],
     );
     // Nothing exact: relative words, a zone-less timestamptz, a type
-    // modifier (which rounds), a float, another type.
+    // modifier (which rounds), a float. A date cast to a timestamp is the
+    // midnight of its day (`date2timestamp`).
     assert_bounds(
         &db,
         "SELECT 'now'::timestamp AS a, 'today'::date AS c, '2024-01-01 10:00'::timestamptz AS e,
@@ -914,9 +915,11 @@ fn literals_conditionals_and_aggregates_carry_bounds() {
             ("h", None),
             ("i", None),
             ("j", None),
-            ("k", None),
+            ("k", Some("[631152000000000, 978220800000000]")),
         ],
     );
+    // Not to a timestamptz: the midnight of the session's time zone.
+    assert_bounds(&db, "SELECT d::timestamptz AS k FROM b", &[("k", None)]);
 }
 
 #[test]

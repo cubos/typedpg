@@ -751,7 +751,9 @@ pub(crate) struct Ctx<'a> {
     /// The analyzed view, for the facts the analyzer proved (the sublink
     /// nullability the `not_in_nullable` rule reads).
     pub view: &'a typedpg_analyzer::QueryView,
-    /// The catalog the query was analyzed against.
+    /// The catalog the query was analyzed against, with the search path it
+    /// was analyzed along (the role's, for a query run as one): a rule's
+    /// own lookup of an unqualified name finds what the query's did.
     pub catalog: &'a PgCatalog,
 }
 
@@ -809,7 +811,9 @@ pub fn lint_query_called(
 /// role must succeed — a role may lack a privilege, or not exist — and
 /// resolve the query to the same types, and the rules read the analysis as
 /// the first role, whose search path decides what its unqualified names
-/// are. No roles: the plain analysis (the schema owner's).
+/// are — and what the rules' own catalog lookups find. Each fix is checked
+/// to keep the query's shape as every role. No roles: the plain analysis
+/// (the schema owner's).
 pub fn lint_query_called_as(
     catalog: &PgCatalog,
     sql: &str,
@@ -817,8 +821,14 @@ pub fn lint_query_called_as(
     roles: &[String],
     options: &LintOptions,
 ) -> Result<Vec<CallFinding>, LocatedError> {
-    let view = match roles {
-        [] => catalog.query_view(sql)?,
+    // The catalog as the analysis the rules read saw it: the first role's
+    // search path decides what the rules' own lookups of unqualified names
+    // find, as it decided the query's.
+    let (view, scoped) = match roles {
+        [] => (
+            catalog.query_view(sql)?,
+            std::borrow::Cow::Borrowed(catalog),
+        ),
         [first, rest @ ..] => {
             let analysis = catalog.analyze_as_located(sql, first)?;
             for role in rest {
@@ -832,7 +842,10 @@ pub fn lint_query_called_as(
                     });
                 }
             }
-            catalog.query_view_as(sql, first)?
+            // `query_view_as`, without checking the privileges again (the
+            // analysis as `first` above did) or cloning the catalog twice.
+            let scoped = catalog.with_role_search_path(first);
+            (scoped.query_view(sql)?, scoped)
         }
     };
     let tokens: Vec<Tok> = typedpg_pg_query::scan(&view.sql)
@@ -857,7 +870,7 @@ pub fn lint_query_called_as(
         tree: &view.tree,
         tokens: &tokens,
         view: &view,
-        catalog,
+        catalog: &scoped,
     };
     let mut placed: Vec<CallFinding> = findings
         .drain(..)
@@ -928,7 +941,9 @@ pub fn lint_query_called_as(
         } else {
             ExpectedColumns::Same
         };
-        if let Err(change) = fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix, columns) {
+        if let Err(change) =
+            fix_keeps_shape(catalog, roles, sql, &view.analyzed, &finding.fix, columns)
+        {
             finding.fix.clear();
             let message = format!(
                 "typedpg bug: the {} fix would have changed {change}, so it was not offered",
@@ -987,17 +1002,41 @@ pub fn lint_query_called_as(
 /// meaning: no rule should ever propose a fix that fails it, so a failure is
 /// a typedpg bug. It can't see a change in the rows themselves; that stays
 /// each rule's proof to make.
+///
+/// With `roles`, the edited query is analyzed as each of them, as the
+/// original was: every role must still be allowed to run it, and its names
+/// resolve along their search paths.
 fn fix_keeps_shape(
     catalog: &PgCatalog,
+    roles: &[String],
     sql: &str,
     original: &typedpg_analyzer::AnalyzedQuery,
     fix: &[SqlEdit],
     columns: ExpectedColumns,
 ) -> Result<(), &'static str> {
     let edited = apply_edits(sql, fix).ok_or("the query text (overlapping edits)")?;
-    let analyzed = catalog
-        .analyze(&edited)
-        .map_err(|_| "the query into one that doesn't analyze")?;
+    let analyses = if roles.is_empty() {
+        vec![catalog.analyze(&edited)]
+    } else {
+        roles
+            .iter()
+            .map(|role| catalog.analyze_as(&edited, role))
+            .collect()
+    };
+    for analyzed in analyses {
+        let analyzed = analyzed.map_err(|_| "the query into one that doesn't analyze")?;
+        same_shape(original, &analyzed, columns)?;
+    }
+    Ok(())
+}
+
+/// Whether `analyzed`, a fixed query's analysis, has the shape of
+/// `original` (see [`fix_keeps_shape`]).
+fn same_shape(
+    original: &typedpg_analyzer::AnalyzedQuery,
+    analyzed: &typedpg_analyzer::AnalyzedQuery,
+    columns: ExpectedColumns,
+) -> Result<(), &'static str> {
     let same_columns = match columns {
         ExpectedColumns::None => analyzed.columns.is_empty(),
         ExpectedColumns::Same => {
@@ -1140,6 +1179,55 @@ pub fn allowed_rules(sql: &str) -> HashSet<Rule> {
     suppressions(sql).0
 }
 
+/// Where the comments that trail the statement ending at byte `end` of
+/// `sql` end: past its `;` (one) and the comments that start on the line
+/// the statement ends on, after it — `DELETE FROM t; -- typedpg-lint:
+/// allow(unbounded_write)`. Those comments are the statement's, not the
+/// next one's. `end` itself when no comment trails it.
+pub fn trailing_comments_end(sql: &str, end: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = end;
+    let mut tail = end;
+    let mut semicolon = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\x0c' => i += 1,
+            b';' if !semicolon => {
+                semicolon = true;
+                i += 1;
+            }
+            // scan.l's `non_newline` is `[^\n\r]`.
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+                return i;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                // Block comments nest.
+                let mut depth = 0usize;
+                while i < bytes.len() {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                tail = i;
+            }
+            _ => break,
+        }
+    }
+    tail
+}
+
 /// What a comment says to the linter.
 enum AllowComment {
     /// Not a `typedpg-lint:` comment.
@@ -1258,7 +1346,7 @@ mod tests {
                 }
             })
             .collect();
-        fix_keeps_shape(catalog, sql, &original, &fix, ExpectedColumns::Same).is_ok()
+        fix_keeps_shape(catalog, &[], sql, &original, &fix, ExpectedColumns::Same).is_ok()
     }
 
     #[test]
@@ -1320,6 +1408,7 @@ mod tests {
         assert!(
             fix_keeps_shape(
                 &db,
+                &[],
                 "SELECT id FROM users",
                 &original,
                 &overlapping,
@@ -1340,17 +1429,33 @@ mod tests {
             text: String::new(),
         }];
         assert!(
-            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::None).is_ok()
+            fix_keeps_shape(
+                &db,
+                &[],
+                sql,
+                &original,
+                &drop_returning,
+                ExpectedColumns::None
+            )
+            .is_ok()
         );
         assert!(
-            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::Same).is_err()
+            fix_keeps_shape(
+                &db,
+                &[],
+                sql,
+                &original,
+                &drop_returning,
+                ExpectedColumns::Same
+            )
+            .is_err()
         );
         // Keeping a column is not what such a fix may do.
         let keep = [SqlEdit {
             range: start..start,
             text: String::new(),
         }];
-        assert!(fix_keeps_shape(&db, sql, &original, &keep, ExpectedColumns::None).is_err());
+        assert!(fix_keeps_shape(&db, &[], sql, &original, &keep, ExpectedColumns::None).is_err());
     }
 
     fn options(level: Option<Severity>, fail_on: Option<Severity>) -> LintOptions {
@@ -2848,6 +2953,58 @@ mod tests {
     }
 
     #[test]
+    fn a_comment_after_a_migration_statement_on_its_line_is_its_own() {
+        // After the `;`, on the statement's last line: the statement's, not
+        // the next one's.
+        let text = "CREATE INDEX users_name_idx ON users (name); \
+                    -- typedpg-lint: allow(create_index_blocking)\n\
+                    CREATE INDEX users_email_idx ON users (email);";
+        let findings = second(text);
+        let blocking = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(blocking.len(), 1, "{findings:?}");
+        assert_eq!(
+            &text[blocking[0].finding.span.clone()],
+            "CREATE INDEX users_email_idx ON users (email)"
+        );
+        // On the file's last statement too, and an invalid one there is
+        // reported once.
+        let text = "CREATE INDEX users_email_idx ON users (email); \
+                    /* typedpg-lint: allow(create_index_blocking) */";
+        assert!(only(&second(text), Rule::CreateIndexBlocking).is_empty());
+        let text = "CREATE INDEX users_email_idx ON users (email); \
+                    -- typedpg-lint: allow(no_such_rule)\n";
+        let findings = second(text);
+        assert_eq!(only(&findings, Rule::InvalidAllow).len(), 1, "{findings:?}");
+        assert_eq!(only(&findings, Rule::CreateIndexBlocking).len(), 1);
+        // A comment on the next line leads into the next statement.
+        let text = "CREATE INDEX users_name_idx ON users (name);\n\
+                    -- typedpg-lint: allow(create_index_blocking)\n\
+                    CREATE INDEX users_email_idx ON users (email);";
+        let findings = second(text);
+        let blocking = only(&findings, Rule::CreateIndexBlocking);
+        assert_eq!(blocking.len(), 1, "{findings:?}");
+        assert_eq!(
+            &text[blocking[0].finding.span.clone()],
+            "CREATE INDEX users_name_idx ON users (name)"
+        );
+    }
+
+    #[test]
+    fn trailing_comments_end_at_the_statements_line() {
+        fn end_of(sql: &str) -> &str {
+            let end = sql.find(" ;").or_else(|| sql.find(';')).unwrap_or(8);
+            &sql[trailing_comments_end(sql, end)..]
+        }
+        assert_eq!(end_of("SELECT 1; -- a\nSELECT 2"), "\nSELECT 2");
+        assert_eq!(end_of("SELECT 1 ; /* a */ /* b */\nx"), "\nx");
+        assert_eq!(end_of("SELECT 1 -- a\nx"), "\nx");
+        assert_eq!(end_of("SELECT 1; /* a /* nested */ */ -- b\rx"), "\rx");
+        // Nothing trails: the statement's end.
+        assert_eq!(end_of("SELECT 1;\n-- a"), ";\n-- a");
+        assert_eq!(end_of("SELECT 1; SELECT 2; -- a"), "; SELECT 2; -- a");
+    }
+
+    #[test]
     fn migration_allow_comments_are_validated() {
         let findings = second(
             "-- typedpg-lint: allow(no_such_rule)\nCREATE INDEX users_email_idx ON users (email);",
@@ -3071,6 +3228,206 @@ mod tests {
         assert!(
             error.starts_with("query resolves differently for roles"),
             "{error}"
+        );
+    }
+
+    /// A catalog where role `app`'s search path finds `app_data.t` before
+    /// `public.t`, a table of the same name with other columns.
+    fn shadowing_role_catalog() -> PgCatalog {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE ROLE app;
+                 CREATE SCHEMA app_data;
+                 CREATE TABLE t (id integer PRIMARY KEY, name text NOT NULL);
+                 CREATE TABLE app_data.t (x bigint PRIMARY KEY, y text);
+                 GRANT USAGE ON SCHEMA app_data TO app;
+                 GRANT SELECT, INSERT ON t, app_data.t TO app;
+                 ALTER ROLE app SET search_path = app_data, public;",
+            )
+            .unwrap();
+        catalog
+    }
+
+    #[test]
+    fn a_fix_is_verified_as_the_role() {
+        let catalog = shadowing_role_catalog();
+        let options = LintOptions::default();
+        let sql = "SELECT x::bigint FROM t";
+        // As `app`, `t` is `app_data.t`, whose `x` is already bigint: the
+        // cast is redundant, and dropping it keeps the column's type — as
+        // `app` analyzes the fixed query. The plain analysis of
+        // `SELECT x FROM t` (`public.t`, without `x`) fails, so a check
+        // made without the role withholds the fix (and panics in a test).
+        let findings =
+            lint_query_called_as(&catalog, sql, &[], &["app".to_owned()], &options).unwrap();
+        let rules: Vec<Rule> = findings.iter().map(|f| f.finding.rule).collect();
+        assert_eq!(rules, vec![Rule::RedundantCast]);
+        let fixed = apply_edits(sql, &findings[0].finding.fix).unwrap();
+        assert_eq!(fixed, "SELECT x FROM t");
+        // `public.t` has no `x`: the plain analysis rejects the query.
+        assert!(lint_query_called_as(&catalog, sql, &[], &[], &options).is_err());
+        // The check runs as the role: a fix only the schema owner's search
+        // path keeps the shape of is refused.
+        let original = catalog.analyze_as(sql, "app").unwrap();
+        let fix = findings[0].finding.fix.clone();
+        assert!(
+            fix_keeps_shape(
+                &catalog,
+                &["app".to_owned()],
+                sql,
+                &original,
+                &fix,
+                ExpectedColumns::Same
+            )
+            .is_ok()
+        );
+        assert!(
+            fix_keeps_shape(&catalog, &[], sql, &original, &fix, ExpectedColumns::Same).is_err()
+        );
+    }
+
+    #[test]
+    fn a_rules_catalog_lookups_see_the_roles_table() {
+        let catalog = shadowing_role_catalog();
+        let options = LintOptions::default();
+        // `insert_without_columns` looks up the table's columns itself to
+        // build its fix: as `app`, they are `app_data.t`'s.
+        let sql = "INSERT INTO t VALUES (1, 'a')";
+        let fix_of = |roles: &[String]| -> String {
+            let findings = lint_query_called_as(&catalog, sql, &[], roles, &options).unwrap();
+            let finding = findings
+                .iter()
+                .find(|f| f.finding.rule == Rule::InsertWithoutColumns)
+                .expect("an insert_without_columns finding");
+            apply_edits(sql, &finding.finding.fix).unwrap()
+        };
+        assert_eq!(
+            fix_of(&["app".to_owned()]),
+            "INSERT INTO t (x, y) VALUES (1, 'a')"
+        );
+        assert_eq!(fix_of(&[]), "INSERT INTO t (id, name) VALUES (1, 'a')");
+    }
+
+    /// What each table reference named `name` of `view`'s tree resolved
+    /// to, in the order they are written.
+    fn relations_named(
+        view: &typedpg_analyzer::QueryView,
+        name: &str,
+    ) -> Vec<Option<typedpg_analyzer::RelationRef>> {
+        let mut refs: Vec<(i32, Option<typedpg_analyzer::RelationRef>)> = view
+            .tree
+            .nodes()
+            .filter_map(|(node, _)| match node {
+                typedpg_pg_query::NodeRef::RangeVar(rv) if rv.relname == name => {
+                    Some((rv.location, view.relation_of(rv)))
+                }
+                _ => None,
+            })
+            .collect();
+        refs.sort_by_key(|(location, _)| *location);
+        refs.dedup_by_key(|(location, _)| *location);
+        refs.into_iter().map(|(_, target)| target).collect()
+    }
+
+    fn relid(catalog: &PgCatalog, schema: &str, name: &str) -> typedpg_analyzer::RelationRef {
+        typedpg_analyzer::RelationRef::Relation(
+            catalog.resolve_table(Some(schema), name).unwrap().oid,
+        )
+    }
+
+    #[test]
+    fn a_table_reference_resolves_as_the_analyzer_resolved_it() {
+        use typedpg_analyzer::RelationRef;
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE TABLE t (id integer PRIMARY KEY, email text);
+                 CREATE INDEX ON t (email);",
+            )
+            .unwrap();
+        let t = relid(&catalog, "public", "t");
+        // A `WITH` query hides the table in the statement it belongs to,
+        // but not in its own body, a schema-qualified reference, or a
+        // data-modifying statement's target.
+        let view = catalog
+            .query_view(
+                "WITH t AS (SELECT id FROM t) \
+                 SELECT * FROM t JOIN public.t p USING (id) \
+                 WHERE id IN (SELECT id FROM t)",
+            )
+            .unwrap();
+        assert_eq!(
+            relations_named(&view, "t"),
+            vec![
+                Some(t),
+                Some(RelationRef::Cte),
+                Some(t),
+                Some(RelationRef::Cte)
+            ]
+        );
+        let view = catalog
+            .query_view("WITH t AS (SELECT 1) UPDATE t SET email = 'a' WHERE id = 1")
+            .unwrap();
+        assert_eq!(relations_named(&view, "t"), vec![Some(t)]);
+        // The rules read it: the UPDATE's target is the table, whose index
+        // on `email` `lower(email)` can't use.
+        let findings = lint(
+            &catalog,
+            "WITH t AS (SELECT 1) UPDATE t SET email = 'a' WHERE lower(email) = $1",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule == Rule::NonSargablePredicate),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_reference_resolves_along_the_roles_search_path() {
+        let catalog = shadowing_role_catalog();
+        let sql = "SELECT * FROM t";
+        let plain = catalog.query_view(sql).unwrap();
+        assert_eq!(
+            relations_named(&plain, "t"),
+            vec![Some(relid(&catalog, "public", "t"))]
+        );
+        let scoped = catalog.with_role_search_path("app");
+        let as_app = scoped.query_view(sql).unwrap();
+        assert_eq!(
+            relations_named(&as_app, "t"),
+            vec![Some(relid(&catalog, "app_data", "t"))]
+        );
+    }
+
+    #[test]
+    fn a_view_bodys_table_reference_does_not_pass_for_the_querys() {
+        let ddl = "CREATE SCHEMA s;
+                   CREATE TABLE t (id integer PRIMARY KEY);
+                   CREATE TABLE s.t (id integer PRIMARY KEY);
+                   SET search_path = s;
+                   CREATE VIEW public.v AS SELECT * FROM t;
+                   RESET search_path;";
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog.apply_sql(ddl).unwrap();
+        // The view's stored query, analyzed again as the query reads it,
+        // has its `t`, a table, at an offset of the migration's text: the
+        // query's own `t`, padded to the same offset, keeps what it
+        // resolved to — a `WITH` query, or the table.
+        let offset = ddl.find("FROM t;").unwrap() + "FROM ".len();
+        let query = |prefix: &str| format!("{prefix}{}t, v", " ".repeat(offset - prefix.len()));
+        let sql = query("WITH t AS (SELECT 1 AS id) SELECT t.id FROM ");
+        let view = catalog.query_view(&sql).unwrap();
+        assert_eq!(
+            relations_named(&view, "t"),
+            vec![Some(typedpg_analyzer::RelationRef::Cte)]
+        );
+        let sql = query("SELECT t.id FROM ");
+        let view = catalog.query_view(&sql).unwrap();
+        assert_eq!(
+            relations_named(&view, "t"),
+            vec![Some(relid(&catalog, "public", "t"))]
         );
     }
 }

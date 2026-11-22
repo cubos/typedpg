@@ -1,197 +1,99 @@
 # `unused_returning`
 
-`execute()` on an `INSERT` / `UPDATE` / `DELETE` / `MERGE` whose `RETURNING`
-rows it throws away.
+`execute()` on an `INSERT`, `UPDATE`, `DELETE` or `MERGE` whose `RETURNING`
+rows it discards.
 
-| | |
-|---|---|
-| Default level | info |
-| Applies to | call sites |
-| Fix | yes (`--fix`): deletes the `RETURNING` clause, when that provably changes nothing else |
+| Level | Applies to | Fix |
+|---|---|---|
+| info | call sites | removes the `RETURNING` clause |
 
-## Why
-
-`execute()` runs a statement and returns the number of affected rows; any
-`RETURNING` rows are discarded. A `RETURNING` nobody reads still costs
-something: PostgreSQL evaluates the list for every written row and sends the
-rows to the client, and typedpg generates a row type for them. It is usually
-a leftover from a version of the code that used the result, or a sign that
-the code meant to `fetch_one()` the new id and forgot to.
-
-## What it reports
-
-A top-level `INSERT`, `UPDATE`, `DELETE` or `MERGE` with a `RETURNING`
-clause, when every call the scan sees on that query is `execute()`. The
-finding is placed at each `execute` call.
-
-The rule needs to know every way the query is used, so it stays silent when
-it cannot:
-
-- Rust: the query is called directly on the `sql!(…)` expression or through
-  a local `let` binding, and every use of that binding is a method call the
-  scan recognizes. Passing the query to a function (`run(q)`), borrowing it,
-  or calling a method that is not one of the query's own silences the rule;
-  a binding also called with `fetch_one`, `fetch_value`, `fetch_stream` or
-  any other method that reads the rows is not reported either.
-- TypeScript: a `.sql` query is always an export that can be used anywhere,
-  so this rule never reports it; neither does it report an exported `sql(…)`
-  binding, or a binding passed to a function. Inline `sql(…).execute(…)` and
-  local bindings are checked.
-
-## Examples
+## Example
 
 ```sql
-CREATE TABLE users (
-    id bigint PRIMARY KEY,
-    email text NOT NULL UNIQUE,
-    name text,
-    created_at timestamptz NOT NULL
-);
+CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL UNIQUE, name text);
 ```
-
-### Bad
-
-Rust:
-
-```rust
-use typedpg::sql;
-
-pub async fn create_user(pool: &typedpg::Pool, id: i64, email: &str) -> typedpg::Result<()> {
-    sql!(pool, "INSERT INTO users (id, email, created_at) VALUES ($id, $email, now()) RETURNING id")
-        .execute()
-        .await?;
-    Ok(())
-}
-```
-
-```
-info[unused_returning]: `.execute()` discards the RETURNING rows
-   ╭─[src/users.rs:5:10]
- 5 │         .execute()
-   ·          ───────
-   ╰────
-  help: remove RETURNING, or fetch the rows
-```
-
-TypeScript:
 
 ```ts
+// src/users.ts
 import { sql } from "./db.ts";
 
 export async function createUser(pool: Pool, id: number, email: string) {
-  await sql("INSERT INTO users (id, email, created_at) VALUES ($id, $email, now()) RETURNING id").execute(pool, { id, email });
+  await sql("INSERT INTO users (id, email) VALUES ($id, $email) RETURNING id").execute(pool, { id, email });
+}
+
+export async function rename(pool: Pool, id: number, name: string) {
+  await sql("UPDATE users SET name = $name WHERE id = $id RETURNING lower(name)").execute(pool, { id, name });
 }
 ```
 
 ```
 info[unused_returning]: `.execute()` discards the RETURNING rows
-   ╭─[src/users.ts:4:99]
- 4 │   await sql("INSERT INTO users (id, email, created_at) VALUES ($id, $email, now()) RETURNING id").execute(pool, { id, email });
-   ·                                                                                                   ───────
+   ╭─[src/users.ts:4:80]
+ 4 │   await sql("INSERT INTO users (id, email) VALUES ($id, $email) RETURNING id").execute(pool, { id, email });
+   ·                                                                                ───────
    ╰────
   help: remove RETURNING, or fetch the rows
 ```
 
-In both, `--fix` removes ` RETURNING id` from the SQL string.
+`--fix` turns the first query into
+`INSERT INTO users (id, email) VALUES ($id, $email)`. The second is reported
+without a fix: `lower(name)` is not a plain column. The same applies to
+`sql!(…).execute()` in Rust.
 
-### Good
+## Why
 
-```rust
-// No RETURNING.
-sql!(pool, "INSERT INTO users (id, email, created_at) VALUES ($id, $email, now())")
-    .execute()
-    .await?;
+PostgreSQL still evaluates and sends the `RETURNING` rows, and typedpg
+generates a row type for them. It is usually a leftover, or a sign the code
+meant to fetch the new id and forgot.
 
-// The returned row is used.
-let id = sql!(pool, "INSERT INTO users (id, email, created_at) VALUES ($id, $email, now()) RETURNING id")
-    .fetch_one()
-    .await?;
+## Reported when
 
-// The query escapes to another function: the rule can't see every use.
-let q = sql!(pool, "DELETE FROM posts WHERE id = $id RETURNING id");
-run_and_log(q).await?;
-```
+The statement has a top-level `RETURNING` and every call on the query is
+`execute()`. Each call is reported. The query must be used where every use
+is visible:
 
-```ts
-// Exported: it may be fetched elsewhere.
-export const deleteReturning = sql("DELETE FROM posts WHERE id = $id RETURNING id");
-await deleteReturning.execute(pool, { id });
-```
+- Rust: methods called on the `sql!(…)` expression or on a local `let`
+  binding of it.
+- TypeScript: inline `sql(…).execute(…)` or a local, non-exported binding.
 
-## Fix
+## Not reported
 
-`--fix` deletes the `RETURNING` keyword, its list and the whitespace before
-it, keeping a trailing `;`. Removing `RETURNING` must not change what the
-statement does, so the fix is offered only when all of these hold:
+- Any call that reads rows (`fetch_one`, `fetchOne`, `fetch_stream`, …).
+- A query passed to a function, borrowed, or with a method call typedpg
+  doesn't recognize.
+- An exported `sql(…)` binding, and every `.sql` file query (each is an
+  export usable anywhere).
+- A `RETURNING` inside a data-modifying CTE (the statement reads it).
 
-- there is exactly one call, the `execute()` (two `execute()` calls of the
-  same query are each reported, without a fix);
-- every `RETURNING` item is a plain column (`id`, `t.id`, `*`, `t.*`) or a
-  plain constant. Anything else — an operator (`1 / id`), a cast
-  (`id::text`), a function call (`lower(name)`, `now()`), a `CASE`, a
-  subquery — can raise an error when evaluated, and removing it could make
-  a failing statement succeed;
-- the statement is an `INSERT`, `UPDATE` or `DELETE` (not `MERGE`) with no
-  `WITH` clause, whose target and every `FROM` / `USING` item is an ordinary
-  table without row-level security or rewrite rules. With row-level security
-  enabled, PostgreSQL applies the table's `SELECT` policies to the rows a
-  write with `RETURNING` may touch, so removing it can change which rows are
-  written; a view or a rule can likewise tie the statement's effect to its
-  `RETURNING`;
-- no relation of the statement may have a virtual generated column, whose
-  expression `RETURNING` would evaluate.
+## Fix not offered
 
-Every fix is checked once more before it is offered: the edited query must
-analyze with no result columns and the same parameters. A fix that fails is
-a typedpg bug; it is withheld and reported as an `internal_error` warning.
-
-For example, this is reported but not fixed, because `lower(name)` can fail:
-
-```rust
-sql!(pool, "UPDATE users SET name = $name WHERE id = $id RETURNING lower(name)")
-    .execute()
-    .await?;
-```
-
-## When it stays silent
-
-- Any call on the query is not `execute()` (it fetches the rows).
-- The query may be used in a way the scan cannot see (see above).
-- The statement has no `RETURNING` at the top level (a `RETURNING` inside a
-  data-modifying `WITH` query is that CTE's, and is read by the statement).
+- The query is executed in more than one place.
+- A `RETURNING` item is anything but a column (`id`, `t.id`, `*`, `t.*`) or a
+  plain constant: an expression, cast or function call can raise an error,
+  and removing it could make a failing statement succeed.
+- The statement is a `MERGE` or has a `WITH` clause.
+- Its target or a `FROM` / `USING` item is not an ordinary table (a view, a
+  partitioned table, …), or has row-level security, rewrite rules or a
+  virtual generated column.
 
 ## Configuration
 
-Rust (`Cargo.toml`):
-
 ```toml
+# Cargo.toml
 [package.metadata.typedpg.lint]
-unused_returning = "warning"   # "error", "warning", "info" or "off"
-fail_on = "warning"            # the severity that fails the run (default "error")
-ignore = ["tests/**"]          # files whose findings are not reported
+unused_returning = "warning"   # error | warning | info | off
 ```
-
-TypeScript (`typedpg.config.json`):
-
 ```json
-{
-  "lint": {
-    "unusedReturning": "warning",
-    "failOn": "warning",
-    "ignore": ["tests/**"]
-  }
-}
+// typedpg.config.json
+{ "lint": { "unusedReturning": "warning" } }
 ```
 
-To allow it for one query, put the allow comment in the SQL:
+Allow one query with `-- typedpg-lint: allow(unused_returning)` in its SQL.
+See [Configuring rules](README.md#configuring-rules).
 
-```rust
-sql!(pool, "-- typedpg-lint: allow(unused_returning)\nINSERT INTO users (id, email, created_at) VALUES ($id, $email, now()) RETURNING id")
-    .execute()
-```
+## Related
 
-## Related rules
-
-- [`fetch_may_return_many`](fetch_may_return_many.md),
-  [`fetch_all_single_row`](fetch_all_single_row.md): the other call-site
-  rules.
+- [`fetch_may_return_many`](fetch_may_return_many.md): `fetch_one` on a
+  query that may return many rows.
+- [`fetch_all_single_row`](fetch_all_single_row.md): `fetch_all` on a
+  single-row query.

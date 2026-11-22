@@ -39,6 +39,16 @@ pub struct NamedQuery {
     /// Where the `/* @name */` comment block ends in the file (bytes):
     /// comments between it and [`Self::text`] are the query's.
     pub after_name: usize,
+    /// Where the `/* @name */` comment starts in the file (bytes).
+    pub name_comment: usize,
+    /// Where the comments leading into the query start (bytes): past the
+    /// previous query's [`Self::tail`], or the file's start.
+    pub lead: usize,
+    /// Where the comments trailing the statement end (bytes): those on the
+    /// line it ends on, after it and its `;` (see
+    /// [`typedpg_lint::trailing_comments_end`]); for the file's last
+    /// query, the end of the file.
+    pub tail: usize,
     pub pos: Position,
 }
 
@@ -54,9 +64,45 @@ pub struct SqlFile {
     pub queries: Vec<NamedQuery>,
     pub diagnostics: Vec<SqlDiagnostic>,
     pub lines: LineIndex,
-    /// The file as read: lint needs the comments before each statement,
+    /// The file as read: lint needs the comments around each statement,
     /// which [`NamedQuery::text`] leaves out.
     pub(crate) source: String,
+    /// Every comment of the file (bytes).
+    pub(crate) comments: Vec<Range<usize>>,
+}
+
+impl SqlFile {
+    /// The text `typedpg lint` reads for `query`, and where it starts in
+    /// the file: every comment of the file belongs to one query, for its
+    /// allow comments to suppress that query's findings and to be checked.
+    /// The text runs from [`NamedQuery::lead`] to [`NamedQuery::tail`],
+    /// with everything outside the statement but the comments (its `;`, the
+    /// `/* @name */` comment, a stray token) blanked to spaces, so offsets
+    /// in it are the file's.
+    pub fn lint_text(&self, query: &NamedQuery) -> (usize, String) {
+        let statement = query.start..query.start + query.text.len();
+        let kept = |at: usize| {
+            statement.contains(&at)
+                || self
+                    .comments
+                    .iter()
+                    .any(|c| c.start != query.name_comment && c.contains(&at))
+        };
+        let bytes: Vec<u8> = (query.lead..query.tail)
+            .map(|at| {
+                let b = self.source.as_bytes()[at];
+                if matches!(b, b'\n' | b'\r') || kept(at) {
+                    b
+                } else {
+                    b' '
+                }
+            })
+            .collect();
+        // Only whole comments and the statement survive, and they start and
+        // end on ASCII bytes: the rest is ASCII spaces.
+        let text = String::from_utf8(bytes).expect("blanking keeps UTF-8");
+        (query.lead, text)
+    }
 }
 
 /// Words a query can't be named: they can't be a `const`'s name.
@@ -119,6 +165,10 @@ struct Block {
     name_span: Range<usize>,
     /// Where the whole `/* @name */` comment ends.
     after_name: usize,
+    /// Where it starts.
+    name_comment: usize,
+    /// Where the comments leading into the query start.
+    lead: usize,
     /// The statement's first and past-its-last byte, once it has a token.
     text: Option<(usize, usize)>,
     /// Its `;` was read: anything but comments after it is an error.
@@ -148,6 +198,10 @@ struct Parser<'a> {
     /// for it, not one per token.
     stray_reported: bool,
     paren_depth: usize,
+    comments: Vec<Range<usize>>,
+    /// Where the last block's trailing comments end: the next query's
+    /// leading comments start there.
+    last_tail: usize,
 }
 
 /// Read `source`, a `.sql` file whose module binds `module`'s names.
@@ -163,14 +217,22 @@ pub fn parse(source: &str, module: &ModuleNames) -> SqlFile {
         block: None,
         stray_reported: false,
         paren_depth: 0,
+        comments: Vec::new(),
+        last_tail: 0,
     };
     p.run();
     p.finish_block();
+    // The comments after the last query are its own: no comment goes
+    // unchecked.
+    if let Some(last) = p.queries.last_mut() {
+        last.tail = source.len();
+    }
     SqlFile {
         queries: p.queries,
         diagnostics: p.diagnostics,
         lines: p.lines,
         source: source.to_owned(),
+        comments: p.comments,
     }
 }
 
@@ -184,15 +246,18 @@ impl Parser<'_> {
                 // scan.l's `non_newline` is `[^\n\r]`: a lone CR ends a
                 // `--` comment too.
                 b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                    let start = i;
                     while i < bytes.len() && !matches!(bytes[i], b'\n' | b'\r') {
                         i += 1;
                     }
+                    self.comments.push(start..i);
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'*') => {
                     let end = skip_block_comment(bytes, i);
                     if end == bytes.len() && !self.source[i..].ends_with("*/") {
                         self.error(i, "unterminated /* comment");
                     }
+                    self.comments.push(i..end);
                     self.comment(i, end);
                     i = end;
                 }
@@ -356,6 +421,8 @@ impl Parser<'_> {
             name: name.to_owned(),
             name_span: name_at..name_at + name_len,
             after_name: end,
+            name_comment: start,
+            lead: self.last_tail,
             text: None,
             terminated: false,
         });
@@ -406,6 +473,11 @@ impl Parser<'_> {
         let Some(block) = self.block.take() else {
             return;
         };
+        let tail = match block.text {
+            Some((_, end)) => typedpg_lint::trailing_comments_end(self.source, end),
+            None => block.after_name,
+        };
+        self.last_tail = tail;
         if block.name.is_empty() {
             return;
         }
@@ -424,6 +496,9 @@ impl Parser<'_> {
                 text: self.source[start..end].to_owned(),
                 start,
                 after_name: block.after_name,
+                name_comment: block.name_comment,
+                lead: block.lead,
+                tail,
                 pos: self.lines.position(start),
             }),
         }

@@ -91,15 +91,14 @@ fn column_list(
     relation: &typedpg_pg_query::ast::RangeVar,
     select: &SelectStmt,
 ) -> Option<Vec<String>> {
-    if !relation.catalogname.is_empty() {
-        return None;
-    }
     let width = width(select)?;
-    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-    let class = ctx.catalog.resolve_table(schema, &relation.relname)?;
+    // The table as the analyzer resolved the statement's target.
+    let Some(typedpg_analyzer::RelationRef::Relation(oid)) = ctx.view.relation_of(relation) else {
+        return None;
+    };
     let columns: Vec<String> = ctx
         .catalog
-        .attributes_of(class.oid)
+        .attributes_of(oid)
         .iter()
         .filter(|attribute| attribute.attnum > 0)
         .take(width)

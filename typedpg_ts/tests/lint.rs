@@ -641,3 +641,209 @@ fn queries_are_linted_as_the_databases_roles() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("redundant_null_check"), "{stdout}");
 }
+
+#[test]
+fn breaks_deployed_queries_checks_the_previous_deployments_copy_in_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "roles": ["app"]
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE ROLE app;\n\
+         CREATE TABLE users (id int4 PRIMARY KEY, name text NOT NULL, age int4);\n\
+         CREATE TABLE events (id int4 PRIMARY KEY, kind text NOT NULL);\n\
+         GRANT INSERT ON users, events TO app;\n",
+    );
+    write(
+        &root.join("src/app.ts"),
+        "import { copyIn } from './db';\n\
+         export const users = copyIn(\"users (id, name, age)\");\n\
+         export const events = copyIn(\"events (id, kind)\");\n",
+    );
+    write(&root.join(".gitignore"), "src/db.ts\n");
+    generate(root);
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A", "."]);
+    git(root, &["commit", "-q", "-m", "deployed"]);
+
+    // The branch limits `age` and takes INSERT on `events` from the role the
+    // code runs as; it no longer copies into either table, the deployed code
+    // still does.
+    write(
+        &root.join("migrations/0002.sql"),
+        "ALTER TABLE users ADD CONSTRAINT users_age_positive CHECK (age > 0);\n\
+         REVOKE INSERT ON events FROM app;\n",
+    );
+    write(&root.join("src/app.ts"), "export {};\n");
+    generate(root);
+
+    let output = run(root, &["lint", "--previous-deployment", "HEAD"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        stdout.matches("warning[breaks_deployed_queries]").count(),
+        2,
+        "{stdout}"
+    );
+    for expected in [
+        "this migration breaks the deployed query at src/app.ts:2 (HEAD): its COPY into users \
+         writes column age, which CHECK constraint \"users_age_positive\" now limits it to at \
+         least 1: writing another value fails",
+        "migrations/0002.sql:1:1",
+        "this migration breaks the deployed query at src/app.ts:3 (HEAD): it no longer runs as \
+         role \"app\": permission denied for table events",
+        "migrations/0002.sql:2:1",
+    ] {
+        assert!(stdout.contains(expected), "{expected}\n{stdout}");
+    }
+}
+
+/// A tsconfig.json `paths` alias for the generated module, inherited through
+/// `extends`, with the `baseUrl` the base sets.
+fn aliased_project(root: &Path) {
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{ "include": ["src"], "out": "src/generated/queries.ts" }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE users (id int4 PRIMARY KEY, name text NOT NULL);\n",
+    );
+    write(
+        &root.join("tsconfig.base.json"),
+        r#"{
+            "compilerOptions": {
+                "baseUrl": ".",
+                "paths": {
+                    "@db": ["./src/generated/queries"],
+                    "@gen/*": ["src/generated/*"]
+                }
+            }
+        }"#,
+    );
+    write(
+        &root.join("tsconfig.json"),
+        r#"{ "extends": "./tsconfig.base.json", "include": ["src"] }"#,
+    );
+    write(
+        &root.join("src/app.ts"),
+        "import { sql } from '@db';\n\
+         import * as db from '@gen/queries';\n\
+         import { sql as viaBaseUrl } from 'src/generated/queries';\n\
+         sql(`SELECT DISTINCT id FROM users`);\n\
+         db.sql(`SELECT DISTINCT id, name FROM users`);\n\
+         viaBaseUrl(`SELECT id FROM users LIMIT 1 OFFSET 0`);\n",
+    );
+}
+
+#[test]
+fn queries_imported_through_tsconfig_paths_are_linted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    aliased_project(root);
+
+    let check = |when: &str| {
+        let output = run(root, &["lint"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{when}: {stdout}\n{stderr}");
+        assert!(stderr.contains("checked 3 queries"), "{when}: {stderr}");
+        assert_eq!(
+            stdout.matches("info[redundant_distinct]").count(),
+            2,
+            "{when}: {stdout}"
+        );
+        for expected in ["src/app.ts:4:13", "src/app.ts:5:16", "src/app.ts:6:"] {
+            assert!(stdout.contains(expected), "{when}: {expected}\n{stdout}");
+        }
+    };
+    // Before `gen`: the generated module doesn't exist, the aliases still
+    // resolve to it.
+    check("before gen");
+    assert!(!root.join("src/generated/queries.ts").exists());
+
+    // `gen` generates the aliased queries, and lint still sees them.
+    generate(root);
+    let module = fs::read_to_string(root.join("src/generated/queries.ts")).unwrap();
+    assert!(module.contains("SELECT DISTINCT id FROM users"), "{module}");
+    assert!(
+        module.contains("SELECT id FROM users LIMIT 1 OFFSET 0"),
+        "{module}"
+    );
+    check("after gen");
+}
+
+/// Every comment of a `.sql` file belongs to a query, for its allow comments
+/// to suppress and be checked: the comments on the line a statement ends
+/// on, after it (and its `;`), are that statement's; the others lead into
+/// the next query; those after the last query are its.
+#[test]
+fn allow_comments_around_sql_file_queries_belong_to_a_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["queries/*.sql"], "emit": "none" }
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE posts (id int4 PRIMARY KEY);\n",
+    );
+    write(
+        &root.join("queries/posts.sql"),
+        "-- typedpg-lint: allow(header_rule)\n\
+         /* @name a */\n\
+         SELECT id AS id FROM posts; -- typedpg-lint: allow(redundant_alias)\n\
+         \n\
+         /* @name b */\n\
+         SELECT id AS id FROM posts; -- typedpg-lint: allow(trailing_rule)\n\
+         \n\
+         -- typedpg-lint: allow(redundant_alias)\n\
+         /* @name c */\n\
+         SELECT id AS id FROM posts;\n\
+         \n\
+         /* @name d */\n\
+         SELECT id AS id FROM posts /* typedpg-lint: allow(redundant_alias) */\n\
+         -- typedpg-lint: allow(last_rule)\n",
+    );
+    write(&root.join("src/app.ts"), "export {};\n");
+    generate(root);
+
+    let output = run(root, &["lint", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut found: Vec<(String, u64)> = json["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .iter()
+        .map(|finding| {
+            (
+                finding["rule"].as_str().unwrap().to_owned(),
+                finding["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    found.sort();
+    assert_eq!(
+        found,
+        [
+            ("invalid_allow".to_owned(), 1),
+            ("invalid_allow".to_owned(), 6),
+            ("invalid_allow".to_owned(), 14),
+            ("redundant_alias".to_owned(), 6),
+        ],
+        "{stdout}"
+    );
+}

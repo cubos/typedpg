@@ -192,6 +192,7 @@ pub(crate) fn process_from_item(
                     cte_reference_columns(cte_scopes, &rv.relname)
             {
                 check_cte_reference(cte_scopes, &rv.relname)?;
+                crate::pg_catalog::note_relation_at(rv, crate::pg_catalog::RelationRef::Cte);
                 super::deferred::unless_planned_alone(&mut cte_cols, alias, rows_kept());
                 super::deferred::reference_cte(&cte_cols, rv.location, removable_side)?;
                 if rows_kept()
@@ -263,7 +264,7 @@ pub(crate) fn process_from_item(
             } else {
                 Some(rv.schemaname.as_str())
             };
-            scope.add_table(
+            let relid = scope.add_table(
                 snapshot,
                 schema,
                 &rv.relname,
@@ -274,6 +275,10 @@ pub(crate) fn process_from_item(
                     aliased: rv.alias.is_some(),
                 },
             )?;
+            crate::pg_catalog::note_relation_at(
+                rv,
+                crate::pg_catalog::RelationRef::Relation(relid),
+            );
             // A foreign table the planner plans (the relation, or an
             // inheritor it expands): get_relation_info opens its wrapper's
             // routine (GetFdwRoutineForRelation), which fails when the

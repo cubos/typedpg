@@ -356,6 +356,36 @@ impl OrdRange {
         }
     }
 
+    /// A `date` range as the `timestamp` range of the midnights of its
+    /// days (`date2timestamp`: a day is `day × USECS_PER_DAY`
+    /// microseconds); `None` for another kind, or a bound out of range.
+    pub(crate) fn date_as_timestamp(&self) -> Option<OrdRange> {
+        const USECS_PER_DAY: i128 = 86_400_000_000;
+        if self.kind != OrdKind::Date {
+            return None;
+        }
+        let at = |b: Option<OrdBound>| -> Option<Option<OrdBound>> {
+            let Some(b) = b else {
+                return Some(None);
+            };
+            let point = match b.point {
+                OrdPoint::Finite(day) => {
+                    OrdPoint::Finite(Num::int(day.to_integer()?.checked_mul(USECS_PER_DAY)?))
+                }
+                p => p,
+            };
+            Some(Some(OrdBound {
+                point,
+                inclusive: b.inclusive,
+            }))
+        };
+        Some(OrdRange {
+            kind: OrdKind::Timestamp,
+            lo: at(self.lo)?,
+            hi: at(self.hi)?,
+        })
+    }
+
     /// The range of integers within `r`, as `numeric` values.
     pub(crate) fn of_ints(r: &crate::refine::IntRange) -> OrdRange {
         let at = |v: Option<i128>| {

@@ -887,11 +887,12 @@ impl Scope {
         name: &str,
         alias: &str,
         site: SourceSite,
-    ) -> Result<(), AnalyzeError> {
+    ) -> Result<crate::oid::PgClassOid, AnalyzeError> {
         let table = snapshot
             .resolve_table(schema, name)
             .ok_or_else(|| undefined_table_error(snapshot, schema, name, site.span))?;
-        self.add_relation_source(snapshot, table, alias, site, true)
+        self.add_relation_source(snapshot, table, alias, site, true)?;
+        Ok(table.oid)
     }
 
     /// Add a trigger's transition table (`REFERENCING NEW TABLE AS

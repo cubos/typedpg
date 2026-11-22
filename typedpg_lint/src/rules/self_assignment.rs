@@ -64,14 +64,11 @@ fn assignments(
         .alias
         .as_ref()
         .map_or(relation.relname.as_str(), |alias| alias.aliasname.as_str());
-    let class = relation
-        .catalogname
-        .is_empty()
-        .then(|| {
-            let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-            ctx.catalog.resolve_table(schema, &relation.relname)
-        })
-        .flatten();
+    // The table as the analyzer resolved the statement's target.
+    let class = match ctx.view.relation_of(relation) {
+        Some(typedpg_analyzer::RelationRef::Relation(oid)) => ctx.catalog.class_row(oid),
+        _ => None,
+    };
     let removable_table = class.is_some_and(|class| {
         matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
             && !ctx.catalog.lint_relation_has_rules(class.oid)

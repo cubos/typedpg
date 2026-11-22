@@ -166,6 +166,114 @@ pub(crate) struct PgSanityServer {
     created_roles: Vec<String>,
 }
 
+/// Serializes the migrations writing a shared (cluster-wide) catalog
+/// across every test process sharing the cluster: `pg_authid`,
+/// `pg_auth_members`, `pg_parameter_acl`, `pg_db_role_setting`,
+/// `pg_database`, `pg_tablespace`, `pg_shdescription`, `pg_shseclabel`.
+/// Each test has its own database, but these rows are shared: two tests
+/// updating the same one at once — `GRANT SET ON PARAMETER
+/// log_min_duration_statement` rewrites that parameter's `pg_parameter_acl`
+/// row — fail one of them with `tuple concurrently updated` (XX000), which
+/// PG raises when a catalog row it updates in place changed under it (or
+/// with a duplicate key when both insert it).
+///
+/// The lock is an exclusive lock on a file in the temporary directory,
+/// named after `POSTGRES_URL`: the test processes run on one host (nextest
+/// starts them all, as `scripts/run-pg-sanity.sh` does). A PostgreSQL
+/// advisory lock would do, but those are per database, so it would take a
+/// third session on the admin database per test — enough, with every
+/// test waiting on it, to run the cluster out of connections. The lock is
+/// released when the guard drops, or the process dies.
+struct SharedCatalogLock(std::fs::File);
+
+impl SharedCatalogLock {
+    fn acquire(admin_conn_str: &str) -> SharedCatalogLock {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        admin_conn_str.hash(&mut hasher);
+        let path = std::env::temp_dir().join(format!(
+            "typedpg-pg-sanity-shared-catalogs-{:016x}.lock",
+            hasher.finish()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("pg_sanity: opening {} failed: {e}", path.display()));
+        file.lock()
+            .unwrap_or_else(|e| panic!("pg_sanity: locking {} failed: {e}", path.display()));
+        SharedCatalogLock(file)
+    }
+}
+
+impl Drop for SharedCatalogLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Whether migration `sql` may write a shared catalog (see
+/// [`SharedCatalogLock`]): a role statement, a grant on a parameter,
+/// database or tablespace, a database or role setting, `ALTER SYSTEM`, a
+/// comment or label on a shared object, `DROP` / `REASSIGN OWNED`, a
+/// tablespace statement, or a `DO` block that names one of those. Erring
+/// towards true only serializes more. A migration that doesn't parse is
+/// taken as one.
+fn writes_shared_catalog(sql: &str) -> bool {
+    use typedpg_pg_query::ast::{Node, ObjectType};
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return true;
+    };
+    let shared = |objtype: ObjectType| {
+        matches!(
+            objtype,
+            ObjectType::ObjectParameterAcl
+                | ObjectType::ObjectDatabase
+                | ObjectType::ObjectTablespace
+                | ObjectType::ObjectRole
+        )
+    };
+    parsed.tree.stmts.iter().any(|raw| match raw.stmt.as_ref() {
+        Some(Node::GrantStmt(g)) => shared(g.objtype),
+        Some(Node::CommentStmt(c)) => shared(c.objtype),
+        Some(Node::SecLabelStmt(l)) => shared(l.objtype),
+        Some(
+            Node::CreateRoleStmt(_)
+            | Node::AlterRoleStmt(_)
+            | Node::AlterRoleSetStmt(_)
+            | Node::DropRoleStmt(_)
+            | Node::GrantRoleStmt(_)
+            | Node::DropOwnedStmt(_)
+            | Node::ReassignOwnedStmt(_)
+            | Node::AlterSystemStmt(_)
+            | Node::AlterDatabaseStmt(_)
+            | Node::AlterDatabaseSetStmt(_)
+            | Node::AlterDatabaseRefreshCollStmt(_)
+            | Node::CreateTableSpaceStmt(_)
+            | Node::DropTableSpaceStmt(_)
+            | Node::AlterTableSpaceOptionsStmt(_),
+        ) => true,
+        // Its body runs whatever it builds: a word naming a shared object
+        // is enough.
+        Some(Node::DoStmt(_)) => {
+            let upper = sql.to_ascii_uppercase();
+            [
+                "ROLE",
+                "USER",
+                "PARAMETER",
+                "DATABASE",
+                "TABLESPACE",
+                "OWNED",
+                "SYSTEM",
+            ]
+            .iter()
+            .any(|word| upper.contains(word))
+        }
+        _ => false,
+    })
+}
+
 impl PgSanityServer {
     /// Read `POSTGRES_URL`, create a per-instance scratch database with a
     /// random name, and return a client connected to it.
@@ -272,7 +380,12 @@ impl PgSanityServer {
     /// Outside a block (the migration ended its last one) either statement
     /// only draws a warning. The caller compares the migration's outcome,
     /// which this returns.
+    ///
+    /// A migration that may write a shared catalog runs under
+    /// [`SharedCatalogLock`], held until its transaction ends.
     fn run_migration(&mut self, sql: &str) -> Result<(), postgres::Error> {
+        let lock =
+            writes_shared_catalog(sql).then(|| SharedCatalogLock::acquire(&self.admin_conn_str));
         let pg_result = self
             .client
             .batch_execute(sql)
@@ -285,6 +398,7 @@ impl PgSanityServer {
                 )
             });
         }
+        drop(lock);
         // A type renamed or moved to another schema keeps its OID: the
         // names cached for the old catalog may be stale.
         self.type_name_cache.clear();
@@ -2448,11 +2562,24 @@ impl Drop for PgSanityServer {
         // Roles are cluster-wide: drop the ones the migrations created so
         // concurrent test processes don't collide. Errors are swallowed (a
         // role may already be gone, or still owned by another database).
-        for role in &self.created_roles {
-            let quoted = typedpg_core::quote_identifier(role);
-            let _ = self
-                .client
-                .batch_execute(&format!("DROP ROLE IF EXISTS {quoted}"));
+        // `pg_authid` is a shared catalog: under the lock, as the
+        // migrations writing it run.
+        if !self.created_roles.is_empty() {
+            let lock = SharedCatalogLock::acquire(&self.admin_conn_str);
+            for role in &self.created_roles {
+                let quoted = typedpg_core::quote_identifier(role);
+                // Its privileges on shared objects (a parameter, a
+                // tablespace) would keep DROP ROLE from dropping it; DROP
+                // OWNED revokes them (and owns nothing in this database).
+                // Its own statement: it fails for a role already gone.
+                let _ = self
+                    .client
+                    .batch_execute(&format!("DROP OWNED BY {quoted}"));
+                let _ = self
+                    .client
+                    .batch_execute(&format!("DROP ROLE IF EXISTS {quoted}"));
+            }
+            drop(lock);
         }
     }
 }
@@ -2669,5 +2796,43 @@ fn qualified_param_type_name_for_compare(ty: &Type) -> String {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }
         Type::AnonymousRecord { .. } => "pg_catalog.record".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::writes_shared_catalog;
+
+    #[test]
+    fn migrations_writing_shared_catalogs_are_serialized() {
+        for sql in [
+            "CREATE ROLE a",
+            "CREATE TABLE t (a int); CREATE USER b",
+            "ALTER ROLE a SET work_mem = '1MB'",
+            "DROP ROLE a",
+            "GRANT a TO b",
+            "GRANT SET ON PARAMETER log_min_duration_statement TO a",
+            "REVOKE ALL ON PARAMETER work_mem FROM a",
+            "GRANT CREATE ON TABLESPACE pg_default TO a",
+            "GRANT CONNECT ON DATABASE postgres TO a",
+            "ALTER DATABASE postgres SET timezone TO 'UTC'",
+            "ALTER SYSTEM SET work_mem = '1MB'",
+            "COMMENT ON ROLE a IS 'x'",
+            "REASSIGN OWNED BY a TO postgres",
+            "DROP OWNED BY a",
+            "DO $$ BEGIN CREATE ROLE a; END $$",
+            // Unparsable: taken as one.
+            "CREATE ROLE",
+        ] {
+            assert!(writes_shared_catalog(sql), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t (a int)",
+            "GRANT SELECT ON t TO a",
+            "COMMENT ON TABLE t IS 'x'",
+            "DO $$ BEGIN PERFORM 1; END $$",
+        ] {
+            assert!(!writes_shared_catalog(sql), "{sql}");
+        }
     }
 }

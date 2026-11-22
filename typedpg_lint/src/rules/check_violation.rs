@@ -80,17 +80,15 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     out
 }
 
-/// The relation a statement writes.
+/// The relation a statement writes, as the analyzer resolved it.
 fn relation_oid(
     ctx: &Ctx<'_>,
     relation: Option<&RangeVar>,
 ) -> Option<typedpg_analyzer::PgClassOid> {
-    let relation = relation?;
-    if !relation.catalogname.is_empty() {
-        return None;
+    match ctx.view.relation_of(relation?)? {
+        typedpg_analyzer::RelationRef::Relation(oid) => Some(oid),
+        typedpg_analyzer::RelationRef::Cte => None,
     }
-    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-    Some(ctx.catalog.resolve_table(schema, &relation.relname)?.oid)
 }
 
 /// The `SET col = value` items of an UPDATE or ON CONFLICT DO UPDATE.

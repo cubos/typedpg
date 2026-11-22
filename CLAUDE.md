@@ -257,8 +257,9 @@ is rejected at compile time with the error the execution raises. That is
 stricter than PREPARE, and correct: the oracle's execute fallback runs such
 a query and compares against the runtime error.
 
-One deliberate exception goes further: writing a literal `NULL` into a NOT
-NULL column (or NOT NULL domain) is rejected at compile time in UPDATE and
+One deliberate exception goes further: writing a literal `NULL` (or
+`DEFAULT` where the column has no default) into a NOT NULL column (or NOT
+NULL domain) is rejected at compile time in UPDATE and
 MERGE too, although PG fails only the executions that touch a row (an UPDATE
 or MERGE matching nothing succeeds). Such a statement is a bug whenever it
 does anything, so typedpg reports it; those tests call `skip_pg_sanity`,

@@ -17,6 +17,31 @@ fn setup() -> PgCatalog {
     db
 }
 
+// ── A domain over boolean is a condition's boolean ───────────────────────────
+
+#[test]
+fn conditions_over_a_boolean_domain_are_accepted() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN dbool AS boolean;
+         CREATE TABLE t (id INT PRIMARY KEY, b dbool NOT NULL);",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE b",
+        "SELECT a.id FROM t a JOIN t c ON a.b",
+        "SELECT b FROM t GROUP BY b HAVING b",
+        "SELECT count(*) FILTER (WHERE b) AS n FROM t",
+        "SELECT CASE WHEN b THEN 1 ELSE 0 END AS x FROM t",
+        "SELECT NOT b AS x, b AND b AS y, b OR b AS z, b IS TRUE AS w FROM t",
+        "UPDATE t SET id = id WHERE b",
+        "DELETE FROM t WHERE b",
+        "MERGE INTO t USING t s ON t.id = s.id WHEN MATCHED AND s.b THEN DELETE",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 // ── Non-boolean expression in WHERE is a type mismatch ───────────────────────
 
 #[test]

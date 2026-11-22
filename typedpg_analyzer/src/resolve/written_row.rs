@@ -156,9 +156,39 @@ pub(crate) struct WriteTarget {
     levels: Vec<(PgClassOid, HashMap<String, String>)>,
 }
 
+/// Which writes [`WriteTarget::follow`] follows down a view chain.
+#[derive(Clone, Copy)]
+enum Writing<'a> {
+    /// Reading a view's rows: rules and triggers don't matter.
+    No,
+    /// Any write: every rule and INSTEAD OF trigger stops it.
+    Any,
+    /// A statement doing `events` (a MERGE's actions', when `merge`).
+    For { events: &'a [DmlEvent], merge: bool },
+}
+
 impl WriteTarget {
     pub(crate) fn resolve(snapshot: &PgCatalog, relid: PgClassOid) -> Option<WriteTarget> {
-        Self::follow(snapshot, relid, true)
+        Self::follow(snapshot, relid, Writing::Any)
+    }
+
+    /// The rows a statement doing `events` on `relid` writes (a MERGE's
+    /// actions', when `merge`), when they are what it says. Only what
+    /// fires for those events stops it, as `RewriteQuery` decides: a DO
+    /// INSTEAD rule for one of them (`matchLocks` matches a rule by event;
+    /// a DO ALSO rule's actions run beside the original statement, which
+    /// is still rewritten into the view's base relation), or an INSTEAD OF
+    /// trigger for one of them on a view (`view_has_instead_trigger`). An
+    /// INSTEAD OF DELETE trigger or a rule ON DELETE leaves an INSERT
+    /// through the view automatically updatable. A MERGE is not allowed on
+    /// a relation with rules at all.
+    pub(crate) fn resolve_for(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        events: &[DmlEvent],
+        merge: bool,
+    ) -> Option<WriteTarget> {
+        Self::follow(snapshot, relid, Writing::For { events, merge })
     }
 
     /// The rows of view `relid` read as rows of its base table: an
@@ -173,12 +203,36 @@ impl WriteTarget {
         if !is_view {
             return None;
         }
-        Self::follow(snapshot, relid, false)
+        Self::follow(snapshot, relid, Writing::No)
     }
 
-    /// Follow `relid` down to its base table; `writing` refuses rules and
-    /// INSTEAD OF triggers, which make a write something else.
-    fn follow(snapshot: &PgCatalog, relid: PgClassOid, writing: bool) -> Option<WriteTarget> {
+    /// Follow `relid` down to its base table; `writing` says which rules
+    /// and INSTEAD OF triggers make the write something else.
+    fn follow(
+        snapshot: &PgCatalog,
+        relid: PgClassOid,
+        writing: Writing<'_>,
+    ) -> Option<WriteTarget> {
+        let rewritten_by_rule = |rel: PgClassOid| {
+            let rules = snapshot.rules.get(&rel).map_or(&[][..], Vec::as_slice);
+            match writing {
+                Writing::No => false,
+                Writing::Any | Writing::For { merge: true, .. } => !rules.is_empty(),
+                Writing::For { events, .. } => rules.iter().any(|r| {
+                    r.instead && r.enabled && events.iter().any(|e| r.event == e.cmd_type())
+                }),
+            }
+        };
+        let instead_trigger = |rel: PgClassOid| {
+            let triggers = snapshot.triggers.get(&rel).map_or(&[][..], Vec::as_slice);
+            match writing {
+                Writing::No => false,
+                Writing::Any => triggers.iter().any(|t| t.instead_row_events != 0),
+                Writing::For { events, .. } => triggers
+                    .iter()
+                    .any(|t| events.iter().any(|e| t.is_instead_row_for(e.trigger_bit()))),
+            }
+        };
         let own = |rel: PgClassOid| -> HashMap<String, String> {
             snapshot
                 .attributes_of(rel)
@@ -192,7 +246,7 @@ impl WriteTarget {
         let mut cur = relid;
         for _ in 0..16 {
             let class = snapshot.pg_class.get(&cur)?;
-            if writing && snapshot.rules.get(&cur).is_some_and(|r| !r.is_empty()) {
+            if rewritten_by_rule(cur) {
                 return None;
             }
             match class.relkind {
@@ -205,12 +259,7 @@ impl WriteTarget {
                     });
                 }
                 crate::pg_catalog::RelKind::View => {
-                    if writing
-                        && snapshot
-                            .triggers
-                            .get(&cur)
-                            .is_some_and(|ts| ts.iter().any(|t| t.instead_row_events != 0))
-                    {
+                    if instead_trigger(cur) {
                         return None;
                     }
                     let upd = snapshot.view_updatability.get(&cur)?;
@@ -292,9 +341,9 @@ impl WriteTarget {
 
     /// What the INSERT writes to base column `attr` it gives no value
     /// for. rewriteTargetListIU fills in each view's defaults on the way
-    /// down: the first view whose columns storing it have a default (or
-    /// are of a domain type, whose default isn't modeled) decides, else
-    /// the base column's own default.
+    /// down: the first view whose columns storing it have a default (their
+    /// own, or their domain's: `build_column_default` falls back on the
+    /// type's) decides, else the base column's own default.
     pub(crate) fn omitted(
         &self,
         snapshot: &PgCatalog,
@@ -304,7 +353,7 @@ impl WriteTarget {
             let mut found: Option<ValueInfo> = None;
             for va in snapshot.attributes_of(*view) {
                 if map.get(&va.attname) != Some(&attr.attname)
-                    || (!va.atthasdef && snapshot.unwrap_domain(va.atttypid) == va.atttypid)
+                    || (!va.atthasdef && !snapshot.domain_has_default(va.atttypid))
                 {
                     continue;
                 }

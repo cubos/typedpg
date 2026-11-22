@@ -1,43 +1,24 @@
 # `detach_partition_blocking`
 
-`ALTER TABLE … DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table takes an `ACCESS EXCLUSIVE` lock on it, blocking every query on every partition.
+`ALTER TABLE … DETACH PARTITION` without `CONCURRENTLY` on a partitioned
+table that already has rows.
 
-| | |
-|---|---|
-| Default level | warning |
-| Applies to | migrations |
-| Fix | no |
+| Level | Applies to | Fix |
+|---|---|---|
+| warning | migrations | — |
 
-## Why
-
-A plain `DETACH PARTITION` locks both the partitioned table and the partition with `ACCESS EXCLUSIVE`. Every query on the partitioned table — whichever partition it would read — waits for the lock, and everything queued behind it waits too. Detaching an old partition to archive it is routine maintenance, and doing it this way stops the whole table.
-
-`DETACH PARTITION … CONCURRENTLY` runs in two transactions and only takes `SHARE UPDATE EXCLUSIVE` on the partitioned table, so queries keep running. It cannot run inside a transaction block (put it in a migration whose first line is `-- no-transaction`), and PostgreSQL refuses it while the partitioned table has a default partition. If it is interrupted, `ALTER TABLE … DETACH PARTITION … FINALIZE` completes it.
-
-## What it reports
-
-An `ALTER TABLE` with a `DETACH PARTITION` subcommand without `CONCURRENTLY`, on a partitioned table that existed before the current file started.
-
-When the partitioned table has a default partition, `CONCURRENTLY` is not an option, and the help says so: the remaining defense is a short `lock_timeout` and a retry.
-
-## Examples
-
-### Bad
+## Example
 
 ```sql
 -- migrations/0001_init.sql
-CREATE TABLE measurements (
-    id bigint NOT NULL,
-    taken_at timestamptz NOT NULL,
-    PRIMARY KEY (id)
-) PARTITION BY RANGE (id);
+CREATE TABLE measurements (id bigint PRIMARY KEY, taken_at timestamptz NOT NULL) PARTITION BY RANGE (id);
 CREATE TABLE measurements_1 PARTITION OF measurements FOR VALUES FROM (0) TO (1000);
 
 -- migrations/0002_detach.sql
 ALTER TABLE measurements DETACH PARTITION measurements_1;
 ```
 
-```text
+```
 warning[detach_partition_blocking]: DETACH PARTITION without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on public.measurements, blocking every query on the partitioned table
    ╭─[migrations/0002_detach.sql:1:1]
  1 │ ALTER TABLE measurements DETACH PARTITION measurements_1;
@@ -46,15 +27,8 @@ warning[detach_partition_blocking]: DETACH PARTITION without CONCURRENTLY takes 
   help: use DETACH PARTITION … CONCURRENTLY, in a migration whose first line is -- no-transaction
 ```
 
-With a default partition (`CREATE TABLE measurements_other PARTITION OF measurements DEFAULT;` in `0001_init.sql`), the same statement gets another help line:
-
-```text
-  help: CONCURRENTLY is not allowed while public.measurements has a default partition: set a short lock_timeout and retry the detach on timeout
-```
-
-The statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md) finding (not shown).
-
-### Good
+The statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md)
+finding. The fix:
 
 ```sql
 -- migrations/0002_detach.sql
@@ -63,37 +37,50 @@ SET lock_timeout = '5s';
 ALTER TABLE measurements DETACH PARTITION measurements_1 CONCURRENTLY;
 ```
 
-Not reported: detaching from a partitioned table created in the same file.
+If a concurrent detach is interrupted, `DETACH PARTITION … FINALIZE`
+completes it.
 
-## When it stays silent
+## Why
 
-- `CONCURRENTLY` or `FINALIZE` is used, or the partitioned table was created in the same file.
-- The file is unchanged from `--previous-deployment`, matches `lint.ignore`, or belongs to `extra_migrations`.
+Every query on the partitioned table waits, whichever partition it reads,
+and everything queued behind it waits too. Detaching an old partition is
+routine maintenance; done this way it stops the whole table.
+
+## Reported when
+
+The partitioned table was created by an earlier migration file.
+
+When it has a default partition, PostgreSQL refuses `CONCURRENTLY`, and the
+help says so instead:
+
+```
+  help: CONCURRENTLY is not allowed while public.ev has a default partition: set a short lock_timeout and retry the detach on timeout
+```
+
+## Not reported
+
+- `DETACH PARTITION … CONCURRENTLY` and `… FINALIZE`.
+- A partitioned table created earlier in the same file.
 
 ## Configuration
 
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-detach_partition_blocking = "error"   # "error", "warning" (default), "info" or "off"
+detach_partition_blocking = "error"   # error | warning | info | off
 ```
-
 ```json
 // typedpg.config.json
 { "lint": { "detachPartitionBlocking": "error" } }
 ```
 
-For one statement (for example, with a default partition, once a `lock_timeout` is set):
+Allow one statement with `-- typedpg-lint: allow(detach_partition_blocking)`
+before it in the migration file, e.g. after a short `SET LOCAL lock_timeout`
+when there is a default partition.
+See [Configuring rules](README.md#configuring-rules).
 
-```sql
-SET LOCAL lock_timeout = '2s';
--- typedpg-lint: allow(detach_partition_blocking)
-ALTER TABLE measurements DETACH PARTITION measurements_1;
-```
-
-See [Configuring rules](README.md#configuring-rules) for `fail_on` / `failOn` and `ignore`.
-
-## Related rules
+## Related
 
 - [`attach_partition_scan`](attach_partition_scan.md): the other direction.
-- [`missing_lock_timeout`](missing_lock_timeout.md)
+- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+  waiting for its lock with no timeout.

@@ -404,7 +404,7 @@ fn expand_set_items_replayed<'a>(
 /// Analyze an UPDATE-style SET list against `table_attrs` — the shared core
 /// of UPDATE, ON CONFLICT DO UPDATE and MERGE ... UPDATE (PG's
 /// `transformUpdateTargetList`). `null_check` enables the static rejection
-/// of `SET not_null_col = NULL`. Returns the SET list with its multiple
+/// of `SET not_null_col = NULL` (or `= DEFAULT` when that is NULL). Returns the SET list with its multiple
 /// assignments' row elements expanded ([`expand_multi_assign_rows`]), what
 /// the later passes over it read.
 pub(crate) fn analyze_set_clause<'a>(
@@ -416,6 +416,9 @@ pub(crate) fn analyze_set_clause<'a>(
     null_check: bool,
 ) -> Result<std::borrow::Cow<'a, [Option<ast::Node>]>, AnalyzeError> {
     let snapshot = ctx.snapshot;
+    if let Some(a) = table_attrs.first() {
+        crate::pg_catalog::note_write_row(a.attrelid);
+    }
     let target_list = expand_multi_assign_rows(target_list, ctx, params)?;
     let items = expand_set_items(&target_list, ctx, params)?;
     // `(column, indirected)` of every assignment, for the rewriter's
@@ -460,9 +463,13 @@ pub(crate) fn analyze_set_clause<'a>(
                 // raises a runtime `null value in column … violates
                 // not-null constraint` error. A NULL stored *inside* the
                 // column (`arr[1] = NULL`) is fine.
+                // `SET col = DEFAULT` with no default (nor one from its
+                // domain) writes NULL too: the same error, with the same
+                // trigger and rule caveats.
                 if null_check
                     && !target.indirected
-                    && is_sql_null_literal(val)
+                    && (is_sql_null_literal(val)
+                        || is_set_to_default(val) && super::dml::null_default(tc, snapshot))
                     && let Some(err) = null_assignment_error(tc, snapshot, table_relname, "assign")
                 {
                     return Err(err);

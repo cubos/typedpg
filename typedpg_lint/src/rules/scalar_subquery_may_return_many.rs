@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 
-use typedpg_analyzer::{RelKind, select_at_most_one_row};
+use typedpg_analyzer::{RelKind, RelationRef, select_at_most_one_row};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{
     AConstValue, LimitOption, Node as N, SelectStmt, SetOperation, SubLinkType,
@@ -34,14 +34,6 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     if !ctx.view.analyzed.spreads.is_empty() {
         return Vec::new();
     }
-    let cte_names: HashSet<&str> = ctx
-        .tree
-        .nodes()
-        .filter_map(|(node, _)| match node {
-            NodeRef::CommonTableExpr(cte) => Some(cte.ctename.as_str()),
-            _ => None,
-        })
-        .collect();
     let mut out = Vec::new();
     // `SET (a, b) = (SELECT …)` repeats the sublink under each column.
     let mut seen = HashSet::new();
@@ -63,7 +55,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let Some(N::SelectStmt(select)) = sub.subselect.as_ref() else {
             continue;
         };
-        if !may_return_many(ctx, select, &cte_names) {
+        if !may_return_many(ctx, select) {
             continue;
         }
         let Some(span) = node_span(ctx, node) else {
@@ -88,7 +80,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 
 /// Whether `select` may return more than one row, as far as the proof can
 /// tell and only where its giving up can't hide a single row.
-fn may_return_many(ctx: &Ctx<'_>, select: &SelectStmt, cte_names: &HashSet<&str>) -> bool {
+fn may_return_many(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     if select.op != SetOperation::SetopNone {
         return false;
     }
@@ -115,7 +107,7 @@ fn may_return_many(ctx: &Ctx<'_>, select: &SelectStmt, cte_names: &HashSet<&str>
     if !select
         .from_clause
         .iter()
-        .all(|item| plain_tables(ctx, item.as_ref(), cte_names))
+        .all(|item| plain_tables(ctx, item.as_ref()))
     {
         return false;
     }
@@ -146,14 +138,14 @@ fn may_return_many(ctx: &Ctx<'_>, select: &SelectStmt, cte_names: &HashSet<&str>
 /// whose unique indexes are all on plain columns, without a predicate (a
 /// proof over an expression or partial index would be one the analyzer
 /// can't make).
-fn plain_tables(ctx: &Ctx<'_>, item: Option<&N>, cte_names: &HashSet<&str>) -> bool {
+fn plain_tables(ctx: &Ctx<'_>, item: Option<&N>) -> bool {
     match item {
         Some(N::RangeVar(range)) => {
-            if range.schemaname.is_empty() && cte_names.contains(range.relname.as_str()) {
+            // A `WITH` query of the same name is no table.
+            let Some(RelationRef::Relation(oid)) = ctx.view.relation_of(range) else {
                 return false;
-            }
-            let schema = (!range.schemaname.is_empty()).then_some(range.schemaname.as_str());
-            let Some(class) = ctx.catalog.resolve_table(schema, &range.relname) else {
+            };
+            let Some(class) = ctx.catalog.class_row(oid) else {
                 return false;
             };
             if !matches!(class.relkind, RelKind::Table | RelKind::Partitioned) {
@@ -168,8 +160,7 @@ fn plain_tables(ctx: &Ctx<'_>, item: Option<&N>, cte_names: &HashSet<&str>) -> b
             })
         }
         Some(N::JoinExpr(join)) => {
-            plain_tables(ctx, join.larg.as_ref(), cte_names)
-                && plain_tables(ctx, join.rarg.as_ref(), cte_names)
+            plain_tables(ctx, join.larg.as_ref()) && plain_tables(ctx, join.rarg.as_ref())
         }
         _ => false,
     }

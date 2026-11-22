@@ -22,11 +22,13 @@
 //! value an index scan could use: no column of the same table, no subquery,
 //! no volatile call. Only the top-level `AND` parts of a condition are read.
 //! The help names the sargable rewrite when it is a range (`::date`,
-//! `date_trunc`). No fix is offered.
+//! `date_trunc`): one no other rule reports (a `timestamptz` column's
+//! bounds convert the day explicitly, as the cast reads it in the session's
+//! `TimeZone`), and says when it selects other rows (around a
+//! daylight-saving change at midnight, a `date_trunc` value not truncated).
+//! No range is named where none is equivalent. No fix is offered.
 
-use std::collections::HashSet;
-
-use typedpg_analyzer::{CastMethod, PgClassOid, PgTypeOid, RelKind};
+use typedpg_analyzer::{CastMethod, PgClassOid, PgTypeOid, RelKind, RelationRef};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{AConstValue, AExpr, AExprKind, ColumnRef, Node};
 
@@ -36,16 +38,9 @@ use crate::{Ctx, RawFinding};
 const DATE: PgTypeOid = PgTypeOid::from_raw(1082);
 const TIMESTAMP: PgTypeOid = PgTypeOid::from_raw(1114);
 const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
+const UNKNOWN: PgTypeOid = PgTypeOid::from_raw(705);
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    let ctes: HashSet<&str> = ctx
-        .tree
-        .nodes()
-        .filter_map(|(node, _)| match node {
-            NodeRef::CommonTableExpr(cte) => Some(cte.ctename.as_str()),
-            _ => None,
-        })
-        .collect();
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         let mut level = Level::default();
@@ -53,25 +48,25 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         match node {
             NodeRef::SelectStmt(select) => {
                 for item in select.from_clause.iter().flatten() {
-                    level.add(ctx, &ctes, item, &mut quals);
+                    level.add(ctx, item, &mut quals);
                 }
                 quals.extend(select.where_clause.as_ref());
             }
             NodeRef::UpdateStmt(update) => {
                 if let Some(relation) = update.relation.as_deref() {
-                    level.add_relation(ctx, &ctes, relation);
+                    level.add_relation(ctx, relation);
                 }
                 for item in update.from_clause.iter().flatten() {
-                    level.add(ctx, &ctes, item, &mut quals);
+                    level.add(ctx, item, &mut quals);
                 }
                 quals.extend(update.where_clause.as_ref());
             }
             NodeRef::DeleteStmt(delete) => {
                 if let Some(relation) = delete.relation.as_deref() {
-                    level.add_relation(ctx, &ctes, relation);
+                    level.add_relation(ctx, relation);
                 }
                 for item in delete.using_clause.iter().flatten() {
-                    level.add(ctx, &ctes, item, &mut quals);
+                    level.add(ctx, item, &mut quals);
                 }
                 quals.extend(delete.where_clause.as_ref());
             }
@@ -99,21 +94,15 @@ struct Level {
 }
 
 impl Level {
-    fn add<'a>(
-        &mut self,
-        ctx: &Ctx<'_>,
-        ctes: &HashSet<&str>,
-        item: &'a Node,
-        quals: &mut Vec<&'a Node>,
-    ) {
+    fn add<'a>(&mut self, ctx: &Ctx<'_>, item: &'a Node, quals: &mut Vec<&'a Node>) {
         match item {
-            Node::RangeVar(relation) => self.add_relation(ctx, ctes, relation),
+            Node::RangeVar(relation) => self.add_relation(ctx, relation),
             Node::JoinExpr(join) => {
                 for side in [join.larg.as_ref(), join.rarg.as_ref()]
                     .into_iter()
                     .flatten()
                 {
-                    self.add(ctx, ctes, side, quals);
+                    self.add(ctx, side, quals);
                 }
                 quals.extend(join.quals.as_ref());
                 if let Some(alias) = &join.alias {
@@ -134,24 +123,20 @@ impl Level {
         }
     }
 
-    fn add_relation(
-        &mut self,
-        ctx: &Ctx<'_>,
-        ctes: &HashSet<&str>,
-        relation: &typedpg_pg_query::ast::RangeVar,
-    ) {
+    fn add_relation(&mut self, ctx: &Ctx<'_>, relation: &typedpg_pg_query::ast::RangeVar) {
         let name = relation
             .alias
             .as_ref()
             .map_or_else(|| relation.relname.clone(), |alias| alias.aliasname.clone());
-        let oid = if relation.schemaname.is_empty() && ctes.contains(relation.relname.as_str()) {
-            None
-        } else {
-            let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-            ctx.catalog
-                .resolve_table(schema, &relation.relname)
+        // What the analyzer resolved the reference to: a `WITH` query of
+        // the same name is no table.
+        let oid = match ctx.view.relation_of(relation) {
+            Some(RelationRef::Relation(oid)) => ctx
+                .catalog
+                .class_row(oid)
                 .filter(|class| matches!(class.relkind, RelKind::Table | RelKind::Partitioned))
-                .map(|class| class.oid)
+                .map(|class| class.oid),
+            _ => None,
         };
         self.entries.push((name, oid));
     }
@@ -205,31 +190,77 @@ struct Wrapped<'a> {
     wrap: Wrap<'a>,
 }
 
+/// A binary comparison read with the wrapped column's side on the left
+/// (`$1 < f(col)` is `f(col) > $1`).
+struct Compared {
+    /// `=`, `<`, `<=`, `>`, `>=`, or `BETWEEN` (its two bounds the other
+    /// side).
+    op: &'static str,
+    /// The other side's type as the operator takes it: `unknown` for a
+    /// parameter or an untyped literal it typed. `None` when unresolved.
+    other_type: Option<PgTypeOid>,
+}
+
 fn comparison(ctx: &Ctx<'_>, level: &Level, expr: &AExpr) -> Option<RawFinding> {
     let operator = operator_name(expr)?;
     let left = expr.lexpr.as_ref()?;
     let right = expr.rexpr.as_ref()?;
-    let (candidates, range_op): (Vec<(&Node, Vec<&Node>)>, bool) = match expr.kind {
-        AExprKind::AexprOp if matches!(operator, "=" | "<" | "<=" | ">" | ">=") => (
-            vec![(left, vec![right]), (right, vec![left])],
-            operator == "=",
-        ),
+    type Candidate<'n> = (&'n Node, Vec<&'n Node>, Option<Compared>);
+    let candidates: Vec<Candidate<'_>> = match expr.kind {
+        AExprKind::AexprOp if matches!(operator, "=" | "<" | "<=" | ">" | ">=") => {
+            let types = ctx.view.operator_types(expr.location);
+            let (op, flipped): (&'static str, &'static str) = match operator {
+                "=" => ("=", "="),
+                "<" => ("<", ">"),
+                "<=" => ("<=", ">="),
+                ">" => (">", "<"),
+                _ => (">=", "<="),
+            };
+            vec![
+                (
+                    left,
+                    vec![right],
+                    Some(Compared {
+                        op,
+                        other_type: types.map(|t| t.right),
+                    }),
+                ),
+                (
+                    right,
+                    vec![left],
+                    Some(Compared {
+                        op: flipped,
+                        other_type: types.and_then(|t| t.left),
+                    }),
+                ),
+            ]
+        }
         AExprKind::AexprBetween => {
             let Node::List(list) = right else {
                 return None;
             };
-            (vec![(left, list.items.iter().flatten().collect())], false)
+            // Its two comparisons share its location: one type when the
+            // bounds agree.
+            let types = ctx.view.operator_types(expr.location);
+            vec![(
+                left,
+                list.items.iter().flatten().collect(),
+                Some(Compared {
+                    op: "BETWEEN",
+                    other_type: types.map(|t| t.right),
+                }),
+            )]
         }
         AExprKind::AexprIn if operator == "=" => {
             let Node::List(list) = right else {
                 return None;
             };
-            (vec![(left, list.items.iter().flatten().collect())], false)
+            vec![(left, list.items.iter().flatten().collect(), None)]
         }
-        AExprKind::AexprOpAny if operator == "=" => (vec![(left, vec![right])], false),
+        AExprKind::AexprOpAny if operator == "=" => vec![(left, vec![right], None)],
         _ => return None,
     };
-    for (side, others) in candidates {
+    for (side, others, compared) in candidates {
         let Some(wrapped) = wrapped_column(ctx, level, side) else {
             continue;
         };
@@ -239,7 +270,14 @@ fn comparison(ctx: &Ctx<'_>, level: &Level, expr: &AExpr) -> Option<RawFinding> 
         {
             continue;
         }
-        return Some(finding(ctx, expr, side, &others, &wrapped, range_op));
+        return Some(finding(
+            ctx,
+            expr,
+            side,
+            &others,
+            &wrapped,
+            compared.as_ref(),
+        ));
     }
     None
 }
@@ -250,7 +288,7 @@ fn finding(
     side: &Node,
     others: &[&Node],
     wrapped: &Wrapped<'_>,
-    equality: bool,
+    compared: Option<&Compared>,
 ) -> RawFinding {
     // Quoted as written: a `$day` parameter stays `$day`.
     let text = |node: &Node| {
@@ -273,19 +311,35 @@ fn finding(
         .iter()
         .find(|a| a.attnum == wrapped.attnum)
         .map(|a| a.atttypid);
-    let rhs = (others.len() == 1).then(|| text(others[0]));
+    // The other side, single, and how the comparison reads it.
+    let other = match (others, compared) {
+        ([other], Some(compared)) if compared.op != "BETWEEN" => Some((*other, compared)),
+        _ => None,
+    };
     let (why, help) = match &wrapped.wrap {
         Wrap::Cast { to } => {
             let why = format!("the column is cast to {}", type_name(*to));
-            let help = match (column_type, rhs.as_deref()) {
-                (Some(TIMESTAMP | TIMESTAMPTZ), Some(rhs)) if *to == DATE && equality => format!(
-                    "compare a range on the column itself: {column} >= {rhs} AND {column} < {rhs} + 1"
-                ),
-                (Some(ty), _) => format!(
-                    "compare the column itself, converting the other side to {} instead",
+            let day_cast = *to == DATE && matches!(column_type, Some(TIMESTAMP | TIMESTAMPTZ));
+            let range = match (column_type, compared) {
+                (Some(ty), Some(compared)) if day_cast => {
+                    date_range(ctx, &column, ty, others, compared)
+                }
+                _ => None,
+            };
+            let help = match (range, column_type) {
+                (Some(help), _) => help,
+                // Converting the other side would compare instants with
+                // each day's midnight: a range is what matches the day.
+                (None, Some(_)) if day_cast => "compare a range on the column itself: a day \
+                                                is from its midnight up to the next day's"
+                    .to_owned(),
+                (None, Some(ty)) => format!(
+                    "compare the column itself, converting the other side to {} instead (the \
+                     same rows only where that conversion is exact: a value it rounds, or a \
+                     text it reads other than as written, compares differently)",
                     type_name(ty)
                 ),
-                (None, _) => "compare the column itself".to_owned(),
+                (None, None) => "compare the column itself".to_owned(),
             };
             (why, help)
         }
@@ -300,16 +354,21 @@ fn finding(
                     _ => None,
                 })
                 .flatten();
-            let help = match (unit, rhs.as_deref()) {
-                (Some(unit), Some(rhs)) if equality => format!(
-                    "compare a range on the column itself: {column} >= {rhs} AND {column} < {rhs} \
-                     + interval '1 {unit}'"
-                ),
-                _ => format!(
+            let range = match (unit, column_type, other) {
+                (Some(unit), Some(ty @ (TIMESTAMP | TIMESTAMPTZ)), Some((other, compared)))
+                    if call.args.len() == 2
+                        && matches!(call.args.get(1), Some(Some(Node::ColumnRef(_)))) =>
+                {
+                    trunc_range(ctx, &column, ty, &unit, other, compared)
+                }
+                _ => None,
+            };
+            let help = range.unwrap_or_else(|| {
+                format!(
                     "compare the column itself, or create an expression index on ({})",
                     text(side)
-                ),
-            };
+                )
+            });
             (why, help)
         }
         Wrap::Arithmetic { operator } => (
@@ -323,7 +382,9 @@ fn finding(
                 type_name(*to)
             ),
             format!(
-                "cast the other side to {} so the column is compared as stored",
+                "cast the other side to {} so the column is compared as stored (the same rows \
+                 only where that cast is exact: a value it rounds or truncates compares \
+                 differently)",
                 type_name(*from)
             ),
         ),
@@ -340,6 +401,146 @@ fn finding(
         help: Some(help),
         fix: Vec::new(),
     }
+}
+
+/// The other side of a comparison as an expression of type `date`, written:
+/// as is when it is one (in parentheses unless it is a single term), with
+/// `::date` when it is a parameter or an untyped literal the comparison
+/// typed. `None` for any other type: no range is equivalent then.
+fn date_operand(ctx: &Ctx<'_>, other: &Node, compared: &Compared) -> Option<String> {
+    let written = ctx.written(node_span(ctx, other.to_ref())?).to_owned();
+    match compared.other_type? {
+        DATE => Some(match other {
+            Node::ParamRef(_)
+            | Node::ColumnRef(_)
+            | Node::FuncCall(_)
+            | Node::TypeCast(_)
+            | Node::SqlValueFunction(_)
+            | Node::AConst(_) => written,
+            _ => format!("({written})"),
+        }),
+        UNKNOWN => match other {
+            Node::ParamRef(_) => Some(format!("{written}::date")),
+            Node::AConst(c) if matches!(c.val, Some(AConstValue::String(_))) => {
+                Some(format!("{written}::date"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The range on the bare column `column` (of type `timestamp` or
+/// `timestamptz`) that selects what `column::date <op> other` does: the
+/// day starts at its midnight — for `timestamptz`, in the session's
+/// `TimeZone`, as the `::date` cast reads it, so the bounds convert the
+/// day explicitly (`::timestamptz`) rather than leave the comparison to
+/// mix `date` and `timestamptz` (see `timestamp_timezone_mix`).
+fn date_range(
+    ctx: &Ctx<'_>,
+    column: &str,
+    column_type: PgTypeOid,
+    others: &[&Node],
+    compared: &Compared,
+) -> Option<String> {
+    // A day's first instant, and the next day's.
+    let bounds = |other: &Node| {
+        let day = date_operand(ctx, other, compared)?;
+        Some(if column_type == TIMESTAMPTZ {
+            (
+                format!("{day}::timestamptz"),
+                format!("({day} + 1)::timestamptz"),
+            )
+        } else {
+            (day.clone(), format!("{day} + 1"))
+        })
+    };
+    let range = match (compared.op, others) {
+        ("BETWEEN", [low, high]) => {
+            let ((start, _), (_, next)) = (bounds(low)?, bounds(high)?);
+            format!("{column} >= {start} AND {column} < {next}")
+        }
+        (op, [other]) => {
+            let (start, next) = bounds(other)?;
+            match op {
+                "=" => format!("{column} >= {start} AND {column} < {next}"),
+                "<" => format!("{column} < {start}"),
+                "<=" => format!("{column} < {next}"),
+                ">" => format!("{column} >= {next}"),
+                ">=" => format!("{column} >= {start}"),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(if column_type == TIMESTAMPTZ {
+        format!(
+            "compare a range on the column itself: `{range}` reads days in the session's \
+             TimeZone as the cast does, and selects the same rows but around a daylight-saving \
+             change at midnight; for days of a fixed zone instead (other rows, unless the \
+             session is in that zone), convert each bound with `::timestamp AT TIME ZONE 'UTC'`"
+        )
+    } else {
+        format!(
+            "compare a range on the column itself: `{range}` selects the same rows (a date \
+             compares with a timestamp as its midnight)"
+        )
+    })
+}
+
+/// The range on the bare column `column` (of type `timestamp` or
+/// `timestamptz`) that selects what `date_trunc('<unit>', column) = other`
+/// does, for a parameter or literal `other` or one of the column's type.
+/// Adding the interval to a `timestamptz` steps through the session's
+/// `TimeZone` as `date_trunc` truncates in it.
+fn trunc_range(
+    ctx: &Ctx<'_>,
+    column: &str,
+    column_type: PgTypeOid,
+    unit: &str,
+    other: &Node,
+    compared: &Compared,
+) -> Option<String> {
+    if compared.op != "=" {
+        return None;
+    }
+    let step = match unit.to_ascii_lowercase().as_str() {
+        unit @ ("microseconds" | "milliseconds" | "second" | "minute" | "hour" | "day" | "week"
+        | "month" | "year" | "decade" | "century" | "millennium") => {
+            format!("1 {unit}")
+        }
+        "quarter" => "3 months".to_owned(),
+        _ => return None,
+    };
+    let written = ctx.written(node_span(ctx, other.to_ref())?).to_owned();
+    let type_name = if column_type == TIMESTAMPTZ {
+        "timestamptz"
+    } else {
+        "timestamp"
+    };
+    let value = match (compared.other_type?, other) {
+        (UNKNOWN, Node::ParamRef(_)) => written,
+        (UNKNOWN, Node::AConst(c)) if matches!(c.val, Some(AConstValue::String(_))) => {
+            format!("{written}::{type_name}")
+        }
+        (ty, Node::ParamRef(_) | Node::ColumnRef(_) | Node::FuncCall(_) | Node::TypeCast(_))
+            if ty == column_type =>
+        {
+            written
+        }
+        (ty, _) if ty == column_type => format!("({written})"),
+        _ => return None,
+    };
+    let dst = if column_type == TIMESTAMPTZ {
+        ", but around a daylight-saving change at midnight"
+    } else {
+        ""
+    };
+    Some(format!(
+        "compare a range on the column itself: `{column} >= {value} AND {column} < {value} + \
+         interval '{step}'` selects the same rows when {value} is itself truncated to the \
+         {unit} (date_trunc never equals any other value){dst}"
+    ))
 }
 
 fn wrapped_column_name(column: &ColumnRef) -> String {
@@ -522,8 +723,8 @@ fn has_column_ref(node: &Node) -> bool {
 mod tests {
     use typedpg_analyzer::PgCatalog;
 
-    use crate::Rule;
     use crate::rules::test_support::lint_rule;
+    use crate::{LintOptions, Rule, Severity, lint_query};
 
     const RULE: Rule = Rule::NonSargablePredicate;
 
@@ -562,12 +763,26 @@ mod tests {
         for (sql, help) in [
             (
                 "SELECT id FROM users WHERE created_at::date = $1",
-                "created_at >= $1 AND created_at < $1 + 1",
+                "`created_at >= $1::date::timestamptz AND created_at < ($1::date + \
+                 1)::timestamptz`",
             ),
             // Quoted as written: named parameters keep their names.
             (
                 "SELECT id FROM users WHERE created_at::date = $day",
-                "created_at >= $day AND created_at < $day + 1",
+                "`created_at >= $day::date::timestamptz AND created_at < ($day::date + \
+                 1)::timestamptz` reads days in the session's TimeZone as the cast does",
+            ),
+            (
+                "SELECT id FROM posts WHERE posted_on::date = $day",
+                "`posted_on >= $day::date AND posted_on < $day::date + 1` selects the same rows",
+            ),
+            (
+                "SELECT id FROM posts WHERE $day < posted_on::date",
+                "`posted_on >= $day::date + 1`",
+            ),
+            (
+                "SELECT id FROM users WHERE created_at::date <= current_date - 7",
+                "`created_at < ((current_date - 7) + 1)::timestamptz`",
             ),
             (
                 "SELECT id FROM posts WHERE date_trunc('day', posted_on) = $day",
@@ -612,7 +827,12 @@ mod tests {
             ("DELETE FROM users WHERE id::text = $1", "converting"),
             (
                 "SELECT id FROM users WHERE created_at::date BETWEEN $1 AND $2",
-                "compare the column itself",
+                "`created_at >= $1::date::timestamptz AND created_at < ($2::date + \
+                 1)::timestamptz`",
+            ),
+            (
+                "SELECT id FROM users WHERE created_at::date IN ($1, $2)",
+                "a day is from its midnight up to the next day's",
             ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
@@ -620,6 +840,100 @@ mod tests {
             let h = findings[0].help.as_deref().unwrap();
             assert!(h.contains(help), "{sql}: {h}");
             assert!(findings[0].fix.is_empty());
+        }
+    }
+
+    /// Every concrete rewrite the help suggests — the text between its
+    /// first pair of backticks, put in place of the comparison — compiles,
+    /// and no rule reports it (every rule enabled).
+    #[test]
+    fn every_suggested_rewrite_passes_every_rule() {
+        let db = catalog();
+        let mut all = LintOptions::default();
+        for rule in Rule::ALL {
+            all.levels.insert(rule, Some(Severity::Info));
+        }
+        let mut checked = 0;
+        for sql in [
+            "SELECT id FROM users WHERE created_at::date = $day",
+            "SELECT id FROM users WHERE created_at::date = '2024-05-01'",
+            "SELECT id FROM users WHERE created_at::date = current_date",
+            "SELECT id FROM users WHERE created_at::date = current_date - 7",
+            "SELECT id FROM users WHERE created_at::date < $day",
+            "SELECT id FROM users WHERE created_at::date <= $day",
+            "SELECT id FROM users WHERE created_at::date > $day",
+            "SELECT id FROM users WHERE created_at::date >= $day",
+            "SELECT id FROM users WHERE $day >= created_at::date",
+            "SELECT id FROM users WHERE created_at::date BETWEEN $from AND $to",
+            "SELECT id FROM posts WHERE posted_on::date BETWEEN '2024-05-01' AND $to",
+            "SELECT id FROM posts WHERE posted_on::date = $day",
+            "SELECT id FROM posts WHERE posted_on::date = '2024-05-01'",
+            "SELECT id FROM posts WHERE posted_on::date = current_date",
+            "SELECT id FROM posts WHERE posted_on::date > $day",
+            "SELECT id FROM posts WHERE $day <= posted_on::date",
+            "SELECT id FROM posts WHERE date_trunc('day', posted_on) = $day",
+            "SELECT id FROM posts WHERE date_trunc('month', posted_on) = '2024-05-01'",
+            "SELECT id FROM posts WHERE date_trunc('quarter', posted_on) = $q",
+            "SELECT id FROM posts WHERE date_trunc('hour', posted_on) = localtimestamp(0)",
+            "SELECT id FROM users WHERE date_trunc('day', created_at) = $day",
+            "SELECT id FROM users WHERE date_trunc('week', created_at) = '2024-05-06'",
+            "SELECT id FROM users WHERE $day = date_trunc('day', created_at)",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            let help = findings[0].help.as_deref().unwrap();
+            let rewrite = help
+                .split('`')
+                .nth(1)
+                .unwrap_or_else(|| panic!("{sql}: no rewrite in {help}"));
+            let span = findings[0].span.clone();
+            let rewritten = format!("{}{rewrite}{}", &sql[..span.start], &sql[span.end..]);
+            let found = lint_query(&db, &rewritten, &all)
+                .unwrap_or_else(|e| panic!("{rewritten}: {}", e.error));
+            assert!(found.is_empty(), "{sql} → {rewritten}: {found:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 23);
+        // The fixed-zone alternative the timestamptz help names passes too.
+        let fixed = "SELECT id FROM users WHERE created_at >= $day::date::timestamp AT TIME ZONE \
+                     'UTC' AND created_at < ($day::date + 1)::timestamp AT TIME ZONE 'UTC'";
+        let found = lint_query(&db, fixed, &all).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        // The check would catch a rewrite another rule reports: the range
+        // with a bare `date` bound on a timestamptz column mixes time zones.
+        let found = lint_query(
+            &db,
+            "SELECT id FROM users WHERE created_at >= $day::date AND created_at < $day::date + 1",
+            &all,
+        )
+        .unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|finding| finding.rule == Rule::TimestampTimezoneMix),
+            "{found:?}"
+        );
+    }
+
+    /// The other sides no range is equivalent for get the general help.
+    #[test]
+    fn no_range_is_suggested_where_none_is_equivalent() {
+        let db = catalog();
+        for sql in [
+            // A timestamp: `date = timestamp` compares the date's midnight.
+            "SELECT id FROM posts WHERE posted_on::date = localtimestamp",
+            // A list.
+            "SELECT id FROM posts WHERE posted_on::date = ANY ($1::date[])",
+            // A truncation in an explicit zone, or of an unknown unit.
+            "SELECT id FROM users WHERE date_trunc('day', created_at, 'UTC') = $1",
+            "SELECT id FROM posts WHERE date_trunc('dow', posted_on) = $1",
+            // Only equality has a range for date_trunc.
+            "SELECT id FROM posts WHERE date_trunc('day', posted_on) < $1",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            let help = findings[0].help.as_deref().unwrap();
+            assert!(!help.contains('`'), "{sql}: {help}");
         }
     }
 

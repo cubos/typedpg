@@ -43,6 +43,16 @@ pub(crate) fn can_coerce(
     source == target || coercion_pathway(target, source, context, snapshot).is_some()
 }
 
+/// Whether a condition of type `t` passes PG's `coerce_to_boolean` (the
+/// `argument of WHERE must be type boolean, not type X` check of CHECK,
+/// WHERE, WHEN, a policy, ...): `boolean` itself, or a type coercible to it
+/// on assignment — a domain over boolean, a type with an assignment cast
+/// to it. `unknown` (an untyped literal, whose input the caller checks)
+/// too.
+pub(crate) fn coerces_to_boolean(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
+    t == oid::UNKNOWN || can_coerce(t, oid::BOOL, CoercionContext::Assignment, snapshot)
+}
+
 /// `pg_type.typcategory` of `t` — PG's `TypeCategory`: `unknown` is
 /// category `X`, a type missing from the catalog has none.
 pub(crate) fn type_category(t: PgTypeOid, snapshot: &PgCatalog) -> Option<TypCategory> {

@@ -55,6 +55,61 @@ pub(crate) fn analyze_insert_with_outer_ctes(
     }
 }
 
+/// For the lint (see [`crate::condition::WriteStatement::base`]): the
+/// table a statement doing `events` (a MERGE's actions', when `merge`)
+/// into view `relid` stores its rows in, when the view is automatically
+/// updatable down to it for those events ([`WriteTarget::resolve_for`]:
+/// no DO INSTEAD rule or INSTEAD OF trigger for them on the way); `None`
+/// for a table, or a view whose writes are something else.
+pub(super) fn write_base(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    events: &[DmlEvent],
+    merge: bool,
+) -> Option<crate::condition::WriteBase> {
+    let is_view = |rel| {
+        snapshot
+            .pg_class
+            .get(&rel)
+            .is_some_and(|c| c.relkind == crate::pg_catalog::RelKind::View)
+    };
+    if !is_view(relid) {
+        return None;
+    }
+    let target = WriteTarget::resolve_for(snapshot, relid, events, merge)?;
+    let columns = snapshot
+        .attributes_of(relid)
+        .iter()
+        .filter_map(|a| {
+            let base = target.to_base.get(&a.attname)?;
+            Some((a.attname.clone(), base.clone()))
+        })
+        .collect();
+    // Each view of the chain fills its defaults in (rewriteTargetListIU):
+    // a column's own, else its domain's (`build_column_default`), as in
+    // `WriteTarget::omitted`.
+    let mut defaulted: Vec<String> = Vec::new();
+    let mut cur = relid;
+    while is_view(cur) {
+        let level = WriteTarget::resolve_for(snapshot, cur, events, merge)?;
+        for a in snapshot.attributes_of(cur) {
+            if a.attnum > 0
+                && (a.atthasdef || snapshot.domain_has_default(a.atttypid))
+                && let Some(base) = level.to_base.get(&a.attname)
+                && !defaulted.contains(base)
+            {
+                defaulted.push(base.clone());
+            }
+        }
+        cur = snapshot.view_updatability.get(&cur)?.base?;
+    }
+    Some(crate::condition::WriteBase {
+        relid: target.base,
+        columns,
+        defaulted,
+    })
+}
+
 fn analyze_insert_here(
     ins: &ast::InsertStmt,
     snapshot: &PgCatalog,
@@ -69,9 +124,13 @@ fn analyze_insert_here(
 
     let tgt = resolve_insert_target(ins, relation, snapshot)?;
     let cte_scopes = build_insert_cte_scopes(ins, snapshot, params, outer_ctes)?;
-    let _write =
-        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Insert, tgt.oid);
+    let _write = crate::pg_catalog::note_write_statement(
+        crate::condition::WriteCommand::Insert,
+        tgt.oid,
+        || write_base(snapshot, tgt.oid, &[DmlEvent::Insert], false),
+    );
     crate::pg_catalog::note_relation_use(tgt.oid, 'a');
+    crate::pg_catalog::note_target_relation(relation, tgt.oid);
 
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
     // The rewriter later sees one target list entry per supplied column.
@@ -1023,6 +1082,7 @@ fn analyze_insert_values(
         let Some(ast::Node::List(list)) = val_list.as_ref() else {
             continue;
         };
+        crate::pg_catalog::note_write_row(tgt.oid);
         let mut row_written: Vec<Option<ValueInfo>> = Vec::with_capacity(list.items.len());
         // transformInsertStmt: every row of a multi-row VALUES must be as
         // long as the first one, which already passed transformInsertRow's
@@ -2361,6 +2421,7 @@ fn analyze_insert_select(
             }
         }
     }
+    crate::pg_catalog::note_write_row(tgt.oid);
     for (i, c) in sel_cols.iter().enumerate() {
         let Some(tc) = target_col_at(tgt, i) else {
             continue;
@@ -2932,9 +2993,13 @@ fn analyze_update_here(
         .unwrap_or_default();
     let table_attrs = snapshot.attributes_of(table_oid).to_vec();
     // The columns the UPDATE writes.
-    let _write =
-        crate::pg_catalog::note_write_statement(crate::condition::WriteCommand::Update, table_oid);
+    let _write = crate::pg_catalog::note_write_statement(
+        crate::condition::WriteCommand::Update,
+        table_oid,
+        || write_base(snapshot, table_oid, &[DmlEvent::Update], false),
+    );
     crate::pg_catalog::note_relation_use(table_oid, 'w');
+    crate::pg_catalog::note_target_relation(relation, table_oid);
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
     crate::privileges::note_write(
         table_oid,
@@ -3217,6 +3282,7 @@ fn analyze_delete_here(
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
     crate::pg_catalog::note_relation_use(table_oid, 'd');
+    crate::pg_catalog::note_target_relation(relation, table_oid);
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
     crate::privileges::note_write(
         table_oid,

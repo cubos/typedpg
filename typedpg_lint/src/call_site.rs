@@ -288,8 +288,12 @@ fn returning_target_is_safe(ctx: &Ctx<'_>, statement: &Node) -> bool {
 /// rules, so reading or writing it cannot make `RETURNING` part of the
 /// statement's effect.
 fn relation_is_safe(ctx: &Ctx<'_>, relation: &typedpg_pg_query::ast::RangeVar) -> bool {
-    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-    let Some(class) = ctx.catalog.resolve_table(schema, &relation.relname) else {
+    // The relation as the analyzer resolved it (a `WITH` query of the same
+    // name is none).
+    let Some(typedpg_analyzer::RelationRef::Relation(oid)) = ctx.view.relation_of(relation) else {
+        return false;
+    };
+    let Some(class) = ctx.catalog.class_row(oid) else {
         return false;
     };
     class.relkind == typedpg_analyzer::RelKind::Table

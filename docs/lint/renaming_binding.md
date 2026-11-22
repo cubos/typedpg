@@ -3,51 +3,13 @@
 A `sql!` binding `p = v` whose only effect is to rename the variable `v` to
 the parameter `$p`.
 
-| | |
-|---|---|
-| Default level | info |
-| Applies to | `sql!` bindings (Rust only: `cargo typedpg lint`) |
-| Fix | yes (`--fix`): rewrites every `$p` in the SQL to `$v` and deletes the binding |
+| Level | Applies to | Fix |
+|---|---|---|
+| info | `sql!` bindings (Rust only) | writes `$v` in the SQL and removes the binding |
 
-## Why
-
-`sql!` parameters capture the variable of their name. When a binding's value
-is just another variable, the parameter could have used that variable's name
-directly:
+## Example
 
 ```rust
-sql!(pool, "SELECT title FROM posts WHERE user_id = $user", user = user_id)
-// is the same as
-sql!(pool, "SELECT title FROM posts WHERE user_id = $user_id")
-```
-
-The second form has one name for one value: a reader of the SQL sees which
-variable feeds the parameter without matching it against the binding list.
-This is a style finding, so it defaults to `info`.
-
-## What it reports
-
-A binding `p = v` after the SQL literal of a `sql!` invocation, where `v` is
-a plain identifier different from `p`, and renaming is safe and meaningful:
-
-- `$p` (or `$..p`) occurs in the SQL;
-- `v` contains a lowercase letter (a `SCREAMING_CASE` name is a constant by
-  convention, and `$MAX_ROWS` would read as one);
-- no parameter named `v` already exists in the SQL (the rename would merge
-  two parameters);
-- no other binding is named `v`, and no other binding also takes its value
-  from `v`.
-
-The help line uses the parameter's sigil: `$v`, or `$..v` when `p` occurs
-only as a spread.
-
-## Examples
-
-### Bad
-
-```rust
-use typedpg::sql;
-
 pub async fn titles(pool: &typedpg::Pool, user_id: i64) -> typedpg::Result<()> {
     let titles = sql!(pool, "SELECT title FROM posts WHERE user_id = $user", user = user_id)
         .fetch_all()
@@ -58,73 +20,55 @@ pub async fn titles(pool: &typedpg::Pool, user_id: i64) -> typedpg::Result<()> {
 
 ```
 info[renaming_binding]: `user = user_id` only renames the variable `user_id`
-   ╭─[src/posts.rs:4:78]
- 4 │     let titles = sql!(pool, "SELECT title FROM posts WHERE user_id = $user", user = user_id)
-   ·                                                                              ──────────────
-   ╰────
-  help: write `$user_id` in the SQL and remove the binding (`cargo typedpg lint --fix` does it)
+    ╭─[src/posts.rs:13:78]
+ 13 │     let titles = sql!(pool, "SELECT title FROM posts WHERE user_id = $user", user = user_id)
+    ·                                                                              ──────────────
+    ╰────
+   help: write `$user_id` in the SQL and remove the binding (`cargo typedpg lint --fix` does it)
 ```
 
-### Good
+`--fix` gives `sql!(pool, "SELECT title FROM posts WHERE user_id = $user_id")`.
+It rewrites every occurrence and keeps a `?`/`!` suffix and the `$..` of a
+spread: `$..post_ids` with `post_ids = ids` becomes `$..ids`.
 
-```rust
-// The parameter has the variable's name.
-sql!(pool, "SELECT title FROM posts WHERE user_id = $user_id")
+## Why
 
-// The value is an expression, not a variable.
-sql!(pool, "SELECT title FROM posts WHERE user_id = $user", user = user.id)
+With the variable's name in the SQL, a reader sees what feeds the parameter
+without matching it against the binding list.
 
-// A SCREAMING_CASE constant: renaming would put $MAX_ROWS in the SQL.
-sql!(pool, "SELECT title FROM posts ORDER BY id LIMIT $limit", limit = MAX_ROWS)
+## Reported when
 
-// Two parameters take the same variable: renaming both would merge them.
-sql!(pool, "SELECT title FROM posts WHERE user_id = $user AND editor_id = $editor",
-     user = user_id, editor = user_id)
-```
+The value is a plain identifier other than the parameter's name, and the
+rename is safe: no parameter named `v` exists already, and no other binding
+is named `v` or also takes `v`.
 
-## Fix
+## Not reported
 
-`--fix` rewrites every occurrence of the parameter in the SQL literal
-(`$user` to `$user_id`, keeping a `?` / `!` nullability suffix and the `$..`
-spread sigil as written) and deletes the binding:
-
-```rust
-let titles = sql!(pool, "SELECT title FROM posts WHERE user_id = $user_id")
-```
-
-Raw string literals (`r#"…"#`) are rewritten the same way.
-
-## When it stays silent
-
-- Any of the conditions above fails.
-- The value is not a plain identifier (`&v`, `v.field`, `v.clone()`, a
-  literal, a path).
-- The parameter name is bound more than once (the macro rejects that).
-- The binding is `v = v`: that is
-  [`redundant_binding`](redundant_binding.md).
+- A value that is not a plain identifier: `user = user.id`, `&v`,
+  `v.clone()`, a literal, a path.
+- A `SCREAMING_CASE` value, which would put `$MAX_ROWS` in the SQL:
+  `limit = MAX_ROWS`.
+- Two parameters bound to the same variable, which the rename would merge:
+  `user = user_id, editor = user_id`.
+- A parameter whose new name is already in the SQL:
+  `"… user_id = $user_id AND editor_id = $editor", editor = user_id`.
+- `v = v`: that is [`redundant_binding`](redundant_binding.md).
 
 ## Configuration
 
-This rule exists only in `cargo typedpg lint`, and only the Rust
-configuration accepts its key:
-
 ```toml
+# Cargo.toml
 [package.metadata.typedpg.lint]
-renaming_binding = "off"   # "error", "warning", "info" or "off"
-fail_on = "warning"        # the severity that fails the run (default "error")
-ignore = ["tests/**"]      # files whose findings are not reported
+renaming_binding = "warning"   # error | warning | info | off
 ```
 
-The TypeScript CLI has no bindings: `typedpg.config.json` rejects a
-`renamingBinding` key as an unknown rule.
+`cargo typedpg lint` only: `typedpg.config.json` rejects `renamingBinding`
+as an unknown rule.
 
-To allow it for one invocation, put an allow comment in the SQL literal:
+Allow one invocation with `-- typedpg-lint: allow(renaming_binding)` in its
+SQL literal. See [Configuring rules](README.md#configuring-rules).
 
-```rust
-sql!(pool, "-- typedpg-lint: allow(renaming_binding)\nSELECT title FROM posts WHERE user_id = $user", user = user_id)
-```
-
-## Related rules
+## Related
 
 - [`redundant_binding`](redundant_binding.md): a binding `x = x` that
   changes nothing.

@@ -19,7 +19,10 @@ use typedpg_pg_query::ast::{
     ObjectType, SortByDir, SortByNulls, TransactionStmtKind, VariableSetKind,
 };
 
-use crate::{AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment};
+use crate::{
+    AllowComment, Finding, LintOptions, RawFinding, Rule, Severity, allow_comment,
+    trailing_comments_end,
+};
 
 /// What [`lint_migrations`] reports for a migration file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2395,7 +2398,10 @@ impl MigrationObserver for MigrationLinter<'_> {
             return;
         }
         self.current_span = self.trimmed(&statement.span);
-        self.current_suppressed = self.suppressions(&statement.span);
+        // The comments on the statement's last line, after its `;`, are
+        // its own too.
+        let tail = trailing_comments_end(&self.files[self.current].sql, statement.span.end);
+        self.current_suppressed = self.suppressions(&(statement.span.start..tail));
         self.before_relation = None;
         self.before_columns.clear();
         if let N::AlterTableStmt(alter) = statement.node
@@ -2425,7 +2431,7 @@ impl MigrationObserver for MigrationLinter<'_> {
         if self.files[self.current].lint == MigrationLint::All {
             self.statement_rules(catalog, statement);
         }
-        self.last_statement_end = statement.span.end;
+        self.last_statement_end = tail;
     }
 
     fn after(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
@@ -5794,6 +5800,9 @@ mod tests {
     /// constraint for table … is implied by existing constraints" message,
     /// or its absence), measured with the same tables; `lint` is what the
     /// rule reports, which differs only where it can't tell and reports.
+    /// `CHECK (b = true)` for `IN (true, false)` and `CHECK (b = false)` for
+    /// `FROM (false) TO (true)` were once silent although PostgreSQL scans
+    /// (it folds the CHECK to `b` / `NOT b`).
     #[test]
     fn attach_partition_scan_agrees_with_postgresql() {
         let one_to_three = "FOR VALUES FROM (1) TO (3)";
@@ -5961,9 +5970,10 @@ mod tests {
                 false,
                 false,
             ),
-            // Where the rule can't tell, it reports: strings it can't order
-            // under the database's default collation, a constant of another
-            // type than the key's, a bare boolean column.
+            // Strings order under the key's collation: known for C / POSIX
+            // and the other collations ordering by code point; under the
+            // database's default collation or an ICU / libc locale the rule
+            // can't tell, and reports.
             (
                 "s text NOT NULL",
                 "RANGE (s)",
@@ -5973,20 +5983,359 @@ mod tests {
                 true,
             ),
             (
+                "s text COLLATE \"POSIX\" NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'b' AND s < 'c')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                false,
+                false,
+            ),
+            (
+                "s text COLLATE \"POSIX\" NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'B' AND s < 'c')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                true,
+                true,
+            ),
+            (
+                "s text COLLATE \"ucs_basic\" NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'b' AND s < 'c')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                false,
+                false,
+            ),
+            (
+                "s text COLLATE \"en-x-icu\" NOT NULL",
+                "RANGE (s)",
+                "CHECK (s >= 'b' AND s < 'c')",
+                "FOR VALUES FROM ('a') TO ('m')",
+                false,
+                true,
+            ),
+            // date against timestamp compare across types in datetime_ops
+            // (a date is its midnight); the operators with timestamptz are
+            // only stable, and predtest doesn't use them.
+            (
                 "d date NOT NULL",
                 "RANGE (d)",
                 "CHECK (d >= '2024-01-01'::timestamp AND d < '2024-02-01'::timestamp)",
                 january,
                 false,
+                false,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2024-01-01 00:00:01'::timestamp AND d < '2024-01-31 12:00'::timestamp)",
+                january,
+                false,
+                false,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2023-12-31 23:59:59'::timestamp AND d < '2024-02-01'::timestamp)",
+                january,
+                true,
                 true,
             ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2024-01-01'::timestamp AND d <= '2024-02-01'::timestamp)",
+                january,
+                true,
+                true,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= TIMESTAMP '-infinity' AND d < TIMESTAMP '2024-02-01')",
+                "FOR VALUES FROM ('-infinity') TO ('2024-02-01')",
+                false,
+                false,
+            ),
+            (
+                "d date NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2024-01-01'::timestamptz AND d < '2024-02-01'::timestamptz)",
+                january,
+                true,
+                true,
+            ),
+            (
+                "d date NOT NULL",
+                "LIST (d)",
+                "CHECK (d IN ('2024-01-01'::timestamp, '2024-01-02'::timestamp))",
+                "FOR VALUES IN ('2024-01-01', '2024-01-02', '2024-01-03')",
+                false,
+                false,
+            ),
+            (
+                "at timestamp NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= DATE '2024-01-02' AND at < DATE '2024-01-20')",
+                january,
+                false,
+                false,
+            ),
+            (
+                "at timestamp(0) NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= '2024-01-01'::date AND at < '2024-02-01'::date)",
+                january,
+                false,
+                false,
+            ),
+            (
+                "at timestamp NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= DATE '2023-12-31' AND at < DATE '2024-01-20')",
+                january,
+                true,
+                true,
+            ),
+            (
+                "at timestamp NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= '2024-01-01'::timestamptz AND at < '2024-02-01'::timestamptz)",
+                january,
+                true,
+                true,
+            ),
+            (
+                "at timestamptz NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= '2024-01-01'::date AND at < '2024-02-01'::date)",
+                january,
+                true,
+                true,
+            ),
+            (
+                "at timestamptz NOT NULL",
+                "RANGE (at)",
+                "CHECK (at >= '2024-01-01'::timestamp AND at < '2024-02-01'::timestamp)",
+                january,
+                true,
+                true,
+            ),
+            // An integer constant for a numeric key is folded to a numeric
+            // one; an integer key against a numeric constant is cast, and
+            // proves nothing. A float key's int / float4 / numeric constant
+            // is not modeled.
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1::integer AND n < 3::bigint)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= '1'::smallint AND n < 2::int)",
+                one_to_three,
+                false,
+                false,
+            ),
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 3000000000::bigint AND n < '3100000000'::int8)",
+                "FOR VALUES FROM (3000000000) TO (3500000000)",
+                false,
+                false,
+            ),
+            (
+                "n numeric NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1::integer AND n <= 3::integer)",
+                one_to_three,
+                true,
+                true,
+            ),
+            (
+                "n integer NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1::numeric AND n < 3::numeric)",
+                one_to_three,
+                true,
+                true,
+            ),
+            (
+                "n float8 NOT NULL",
+                "RANGE (n)",
+                "CHECK (n >= 1::integer AND n < 3::integer)",
+                one_to_three,
+                false,
+                true,
+            ),
+            // A boolean key's `b = true` / `b <> true` is folded to `b` /
+            // `NOT b`, on both sides — a one-value list too — but neither an
+            // `= ANY (ARRAY[…])` element nor a range's `>=` / `<` is: `b`
+            // implies only `b`, and an unfolded `b = true` implies `b`.
             (
                 "b boolean NOT NULL",
                 "LIST (b)",
                 "CHECK (b)",
                 "FOR VALUES IN (true)",
                 false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (NOT b)",
+                "FOR VALUES IN (false)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b = false)",
+                "FOR VALUES IN (false)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b <> true)",
+                "FOR VALUES IN (false)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (true = b)",
+                "FOR VALUES IN (true)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (NOT NOT b)",
+                "FOR VALUES IN (true)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (NOT (b = false))",
+                "FOR VALUES IN (true)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b IN (true))",
+                "FOR VALUES IN (true)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b = ANY (ARRAY[true]))",
+                "FOR VALUES IN (true)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b IN (true, false))",
+                "FOR VALUES IN (true, false)",
+                false,
+                false,
+            ),
+            (
+                "b boolean",
+                "LIST (b)",
+                "CHECK (b)",
+                "FOR VALUES IN (true, NULL)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (NOT b)",
+                "FOR VALUES IN (true)",
                 true,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b)",
+                "FOR VALUES IN (true, false)",
+                true,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b = true)",
+                "FOR VALUES IN (true, false)",
+                true,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b = ANY (ARRAY[true, false]))",
+                "FOR VALUES IN (true)",
+                true,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "LIST (b)",
+                "CHECK (b IS TRUE)",
+                "FOR VALUES IN (true)",
+                true,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "RANGE (b)",
+                "CHECK (b = false)",
+                "FOR VALUES FROM (false) TO (true)",
+                true,
+                true,
+            ),
+            (
+                "b boolean NOT NULL",
+                "RANGE (b)",
+                "CHECK (b >= false AND b < true)",
+                "FOR VALUES FROM (false) TO (true)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL, n integer NOT NULL",
+                "RANGE (b, n)",
+                "CHECK (b AND n >= 1 AND n < 5)",
+                "FOR VALUES FROM (true, 1) TO (true, 5)",
+                false,
+                false,
+            ),
+            (
+                "b boolean NOT NULL, n integer NOT NULL",
+                "RANGE (b, n)",
+                "CHECK (b = true AND n >= 1 AND n < 5)",
+                "FOR VALUES FROM (true, 1) TO (true, 5)",
+                false,
+                false,
             ),
         ] {
             let before = format!("ALTER TABLE measurements_new ADD CONSTRAINT bound {check};");
@@ -5997,6 +6346,61 @@ mod tests {
             );
             // A report where PostgreSQL scans is never missing.
             assert!(!pg || reported, "{check}");
+        }
+        // A domain over boolean or date compares as its base type (both
+        // sides read the column through the same relabeling).
+        for (columns, key, check, bound, pg) in [
+            (
+                "b dbool NOT NULL",
+                "LIST (b)",
+                "CHECK (b = true)",
+                "FOR VALUES IN (true)",
+                false,
+            ),
+            (
+                "b dbool NOT NULL",
+                "LIST (b)",
+                "CHECK (b = true)",
+                "FOR VALUES IN (true, false)",
+                true,
+            ),
+            (
+                "d ddate NOT NULL",
+                "RANGE (d)",
+                "CHECK (d >= '2024-01-01'::timestamp AND d < '2024-02-01'::timestamp)",
+                january,
+                false,
+            ),
+        ] {
+            let findings = lint(
+                &[
+                    (
+                        "001_base.sql",
+                        &format!(
+                            "CREATE DOMAIN dbool AS boolean;
+                             CREATE DOMAIN ddate AS date;
+                             CREATE TABLE measurements ({columns}) PARTITION BY {key};
+                             CREATE TABLE measurements_new ({columns});
+                             ALTER TABLE measurements_new ADD CONSTRAINT bound {check};"
+                        ),
+                        MigrationLint::All,
+                    ),
+                    (
+                        "002_attach.sql",
+                        &format!(
+                            "ALTER TABLE measurements ATTACH PARTITION measurements_new {bound};"
+                        ),
+                        MigrationLint::All,
+                    ),
+                ],
+                true,
+                &LintOptions::default(),
+            );
+            assert_eq!(
+                !only(&findings, Rule::AttachPartitionScan).is_empty(),
+                pg,
+                "{columns} / {check} / {bound}: {findings:?}"
+            );
         }
         // A NOT NULL constraint that is NOT VALID proves nothing.
         assert_eq!(

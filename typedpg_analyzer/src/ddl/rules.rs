@@ -503,11 +503,7 @@ fn check_rule_qual(
         Ok(r)
     })
     .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
-    let (bool_oid, unknown) = (
-        crate::pg_catalog::oid::BOOL,
-        crate::pg_catalog::oid::UNKNOWN,
-    );
-    if result.type_oid != bool_oid && result.type_oid != unknown {
+    if !crate::coerce::coerces_to_boolean(result.type_oid, interp) {
         return Err(DdlError::UnsupportedDdl(format!(
             "argument of WHERE must be type boolean, not type {}",
             super::util::format_type_for_message(interp, result.type_oid)

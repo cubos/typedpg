@@ -473,14 +473,26 @@ fn describe(r: &Refinement, kind: Kind, cmp: Cmp) -> Option<String> {
             let b = r.int_bounds()?;
             Some(int_words(&b))
         }
-        Kind::Ord(OrdKind::Numeric) => {
-            let b = r.bounds?;
-            let point = |p: OrdPoint| match p {
-                OrdPoint::Finite(n) => n.to_string(),
-                OrdPoint::NegInfinity => "-Infinity".to_owned(),
-                OrdPoint::Infinity => "Infinity".to_owned(),
-                OrdPoint::NaN => "NaN".to_owned(),
+        Kind::Ord(ord) => {
+            // (A `date` or timestamp decided otherwise than by its bounds,
+            // its finiteness: said vaguely.)
+            let vague = || {
+                (ord != OrdKind::Numeric)
+                    .then(|| "always within the bounds known for it".to_owned())
             };
+            let Some(b) = r.bounds.filter(|b| b.kind == ord) else {
+                return vague();
+            };
+            let point = |p: OrdPoint| match (p, ord) {
+                (OrdPoint::Finite(n), OrdKind::Numeric) => Some(n.to_string()),
+                (OrdPoint::Finite(n), _) => datetime_words(n.to_integer()?, ord),
+                (OrdPoint::NegInfinity, OrdKind::Numeric) => Some("-Infinity".to_owned()),
+                (OrdPoint::Infinity, OrdKind::Numeric) => Some("Infinity".to_owned()),
+                (OrdPoint::NegInfinity, _) => Some("-infinity".to_owned()),
+                (OrdPoint::Infinity, _) => Some("infinity".to_owned()),
+                (OrdPoint::NaN, _) => Some("NaN".to_owned()),
+            };
+            let point = |p: OrdPoint| point(p).unwrap_or_else(|| "a bound".to_owned());
             Some(match (b.lo, b.hi) {
                 (Some(lo), Some(hi)) if lo.point == hi.point => {
                     format!("always {}", point(lo.point))
@@ -502,12 +514,62 @@ fn describe(r: &Refinement, kind: Kind, cmp: Cmp) -> Option<String> {
                     if hi.inclusive { "at most" } else { "below" },
                     point(hi.point)
                 ),
-                (None, None) => return None,
+                (None, None) => return vague(),
             })
         }
-        Kind::Ord(_) => Some("always within the bounds known for it".to_owned()),
         Kind::Exact(_) => None,
     }
+}
+
+/// A finite `date` (`v` days from 2000-01-01), `timestamp` or
+/// `timestamptz` (`v` microseconds from 2000-01-01 00:00, UTC for a
+/// `timestamptz`) in words, as the ISO `DateStyle` prints it — a
+/// `timestamptz` in UTC (`+00`), a year before 1 as `BC`. `None` for
+/// another kind.
+fn datetime_words(v: i128, kind: OrdKind) -> Option<String> {
+    const USECS_PER_DAY: i128 = 86_400_000_000;
+    let (days, usecs) = match kind {
+        OrdKind::Date => (v, None),
+        OrdKind::Timestamp | OrdKind::TimestampTz => (
+            v.div_euclid(USECS_PER_DAY),
+            Some(v.rem_euclid(USECS_PER_DAY)),
+        ),
+        OrdKind::Numeric => return None,
+    };
+    // Days from 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 10_957 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i128::from(month <= 2);
+    let date = if year <= 0 {
+        format!("{:04}-{month:02}-{day:02} BC", 1 - year)
+    } else {
+        format!("{year:04}-{month:02}-{day:02}")
+    };
+    let Some(usecs) = usecs else {
+        return Some(date);
+    };
+    let secs = usecs / 1_000_000;
+    let fraction = usecs % 1_000_000;
+    let mut time = format!("{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+    if fraction != 0 {
+        time.push_str(format!(".{fraction:06}").trim_end_matches('0'));
+    }
+    let zone = if kind == OrdKind::TimestampTz {
+        "+00"
+    } else {
+        ""
+    };
+    // PostgreSQL puts the era after the time.
+    Some(match date.strip_suffix(" BC") {
+        Some(date) => format!("{date} {time}{zone} BC"),
+        None => format!("{date} {time}{zone}"),
+    })
 }
 
 fn int_words(b: &IntRange) -> String {
@@ -772,6 +834,22 @@ pub enum CheckReading {
     Other,
 }
 
+/// What a [`CheckPart`] evaluates to over the rows a statement writes (see
+/// [`PgCatalog::check_part_outcome`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartOutcome {
+    /// TRUE or NULL for every row: the rows pass it.
+    Passes,
+    /// FALSE for every row: every row written fails it.
+    Fails,
+    /// Not known, or TRUE for some rows and FALSE for others.
+    Unknown,
+}
+
+/// The most combinations of the constants a row may hold that
+/// [`PgCatalog::check_part_outcome`] evaluates a conjunct over.
+const MAX_COMBINATIONS: usize = 64;
+
 /// What a data-modifying statement of a query writes (see
 /// [`crate::QueryView::writes`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -782,6 +860,34 @@ pub struct WriteStatement {
     /// The values it writes into the relation's columns, in the order they
     /// were analyzed: one per VALUES row and per assignment.
     pub columns: Vec<WrittenColumn>,
+    /// How many target lists the values were written by (see
+    /// [`WrittenColumn::row`]).
+    pub rows: usize,
+    /// When `relid` is an automatically updatable view (through a chain of
+    /// them): the table the rows are stored in. `None` for a table, and
+    /// for a view whose writes for the statement's command are something
+    /// else — a DO INSTEAD rule or an INSTEAD OF trigger for it on the
+    /// view, on a view below it or (a rule) on the table; a MERGE through
+    /// any rule.
+    pub base: Option<WriteBase>,
+}
+
+/// The table a write through an automatically updatable view stores its
+/// rows in (see [`WriteStatement::base`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteBase {
+    /// The base table.
+    pub relid: crate::oid::PgClassOid,
+    /// Each column of the view the base table stores as is, with the base
+    /// column it stores it in: `(view column, base column)`, in the view's
+    /// column order.
+    pub columns: Vec<(String, String)>,
+    /// The base columns an INSERT giving no value for gets a value from a
+    /// view of the chain instead of the base column's own default: a view
+    /// column storing it has a default, its own or its domain's —
+    /// PostgreSQL's rewriteTargetListIU fills each view's defaults in on
+    /// the way down (`build_column_default`).
+    pub defaulted: Vec<String>,
 }
 
 /// The command of a [`WriteStatement`].
@@ -799,6 +905,11 @@ pub struct WrittenColumn {
     /// Written by an UPDATE: an UPDATE's SET, an `ON CONFLICT DO UPDATE
     /// SET`, a MERGE's `UPDATE SET`. Otherwise an inserted row's.
     pub update: bool,
+    /// The target list that writes it, numbered from 0 in the statement:
+    /// a VALUES row, an `INSERT … SELECT`'s output, an UPDATE's (or an `ON
+    /// CONFLICT DO UPDATE`'s) SET list, a MERGE action. The values of one
+    /// target list are written into one row together.
+    pub row: usize,
     pub value: WrittenValue,
 }
 
@@ -992,6 +1103,280 @@ impl PgCatalog {
         out
     }
 
+    /// What the CHECK conjunct `key` — the [`CheckPart::key`] of a part of
+    /// one of [`Self::column_write_constraints`]`(relid, column)` —
+    /// evaluates to over the row an INSERT (`update` false) or an UPDATE
+    /// writes into relation `relid` when `row` holds the values the
+    /// statement writes into its columns (by column name; a column it
+    /// doesn't give is not known). Every column the conjunct reads must be
+    /// written a constant, or one of a few (a `CASE` of constants, NULL
+    /// when it may be NULL): the conjunct is evaluated over each
+    /// combination of them, with PostgreSQL's built-in comparisons of
+    /// integers, booleans and strings, `length` and `upper` / `lower` of
+    /// text, `AND` / `OR` / `NOT` and the NULL tests (see
+    /// [`crate::nonnull::subst::Eval`]); a CHECK passes a row it is NULL
+    /// for. `Unknown` when a column it reads is not written a constant,
+    /// when something can't be evaluated, when the relation isn't a table
+    /// or a DO INSTEAD rule or a BEFORE ROW trigger may change the row
+    /// before it is checked.
+    pub fn check_part_outcome(
+        &self,
+        relid: crate::oid::PgClassOid,
+        column: &str,
+        key: &str,
+        row: &std::collections::HashMap<String, &WrittenValue>,
+        update: bool,
+    ) -> PartOutcome {
+        use crate::ddl::tables::check_inherit::StoredExpr;
+        use crate::resolve::DmlEvent;
+        let Some(class) = self.pg_class.get(&relid) else {
+            return PartOutcome::Unknown;
+        };
+        let event = if update {
+            DmlEvent::Update
+        } else {
+            DmlEvent::Insert
+        };
+        if !matches!(
+            class.relkind,
+            crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+        ) || crate::resolve::returning_rewritten(self, relid, &[event])
+            || crate::resolve::before_row_trigger_rewrites(self, relid, event)
+        {
+            return PartOutcome::Unknown;
+        }
+        let attrs = self.attributes_of(relid);
+        let Some(attr) = attrs.iter().find(|a| a.attname == column && a.attnum > 0) else {
+            return PartOutcome::Unknown;
+        };
+        let is_column = |name: &str| attrs.iter().any(|a| a.attnum > 0 && a.attname == name);
+        for con in self.pg_constraint.values().filter(|c| {
+            c.conrelid == relid
+                && c.contype == crate::pg_catalog::ConType::Check
+                && c.conenforced
+                && c.conkey.contains(&attr.attnum)
+        }) {
+            let Some(def) = self.check_defs.get(&con.oid) else {
+                continue;
+            };
+            let (StoredExpr::Written(expr), Some(trust)) = (&def.expr, &def.trusted) else {
+                continue;
+            };
+            for n in crate::nonnull::checks::check_conjuncts((**expr).as_ref()) {
+                if node_key("relation:", n) == key {
+                    let read: Vec<(String, String)> = read_columns(n, is_column)
+                        .into_iter()
+                        .map(|c| (c.clone(), c))
+                        .collect();
+                    return self.evaluate_conjunct(relid, n, trust, &read, row);
+                }
+            }
+        }
+        for domain in self.domain_chain(attr.atttypid) {
+            for check in self.domain_constraints.get(&domain).into_iter().flatten() {
+                let (Some(StoredExpr::Written(expr)), Some(trust)) = (&check.expr, &check.trusted)
+                else {
+                    continue;
+                };
+                for n in crate::nonnull::checks::check_conjuncts((**expr).as_ref()) {
+                    if node_key("domain:", n) == key {
+                        // domainAddCheckConstraint reads `VALUE` as a
+                        // column of this name.
+                        let read = [("value".to_owned(), column.to_owned())];
+                        return self.evaluate_conjunct(relid, n, trust, &read, row);
+                    }
+                }
+            }
+        }
+        PartOutcome::Unknown
+    }
+
+    /// [`Self::check_part_outcome`] of conjunct `n`, whose column
+    /// references `read` maps to the columns of `relid` they read.
+    fn evaluate_conjunct(
+        &self,
+        relid: crate::oid::PgClassOid,
+        n: Option<&ast::Node>,
+        trust: &crate::nonnull::TrustedNodes,
+        read: &[(String, String)],
+        row: &std::collections::HashMap<String, &WrittenValue>,
+    ) -> PartOutcome {
+        use crate::nonnull::subst::{Eval, Val};
+        // The constants each column read may hold.
+        let mut choices: Vec<(&str, Vec<Val>)> = Vec::new();
+        for (name, column) in read {
+            let Some(attr) = self
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum > 0 && &a.attname == column)
+            else {
+                return PartOutcome::Unknown;
+            };
+            let Some(vals) = row
+                .get(column)
+                .and_then(|v| self.written_constants(v, attr))
+            else {
+                return PartOutcome::Unknown;
+            };
+            choices.push((name, vals));
+        }
+        if choices.is_empty()
+            || choices
+                .iter()
+                .try_fold(1usize, |n, (_, vals)| n.checked_mul(vals.len()))
+                .is_none_or(|n| n > MAX_COMBINATIONS)
+        {
+            return PartOutcome::Unknown;
+        }
+        let (mut passes, mut fails) = (0usize, 0usize);
+        let mut total = 0usize;
+        let mut index = vec![0usize; choices.len()];
+        loop {
+            let column = |node: &ast::Node| -> Val {
+                let ast::Node::ColumnRef(c) = node else {
+                    return Val::Unknown;
+                };
+                let names = crate::expr::extract_string_fields(&c.fields);
+                let Some(name) = names.last() else {
+                    return Val::Unknown;
+                };
+                choices
+                    .iter()
+                    .zip(&index)
+                    .find(|((n, _), _)| n == name)
+                    .map_or(Val::Unknown, |((_, vals), &i)| vals[i].clone())
+            };
+            match (Eval {
+                column: &column,
+                trust,
+                snapshot: self,
+            })
+            .eval(n)
+            {
+                Val::Bool(true) | Val::Null => passes += 1,
+                Val::Bool(false) => fails += 1,
+                _ => return PartOutcome::Unknown,
+            }
+            total += 1;
+            // The next combination.
+            let mut k = 0;
+            while k < index.len() {
+                index[k] += 1;
+                if index[k] < choices[k].1.len() {
+                    break;
+                }
+                index[k] = 0;
+                k += 1;
+            }
+            if k == index.len() {
+                break;
+            }
+        }
+        if passes == total {
+            PartOutcome::Passes
+        } else if fails == total {
+            PartOutcome::Fails
+        } else {
+            PartOutcome::Unknown
+        }
+    }
+
+    /// The constants `value` may be once stored into column `attr`, as
+    /// [`crate::nonnull::subst::Val`]s: each of the few values it is known
+    /// to be, of a type whose equal values print the same (an integer, a
+    /// boolean, a string under a deterministic collation — not a padded
+    /// `char(n)`), and NULL when it may be NULL. `None` when that isn't
+    /// known: a parameter, `DEFAULT`, a value of unknown contents, one the
+    /// column's type modifier may change.
+    fn written_constants(
+        &self,
+        value: &WrittenValue,
+        attr: &crate::pg_catalog::PgAttribute,
+    ) -> Option<Vec<crate::nonnull::subst::Val>> {
+        use crate::nonnull::subst::Val;
+        let WrittenValue::Expression {
+            type_oid,
+            nullable,
+            refinement,
+            ..
+        } = value
+        else {
+            return None;
+        };
+        // A bare NULL: an untyped value with no known contents.
+        if *type_oid == crate::pg_catalog::oid::UNKNOWN && refinement.values.is_none() {
+            return nullable.then(|| vec![Val::Null]);
+        }
+        let kind = Exact::of(attr.atttypid, attr.attcollation, self)?;
+        let converted = refinement.converted(*type_oid, attr.atttypid, self);
+        let values: Vec<String> = match (&converted.values, converted.range) {
+            (Some(vs), _) => vs.iter().cloned().collect(),
+            (
+                None,
+                Some(IntRange {
+                    lo: Some(lo),
+                    hi: Some(hi),
+                }),
+            ) if lo == hi => vec![lo.to_string()],
+            _ => return None,
+        };
+        let typmod = self.effective_typmod(attr.atttypid, attr.atttypmod);
+        let mut out: Vec<Val> = values
+            .iter()
+            .map(|v| match kind {
+                Exact::Int => v.parse().ok().map(Val::Int),
+                Exact::Bool => match v.as_str() {
+                    "true" => Some(Val::Bool(true)),
+                    "false" => Some(Val::Bool(false)),
+                    _ => None,
+                },
+                // A `varchar(n)` keeps a string of at most n characters as
+                // is.
+                Exact::Text => typmod
+                    .is_none_or(|m| {
+                        i64::try_from(v.chars().count()).is_ok_and(|n| n <= i64::from(m) - 4)
+                    })
+                    .then(|| Val::Text(v.clone())),
+            })
+            .collect::<Option<_>>()?;
+        if *nullable {
+            out.push(Val::Null);
+        }
+        Some(out)
+    }
+
+    /// For the lint: what is known of a value of type `from`, known `r`
+    /// about, once converted to type `to` — a column's, by the assignment
+    /// that stores it (see [`Refinement::converted`]: an untyped literal
+    /// read by the type's input function, an integer's range as `numeric`
+    /// bounds, a `date`'s bounds as `timestamp` ones). A type modifier
+    /// the conversion applies is not accounted for.
+    pub fn lint_converted_refinement(
+        &self,
+        r: &Refinement,
+        from: PgTypeOid,
+        to: PgTypeOid,
+    ) -> Refinement {
+        r.converted(from, to, self)
+    }
+
+    /// For the lint: whether column `column` of relation `relid` has a
+    /// default an INSERT that leaves it out (or `SET column = DEFAULT`)
+    /// stores: a DEFAULT of its own, an identity or generation expression,
+    /// or — none of those — its domain's DEFAULT (`build_column_default`
+    /// falls back on the type's).
+    pub fn lint_column_has_default(&self, relid: crate::oid::PgClassOid, column: &str) -> bool {
+        self.attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum > 0 && a.attname == column)
+            .is_some_and(|a| {
+                a.atthasdef
+                    || a.attidentity.is_some()
+                    || a.attgenerated.is_some()
+                    || self.domain_has_default(a.atttypid)
+            })
+    }
+
     /// What `r` allows column `column` of relation `relid`, in words (`one
     /// of 'a', 'b'`, `at least 0`, `finite`); `None` when it says nothing
     /// the words can tell.
@@ -1011,12 +1396,38 @@ impl PgCatalog {
         };
         let text = kind
             .and_then(|kind| describe(r, kind, Cmp::Eq))
-            .filter(|text| text != "unbounded")
+            .filter(|text| text != "unbounded" && !text.ends_with("the bounds known for it"))
             .map(|text| text.strip_prefix("always ").unwrap_or(&text).to_owned());
         match text {
             Some(text) if r.finite => Some(format!("finite and {text}")),
             Some(text) => Some(text),
             None => r.finite.then(|| "finite".to_owned()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datetimes_in_words() {
+        // Day counts and microseconds as PostgreSQL 19 computes them
+        // (`'2000-01-01'::date - '0044-03-15 BC'::date` is 746117).
+        assert_eq!(datetime_words(0, OrdKind::Date).unwrap(), "2000-01-01");
+        assert_eq!(datetime_words(8036, OrdKind::Date).unwrap(), "2022-01-01");
+        assert_eq!(
+            datetime_words(-746_117, OrdKind::Date).unwrap(),
+            "0044-03-15 BC"
+        );
+        assert_eq!(
+            datetime_words(-500_000, OrdKind::Timestamp).unwrap(),
+            "1999-12-31 23:59:59.5"
+        );
+        assert_eq!(
+            datetime_words(3_600_000_000, OrdKind::TimestampTz).unwrap(),
+            "2000-01-01 01:00:00+00"
+        );
+        assert_eq!(datetime_words(1, OrdKind::Numeric), None);
     }
 }

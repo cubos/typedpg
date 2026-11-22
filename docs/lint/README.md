@@ -1,8 +1,14 @@
 # Lint rules
 
-`cargo typedpg lint` (Rust) and `npx typedpg lint` (TypeScript) analyze every query against the schema your migrations build, without a database, and lint the migrations themselves. Because each rule works from what the analyzer proves — column types, nullability, `CHECK` constraints, unique keys, foreign keys, the locks a statement takes — it can report what a text-based linter can't, and stay silent when a fact can't be proven.
+`cargo typedpg lint` (Rust) and `npx typedpg lint` (TypeScript) check every
+query against the schema your migrations build, and the migrations
+themselves, without a database. Rules work from what the schema states
+(types, nullability, `CHECK`s, unique and foreign keys, the locks a
+statement takes), so they catch what a text-based linter can't, and stay
+silent when they can't be sure.
 
-Each rule below links to a page with its motivation, exact conditions, verified examples and configuration. The level is the default; "off" rules report at `info` once you give them a level.
+Each rule links to a page with an example, what triggers it and what
+doesn't. The level shown is the default.
 
 ## Queries
 
@@ -44,7 +50,7 @@ Rules over the SQL of each query (`sql!` in Rust, `sql` / `.sql` files in TypeSc
 
 ## `sql!` bindings
 
-Rules over the Rust source of a `sql!` invocation, not its SQL. Only `cargo typedpg lint` runs them, and only the Rust configuration accepts their keys.
+Rules over the Rust source of a `sql!` invocation, not its SQL. Rust only.
 
 | Rule | Default | Reports |
 |---|---|---|
@@ -53,7 +59,7 @@ Rules over the Rust source of a `sql!` invocation, not its SQL. Only `cargo type
 
 ## Call sites
 
-Rules over how a query's result is used — `fetch_one`, `fetchOne`, `execute`, … — against what the schema proves about its rows. Both CLIs run them; findings are placed at the method call.
+Rules over how a query's result is used (`fetch_one`, `fetchOne`, `execute`, …). Findings are placed at the method call.
 
 | Rule | Default | Reports |
 |---|---|---|
@@ -63,7 +69,7 @@ Rules over how a query's result is used — `fetch_one`, `fetchOne`, `execute`, 
 
 ## Migrations
 
-Rules over each migration statement, on tables that already existed when its file started — typedpg can't see row counts, so it treats every table an earlier file created as one that holds rows, and every table created earlier in the same file as empty.
+Rules over each migration statement. A table created by an earlier file is assumed to hold rows; one created earlier in the same file is assumed empty.
 
 | Rule | Default | Reports |
 |---|---|---|
@@ -81,7 +87,7 @@ Rules over each migration statement, on tables that already existed when its fil
 
 ## Final schema
 
-Rules over the schema the migrations leave behind, run once after the last migration. Each finding is placed on the statement that created the object (the column's type, the constraint, the index, the policy, the routine), so a later migration that fixes the problem makes it go away.
+Rules over the schema after the last migration. Each finding is placed on the statement that created the object, and a later migration that fixes the problem clears it.
 
 | Rule | Default | Reports |
 |---|---|---|
@@ -114,56 +120,61 @@ cargo typedpg lint [--manifest-path ./Cargo.toml] [--format human|json|sarif] [-
 npx typedpg lint [--config typedpg.config.json] [--format human|json|sarif] [--previous-deployment <ref>] [--fix]
 ```
 
-Findings go to stdout and the summary to stderr. The run exits non-zero when a finding reaches the `fail_on` severity, or when a query or migration fails analysis.
+Findings go to stdout, the summary to stderr. The run fails (non-zero exit)
+when a finding reaches `fail_on`, or when a query or migration doesn't
+analyze.
 
 ### Levels
 
-Every rule has a level: `"error"`, `"warning"`, `"info"` or `"off"`. Rules you don't mention keep their default (the tables above). `like_unescaped_param` and the `prefer_*` rules are off by default; give them any level to enable them.
+Each rule is `"error"`, `"warning"`, `"info"` or `"off"`. Unlisted rules keep
+the defaults above; give an `off` rule any level to enable it.
 
-In Rust, the levels go in `Cargo.toml`, under `[package.metadata.typedpg.lint]`, with the rule names as keys. The section applies to every database of the crate (`[package.metadata.typedpg.databases.*]` included):
+Rust: `[package.metadata.typedpg.lint]` in `Cargo.toml`, snake_case keys,
+for every database of the crate:
 
 ```toml
 [package.metadata.typedpg.lint]
-fail_on = "warning"          # the severity that fails the run: "error" (default), "warning" or "info"
+fail_on = "warning"
 null_comparison = "off"
-redundant_index = "warning"
 prefer_timestamptz = "info"
-ignore = ["tests/**"]        # see below
+ignore = ["tests/**"]
 ```
 
-In TypeScript, they go in `typedpg.config.json`'s top-level `lint` object, for every database, with the rule names in camelCase:
+TypeScript: the top-level `lint` object of `typedpg.config.json`, camelCase
+keys, for every database:
 
 ```json
 {
-  "include": ["src"],
-  "out": "src/db.ts",
-  "migrations": "migrations",
   "lint": {
     "failOn": "warning",
     "nullComparison": "off",
-    "redundantIndex": "warning",
     "preferTimestamptz": "info",
     "ignore": ["tests/**"]
   }
 }
 ```
 
-An unknown key or an invalid value is a configuration error. `redundant_binding` and `renaming_binding` are only accepted in the Rust configuration; `invalid_allow` and `internal_error` are accepted in neither.
+An unknown key or value is a configuration error and nothing is checked.
+The `sql!` binding rules are Rust-only keys; `invalid_allow` and
+`internal_error` can't be configured.
 
 ### `fail_on` / `failOn`
 
-The severity at which a finding fails the run: `"error"` (the default), `"warning"` or `"info"`. With `"warning"`, every warning or error fails it. `invalid_allow` is always an error, so it always fails the run. Info findings are printed but only fail the run with `"info"`.
+The lowest severity that fails the run: `"error"` (default), `"warning"` or
+`"info"`. Lower findings are printed only.
 
 ### `ignore`
 
-Glob patterns, relative to the directory of `Cargo.toml` (Rust) or of `typedpg.config.json` (TypeScript), with forward slashes; `*` does not cross a `/`, `**` does.
+Globs relative to the directory of `Cargo.toml` or `typedpg.config.json`,
+with `/`; `*` stays within a directory, `**` crosses them.
 
-- Findings in a matching query file are dropped. Its queries are still analyzed, and one that does not compile still fails the run.
-- A matching migration file is still applied and builds the schema, but its statement rules (the migration rules above) are skipped. Its schema findings are still reported, on the statements that created the objects, with a help line that puts the fix in a new migration, and its allow comments are still honored and validated.
+- Query files: findings are dropped. Queries are still analyzed, and one
+  that doesn't compile still fails the run.
+- Migration files: still applied to build the schema, but the migration
+  rules skip them. Schema rules still report on their statements, with a
+  help that puts the fix in a new migration.
 
 ### Allow comments
-
-A comment suppresses rules for one query or one migration statement:
 
 ```sql
 -- typedpg-lint: allow(unbounded_write)
@@ -173,24 +184,49 @@ DELETE FROM sessions;
 CREATE INDEX users_email_idx ON users (email);
 ```
 
-The comment must be exactly `typedpg-lint: allow(` followed by comma-separated rule names and `)`, with nothing after it; anything else starting with `typedpg-lint:` is an [`invalid_allow`](invalid_allow.md) error, as is an unknown rule name.
+The text must be exactly `typedpg-lint: allow(` + comma-separated rule names
++ `)`, with nothing after it. Anything else starting with `typedpg-lint:`,
+or an unknown rule name, is an [`invalid_allow`](invalid_allow.md) error.
 
-- **Queries.** The comment can be anywhere in the query's SQL and covers the whole query, including the call-site rules' findings for it. In Rust, the binding rules read the allow comments of the `sql!` template's SQL.
-- **Migration statements.** The comment covers the statement it is inside, or the statement it leads into (a comment between the previous statement and this one) — not the rest of the file.
-- **Schema rules.** The finding is suppressed by an allow comment on the statement it is placed on: the one that created the column, constraint, index, table, policy or routine (or enabled row-level security). The comment covers every object that statement creates.
-- **`breaks_deployed_queries`.** On the migration statement that breaks the query, or in the deployed query's own SQL.
+A comment after a statement's `;`, on the line the statement ends on,
+belongs to that statement, not the next one:
+
+```sql
+DELETE FROM sessions; -- typedpg-lint: allow(unbounded_write)
+```
+
+| Finding | Where the comment goes |
+|---|---|
+| query and call-site rules | anywhere in the query's SQL; covers the whole query |
+| query and call-site rules, `.sql` file | inside the query, between its `/* @name */` comment and its statement, after its `;` on the statement's last line, or on the lines before its `/* @name */` comment (after the previous query's last line); comments after the file's last query are its |
+| `sql!` binding rules | in the `sql!` template's SQL |
+| migration rules | inside the statement, just before it, or after its `;` on the statement's last line; covers that statement only |
+| schema rules | on the statement the finding is placed on (the `CREATE` of the object); covers everything it creates |
+| [`breaks_deployed_queries`](breaks_deployed_queries.md) | on the breaking migration statement, or in the deployed query |
 
 ### `--fix`
 
-`--fix` applies the fixes findings carry, writes the files, then lints again and reports what remains. In Rust it deletes `redundant_binding` bindings, rewrites `renaming_binding` parameters, and applies SQL edits; in TypeScript it writes SQL edits into the sources and `.sql` files. The SQL fixes come from `redundant_null_check` (its `COALESCE`), `redundant_limit`, `redundant_distinct`, `constant_condition`, `case_without_else`, `redundant_cast`, `redundant_alias`, `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, `redundant_join`, `redundant_order_by`, `redundant_group_by`, `count_not_null` and `unused_returning`. Migration findings never have fixes.
+Applies the fixes findings carry, writes the files, lints again and reports
+what remains. A fix never changes a query's result columns (names, types,
+nullability), its parameters or what it does; when that can't be
+guaranteed, the fix isn't offered and the finding is reported without one.
+A fix that fails typedpg's final check is withheld and reported as
+[`internal_error`](internal_error.md). Migration findings have no fixes.
 
-A fix is only offered when its rule proves it keeps the query's meaning, and every fix is checked again before it is offered: the edited query must analyze to the same output columns (names, types, nullability, known values), the same parameters and the same ability to run as a subquery (`unused_returning`'s must have no output columns). A fix that fails that check is withheld and reported as [`internal_error`](internal_error.md).
+Rules with fixes: `redundant_null_check` (its `COALESCE` case),
+`redundant_limit`, `redundant_distinct`, `constant_condition`,
+`case_without_else`, `redundant_cast`, `redundant_alias`,
+`insert_without_columns`, `self_assignment`, `unused_cte`,
+`simplifiable_case`, `redundant_join`, `redundant_order_by`,
+`redundant_group_by`, `count_not_null`, `unused_returning`, and in Rust
+`redundant_binding` and `renaming_binding`.
 
 ### `--format`
 
-- `human` (the default): one box per finding, as in the rule pages, then a summary.
-- `json`: one JSON document with the findings, the analysis failures and the summary.
-- `sarif`: SARIF 2.1.0, for code scanning (each rule's one-line description is its SARIF metadata). Both `json` and `sarif` include the analysis failures, which the human format prints on stderr.
+- `human` (default): one box per finding, as on the rule pages, then a
+  summary.
+- `json`: one document with the findings, analysis failures and summary.
+- `sarif`: SARIF 2.1.0 for code scanning, analysis failures included.
 
 ```yaml
 - run: cargo typedpg lint --format sarif > lint.sarif
@@ -202,13 +238,25 @@ A fix is only offered when its rule proves it keeps the query's meaning, and eve
 
 ### `--previous-deployment <ref>`
 
-Names the git ref of what is deployed now, for example `origin/main` or a release tag. Its former name, `--ignore-migrations-from`, still works. It does two things:
+The git ref of what runs in production now, e.g. `origin/main` or a release
+tag (formerly `--ignore-migrations-from`, still accepted).
 
-- **Applied migrations skip the statement rules.** A migration file identical to its version at the ref has already run in production and can't be changed, so its locks, scans and rewrites are no longer reported. It is still applied for the schema, the schema rules still report on its statements (with help lines that put the fix in a new migration), and its allow comments are still honored and validated. A file absent from the ref, or changed by the branch, is linted as usual. The summary says how many files this applied to, e.g. `(300 unchanged from origin/main: statement rules skipped)`.
-- **[`breaks_deployed_queries`](breaks_deployed_queries.md) runs.** The code at the ref keeps running while the new migrations apply and during the rollout; its queries, read from the ref, are analyzed against the new schema, and each one that breaks is reported on the migration statement that breaks it.
+- Migration files identical at the ref have already run and can't change:
+  the migration rules skip them. They still build the schema, schema rules
+  still report on them (with the fix in a new migration), and their allow
+  comments still apply. The summary counts them, e.g.
+  `(300 unchanged from origin/main: statement rules skipped)`.
+- [`breaks_deployed_queries`](breaks_deployed_queries.md) runs: the queries
+  of the code at the ref are checked against the new schema, since that code
+  keeps running while the migrations apply.
 
 ### What the migration rules assume
 
-- Migration files are applied in order to build the schema. `extra_migrations` (Rust) / `extraMigrations` (TypeScript) directories build it too, but nothing in them is ever reported: they are another project's schema.
-- A table that existed before a file started is assumed to hold rows; one created earlier in the same file is assumed empty.
-- Whether a file runs in a transaction follows the runner: `use_transaction` / `useTransaction` (default true), unless the file's first line is `-- no-transaction`. This decides which statements are allowed at all (`CREATE INDEX CONCURRENTLY` inside a transaction is an error, as in PostgreSQL), how long a lock is held, and whether `SET LOCAL` has any effect.
+- Migrations apply in order. `extra_migrations` / `extraMigrations`
+  directories build the schema too, but are never reported.
+- A table from an earlier file holds rows; one created earlier in the same
+  file is empty.
+- A file runs in one transaction when `use_transaction` / `useTransaction`
+  is on (default), unless its first line is `-- no-transaction`. This
+  decides what is allowed (`CREATE INDEX CONCURRENTLY` fails in a
+  transaction), how long locks are held, and whether `SET LOCAL` applies.

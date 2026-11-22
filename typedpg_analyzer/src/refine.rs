@@ -338,7 +338,8 @@ impl Refinement {
     /// `true` / `false`; an enum's label into `text` / `varchar`, and back
     /// for the strings that are labels — `enum_in` rejects the others;
     /// `text` and `varchar` into each other); an integer's range becomes
-    /// `numeric` bounds. A type modifier the conversion applies
+    /// `numeric` bounds, a `date`'s bounds `timestamp` ones. A type modifier
+    /// the conversion applies
     /// (`varchar(2)`, `numeric(5,2)`) is the caller's to account for.
     pub(crate) fn converted(
         &self,
@@ -423,6 +424,13 @@ impl Refinement {
         } else if exact_from == Some(Exact::Int) && to_kind == Some(OrdKind::Numeric) {
             // An integer is the same number as a `numeric`.
             self.int_bounds().map(|r| OrdRange::of_ints(&r))
+        } else if from == oid::DATE && to == oid::TIMESTAMP {
+            // `date2timestamp`: the day's midnight, whatever the session's
+            // time zone (an infinity stays one). Not into `timestamptz`,
+            // whose midnight is the session time zone's.
+            self.bounds
+                .filter(|b| b.kind == OrdKind::Date)
+                .and_then(|b| b.date_as_timestamp())
         } else {
             None
         };

@@ -187,11 +187,11 @@ fn common_migration_statements_are_accepted() {
          ALTER STATISTICS st SET STATISTICS 100;
          ALTER DATABASE postgres SET timezone TO 'UTC';
          ALTER DATABASE postgres RESET timezone;
-         CREATE ROLE r;
-         ALTER ROLE r SET search_path = public;
-         REASSIGN OWNED BY r TO postgres;
-         DROP OWNED BY r;
-         DROP ROLE r;
+         CREATE ROLE misc_common_r;
+         ALTER ROLE misc_common_r SET search_path = public;
+         REASSIGN OWNED BY misc_common_r TO postgres;
+         DROP OWNED BY misc_common_r;
+         DROP ROLE misc_common_r;
          PREPARE q AS SELECT 1;
          EXECUTE q;
          DEALLOCATE q;
@@ -5415,7 +5415,7 @@ fn set_to_null_empties_a_list_parameter() {
             "NULL is an invalid value for work_mem",
         ),
         (
-            "CREATE ROLE r; ALTER ROLE r SET work_mem TO NULL;",
+            "CREATE ROLE misc_null_r; ALTER ROLE misc_null_r SET work_mem TO NULL;",
             "NULL is an invalid value for work_mem",
         ),
     ] {
@@ -5433,8 +5433,8 @@ fn set_to_null_empties_a_list_parameter() {
              SET LOCAL search_path TO NULL;
              SET temp_tablespaces TO NULL;
              SET DateStyle TO NULL;
-             CREATE ROLE r;
-             ALTER ROLE r SET search_path TO NULL;
+             CREATE ROLE misc_null_r;
+             ALTER ROLE misc_null_r SET search_path TO NULL;
              CREATE FUNCTION public.g() RETURNS int LANGUAGE sql SET search_path TO NULL
                  AS 'SELECT 1';",
         ),
