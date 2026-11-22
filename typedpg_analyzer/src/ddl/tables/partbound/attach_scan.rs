@@ -17,18 +17,27 @@
 //! and `x IS NULL` tests, and the btree implication of `key op constant`
 //! comparisons (`<`, `<=`, `=`, `>=`, `>`), an `IN` list or `= ANY (ARRAY
 //! […])` (up to predtest's 100 elements) being an `OR` of equalities and
-//! `BETWEEN` an `AND`. Whatever it can't model — an expression key, a key
-//! whose operator class or collation differs from the column's, a constant
-//! it can't order, a hash bound, a default partition's negated constraint —
+//! `BETWEEN` an `AND`. Constants compare across types where predtest's
+//! test operator is immutable and the analyzer compares them exactly: the
+//! integer types among themselves, `date` against `timestamp`, and an
+//! integer constant folded into a `numeric` key's type. A boolean key's
+//! `b = true` / `b <> true` is folded to `b` / `NOT b` on both sides, as
+//! eval_const_expressions does before the proof. Whatever it can't model —
+//! an expression key, a key whose operator class or collation differs from
+//! the column's, a constant it can't order (strings under a collation that
+//! doesn't order by code point: the analyzer has no libc / ICU
+//! comparison), a hash bound, a default partition's negated constraint —
 //! is not proven, so the attach is taken to scan.
 
 use std::cmp::Ordering;
 
 use typedpg_pg_query::ast::{self, AExprKind, BoolExprType, NullTestType, PartitionBoundSpec};
 
-use super::{Bound, Datum, PartKey, PartSpec, RangeDatum, Strategy, normalize, orderable};
+use super::{
+    Bound, Datum, NumericKey, PartKey, PartSpec, RangeDatum, Strategy, normalize, orderable,
+};
 use crate::oid::PgClassOid;
-use crate::pg_catalog::{ConType, PgCatalog, RelKind};
+use crate::pg_catalog::{ConType, PgCatalog, RelKind, oid};
 
 /// predtest's `MAX_SAOP_ARRAY_SIZE`: a longer `IN` list / `= ANY (ARRAY…)`
 /// is an opaque atom, proven only by an identical one.
@@ -169,6 +178,9 @@ enum Expr {
     NotNull(String),
     IsNull(String),
     Cmp(String, Op, Val),
+    /// A boolean column (`b`) or its negation (`NOT b`): what
+    /// eval_const_expressions makes of `b = true`, `b <> true`, `NOT b`, ….
+    Bool(String, bool),
     /// Anything else: it implies nothing, and nothing implies it.
     Other,
 }
@@ -212,11 +224,40 @@ struct Val {
     datum: Datum,
     /// The literal as written, when it is one.
     raw: Option<String>,
+    /// The constant is a `date`, its [`Datum::Int`] a count of days, where
+    /// the other side may be a `timestamp`'s microseconds: the two compare
+    /// across types in the `datetime_ops` family.
+    days: bool,
 }
 
+/// Microseconds in a day: a `date` is the `timestamp` at its midnight
+/// (date2timestamp).
+const USECS_PER_DAY: i128 = 86_400_000_000;
+
 impl Val {
+    /// A constant of the key's own type.
+    fn of_key(interp: &PgCatalog, datum: Datum, raw: Option<String>, key: &PartKey) -> Val {
+        Val {
+            datum,
+            raw,
+            days: interp.unwrap_domain(key.type_oid) == oid::DATE,
+        }
+    }
+
     /// Their order under the key's comparison, when the analyzer knows it.
     fn cmp(&self, other: &Val) -> Option<Ordering> {
+        if self.days != other.days {
+            // A date against a timestamp (date_cmp_timestamp): the date
+            // at its midnight, ±infinity matching ±infinity.
+            let micros = |v: &Val| match v.datum {
+                Datum::Int(i) if v.days && i != i128::MAX && i != i128::MIN => {
+                    Some(i * USECS_PER_DAY)
+                }
+                Datum::Int(i) => Some(i),
+                _ => None,
+            };
+            return Some(micros(self)?.cmp(&micros(other)?));
+        }
         if orderable(&self.datum)
             && std::mem::discriminant(&self.datum) == std::mem::discriminant(&other.datum)
         {
@@ -261,7 +302,8 @@ fn bound_qual(
             (!others).then(Vec::new)
         }
         Bound::List(values) => {
-            let col = column(spec.keys.first()?)?;
+            let key = spec.keys.first()?;
+            let col = column(key)?;
             let has_null = values.iter().any(Option::is_none);
             let elems: Vec<Expr> = values
                 .iter()
@@ -271,16 +313,20 @@ fn bound_qual(
                     Some(Expr::Cmp(
                         col.clone(),
                         Op::Eq,
-                        Val {
-                            datum,
-                            raw: raws.list.get(i).cloned().flatten(),
-                        },
+                        Val::of_key(interp, datum, raws.list.get(i).cloned().flatten(), key),
                     ))
                 })
                 .collect();
             if elems.len() > MAX_SAOP_ARRAY_SIZE {
                 return None;
             }
+            // One value is an `=` operator (make_partition_op_expr), which
+            // eval_const_expressions folds to `b` / `NOT b` for a boolean
+            // key; several are a `= ANY (ARRAY[…])`, left as is.
+            let elems = match elems.as_slice() {
+                [Expr::Cmp(col, Op::Eq, val)] => vec![equality(interp, col, val, key)],
+                _ => elems,
+            };
             let any = (!elems.is_empty()).then_some(Expr::Or(elems));
             Some(if has_null {
                 vec![match any {
@@ -301,12 +347,18 @@ fn bound_qual(
             let n = cols.len();
             let value =
                 |datums: &[RangeDatum], raws: &[Option<String>], i: usize| match datums.get(i) {
-                    Some(RangeDatum::Value(d)) => Some(Val {
-                        datum: d.clone(),
-                        raw: raws.get(i).cloned().flatten(),
-                    }),
+                    Some(RangeDatum::Value(d)) => Some(Val::of_key(
+                        interp,
+                        d.clone(),
+                        raws.get(i).cloned().flatten(),
+                        &spec.keys[i],
+                    )),
                     _ => None,
                 };
+            let compare = |j: usize, op: Op, v: &Val| match op {
+                Op::Eq => equality(interp, &cols[j], v, &spec.keys[j]),
+                _ => Expr::Cmp(cols[j].clone(), op, v.clone()),
+            };
             let is_value = |d: Option<&RangeDatum>| matches!(d, Some(RangeDatum::Value(_)));
             // get_range_nulltest: every key column IS NOT NULL.
             let mut items: Vec<Expr> = cols.iter().cloned().map(Expr::NotNull).collect();
@@ -324,7 +376,7 @@ fn bound_qual(
                 if i == n - 1 || lo.cmp(&hi)? != Ordering::Equal {
                     break;
                 }
-                items.push(Expr::Cmp(cols[i].clone(), Op::Eq, lo));
+                items.push(compare(i, Op::Eq, &lo));
                 i += 1;
             }
             let mut lower_arms = Vec::new();
@@ -348,7 +400,7 @@ fn bound_qual(
                         } else {
                             Op::Gt
                         };
-                        lower_args.push(Expr::Cmp(cols[j].clone(), op, lo.clone()));
+                        lower_args.push(compare(j, op, lo));
                     }
                     if need_upper && let Some(hi) = &hi {
                         let op = if j - i < current {
@@ -358,7 +410,7 @@ fn bound_qual(
                         } else {
                             Op::Lt
                         };
-                        upper_args.push(Expr::Cmp(cols[j].clone(), op, hi.clone()));
+                        upper_args.push(compare(j, op, hi));
                     }
                     j += 1;
                     if j - i > current {
@@ -390,6 +442,18 @@ fn bound_qual(
             }
             Some(items)
         }
+    }
+}
+
+/// `col = val` as the partition constraint holds it once
+/// eval_const_expressions ran: `b` / `NOT b` for a boolean key
+/// (simplify_boolean_equality).
+fn equality(interp: &PgCatalog, col: &str, val: &Val, key: &PartKey) -> Expr {
+    match val.datum {
+        Datum::Int(v) if interp.unwrap_domain(key.type_oid) == oid::BOOL => {
+            Expr::Bool(col.to_owned(), v != 0)
+        }
+        _ => Expr::Cmp(col.to_owned(), Op::Eq, val.clone()),
     }
 }
 
@@ -479,9 +543,29 @@ fn check_expr(interp: &PgCatalog, node: Option<&ast::Node>, keys: &[(&str, &Part
             match b.boolop {
                 BoolExprType::AndExpr => Expr::And(args()),
                 BoolExprType::OrExpr => Expr::Or(args()),
-                BoolExprType::NotExpr => Expr::Other,
+                // eval_const_expressions negates the argument
+                // (negate_clause): `NOT b` stays, `NOT NOT b` is `b`.
+                // Other negations are not modeled.
+                BoolExprType::NotExpr => match b.args.as_slice() {
+                    [arg] => match check_expr(interp, arg.as_ref(), keys) {
+                        Expr::Bool(col, value) => Expr::Bool(col, !value),
+                        _ => Expr::Other,
+                    },
+                    _ => Expr::Other,
+                },
             }
         }
+        // A bare boolean key column.
+        ast::Node::ColumnRef(_) => match column_name(Some(node)) {
+            Some(col)
+                if keys.iter().any(|(name, key)| {
+                    *name == col && interp.unwrap_domain(key.type_oid) == oid::BOOL
+                }) =>
+            {
+                Expr::Bool(col.to_owned(), true)
+            }
+            _ => Expr::Other,
+        },
         ast::Node::NullTest(t) => match column_name(t.arg.as_ref()) {
             Some(col) if !t.argisrow => match t.nulltesttype {
                 NullTestType::IsNotNull => Expr::NotNull(col.to_owned()),
@@ -517,14 +601,44 @@ fn aexpr(interp: &PgCatalog, a: &ast::AExpr, keys: &[(&str, &PartKey)]) -> Optio
             compared(a.lexpr.as_ref(), high.as_ref(), Op::Le)?,
         ]));
     }
-    let op = operator(&a.name)?;
+    // A boolean key's `b = true` / `b <> true` (either way round) is folded
+    // to `b` / `NOT b` by eval_const_expressions
+    // (simplify_boolean_equality).
+    let boolean = |e: Expr| match e {
+        Expr::Cmp(col, Op::Eq, val) => match val.datum {
+            Datum::Int(v)
+                if keys.iter().any(|(name, key)| {
+                    *name == col && interp.unwrap_domain(key.type_oid) == oid::BOOL
+                }) =>
+            {
+                Expr::Bool(col, v != 0)
+            }
+            _ => Expr::Cmp(col, Op::Eq, val),
+        },
+        e => e,
+    };
+    let binary = |op: Op| {
+        compared(a.lexpr.as_ref(), a.rexpr.as_ref(), op)
+            .or_else(|| compared(a.rexpr.as_ref(), a.lexpr.as_ref(), op.commuted()))
+    };
+    if a.kind == AExprKind::AexprOp && operator_name(&a.name) == Some("<>") {
+        return match boolean(binary(Op::Eq)?) {
+            Expr::Bool(col, value) => Some(Expr::Bool(col, !value)),
+            _ => None,
+        };
+    }
+    let op = Op::from_name(operator_name(&a.name)?)?;
     match a.kind {
-        AExprKind::AexprOp => compared(a.lexpr.as_ref(), a.rexpr.as_ref(), op)
-            .or_else(|| compared(a.rexpr.as_ref(), a.lexpr.as_ref(), op.commuted())),
+        AExprKind::AexprOp => binary(op).map(boolean),
         AExprKind::AexprIn if op == Op::Eq => {
             let Some(ast::Node::List(list)) = a.rexpr.as_ref() else {
                 return None;
             };
+            // One value is an `=` operator (transformAExprIn); several are
+            // a `= ANY (ARRAY[…])`, which is not folded.
+            if let [value] = list.items.as_slice() {
+                return compared(a.lexpr.as_ref(), value.as_ref(), Op::Eq).map(boolean);
+            }
             equalities(&list.items, |v| compared(a.lexpr.as_ref(), v, Op::Eq))
         }
         AExprKind::AexprOpAny if op == Op::Eq => {
@@ -552,15 +666,15 @@ fn equalities(
     Some(Expr::Or(arms))
 }
 
-/// The comparison an `A_Expr` name is: one of the built-in btree
-/// operators, unqualified or in `pg_catalog`.
-fn operator(name: &[Option<ast::Node>]) -> Option<Op> {
+/// The operator an `A_Expr` names, unqualified or in `pg_catalog` (where
+/// the built-in comparisons are).
+fn operator_name(name: &[Option<ast::Node>]) -> Option<&str> {
     let names: Vec<&str> = name
         .iter()
         .filter_map(|n| crate::ddl::util::node_string(n.as_ref()))
         .collect();
     match names.as_slice() {
-        [op] | ["pg_catalog", op] => Op::from_name(op),
+        [op] | ["pg_catalog", op] => Some(op),
         _ => None,
     }
 }
@@ -582,8 +696,14 @@ fn column_name(node: Option<&ast::Node>) -> Option<&str> {
 /// column's type), an integer literal for an integer key, or a literal cast
 /// to the key's type. A constant that makes PostgreSQL cast the column
 /// instead (`int_col >= 1.5` compares numerics) is not one.
+///
+/// Two casts to another type are read too, where predtest compares the
+/// constants exactly: an integer cast for a `numeric` key (no cross-type
+/// operator: the constant is coerced to `numeric`, and folded), and a
+/// `timestamp` for a `date` key or a `date` for a `timestamp` key (the
+/// immutable cross-type operators of `datetime_ops`; those with
+/// `timestamptz` are only stable, which get_btree_test_op refuses).
 fn check_value(interp: &PgCatalog, v: &ast::Node, key: &PartKey) -> Option<Val> {
-    use crate::pg_catalog::oid;
     let base = interp.unwrap_domain(key.type_oid);
     let integer_key = [oid::INT2, oid::INT4, oid::INT8].contains(&base);
     let (literal, cast) = match v {
@@ -598,27 +718,50 @@ fn check_value(interp: &PgCatalog, v: &ast::Node, key: &PartKey) -> Option<Val> 
         },
         _ => return None,
     };
-    // A cast to another type is only compared with the column as is when
-    // both are integers (one btree family).
+    let integer = |t: crate::oid::PgTypeOid| [oid::INT2, oid::INT4, oid::INT8].contains(&t);
+    let integer_value = || match literal.val.as_ref()? {
+        ast::AConstValue::Integer(i) => Some(i128::from(i.ival)),
+        // An integer literal past int4's range is an int8 constant;
+        // one with a fraction or an exponent is numeric.
+        ast::AConstValue::Float(f) => f.fval.parse::<i128>().ok(),
+        ast::AConstValue::String(s) => crate::literal_input::parse_pg_integer(&s.sval),
+        _ => None,
+    };
+    // A cast to another type is compared with the column as is when both
+    // are integers (one btree family); the others modeled are read here.
     if let Some(target) = cast
         && target != base
-        && !(integer_key && [oid::INT2, oid::INT4, oid::INT8].contains(&target))
+        && !(integer_key && integer(target))
     {
-        return None;
+        if base == oid::NUMERIC && integer(target) {
+            let value = NumericKey::parse(&integer_value()?.to_string())?;
+            return Some(Val {
+                datum: Datum::Numeric(value),
+                raw: None,
+                days: false,
+            });
+        }
+        let ((oid::DATE, oid::TIMESTAMP) | (oid::TIMESTAMP, oid::DATE)) = (base, target) else {
+            return None;
+        };
+        let Some(ast::AConstValue::String(s)) = literal.val.as_ref() else {
+            return None;
+        };
+        let days = target == oid::DATE;
+        let value =
+            crate::datetime_input::datetime_value(&s.sval, (!days).then_some(false), false)?;
+        return Some(Val {
+            datum: Datum::Int(value),
+            raw: None,
+            days,
+        });
     }
     let raw = literal_text(Some(v))?;
     if integer_key {
-        let value = match literal.val.as_ref()? {
-            ast::AConstValue::Integer(i) => i128::from(i.ival),
-            // An integer literal past int4's range is an int8 constant;
-            // one with a fraction or an exponent is numeric.
-            ast::AConstValue::Float(f) => f.fval.parse::<i128>().ok()?,
-            ast::AConstValue::String(s) => crate::literal_input::parse_pg_integer(&s.sval)?,
-            _ => return None,
-        };
         return Some(Val {
-            datum: Datum::Int(value),
+            datum: Datum::Int(integer_value()?),
             raw: Some(raw),
+            days: false,
         });
     }
     // Any other key: an untyped literal or one cast to the key's type is
@@ -640,6 +783,7 @@ fn check_value(interp: &PgCatalog, v: &ast::Node, key: &PartKey) -> Option<Val> 
     Some(Val {
         datum: normalize(interp, v, &unmodified, interp.timezone_utc.get()),
         raw: Some(raw),
+        days: base == oid::DATE,
     })
 }
 
@@ -689,6 +833,20 @@ fn implies(clause: &Expr, predicate: &Expr) -> bool {
 fn atom_implies(clause: &Expr, predicate: &Expr) -> bool {
     match (clause, predicate) {
         (Expr::NotNull(a), Expr::NotNull(b)) | (Expr::IsNull(a), Expr::IsNull(b)) => a == b,
+        (Expr::Bool(a, x), Expr::Bool(b, y)) => a == b && x == y,
+        // An `= ANY (ARRAY[…])` element is a `b = true` / `b = false` that
+        // was never folded: it implies `b` / `NOT b`.
+        (
+            Expr::Cmp(
+                a,
+                Op::Eq,
+                Val {
+                    datum: Datum::Int(x),
+                    ..
+                },
+            ),
+            Expr::Bool(b, y),
+        ) => a == b && (*x != 0) == *y,
         (Expr::Cmp(a, clause_op, c), Expr::Cmp(b, pred_op, p)) if a == b => {
             // The clause's values are a subset of the predicate's.
             let Some(order) = c.cmp(p) else {
@@ -718,6 +876,7 @@ mod tests {
         Val {
             datum: Datum::Int(i),
             raw: None,
+            days: false,
         }
     }
 
