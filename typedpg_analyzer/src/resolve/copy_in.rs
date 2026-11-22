@@ -76,6 +76,48 @@ impl PgCatalog {
         crate::stack::with_stack(|| self.analyze_copy_in_here(target))
     }
 
+    /// [`Self::analyze_copy_in`], checked against `role` as
+    /// [`Self::analyze_as`] checks a statement: the target is resolved
+    /// under the role's search path, and the role must be allowed to run
+    /// the COPY — INSERT on the columns, what the defaults and the INSERT
+    /// triggers it fires run, and no row-level security on the table
+    /// (`COPY FROM not supported with row-level security`).
+    pub fn analyze_copy_in_as(
+        &self,
+        target: &str,
+        role: &str,
+    ) -> Result<AnalyzedCopyIn, AnalyzeError> {
+        if !self.role_exists(role) {
+            return Err(Self::unknown_role(role));
+        }
+        let path = self.role_search_path(role);
+        let catalog = if path == self.search_path {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            let mut catalog = self.clone();
+            catalog.search_path = path;
+            std::borrow::Cow::Owned(catalog)
+        };
+        crate::stack::with_stack(|| {
+            crate::privileges::as_role(role, || {
+                let (result, required) =
+                    crate::privileges::collect(|| catalog.analyze_copy_in_here(target));
+                let analyzed = result?;
+                // A denial's hint and notes are rendered against the
+                // target, as for a statement.
+                let lex = crate::param::LexOutput {
+                    sql: target.to_owned(),
+                    params: Vec::new(),
+                    spreads: Vec::new(),
+                    rewrites: Vec::new(),
+                };
+                let _guard = crate::error::DiagContextGuard::install(target, &lex);
+                catalog.check_requirements(role, &required)?;
+                Ok(analyzed)
+            })
+        })
+    }
+
     fn analyze_copy_in_here(&self, target: &str) -> Result<AnalyzedCopyIn, AnalyzeError> {
         let invalid = |msg: String| AnalyzeError::Invalid(msg);
         const PREFIX: &str = "COPY ";
@@ -128,6 +170,32 @@ impl PgCatalog {
                 .filter_map(|n| attrs.iter().find(|a| a.attname == *n))
                 .collect()
         };
+
+        // What the COPY requires of the role running it, when one is
+        // checked: an explicitly named schema's USAGE
+        // (LookupExplicitNamespace), then DoCopy's and CopyFrom's.
+        if !rv.schemaname.is_empty() {
+            crate::privileges::note_schema(class.relnamespace);
+        }
+        let copied: Vec<(String, crate::oid::PgTypeOid)> = targets
+            .iter()
+            .map(|a| (a.attname.clone(), a.atttypid))
+            .collect();
+        let defaulted: Vec<i16> = attrs
+            .iter()
+            .filter(|a| a.attnum > 0 && !targets.iter().any(|t| t.attnum == a.attnum))
+            .map(|a| a.attnum)
+            .collect();
+        crate::privileges::note_copy_from(
+            relid,
+            &copied,
+            &defaulted,
+            |ty| {
+                self.get_type(ty)
+                    .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain)
+            },
+            class.relkind == crate::pg_catalog::RelKind::Partitioned,
+        );
 
         let mut columns = Vec::with_capacity(targets.len());
         for attr in &targets {

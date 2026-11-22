@@ -382,6 +382,18 @@ pub(crate) fn row_security_off(relation: &str, owner: bool) -> RawError {
     )
 }
 
+/// DoCopy (copy.c): row security applies to a `COPY ... FROM` target —
+/// SQLSTATE 0A000.
+pub(crate) fn copy_from_row_security() -> RawError {
+    RawError::new(
+        AnalyzeError::FeatureNotSupported(
+            "COPY FROM not supported with row-level security".to_owned(),
+        ),
+        None,
+        Some("Use INSERT statements instead.".to_owned()),
+    )
+}
+
 /// `fireRIRrules` (rewriteHandler.c): a policy's subquery reaches its own
 /// relation (directly or through other relations' policies), so the
 /// rewriter would expand it forever — SQLSTATE 42P17.

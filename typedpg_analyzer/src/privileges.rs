@@ -406,6 +406,9 @@ struct RelationRequirement {
     insert_leaves: Vec<PgClassOid>,
     /// A row whose partition isn't known: every partition may be reached.
     insert_route_unknown: bool,
+    /// The target of a `COPY ... FROM` (DoCopy): no policy applies to it —
+    /// row security on it is an error.
+    copy_from: bool,
 }
 
 /// A write a statement makes to a relation: the trigger event it fires.
@@ -459,6 +462,16 @@ pub(crate) enum UtilityCheck {
     /// `SET` of a parameter only a superuser may set unless granted
     /// (`PGC_SUSET`: `pg_parameter_aclcheck` for `ACL_SET`).
     SetParameter { name: String },
+    /// `set_config` of such a parameter: the same check, made when the
+    /// call runs (`set_config_by_name`) — not by an `EXPLAIN` without
+    /// `ANALYZE`.
+    SetConfig { name: String },
+    /// `ANALYZE` of relation `relid`: analyze_rel reaches the handler of
+    /// each foreign table among it and the inheritors it samples
+    /// (GetFdwRoutineForRelation), and a wrapper without one fails — but
+    /// only for a role that may analyze it (MAINTAIN:
+    /// vacuum_is_permitted_for_relation skips the others with a WARNING).
+    AnalyzeHandler { relid: PgClassOid },
     /// `SET ROLE name`: the role must be able to become it
     /// (`member_can_set_role`).
     SetRole { name: String },
@@ -624,6 +637,7 @@ impl Requirements {
             entry.conflict_select |= rel.conflict_select;
             entry.merge_target |= rel.merge_target;
             entry.target_select |= rel.target_select;
+            entry.copy_from |= rel.copy_from;
             entry.view_owner |= rel.view_owner;
             entry.no_range_table &= rel.no_range_table;
             // Every scan occurrence must be certainly empty: one live scan
@@ -738,6 +752,7 @@ impl Requirements {
                     assigned: Vec::new(),
                     insert_leaves: Vec::new(),
                     insert_route_unknown: false,
+                    copy_from: false,
                 });
                 self.relations.len() - 1
             }
@@ -2582,6 +2597,36 @@ pub(crate) fn note_insert_route_unknown(relid: PgClassOid) {
 /// `TRIGGER_TYPE_*` bit), which fires its triggers for that event. `only`:
 /// the write reaches no inheritance children (`UPDATE ONLY` / `DELETE FROM
 /// ONLY`).
+/// `COPY relid (columns) FROM ...` (DoCopy, CopyFrom): INSERT on the
+/// columns, which take the input values as their own types (a domain's
+/// input checks its constraints), the defaults of the others, and the
+/// INSERT triggers and partition routing of an INSERT. No rule is applied,
+/// and row security is an error rather than policies.
+pub(crate) fn note_copy_from(
+    relid: PgClassOid,
+    columns: &[(String, PgTypeOid)],
+    defaulted: &[i16],
+    is_domain: impl Fn(PgTypeOid) -> bool,
+    partitioned: bool,
+) {
+    note_relation(relid, bits::INSERT);
+    note_write(relid, crate::ddl::triggers::TRIGGER_TYPE_INSERT, false);
+    for (name, ty) in columns {
+        note_column(relid, name, ColumnAccess::Insert);
+        note_column_value(relid, name, Some(*ty));
+        if is_domain(*ty) {
+            note_domain_coercion(*ty);
+        }
+    }
+    for &attnum in defaulted {
+        note_default(relid, attnum);
+    }
+    if partitioned {
+        note_insert_route_unknown(relid);
+    }
+    with(|req| req.relation(relid).copy_from = true);
+}
+
 /// A utility statement's own privilege check (see [`UtilityCheck`]).
 pub(crate) fn note_utility(check: UtilityCheck) {
     with(|req| req.utility.push(check.clone()));
@@ -2977,6 +3022,9 @@ impl PgCatalog {
             self.check_schema_usage(role, ns)?;
         }
         for check in &req.utility {
+            if matches!(check, UtilityCheck::SetConfig { .. }) && !req.executes {
+                continue;
+            }
             self.check_utility(role, check, ctx)?;
         }
 
@@ -4484,6 +4532,7 @@ impl PgCatalog {
                                     assigned: Vec::new(),
                                     insert_leaves: Vec::new(),
                                     insert_route_unknown: false,
+                                    copy_from: false,
                                 });
                                 inner.len() - 1
                             }
@@ -4663,6 +4712,8 @@ impl PgCatalog {
                         only: base_only,
                         insert_leaves: rel.insert_leaves.clone(),
                         insert_route_unknown: rel.insert_route_unknown,
+                        // COPY FROM never writes through a view.
+                        copy_from: false,
                         assigned: rel
                             .assigned
                             .iter()
@@ -5802,7 +5853,7 @@ impl PgCatalog {
                 ));
                 Err(raw.finalize_implicit())
             }
-            UtilityCheck::SetParameter { name } => {
+            UtilityCheck::SetParameter { name } | UtilityCheck::SetConfig { name } => {
                 if self.has_parameter_privilege(role, name, crate::ddl::acl::bits::SET) {
                     return Ok(());
                 }
@@ -5873,6 +5924,25 @@ impl PgCatalog {
                 let owner = self.owner_of(AclObject::Relation(*relid));
                 let owner = self.roles.name(owner).to_owned();
                 self.check_requirements_in(&owner, req, ctx)
+            }
+            UtilityCheck::AnalyzeHandler { relid } => {
+                // The database owner's right to analyze isn't modelled:
+                // that only misses the error.
+                if !self.has_table_privilege(role, *relid, crate::Privilege::Maintain) {
+                    return Ok(());
+                }
+                match crate::ddl::tables::inherit::all_inheritors(self, *relid)
+                    .into_iter()
+                    .find_map(|r| crate::ddl::fdw::no_handler_error(self, r))
+                {
+                    Some(msg) => Err(RawError::new(
+                        AnalyzeError::ObjectNotInPrerequisiteState(msg),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit()),
+                    None => Ok(()),
+                }
             }
         }
     }
@@ -6217,6 +6287,10 @@ impl PgCatalog {
                 .has_privs_of_role(who, self.owner_of(AclObject::Relation(rel.relid)));
             return Err(crate::pgmsg::row_security_off(&class.relname, owner).finalize_implicit());
         }
+        // DoCopy: check_enable_rls said RLS_ENABLED for a COPY FROM target.
+        if rel.copy_from {
+            return Err(crate::pgmsg::copy_from_row_security().finalize_implicit());
+        }
         // A policy whose subquery reaches the same relation again would
         // recurse forever. PG rejects the query (`infinite recursion
         // detected in policy`) when the clauses it is adding hold a
@@ -6525,6 +6599,7 @@ impl PgCatalog {
                         assigned: Vec::new(),
                         insert_leaves: Vec::new(),
                         insert_route_unknown: false,
+                        copy_from: false,
                     });
                     required.relations.last_mut().expect("just pushed")
                 }

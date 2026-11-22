@@ -2112,6 +2112,19 @@ impl PgSanityServer {
                 Err(pg_err) => {
                     check_error_prefix(&e.to_string(), e.sqlstate(), pg_err, sql, "role")
                 }
+                // An error only a role may hit as the statement runs (the
+                // missing handler ANALYZE reaches for a role that may
+                // analyze the table): PG's execution raises it.
+                Ok(())
+                    if pg.executions.iter().any(|r| {
+                        r.as_ref().err().is_some_and(|pg_err| {
+                            check_error_prefix(&e.to_string(), e.sqlstate(), pg_err, sql, "role")
+                                .is_none()
+                        })
+                    }) =>
+                {
+                    None
+                }
                 Ok(()) => Some(Divergence {
                     kind: DivergenceKind::AnalyzeAcceptedExecuted,
                     message: format!(

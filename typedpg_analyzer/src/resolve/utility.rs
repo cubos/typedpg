@@ -431,6 +431,11 @@ pub(super) fn analyze_vacuum(
             };
             return Err(RawError::new(error, None, None).finalize_implicit());
         }
+        // Whether analyze_rel reaches a missing handler depends on the
+        // role running it: checked against it.
+        crate::privileges::note_utility(crate::privileges::UtilityCheck::AnalyzeHandler {
+            relid: class.oid,
+        });
     }
     Ok(())
 }

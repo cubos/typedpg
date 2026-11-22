@@ -1620,20 +1620,22 @@ impl PgCatalog {
         self.analyze_as(sql, role).map_err(LocatedError::new)
     }
 
+    /// A role the migrations don't create: check_role's wording for SET
+    /// ROLE.
+    pub(crate) fn unknown_role(role: &str) -> AnalyzeError {
+        AnalyzeError::UndefinedObject(format!(
+            "role \"{role}\" does not exist (typedpg can check only the roles the migrations \
+             create)"
+        ))
+    }
+
     fn analyze_as_with_sql(
         &self,
         sql: &str,
         role: &str,
     ) -> (String, Result<AnalyzedQuery, AnalyzeError>) {
         if !self.role_exists(role) {
-            // check_role's wording for SET ROLE.
-            return (
-                sql.to_owned(),
-                Err(AnalyzeError::UndefinedObject(format!(
-                    "role \"{role}\" does not exist (typedpg can check only the roles the \
-                     migrations create)"
-                ))),
-            );
+            return (sql.to_owned(), Err(Self::unknown_role(role)));
         }
         let path = self.role_search_path(role);
         crate::privileges::as_role(role, || {

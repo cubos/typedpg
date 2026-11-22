@@ -10593,6 +10593,216 @@ fn set_of_a_superuser_parameter_needs_set_on_it() {
 }
 
 #[test]
+fn set_config_of_a_superuser_parameter_needs_set_on_it() {
+    // set_config_by_name checks it when the call runs.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_usc_app;
+         CREATE ROLE qp_usc_granted;
+         GRANT SET ON PARAMETER log_min_duration_statement TO qp_usc_granted;",
+    )]);
+    allowed(
+        &db,
+        "qp_usc_app",
+        "SELECT set_config('statement_timeout', '1s', true)",
+    );
+    for sql in [
+        "SELECT set_config('log_min_duration_statement', '1', false)",
+        "SELECT set_config('Log_Min_Duration_Statement', '1', true)",
+        "SELECT 1 WHERE set_config('log_min_duration_statement', '1', true) IS NULL",
+    ] {
+        denied_with(
+            &db,
+            "qp_usc_app",
+            sql,
+            "permission denied to set parameter \"log_min_duration_statement\"",
+        );
+    }
+    allowed(
+        &db,
+        "qp_usc_granted",
+        "SELECT set_config('log_min_duration_statement', '1', true)",
+    );
+    // Nothing runs it: an EXPLAIN without ANALYZE, an unreached CASE result.
+    allowed(
+        &db,
+        "qp_usc_app",
+        "EXPLAIN SELECT set_config('log_min_duration_statement', '1', false)",
+    );
+    allowed(
+        &db,
+        "qp_usc_app",
+        "SELECT CASE WHEN false THEN set_config('log_min_duration_statement', '1', true) END",
+    );
+}
+
+#[test]
+fn analyze_of_a_foreign_table_without_a_handler_fails_for_a_role_that_may_analyze_it() {
+    // vacuum_is_permitted_for_relation skips (with a WARNING) a relation
+    // the role has no MAINTAIN on; analyze_rel then opens the wrapper's
+    // handler of the table and of the inheritors it samples.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE qp_afh_app;
+         CREATE ROLE qp_afh_maint;
+         CREATE FOREIGN DATA WRAPPER qp_afh_w;
+         CREATE SERVER qp_afh_s FOREIGN DATA WRAPPER qp_afh_w;
+         CREATE FOREIGN TABLE qp_afh_ft (a int) SERVER qp_afh_s;
+         CREATE TABLE qp_afh_ip (a int);
+         CREATE FOREIGN TABLE qp_afh_ic () INHERITS (qp_afh_ip) SERVER qp_afh_s;
+         CREATE TABLE qp_afh_t (a int);
+         GRANT MAINTAIN ON qp_afh_ft, qp_afh_ip, qp_afh_t TO qp_afh_maint;",
+    )]);
+    // Inheritance statistics sample the children, ONLY or not.
+    for sql in [
+        "ANALYZE qp_afh_ft",
+        "ANALYZE qp_afh_ip",
+        "ANALYZE ONLY qp_afh_ip",
+    ] {
+        allowed(&db, "qp_afh_app", sql);
+        denied_with(
+            &db,
+            "qp_afh_maint",
+            sql,
+            "foreign-data wrapper \"qp_afh_w\" has no handler",
+        );
+    }
+    allowed(&db, "qp_afh_maint", "ANALYZE qp_afh_t");
+}
+
+/// The schema and roles of the `copy_in!` role checks: what PG 19.0 does
+/// for each was checked by running the COPY as the role.
+const COPY_IN_SETUP: &str = "CREATE ROLE qp_ci_app;
+     CREATE ROLE qp_ci_cols;
+     CREATE ROLE qp_ci_off;
+     ALTER ROLE qp_ci_off SET row_security = off;
+     CREATE TABLE qp_ci_t (a int, b text);
+     GRANT INSERT ON qp_ci_t TO qp_ci_app;
+     GRANT INSERT (a) ON qp_ci_t TO qp_ci_cols;
+     CREATE TABLE qp_ci_rls (a int);
+     ALTER TABLE qp_ci_rls ENABLE ROW LEVEL SECURITY;
+     CREATE POLICY qp_ci_all ON qp_ci_rls USING (true) WITH CHECK (true);
+     GRANT INSERT ON qp_ci_rls TO qp_ci_app, qp_ci_off;
+     CREATE TABLE qp_ci_log (a int);
+     CREATE FUNCTION qp_ci_trg() RETURNS trigger LANGUAGE plpgsql
+         AS $$ BEGIN INSERT INTO qp_ci_log VALUES (NEW.a); RETURN NEW; END $$;
+     CREATE TABLE qp_ci_trig (a int);
+     CREATE TRIGGER qp_ci_ti BEFORE INSERT ON qp_ci_trig
+         FOR EACH ROW EXECUTE FUNCTION qp_ci_trg();
+     GRANT INSERT ON qp_ci_trig TO qp_ci_app;
+     CREATE SEQUENCE qp_ci_seq;
+     CREATE TABLE qp_ci_def (id bigint DEFAULT nextval('qp_ci_seq'), a int);
+     GRANT INSERT ON qp_ci_def TO qp_ci_app;
+     CREATE TABLE qp_ci_id (id int GENERATED ALWAYS AS IDENTITY, a int);
+     GRANT INSERT ON qp_ci_id TO qp_ci_app;
+     CREATE VIEW qp_ci_v AS SELECT a FROM qp_ci_log;
+     CREATE TRIGGER qp_ci_vi INSTEAD OF INSERT ON qp_ci_v
+         FOR EACH ROW EXECUTE FUNCTION qp_ci_trg();
+     GRANT INSERT ON qp_ci_v TO qp_ci_app;";
+
+#[track_caller]
+fn copy_in_denied(db: &PgCatalog, role: &str, target: &str, prefix: &str) {
+    match db.analyze_copy_in_as(target, role) {
+        Ok(_) => panic!("expected {role} to be denied COPY {target} FROM STDIN"),
+        Err(e) => assert!(
+            e.to_string().starts_with(prefix),
+            "{role} copying into {target}\n  expected prefix: {prefix}\n             got: {e}"
+        ),
+    }
+}
+
+#[track_caller]
+fn copy_in_allowed(db: &PgCatalog, role: &str, target: &str) {
+    if let Err(e) = db.analyze_copy_in_as(target, role) {
+        panic!("expected {role} to be allowed COPY {target} FROM STDIN\n{e}");
+    }
+}
+
+#[test]
+fn copy_in_needs_insert_on_the_columns_it_copies() {
+    let db = build_db(&[("0001.sql", COPY_IN_SETUP)]);
+    copy_in_allowed(&db, "qp_ci_app", "qp_ci_t");
+    copy_in_allowed(&db, "qp_ci_cols", "qp_ci_t (a)");
+    copy_in_denied(
+        &db,
+        "qp_ci_cols",
+        "qp_ci_t (a, b)",
+        "permission denied for table qp_ci_t",
+    );
+    copy_in_denied(
+        &db,
+        "qp_ci_cols",
+        "qp_ci_t",
+        "permission denied for table qp_ci_t",
+    );
+    copy_in_denied(
+        &db,
+        "qp_ci_cols",
+        "qp_ci_log",
+        "permission denied for table qp_ci_log",
+    );
+    let err = db.analyze_copy_in_as("qp_ci_t", "nobody").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("role \"nobody\" does not exist"),
+        "{err}"
+    );
+}
+
+#[test]
+fn copy_in_refuses_row_level_security() {
+    // DoCopy: ExecCheckPermissions, then check_enable_rls — which raises
+    // itself under row_security off.
+    let db = build_db(&[("0001.sql", COPY_IN_SETUP)]);
+    copy_in_denied(
+        &db,
+        "qp_ci_app",
+        "qp_ci_rls",
+        "COPY FROM not supported with row-level security",
+    );
+    copy_in_denied(
+        &db,
+        "qp_ci_off",
+        "qp_ci_rls",
+        "query would be affected by row-level security policy for table \"qp_ci_rls\"",
+    );
+    copy_in_denied(
+        &db,
+        "qp_ci_cols",
+        "qp_ci_rls",
+        "permission denied for table qp_ci_rls",
+    );
+}
+
+#[test]
+fn copy_in_runs_the_triggers_and_defaults_of_an_insert() {
+    let db = build_db(&[("0001.sql", COPY_IN_SETUP)]);
+    // The trigger function runs as the role, and inserts into qp_ci_log.
+    copy_in_denied(
+        &db,
+        "qp_ci_app",
+        "qp_ci_trig",
+        "permission denied for table qp_ci_log",
+    );
+    copy_in_denied(
+        &db,
+        "qp_ci_app",
+        "qp_ci_v (a)",
+        "permission denied for table qp_ci_log",
+    );
+    // A column it leaves to its default runs nextval.
+    copy_in_denied(
+        &db,
+        "qp_ci_app",
+        "qp_ci_def (a)",
+        "permission denied for sequence qp_ci_seq",
+    );
+    copy_in_allowed(&db, "qp_ci_app", "qp_ci_def (id, a)");
+    // An identity column's sequence isn't checked.
+    copy_in_allowed(&db, "qp_ci_app", "qp_ci_id (a)");
+}
+
+#[test]
 fn set_role_needs_membership_with_set() {
     // The mirror runs as a superuser session under SET ROLE, where SET ROLE
     // to anything succeeds: an application role logging in as itself is

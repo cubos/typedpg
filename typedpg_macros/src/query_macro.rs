@@ -194,52 +194,56 @@ pub struct QueryInput {
     pub assignment_spans: Vec<Span>,
 }
 
+/// The optional `db = <name>,` and `role = "<role>",` prefixes of `sql!`
+/// and `copy_in!`, in either order. Both are prefixes — a suffix would
+/// clash with `sql!`'s named parameters (`name = value`).
+pub(crate) fn parse_prefixes(input: ParseStream) -> syn::Result<(Option<Ident>, Option<LitStr>)> {
+    let mut db_name = None;
+    let mut role = None;
+    loop {
+        if !input.peek(Ident) {
+            break;
+        }
+        let fork = input.fork();
+        let ident: Ident = fork.parse()?;
+        if !fork.peek(Token![=]) {
+            break;
+        }
+        match ident.to_string().as_str() {
+            "db" => {
+                // Consume from the real stream.
+                let _: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                let name: Ident = input.parse()?;
+                input.parse::<Token![,]>()?;
+                if db_name.replace(name).is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "duplicate `db = <name>` prefix: the database is chosen once",
+                    ));
+                }
+            }
+            "role" => {
+                let _: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                let value: LitStr = input.parse()?;
+                input.parse::<Token![,]>()?;
+                if role.replace(value).is_some() {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "duplicate `role = \"<role>\"` prefix: the role is chosen once",
+                    ));
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok((db_name, role))
+}
+
 impl Parse for QueryInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        // Optional `db = <name>,` and `role = "<role>",` prefixes, in either
-        // order. Both are prefixes — a suffix would clash with the named
-        // parameters (`name = value`).
-        let mut db_name = None;
-        let mut role = None;
-        loop {
-            if !input.peek(Ident) {
-                break;
-            }
-            let fork = input.fork();
-            let ident: Ident = fork.parse()?;
-            if !fork.peek(Token![=]) {
-                break;
-            }
-            match ident.to_string().as_str() {
-                "db" => {
-                    // Consume from the real stream.
-                    let _: Ident = input.parse()?;
-                    input.parse::<Token![=]>()?;
-                    let name: Ident = input.parse()?;
-                    input.parse::<Token![,]>()?;
-                    if db_name.replace(name).is_some() {
-                        return Err(syn::Error::new(
-                            ident.span(),
-                            "duplicate `db = <name>` prefix: the database is chosen once",
-                        ));
-                    }
-                }
-                "role" => {
-                    let _: Ident = input.parse()?;
-                    input.parse::<Token![=]>()?;
-                    let value: LitStr = input.parse()?;
-                    input.parse::<Token![,]>()?;
-                    if role.replace(value).is_some() {
-                        return Err(syn::Error::new(
-                            ident.span(),
-                            "duplicate `role = \"<role>\"` prefix: the role is chosen once",
-                        ));
-                    }
-                }
-                _ => break,
-            }
-        }
-
+        let (db_name, role) = parse_prefixes(input)?;
         let executor: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
         let sql: LitStr = input.parse()?;

@@ -622,7 +622,13 @@ fn check_config_call(
             _ => AnalyzeError::Invalid(message),
         };
         crate::error::RawError::new(kind, None, None).finalize_implicit()
-    })
+    })?;
+    // Setting a parameter only a superuser may set needs SET on it: checked
+    // against the role running the statement.
+    if let Some(name) = crate::ddl::guc::superuser_set_config(snapshot, &proc.proname, &args) {
+        crate::privileges::note_utility(crate::privileges::UtilityCheck::SetConfig { name });
+    }
+    Ok(())
 }
 
 /// ParseFuncOrColumn: a function taking or returning the pseudo-type

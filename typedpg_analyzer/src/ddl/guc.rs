@@ -105,6 +105,20 @@ pub(crate) fn constant_call_error(
     }
 }
 
+/// The parameter a `set_config` call over a constant name sets, when only
+/// a superuser may set it (`PGC_SUSET`) unless granted SET on it.
+pub(crate) fn superuser_set_config(
+    interp: &PgCatalog,
+    proname: &str,
+    args: &[Option<Option<ConstArg<'_>>>],
+) -> Option<String> {
+    let ("set_config", [Some(Some(ConstArg::Str(name))), _, _]) = (proname, args) else {
+        return None;
+    };
+    let setting = check_settable(interp, name).ok()??;
+    (setting.context == "superuser").then(|| setting.name.clone())
+}
+
 /// A constant argument of a configuration function (see
 /// [`constant_call_error`]).
 #[derive(Debug, Clone, Copy)]
