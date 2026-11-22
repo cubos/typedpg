@@ -71,6 +71,7 @@ mod privileges;
 pub use pg_sanity::{Divergence, DivergenceKind};
 mod range_input;
 mod refine;
+mod refine_bounds;
 mod reg_input;
 mod regex_input;
 mod resolve;
@@ -116,7 +117,8 @@ pub use pg_catalog::{
     CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement, PgCatalog,
     QueryView, SublinkNullability, UserObjectCounts,
 };
-pub use refine::Refinement;
+pub use refine::{IntRange, Refinement};
+pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,

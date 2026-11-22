@@ -5,6 +5,7 @@
 //! intervals.
 
 use crate::common::*;
+use typedpg_analyzer::{OrdPoint, OrdRange};
 
 fn setup() -> PgCatalog {
     let mut db = PgCatalog::new().unwrap();
@@ -703,4 +704,389 @@ fn parameters_a_generator_binds_finite_are_finite() {
         db.assume_finite_parameters(&[QualifiedName::new("pg_catalog", "nosuch")])
             .is_err()
     );
+}
+
+// ── Bounds of numerics, dates and timestamps ─────────────────────────────────
+//
+// A date's point counts days from 2000-01-01, a timestamp's microseconds
+// from 2000-01-01 00:00 (UTC for timestamptz): 2020-01-01 is day 7305,
+// 2024-01-01 day 8766, 2030-12-31 day 11322, 1970-01-01 day -10957.
+
+fn bounds_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN price AS numeric CHECK (VALUE >= 0);
+         CREATE DOMAIN decade AS date CHECK (VALUE BETWEEN '2020-01-01' AND '2030-12-31');
+         CREATE TABLE b (id int PRIMARY KEY,
+                         amount numeric NOT NULL CHECK (amount >= 0),
+                         capped numeric NOT NULL CHECK (capped > 0 AND capped <= 99.50),
+                         two numeric NOT NULL CHECK (two IN (1.5, 2)),
+                         free numeric NOT NULL,
+                         d date NOT NULL CHECK (d BETWEEN '2020-01-01' AND '2030-12-31'),
+                         dd date NOT NULL,
+                         ts timestamp NOT NULL CHECK (ts >= '2020-01-01 00:00:00'),
+                         tz timestamptz NOT NULL CHECK (tz >= '2020-01-01 00:00:00+00'),
+                         tz_local timestamptz NOT NULL CHECK (tz_local >= '2020-01-01'),
+                         p price, r decade,
+                         f float8 NOT NULL CHECK (f >= 0));",
+    )
+    .unwrap();
+    db
+}
+
+/// A bound as the tests write it: `[lo, hi)`, an end left out when open.
+fn render_bounds(b: &Option<OrdRange>) -> Option<String> {
+    let b = b.as_ref()?;
+    let point = |p: &OrdPoint| match p {
+        OrdPoint::NegInfinity => "-inf".to_owned(),
+        OrdPoint::Infinity => "inf".to_owned(),
+        OrdPoint::NaN => "nan".to_owned(),
+        OrdPoint::Finite(n) => n.to_string(),
+    };
+    let (open, lo) = match &b.lo {
+        Some(l) => (if l.inclusive { "[" } else { "(" }, point(&l.point)),
+        None => ("(", String::new()),
+    };
+    let (hi, close) = match &b.hi {
+        Some(h) => (point(&h.point), if h.inclusive { "]" } else { ")" }),
+        None => (String::new(), ")"),
+    };
+    Some(format!("{open}{lo}, {hi}{close}"))
+}
+
+/// Each column's (name, bounds).
+#[track_caller]
+fn assert_bounds(db: &PgCatalog, sql: &str, expected: &[(&str, Option<&str>)]) {
+    let s = db.analyze(sql).unwrap();
+    let actual: Vec<(&str, Option<String>)> = s
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), render_bounds(&c.refinement.bounds)))
+        .collect();
+    let expected: Vec<(&str, Option<String>)> = expected
+        .iter()
+        .map(|(n, b)| (*n, b.map(str::to_owned)))
+        .collect();
+    assert_eq!(actual, expected, "bounds mismatch for `{sql}`");
+}
+
+#[test]
+fn checks_and_domains_bound_numerics_dates_and_timestamps() {
+    let db = bounds_setup();
+    assert_bounds(
+        &db,
+        "SELECT amount, capped, two, free, d, dd, ts, tz, tz_local, p, r, f FROM b",
+        &[
+            // `Infinity` and `NaN` are above 0: the top stays open.
+            ("amount", Some("[0, )")),
+            ("capped", Some("(0, 99.5]")),
+            ("two", Some("[1.5, 2]")),
+            ("free", None),
+            ("d", Some("[7305, 11322]")),
+            ("dd", None),
+            ("ts", Some("[631152000000000, )")),
+            ("tz", Some("[631152000000000, )")),
+            // Without a zone, the literal is the migration session's time.
+            ("tz_local", None),
+            ("p", Some("[0, )")),
+            ("r", Some("[7305, 11322]")),
+            // Floats are never bounded.
+            ("f", None),
+        ],
+    );
+    // A date bounded on both sides is finite; one bounded below isn't.
+    assert_finite(
+        &db,
+        "SELECT d, r, ts FROM b",
+        &[("d", false, true), ("r", true, true), ("ts", false, false)],
+    );
+    // No value set: `numeric` 2 may print `2.0`.
+    assert_values(&db, "SELECT two FROM b", &[("two", None)]);
+}
+
+#[test]
+fn conditions_bound_a_column_where_it_is_read() {
+    let db = bounds_setup();
+    assert_bounds(
+        &db,
+        "SELECT free, dd, tz, capped FROM b
+         WHERE free > 5 AND dd BETWEEN '2024-01-01' AND '2024-12-31'
+           AND tz < '2024-01-01 00:00:00+02' AND capped < 10",
+        &[
+            // `NaN` and `Infinity` are above 5.
+            ("free", Some("(5, )")),
+            ("dd", Some("[8766, 9131]")),
+            ("tz", Some("[631152000000000, 757375200000000)")),
+            ("capped", Some("(0, 10)")),
+        ],
+    );
+    assert_bounds(
+        &db,
+        "SELECT a.free FROM b a JOIN b c ON a.free <= 1e3 AND c.id = a.id",
+        &[("free", Some("(, 1000]"))],
+    );
+    // `epoch` is exact; `today` is not, nor a zone-less timestamptz, nor
+    // a comparison with another type.
+    assert_bounds(
+        &db,
+        "SELECT dd FROM b WHERE dd >= 'epoch'",
+        &[("dd", Some("[-10957, )"))],
+    );
+    assert_bounds(
+        &db,
+        "SELECT dd, tz, d FROM b
+         WHERE dd >= 'today' AND tz < '2024-01-01' AND d < '2024-01-01'::timestamp",
+        &[
+            ("dd", None),
+            ("tz", Some("[631152000000000, )")),
+            ("d", Some("[7305, 11322]")),
+        ],
+    );
+    // Special values sit at the ends of the order.
+    assert_bounds(
+        &db,
+        "SELECT free, dd FROM b WHERE free < 'Infinity' AND dd < 'infinity'",
+        &[("free", Some("(, inf)")), ("dd", Some("(, inf)"))],
+    );
+    assert_finite(
+        &db,
+        "SELECT dd FROM b WHERE dd < 'infinity'",
+        &[("dd", false, false)],
+    );
+    assert_finite(
+        &db,
+        "SELECT dd FROM b WHERE dd > '-infinity' AND dd < 'infinity'",
+        &[("dd", false, true)],
+    );
+}
+
+#[test]
+fn literals_conditionals_and_aggregates_carry_bounds() {
+    let db = bounds_setup();
+    assert_bounds(
+        &db,
+        "SELECT 1.50 AS a, '2024-01-01'::date AS c, 'NaN'::numeric AS e,
+                '-inf'::numeric AS g, CASE WHEN id > 0 THEN 1.5 ELSE 2 END AS h,
+                greatest(capped, 200) AS i, least(two, 0.5) AS j,
+                coalesce(p, 7) AS k, '2024-01-01 00:00:00Z'::timestamptz AS l
+         FROM b",
+        &[
+            ("a", Some("[1.5, 1.5]")),
+            ("c", Some("[8766, 8766]")),
+            ("e", Some("[nan, nan]")),
+            ("g", Some("[-inf, -inf]")),
+            ("h", Some("[1.5, 2]")),
+            ("i", Some("(0, 200]")),
+            ("j", Some("[0.5, 2]")),
+            ("k", Some("[0, )")),
+            ("l", Some("[757382400000000, 757382400000000]")),
+        ],
+    );
+    assert_bounds(
+        &db,
+        "SELECT 1.5 AS x UNION ALL SELECT 3 UNION ALL SELECT capped FROM b",
+        &[("x", Some("(0, 99.5]"))],
+    );
+    assert_bounds(
+        &db,
+        "SELECT min(d) AS a, max(capped) AS c FROM b",
+        &[("a", Some("[7305, 11322]")), ("c", Some("(0, 99.5]"))],
+    );
+    assert_bounds(
+        &db,
+        "SELECT lag(d, 1, '2020-06-01'::date) OVER () AS e, lag(d, 1, '2040-01-01') OVER () AS g
+         FROM b",
+        &[("e", Some("[7305, 11322]")), ("g", Some("[7305, 14610]"))],
+    );
+    // Nothing exact: relative words, a zone-less timestamptz, a type
+    // modifier (which rounds), a float, another type.
+    assert_bounds(
+        &db,
+        "SELECT 'now'::timestamp AS a, 'today'::date AS c, '2024-01-01 10:00'::timestamptz AS e,
+                1.234::numeric(5,2) AS g, capped::numeric(4,1) AS h,
+                '2024-01-01'::timestamp(0) AS i, 1.5::float8 AS j, d::timestamp AS k
+         FROM b",
+        &[
+            ("a", None),
+            ("c", None),
+            ("e", None),
+            ("g", None),
+            ("h", None),
+            ("i", None),
+            ("j", None),
+            ("k", None),
+        ],
+    );
+}
+
+#[test]
+fn bounds_refute_case_branches() {
+    let db = bounds_setup();
+    let nullable = |sql: &str| -> Vec<bool> {
+        db.analyze(sql)
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| c.nullable)
+            .collect()
+    };
+    // A CHECK leaves no value for the ELSE.
+    assert_eq!(
+        nullable(
+            "SELECT CASE WHEN amount >= 0 THEN 'a' END AS a,
+                    CASE WHEN d < '2020-01-01' THEN 'old' WHEN d <= '2030-12-31' THEN 'ok' END AS c,
+                    CASE WHEN d < '2025-01-01' THEN 'old' END AS e
+             FROM b"
+        ),
+        [false, false, true]
+    );
+    // `NaN` and `Infinity` are above 5: the order is total.
+    assert_eq!(
+        nullable("SELECT CASE WHEN free > 5 THEN 'a' WHEN free <= 5 THEN 'b' END AS a FROM b"),
+        [false]
+    );
+    // A CTE's column keeps its bounds.
+    assert_eq!(
+        nullable(
+            "WITH c AS (SELECT CASE WHEN id > 0 THEN 1.5 ELSE 2.5 END AS v FROM b)
+             SELECT CASE WHEN v < 3 THEN 'x' END AS a, CASE WHEN v < 2 THEN 'x' END AS e FROM c"
+        ),
+        [false, true]
+    );
+}
+
+#[test]
+fn casts_that_keep_values() {
+    let mut db = values_setup();
+    db.apply_sql(
+        "CREATE COLLATION und (provider = icu, locale = 'und');
+         CREATE TABLE w (s text NOT NULL CHECK (s IN ('ok', 'meh')),
+                         small int NOT NULL CHECK (small BETWEEN 1 AND 3),
+                         u text COLLATE und CHECK (u IN ('a', 'b')),
+                         cc text COLLATE \"C\" CHECK (cc IN ('x')));",
+    )
+    .unwrap();
+    assert_values(
+        &db,
+        "SELECT m::text AS a, m::varchar AS c, s::mood AS e, n::text AS g, flag::text AS h,
+                flag::varchar AS i, kind::varchar(1) AS j, small::text AS k, u, cc,
+                kind::varchar::text AS l, s::char(3) AS o
+         FROM v, w",
+        &[
+            ("a", Some(&["happy", "ok", "sad"])),
+            ("c", Some(&["happy", "ok", "sad"])),
+            // Only a label is an enum value.
+            ("e", Some(&["ok"])),
+            ("g", Some(&["1", "2"])),
+            // `text(boolean)`, not `boolout`.
+            ("h", Some(&["false", "true"])),
+            ("i", Some(&["false", "true"])),
+            // `varchar(1)` truncates; `char(3)` pads.
+            ("j", None),
+            ("k", Some(&["1", "2", "3"])),
+            // A deterministic ICU collation compares strings as written.
+            ("u", Some(&["a", "b"])),
+            ("cc", Some(&["x"])),
+            ("l", Some(&["a", "b"])),
+            ("o", None),
+        ],
+    );
+}
+
+#[test]
+fn value_sets_are_capped() {
+    let mut db = PgCatalog::new().unwrap();
+    let list = |n: usize| {
+        (1..=n)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    db.apply_sql(&format!(
+        "CREATE TABLE many (a int NOT NULL CHECK (a IN ({})), b int NOT NULL CHECK (b IN ({})),
+                            c int NOT NULL CHECK (c BETWEEN 1 AND 17),
+                            e int NOT NULL CHECK (e BETWEEN 1 AND 16));",
+        list(32),
+        list(33)
+    ))
+    .unwrap();
+    let s = db.analyze("SELECT a, b, c, e FROM many").unwrap();
+    let sizes: Vec<Option<usize>> = s
+        .columns
+        .iter()
+        .map(|c| c.refinement.values.as_ref().map(|v| v.len()))
+        .collect();
+    // 32 listed values are kept, 33 dropped; a range of up to 16
+    // integers is listed.
+    assert_eq!(sizes, [Some(32), None, None, Some(16)]);
+    // Narrowed under the cap, a set is listed again.
+    let s = db.analyze("SELECT b FROM many WHERE b <> 33").unwrap();
+    assert_eq!(
+        s.columns[0].refinement.values.as_ref().map(|v| v.len()),
+        Some(32)
+    );
+}
+
+/// Constraints the oracle's seeded rows satisfy (numbers 1 and 2, dates
+/// 2000-01-01, 2001-01-01 and `infinity`), so under `pg_sanity` every bound
+/// below is checked against rows PG returns.
+#[test]
+fn bounds_hold_over_seeded_rows() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE s (id int PRIMARY KEY, n numeric NOT NULL CHECK (n >= 1),
+                         m numeric CHECK (m BETWEEN 1 AND 2),
+                         d date NOT NULL CHECK (d >= '2000-01-01'),
+                         e date CHECK (e BETWEEN '2000-01-01' AND '2001-12-31'),
+                         t timestamp CHECK (t >= '2000-01-01'),
+                         tz timestamptz CHECK (tz > '1999-12-31 00:00:00-03'));",
+    )
+    .unwrap();
+    assert_bounds(
+        &db,
+        "SELECT n, m, d, e, t, tz FROM s",
+        &[
+            ("n", Some("[1, )")),
+            ("m", Some("[1, 2]")),
+            ("d", Some("[0, )")),
+            ("e", Some("[0, 730]")),
+            ("t", Some("[0, )")),
+            ("tz", Some("(-75600000000, )")),
+        ],
+    );
+    assert_bounds(
+        &db,
+        "SELECT n, d, max(e) OVER () AS e, CASE WHEN m > 1.5 THEN m ELSE 1.25 END AS m
+         FROM s WHERE n > 1 AND d < 'infinity'",
+        &[
+            ("n", Some("(1, )")),
+            ("d", Some("[0, inf)")),
+            ("e", Some("[0, 730]")),
+            ("m", Some("[1.25, 2]")),
+        ],
+    );
+}
+
+/// A constant a domain's bounds exclude fails every execution.
+#[test]
+fn a_constant_out_of_a_domains_bounds_fails() {
+    let db = bounds_setup();
+    for (sql, domain) in [
+        ("SELECT '2019-12-31'::decade AS x", "decade"),
+        ("SELECT (-0.5)::price AS x", "price"),
+        ("SELECT '-Infinity'::price AS x", "price"),
+    ] {
+        let err = db.analyze(sql).unwrap_err().to_string();
+        let want =
+            format!("value for domain {domain} violates check constraint \"{domain}_check\"");
+        assert!(err.starts_with(&want), "`{sql}`: {err}");
+    }
+    // `NaN` and `Infinity` are above 0.
+    for sql in [
+        "SELECT 'NaN'::price AS x",
+        "SELECT 'Infinity'::price AS x",
+        "SELECT '2020-01-01'::decade AS x",
+    ] {
+        db.analyze(sql).unwrap();
+    }
 }

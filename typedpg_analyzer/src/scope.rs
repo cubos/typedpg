@@ -976,6 +976,7 @@ impl Scope {
                     finite: finite.contains(&c.attname),
                     values: None,
                     range: None,
+                    bounds: None,
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
@@ -1082,6 +1083,7 @@ impl Scope {
                     finite: finite.contains(&c.attname),
                     values: None,
                     range: None,
+                    bounds: None,
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
                 origin: None,
