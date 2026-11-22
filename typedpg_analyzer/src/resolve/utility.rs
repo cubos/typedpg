@@ -75,6 +75,22 @@ fn truncate_check_rel(
         )
         .finalize_implicit());
     }
+    // A foreign table's wrapper must have a handler supporting TRUNCATE.
+    if let Some((wrapper, routine)) = crate::ddl::fdw::table_routine(snapshot, class.oid) {
+        use crate::ddl::fdw::FdwRoutine;
+        let error = match routine {
+            FdwRoutine::NoHandler => Some(AnalyzeError::ObjectNotInPrerequisiteState(
+                crate::ddl::fdw::no_handler_message(&wrapper),
+            )),
+            FdwRoutine::Known(r) if !r.truncate => Some(AnalyzeError::FeatureNotSupported(
+                format!("cannot truncate foreign table \"{}\"", class.relname),
+            )),
+            _ => None,
+        };
+        if let Some(error) = error {
+            return Err(RawError::new(error, None, None).finalize_implicit());
+        }
+    }
     if snapshot.is_system_class(class.oid) {
         return Err(RawError::new(
             AnalyzeError::InsufficientPrivilege(format!(

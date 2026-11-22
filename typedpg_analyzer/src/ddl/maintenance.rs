@@ -4,8 +4,8 @@
 //! named objects which must exist and suit the command.
 
 use typedpg_pg_query::ast::{
-    self, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, RepackCommand, RepackStmt,
-    SecLabelStmt, TruncateStmt, VacuumStmt,
+    self, CmdType, DropBehavior, LockStmt, ReindexObjectType, ReindexStmt, RepackCommand,
+    RepackStmt, SecLabelStmt, TruncateStmt, VacuumStmt,
 };
 
 use super::DdlError;
@@ -44,6 +44,7 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
                 rv.relname
             )));
         }
+        truncate_foreign_check(interp, relid)?;
         // truncate_check_rel: a system catalog (IsSystemClass) is off
         // limits unless allow_system_table_mods is on.
         crate::ddl::util::check_not_system_class(interp, relid)?;
@@ -61,6 +62,9 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
             while i < targets.len() {
                 for child in super::tables::inherit::children_of(interp, targets[i]) {
                     if !targets.contains(&child) {
+                        // truncate_check_rel of each child (only a foreign
+                        // table's wrapper can refuse one).
+                        truncate_foreign_check(interp, child)?;
                         targets.push(child);
                     }
                 }
@@ -110,6 +114,24 @@ pub fn truncate(interp: &mut PgCatalog, stmt: &TruncateStmt) -> Result<(), DdlEr
     }
     new_relfilenodes(interp, &targets);
     Ok(())
+}
+
+/// truncate_check_rel of a foreign table: its wrapper's handler
+/// (GetFdwRoutineByServerId) must support TRUNCATE.
+fn truncate_foreign_check(interp: &PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+    use super::fdw::FdwRoutine;
+    match super::fdw::table_routine(interp, relid) {
+        Some((wrapper, FdwRoutine::NoHandler)) => Err(DdlError::UnsupportedDdl(
+            super::fdw::no_handler_message(&wrapper),
+        )),
+        Some((_, FdwRoutine::Known(routine))) if !routine.truncate => {
+            Err(DdlError::UnsupportedDdl(format!(
+                "cannot truncate foreign table \"{}\"",
+                relname(interp, relid)
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// REPACK / CLUSTER / VACUUM FULL of `relid`: its heap is rewritten (make_new_heap),
@@ -739,6 +761,9 @@ pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError>
             continue;
         }
         analyze_columns(interp, relid, &vr.va_cols)?;
+        if !stmt.is_vacuumcmd {
+            analyze_foreign_check(interp, relid)?;
+        }
         if full {
             rewritten.push(relid);
         }
@@ -747,6 +772,30 @@ pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError>
         heap_rewrites(interp, relid, true);
     }
     Ok(())
+}
+
+/// analyze_rel of `relid` (a plain ANALYZE), once the column list checks
+/// out: a foreign table is analyzed through its wrapper's handler
+/// (GetFdwRoutineForRelation), and so is a foreign table among the
+/// inheritors whose rows the inheritance statistics sample
+/// (acquire_inherited_sample_rows) — a wrapper without one fails. Only
+/// for a relation the role may analyze (vacuum_is_permitted_for_relation
+/// skips the others with a WARNING): MAINTAIN on it; the database
+/// owner's right isn't modelled, which only misses the error.
+fn analyze_foreign_check(interp: &mut PgCatalog, relid: PgClassOid) -> Result<(), DdlError> {
+    let role = super::roles::current_role(interp);
+    let role = interp.roles.name(role).to_owned();
+    if !interp.has_table_privilege(&role, relid, super::acl::Privilege::Maintain) {
+        return Ok(());
+    }
+    // The relation first, then its inheritors.
+    match super::tables::inherit::all_inheritors(interp, relid)
+        .into_iter()
+        .find_map(|r| super::fdw::no_handler_error(interp, r))
+    {
+        Some(msg) => Err(DdlError::UnsupportedDdl(msg)),
+        None => Ok(()),
+    }
 }
 
 /// ExecVacuum's options, as it parses and checks them before anything
@@ -962,7 +1011,20 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
         let Some(query) = stmt.query.as_ref() else {
             return Ok(());
         };
-        // BeginCopyTo: the query runs, and FORCE_QUOTE names its columns
+        // BeginCopyTo: pg_analyze_and_rewrite_fixedparams first — parse
+        // analysis and the rewriter, whose errors come before anything
+        // else — then the checks of the queries it returned, and only then
+        // planning and ExecutorStart.
+        let analyzed = super::dml::verdict(crate::resolve::without_execution(|| {
+            crate::expr::with_rewriting(true, || {
+                crate::resolve::analyze_raw_node(interp, query, &[])
+            })
+        }))?;
+        if analyzed.is_none() {
+            return Ok(());
+        }
+        copy_query_shape(interp, query)?;
+        // The query runs, and FORCE_QUOTE names its columns
         // (CopyGetAttnums without a relation), every one of which is
         // copied.
         let Some(columns) =
@@ -972,7 +1034,6 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
         else {
             return Ok(());
         };
-        copy_query_shape(interp, query)?;
         if let CopyColumns::Names(names) = &opts.force_quote {
             let columns: Vec<CopyColumn> = columns
                 .iter()
@@ -1102,15 +1163,28 @@ pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Resul
     if opts.freeze {
         copy_freeze(interp, relid, kind)?;
     }
-    Ok(())
+    // CopyFrom: ExecInitResultRelation opens a foreign table's routine
+    // (GetFdwRoutineForRelation), then CheckValidResultRel needs its
+    // ExecForeignInsert.
+    use super::fdw::FdwRoutine;
+    match super::fdw::table_routine(interp, relid) {
+        Some((wrapper, FdwRoutine::NoHandler)) => Err(DdlError::UnsupportedDdl(
+            super::fdw::no_handler_message(&wrapper),
+        )),
+        Some((_, FdwRoutine::Known(routine))) if !routine.insert => Err(DdlError::UnsupportedDdl(
+            format!("cannot insert into foreign table \"{relname}\""),
+        )),
+        _ => Ok(()),
+    }
 }
 
-/// BeginCopyTo's checks of an analyzed COPY query: no SELECT INTO, and a
-/// data-modifying statement must have a RETURNING clause. A statement on
-/// a relation with rules is left alone: the rewriter may turn it into
-/// none or several queries, which BeginCopyTo refuses first.
+/// BeginCopyTo's checks of an analyzed and rewritten COPY query: the
+/// rewriter must have returned exactly one query (the rules on a
+/// data-modifying statement's relation may make it none or several),
+/// which is no SELECT INTO, no utility command (a DO INSTEAD NOTIFY
+/// rule's action), and — a data-modifying one — has a RETURNING clause.
 fn copy_query_shape(interp: &PgCatalog, query: &ast::Node) -> Result<(), DdlError> {
-    let (relation, returning) = match query {
+    let (relation, returning, cmd) = match query {
         ast::Node::SelectStmt(select) => {
             // The grammar leaves INTO on the leftmost SELECT of a set
             // operation.
@@ -1125,24 +1199,56 @@ fn copy_query_shape(interp: &PgCatalog, query: &ast::Node) -> Result<(), DdlErro
             }
             return Ok(());
         }
-        ast::Node::InsertStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
-        ast::Node::UpdateStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
-        ast::Node::DeleteStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
-        ast::Node::MergeStmt(s) => (s.relation.as_deref(), s.returning_clause.as_deref()),
+        ast::Node::InsertStmt(s) => (
+            s.relation.as_deref(),
+            s.returning_clause.as_deref(),
+            CmdType::CmdInsert,
+        ),
+        ast::Node::UpdateStmt(s) => (
+            s.relation.as_deref(),
+            s.returning_clause.as_deref(),
+            CmdType::CmdUpdate,
+        ),
+        ast::Node::DeleteStmt(s) => (
+            s.relation.as_deref(),
+            s.returning_clause.as_deref(),
+            CmdType::CmdDelete,
+        ),
+        ast::Node::MergeStmt(s) => (
+            s.relation.as_deref(),
+            s.returning_clause.as_deref(),
+            CmdType::CmdMerge,
+        ),
         _ => return Ok(()),
     };
-    if returning.is_some_and(|r| !r.exprs.is_empty()) {
+    let Some((_, relid)) = relation.and_then(|rv| super::util::lookup_relation(interp, rv).ok())
+    else {
         return Ok(());
+    };
+    // The one query: the statement, the action of the one unconditional
+    // DO INSTEAD rule firing, or the statement rewritten onto a view's
+    // base relation.
+    let cmd = crate::resolve::rewrite::copy_query_rewritten(interp, relid, cmd)
+        .map_err(DdlError::UnsupportedDdl)?;
+    match cmd {
+        CmdType::CmdSelect => Ok(()),
+        CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete | CmdType::CmdMerge => {
+            // A rule action keeps a RETURNING list only when the statement
+            // has one (rewriteRuleAction; one with none of its own then
+            // fails the rewriter first), as the rewrite onto a view's base
+            // relation does: the query returns rows when the statement does.
+            if returning.is_some_and(|r| !r.exprs.is_empty()) {
+                Ok(())
+            } else {
+                Err(DdlError::UnsupportedDdl(
+                    "COPY query must have a RETURNING clause".into(),
+                ))
+            }
+        }
+        _ => Err(DdlError::UnsupportedDdl(
+            "COPY query must not be a utility command".into(),
+        )),
     }
-    let has_rules = relation
-        .and_then(|rv| super::util::lookup_relation(interp, rv).ok())
-        .is_none_or(|(_, relid)| interp.rules.get(&relid).is_some_and(|r| !r.is_empty()));
-    if has_rules {
-        return Ok(());
-    }
-    Err(DdlError::UnsupportedDdl(
-        "COPY query must have a RETURNING clause".into(),
-    ))
 }
 
 /// A column CopyGetAttnums can name: a relation's, or a COPY query's.

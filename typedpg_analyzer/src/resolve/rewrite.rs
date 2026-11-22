@@ -253,6 +253,11 @@ pub(crate) fn collect_rule_actions<R>(f: impl FnOnce() -> R) -> (R, Vec<RuleActi
     (out, actions)
 }
 
+/// Whether a rule's actions are being analyzed ([`collect_rule_actions`]).
+pub(crate) fn collecting_rule_actions() -> bool {
+    RULE_ACTIONS.with(|c| c.borrow().is_some())
+}
+
 /// Where a query `RewriteQuery` rewrites comes from, for the NOT NULL
 /// violation a bare `NULL` it writes raises at execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,6 +325,54 @@ fn rewrite_level(
     {
         errors.execution =
             Some(crate::pgmsg::cannot_change_relation(kind, relname).finalize_implicit());
+    }
+    // A foreign result relation: the planner opens its wrapper's routine
+    // (make_modifytable's GetFdwRoutineByRelId), which fails when the
+    // wrapper has no handler; CheckValidResultRel (ExecInitModifyTable)
+    // then needs the routine's callback for the command. Either fails
+    // every execution, whatever the rows. (MERGE never takes a foreign
+    // table: parse analysis refuses it.)
+    if !rw.merge
+        && let Some((wrapper, routine)) = crate::ddl::fdw::table_routine(snapshot, relid)
+    {
+        use crate::ddl::fdw::FdwRoutine;
+        match routine {
+            FdwRoutine::NoHandler
+                if crate::expr::plan_time_checks() && errors.planning.is_none() =>
+            {
+                errors.planning = Some(
+                    crate::error::RawError::new(
+                        AnalyzeError::ObjectNotInPrerequisiteState(
+                            crate::ddl::fdw::no_handler_message(&wrapper),
+                        ),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit(),
+                );
+            }
+            FdwRoutine::Known(r) if super::executor_starts() && errors.execution.is_none() => {
+                let refused = match rw.actions.first().and_then(|a| a.event) {
+                    Some(DmlEvent::Insert) if !r.insert => Some("insert into"),
+                    Some(DmlEvent::Update) if !r.update => Some("update"),
+                    Some(DmlEvent::Delete) if !r.delete => Some("delete from"),
+                    _ => None,
+                };
+                if let Some(verb) = refused {
+                    errors.execution = Some(
+                        crate::error::RawError::new(
+                            AnalyzeError::FeatureNotSupported(format!(
+                                "cannot {verb} foreign table \"{relname}\""
+                            )),
+                            None,
+                            None,
+                        )
+                        .finalize_implicit(),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
     let attrs = snapshot.attributes_of(relid);
 
@@ -885,18 +938,44 @@ pub(crate) fn check_with_query_rules(
             (CmdType::CmdSelect | CmdType::CmdInsert | CmdType::CmdUpdate | CmdType::CmdDelete, _),
         ] => Ok(()),
         [_] => Err(unsupported("DO INSTEAD NOTIFY")),
-        [] => Err(unsupported("DO INSTEAD NOTHING")),
-        many => {
-            for (_, src) in many {
-                match src {
-                    QuerySource::QualInsteadRule => {
-                        return Err(unsupported("conditional DO INSTEAD"));
-                    }
-                    QuerySource::NonInsteadRule => return Err(unsupported("DO ALSO")),
-                    _ => {}
-                }
-            }
-            Err(unsupported("multi-statement DO INSTEAD"))
+        many => Err(unsupported(not_one_query(many))),
+    }
+}
+
+/// Which rules made `RewriteQuery` return no query or several (`many`),
+/// as the callers wanting exactly one name them: the first query a
+/// conditional DO INSTEAD or a DO ALSO rule added, else several DO INSTEAD
+/// actions.
+fn not_one_query(many: &[(CmdType, QuerySource)]) -> &'static str {
+    if many.is_empty() {
+        return "DO INSTEAD NOTHING";
+    }
+    for (_, src) in many {
+        match src {
+            QuerySource::QualInsteadRule => return "conditional DO INSTEAD",
+            QuerySource::NonInsteadRule => return "DO ALSO",
+            _ => {}
         }
+    }
+    "multi-statement DO INSTEAD"
+}
+
+/// BeginCopyTo's check of what `pg_analyze_and_rewrite` made of a COPY
+/// query, a statement of `cmd` on `relid`: exactly one query, whose
+/// command is returned (the statement's own, a rule action's — a NOTIFY's
+/// `CmdUtility` — or the statement's rewritten onto a view's base
+/// relation); otherwise the error naming the rules (0A000).
+pub(crate) fn copy_query_rewritten(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    cmd: CmdType,
+) -> Result<CmdType, String> {
+    let queries = rewritten_queries(snapshot, relid, cmd, QuerySource::Original, &mut Vec::new());
+    match queries.as_slice() {
+        [(cmd, _)] => Ok(*cmd),
+        many => Err(format!(
+            "{} rules are not supported for COPY",
+            not_one_query(many)
+        )),
     }
 }

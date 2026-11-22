@@ -52,6 +52,8 @@ mod expression_facts;
 mod expressions;
 #[path = "query/fact_soundness.rs"]
 mod fact_soundness;
+#[path = "query/foreign_tables.rs"]
+mod foreign_tables;
 #[path = "query/function_aggregate_narrowing.rs"]
 mod function_aggregate_narrowing;
 #[path = "query/function_soundness.rs"]

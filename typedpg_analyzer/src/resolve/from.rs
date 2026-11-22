@@ -274,6 +274,29 @@ pub(crate) fn process_from_item(
                     aliased: rv.alias.is_some(),
                 },
             )?;
+            // A foreign table the planner plans (the relation, or an
+            // inheritor it expands): get_relation_info opens its wrapper's
+            // routine (GetFdwRoutineForRelation), which fails when the
+            // wrapper has no handler — however few rows the scan would
+            // read. Not recorded for a rule's actions, planned with the
+            // statements firing it: the wrapper may get a handler by then.
+            if crate::expr::plan_time_checks()
+                && !super::rewrite::collecting_rule_actions()
+                && let Some(class) = snapshot.resolve_table(schema, &rv.relname)
+                && let Some(msg) =
+                    crate::ddl::fdw::scan_no_handler_error(snapshot, class.oid, rv.inh)
+                && let Some(e) = crate::expr::plan_time_error(
+                    Some(rv.location),
+                    crate::error::RawError::new(
+                        AnalyzeError::ObjectNotInPrerequisiteState(msg),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit(),
+                )
+            {
+                return Err(e);
+            }
             // A view the planner pulls up raises what its query does, like
             // a FROM subquery (see `deferred`).
             if crate::expr::plan_time_checks()

@@ -24,6 +24,9 @@ pub(crate) struct ForeignData {
     /// The wrappers, by OID, with a CONNECTION function
     /// (`fdwconnection`, PostgreSQL 19).
     with_connection: std::collections::HashSet<crate::oid::PgGenericOid>,
+    /// Each wrapper's HANDLER function (`fdwhandler`), by the wrapper's
+    /// OID; a wrapper without one is absent.
+    handlers: std::collections::HashMap<crate::oid::PgGenericOid, crate::oid::PgProcOid>,
     /// `(server, wrapper)`.
     servers: Vec<(String, String)>,
     /// `(user, server)`.
@@ -79,6 +82,7 @@ impl ForeignData {
         self.wrappers.retain(|w| w != name);
         if let Some(oid) = self.wrapper_oids.remove(name) {
             self.with_connection.remove(&oid);
+            self.handlers.remove(&oid);
         }
         self.options
             .retain(|owner, _| !matches!(owner, OptionsOwner::Wrapper(w) if w == name));
@@ -157,21 +161,151 @@ pub(crate) fn check_fdw(interp: &PgCatalog, name: &str) -> Result<(), DdlError> 
     }
 }
 
+/// What the analyzer knows of the `FdwRoutine` a foreign table's wrapper
+/// hands out (GetFdwRoutineByServerId).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FdwRoutine {
+    /// The wrapper has no handler: GetFdwRoutineByServerId fails.
+    NoHandler,
+    /// A handler whose routine is known (a bundled extension's).
+    Known(KnownRoutine),
+    /// A handler whose routine the analyzer can't see.
+    Unknown,
+}
+
+/// The optional callbacks of a known `FdwRoutine` the executor checks
+/// before using them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KnownRoutine {
+    /// `ExecForeignInsert` (CheckValidResultRel).
+    pub(crate) insert: bool,
+    /// `ExecForeignUpdate`.
+    pub(crate) update: bool,
+    /// `ExecForeignDelete`.
+    pub(crate) delete: bool,
+    /// `ExecForeignTruncate` (truncate_check_rel).
+    pub(crate) truncate: bool,
+    /// `ImportForeignSchema` (ImportForeignSchema).
+    pub(crate) import_schema: bool,
+}
+
+/// file_fdw_handler (contrib/file_fdw, PostgreSQL 19): scans and ANALYZE
+/// only.
+const FILE_FDW: KnownRoutine = KnownRoutine {
+    insert: false,
+    update: false,
+    delete: false,
+    truncate: false,
+    import_schema: false,
+};
+
+/// `foreign-data wrapper "w" has no handler` — SQLSTATE 55000
+/// (GetFdwRoutineByServerId, ImportForeignSchema).
+pub(crate) fn no_handler_message(wrapper: &str) -> String {
+    format!("foreign-data wrapper \"{wrapper}\" has no handler")
+}
+
+/// The routine handler `handler` returns, when the analyzer knows it: the
+/// one a bundled extension's script created, by that extension's name and
+/// its own (a C handler is known by its symbol, which the analyzer doesn't
+/// keep, so a copy under another name stays unknown).
+fn known_routine(interp: &PgCatalog, handler: crate::oid::PgProcOid) -> Option<KnownRoutine> {
+    let proc = interp.pg_proc.get(&handler)?;
+    let addr = super::depend::ObjectAddress::proc(handler);
+    let extension = interp.pg_depend.iter().find_map(|d| {
+        (d.classid == addr.classid
+            && d.objid == addr.objid
+            && d.deptype == crate::pg_catalog::DepType::Extension
+            && d.refclassid == crate::pg_catalog::PG_EXTENSION_RELID)
+            .then(|| crate::oid::PgExtensionOid::new(d.refobjid.get()))
+            .flatten()
+    })?;
+    let extension = interp.pg_extension.get(&extension)?;
+    match (extension.extname.as_str(), proc.proname.as_str()) {
+        ("file_fdw", "file_fdw_handler") => Some(FILE_FDW),
+        _ => None,
+    }
+}
+
+/// The wrapper of server `server`, and its routine.
+pub(crate) fn server_routine(interp: &PgCatalog, server: &str) -> Option<(String, FdwRoutine)> {
+    let data = &interp.foreign_data;
+    let (_, wrapper) = data.servers.iter().find(|(s, _)| s == server)?;
+    let oid = data.wrapper_oid(wrapper)?;
+    let routine = match data.handlers.get(&oid) {
+        None => FdwRoutine::NoHandler,
+        Some(&handler) => {
+            known_routine(interp, handler).map_or(FdwRoutine::Unknown, FdwRoutine::Known)
+        }
+    };
+    Some((wrapper.clone(), routine))
+}
+
+/// The wrapper of foreign table `relid`, and its routine
+/// (GetFdwRoutineForRelation); `None` for any other relation.
+pub(crate) fn table_routine(interp: &PgCatalog, relid: PgClassOid) -> Option<(String, FdwRoutine)> {
+    let server = interp.foreign_data.table_servers.get(&relid)?;
+    server_routine(interp, server)
+}
+
+/// The error GetFdwRoutineForRelation raises for foreign table `relid`,
+/// whose wrapper has no handler.
+pub(crate) fn no_handler_error(interp: &PgCatalog, relid: PgClassOid) -> Option<String> {
+    match table_routine(interp, relid)? {
+        (wrapper, FdwRoutine::NoHandler) => Some(no_handler_message(&wrapper)),
+        _ => None,
+    }
+}
+
+/// The error the planner raises planning a scan of relation `relid`
+/// (`inh` unless ONLY): get_relation_info opens a foreign table's routine,
+/// for the relation itself and — expanding an inheritance parent
+/// (expand_inherited_rtentry, find_all_inheritors) — for every inheritor.
+/// A partitioned table's partitions may be pruned first: not counted.
+pub(crate) fn scan_no_handler_error(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    inh: bool,
+) -> Option<String> {
+    let expands = inh
+        && interp
+            .pg_class
+            .get(&relid)
+            .is_some_and(|c| c.relkind != crate::pg_catalog::RelKind::Partitioned);
+    if !expands {
+        return no_handler_error(interp, relid);
+    }
+    super::tables::inherit::all_inheritors(interp, relid)
+        .into_iter()
+        .find_map(|r| no_handler_error(interp, r))
+}
+
+/// What a wrapper's function options set, where they name it.
+#[derive(Default)]
+struct FunctionOptions {
+    /// `[NO] CONNECTION`: whether the wrapper has a connection function.
+    connection: Option<bool>,
+    /// `[NO] HANDLER`: the handler function, or none.
+    handler: Option<Option<crate::oid::PgProcOid>>,
+}
+
 /// The HANDLER / VALIDATOR / CONNECTION functions (lookup_fdw_handler_func
-/// / lookup_fdw_validator_func / lookup_fdw_connection_func). Returns
-/// whether the wrapper now has a connection function, when the options
-/// say (`[NO] CONNECTION`).
+/// / lookup_fdw_validator_func / lookup_fdw_connection_func), and what the
+/// options set.
 fn check_functions(
     interp: &PgCatalog,
     options: &[Option<typedpg_pg_query::ast::Node>],
-) -> Result<Option<bool>, DdlError> {
-    let mut connection = None;
+) -> Result<FunctionOptions, DdlError> {
+    let mut set = FunctionOptions::default();
     for opt in options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
         };
-        if de.defname == "connection" {
-            connection = Some(de.arg.is_some());
+        match de.defname.as_str() {
+            "connection" => set.connection = Some(de.arg.is_some()),
+            // `NO HANDLER` has no argument.
+            "handler" if de.arg.is_none() => set.handler = Some(None),
+            _ => {}
         }
         let Some(ast::Node::List(l)) = de.arg.as_ref() else {
             continue;
@@ -204,6 +338,7 @@ fn check_functions(
                         "function {name} must return type fdw_handler"
                     )));
                 }
+                set.handler = Some(Some(p.oid));
             }
             "validator" => {
                 // (text[], oid)
@@ -240,7 +375,7 @@ fn check_functions(
             _ => {}
         }
     }
-    Ok(connection)
+    Ok(set)
 }
 
 /// transformGenericOptions: `options` (an `OPTIONS (...)` list) applied
@@ -293,7 +428,7 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
             stmt.fdwname
         )));
     }
-    let connection = check_functions(interp, &stmt.func_options)?;
+    let functions = check_functions(interp, &stmt.func_options)?;
     apply_generic_options(
         interp,
         OptionsOwner::Wrapper(stmt.fdwname.clone()),
@@ -305,8 +440,11 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
         .foreign_data
         .wrapper_oids
         .insert(stmt.fdwname.clone(), oid);
-    if connection == Some(true) {
+    if functions.connection == Some(true) {
         interp.foreign_data.with_connection.insert(oid);
+    }
+    if let Some(Some(handler)) = functions.handler {
+        interp.foreign_data.handlers.insert(oid, handler);
     }
     Ok(())
 }
@@ -316,20 +454,35 @@ pub fn alter_fdw(
     stmt: &typedpg_pg_query::ast::AlterFdwStmt,
 ) -> Result<(), DdlError> {
     check_fdw(interp, &stmt.fdwname)?;
-    let connection = check_functions(interp, &stmt.func_options)?;
+    let functions = check_functions(interp, &stmt.func_options)?;
     apply_generic_options(
         interp,
         OptionsOwner::Wrapper(stmt.fdwname.clone()),
         &stmt.options,
     )?;
-    if let (Some(connection), Some(oid)) =
-        (connection, interp.foreign_data.wrapper_oid(&stmt.fdwname))
-    {
-        if connection {
-            interp.foreign_data.with_connection.insert(oid);
-        } else {
-            interp.foreign_data.with_connection.remove(&oid);
+    let Some(oid) = interp.foreign_data.wrapper_oid(&stmt.fdwname) else {
+        return Ok(());
+    };
+    let fd = &mut interp.foreign_data;
+    match functions.connection {
+        Some(true) => {
+            fd.with_connection.insert(oid);
         }
+        Some(false) => {
+            fd.with_connection.remove(&oid);
+        }
+        None => {}
+    }
+    // AlterForeignDataWrapper: a new handler, or none, only warns that the
+    // existing foreign tables' behavior changes.
+    match functions.handler {
+        Some(Some(handler)) => {
+            fd.handlers.insert(oid, handler);
+        }
+        Some(None) => {
+            fd.handlers.remove(&oid);
+        }
+        None => {}
     }
     Ok(())
 }
@@ -461,9 +614,9 @@ pub fn drop_user_mapping(
     Ok(())
 }
 
-/// IMPORT FOREIGN SCHEMA: the server and the local schema must exist. The
-/// imported tables come from the remote server, which the analyzer can't
-/// see.
+/// IMPORT FOREIGN SCHEMA: the server and the local schema must exist, and
+/// the server's wrapper have a handler that supports IMPORT. The imported
+/// tables come from the remote server, which the analyzer can't see.
 pub fn import_foreign_schema(
     interp: &PgCatalog,
     stmt: &ImportForeignSchemaStmt,
@@ -475,7 +628,19 @@ pub fn import_foreign_schema(
             stmt.local_schema
         )));
     }
-    Ok(())
+    // ImportForeignSchema: the wrapper's handler, then its
+    // ImportForeignSchema callback (ERRCODE_FDW_NO_SCHEMAS).
+    match server_routine(interp, &stmt.server_name) {
+        Some((wrapper, FdwRoutine::NoHandler)) => {
+            Err(DdlError::UnsupportedDdl(no_handler_message(&wrapper)))
+        }
+        Some((wrapper, FdwRoutine::Known(routine))) if !routine.import_schema => {
+            Err(DdlError::UnsupportedDdl(format!(
+                "foreign-data wrapper \"{wrapper}\" does not support IMPORT FOREIGN SCHEMA"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// DROP FOREIGN DATA WRAPPER / DROP SERVER, with their dependents.

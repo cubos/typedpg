@@ -224,11 +224,12 @@ fn refresh_materialized_view_requires_one() {
 #[test]
 fn foreign_tables_are_relations() {
     // PG 18: the foreign table has its declared columns; DROP TABLE on it is
-    // refused, DROP FOREIGN TABLE works.
+    // refused, DROP FOREIGN TABLE works. (Its wrapper needs a handler for
+    // a query to read it.)
     let mut db = build_db(&[(
         "0001.sql",
-        "CREATE FOREIGN DATA WRAPPER w;
-         CREATE SERVER srv FOREIGN DATA WRAPPER w;
+        "CREATE EXTENSION postgres_fdw;
+         CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw;
          CREATE FOREIGN TABLE ft (a int NOT NULL, b text) SERVER srv;",
     )]);
     assert_cols(
@@ -9435,6 +9436,119 @@ fn copy_query_must_be_a_query_returning_rows() {
             "0002.sql",
             "COPY (INSERT INTO t VALUES (1) RETURNING a) TO STDOUT;
              COPY (SELECT 1 UNION SELECT 2) TO STDOUT;",
+        ),
+    ]);
+}
+
+#[test]
+fn copy_query_must_rewrite_to_one_query() {
+    // PG 19 BeginCopyTo: pg_analyze_and_rewrite must return exactly one
+    // query — the rules on a data-modifying statement's relation may make
+    // it none or several, refused before the one query's own checks
+    // (RETURNING, utility) and before planning. The rewriter's errors
+    // (RETURNING without an INSTEAD rule returning rows) come first.
+    let setup = "CREATE TABLE t (a int);
+                 CREATE TABLE log (a int);
+                 CREATE TABLE nothing (a int);
+                 CREATE RULE r AS ON INSERT TO nothing DO INSTEAD NOTHING;
+                 CREATE TABLE also (a int);
+                 CREATE RULE r AS ON INSERT TO also DO ALSO INSERT INTO log VALUES (NEW.a);
+                 CREATE TABLE cond (a int);
+                 CREATE RULE r AS ON INSERT TO cond WHERE NEW.a > 0
+                     DO INSTEAD INSERT INTO log VALUES (NEW.a);
+                 CREATE TABLE multi (a int);
+                 CREATE RULE r AS ON INSERT TO multi
+                     DO INSTEAD (INSERT INTO log VALUES (NEW.a); INSERT INTO log VALUES (NEW.a));
+                 CREATE TABLE inst (a int);
+                 CREATE RULE r AS ON INSERT TO inst
+                     DO INSTEAD INSERT INTO log VALUES (NEW.a) RETURNING *;
+                 CREATE TABLE ntf (a int);
+                 CREATE RULE r AS ON INSERT TO ntf DO INSTEAD NOTIFY ch;
+                 CREATE TABLE sel (a int);
+                 CREATE RULE r AS ON INSERT TO sel DO INSTEAD SELECT 1 AS a;
+                 CREATE TABLE upd (a int);
+                 CREATE RULE r AS ON UPDATE TO upd DO ALSO NOTIFY ch;
+                 CREATE VIEW vv AS SELECT a FROM also;
+                 CREATE TABLE inst2 (a int);
+                 CREATE RULE r AS ON INSERT TO inst2
+                     DO INSTEAD INSERT INTO also VALUES (NEW.a) RETURNING *;";
+    let also = "DO ALSO rules are not supported for COPY";
+    let returning = "COPY query must have a RETURNING clause";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "COPY (INSERT INTO nothing VALUES (1)) TO STDOUT;",
+            "DO INSTEAD NOTHING rules are not supported for COPY",
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO nothing VALUES (1) RETURNING a) TO STDOUT;",
+            "cannot perform INSERT RETURNING on relation \"nothing\"",
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO also VALUES (1) RETURNING a) TO STDOUT;",
+            also,
+        ),
+        (setup, "COPY (INSERT INTO also VALUES (1)) TO STDOUT;", also),
+        (
+            setup,
+            "COPY (INSERT INTO cond VALUES (1)) TO STDOUT;",
+            "conditional DO INSTEAD rules are not supported for COPY",
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO multi VALUES (1)) TO STDOUT;",
+            "multi-statement DO INSTEAD rules are not supported for COPY",
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO inst VALUES (1)) TO STDOUT;",
+            returning,
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO ntf VALUES (1)) TO STDOUT;",
+            "COPY query must not be a utility command",
+        ),
+        (
+            setup,
+            "COPY (UPDATE upd SET a = 1 RETURNING a) TO STDOUT;",
+            also,
+        ),
+        (setup, "COPY (UPDATE upd SET a = 1) TO STDOUT;", also),
+        // Through a view, onto its base relation's rules.
+        (
+            setup,
+            "COPY (INSERT INTO vv VALUES (1) RETURNING a) TO STDOUT;",
+            also,
+        ),
+        // A rule action's own rules.
+        (
+            setup,
+            "COPY (INSERT INTO inst2 VALUES (1) RETURNING a) TO STDOUT;",
+            also,
+        ),
+        // Before planning folds the constant.
+        (
+            setup,
+            "COPY (INSERT INTO also VALUES (1/0)) TO STDOUT;",
+            also,
+        ),
+        (
+            setup,
+            "COPY (INSERT INTO t VALUES (1/0)) TO STDOUT;",
+            returning,
+        ),
+    ]);
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COPY (INSERT INTO inst VALUES (1) RETURNING a) TO STDOUT;
+             COPY (INSERT INTO sel VALUES (1)) TO STDOUT;
+             COPY (UPDATE also SET a = 1 RETURNING a) TO STDOUT;
+             COPY (DELETE FROM nothing RETURNING a) TO STDOUT;",
         ),
     ]);
 }
