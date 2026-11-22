@@ -48,35 +48,19 @@ use std::collections::BTreeSet;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{self, AExprKind, BoolExprType, JoinType, Node, SetOperation, Token};
 
-use super::proof::{column_not_null, has_volatile};
+use super::dedup;
+use super::proof::{FromScope, column_not_null, has_volatile};
 use super::{Candidate, Ctx, Edit, Rule};
 use crate::ddl::tables::inherit::{all_inheritors, children_of};
 use crate::oid::PgClassOid;
-use crate::pg_catalog::{ConType, PgCatalog, RelKind};
+use crate::pg_catalog::{ConType, PgCatalog, QueryView, RelKind};
 use crate::resolve::row_guarantees::{FkEquality, fk_equalities_hold, fk_parent_ok};
 
 pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
-    let [raw] = ctx.tree.stmts.as_slice() else {
+    let Some((root, sel)) = plain_select(ctx) else {
         return Vec::new();
     };
-    let Some(root) = raw.stmt.as_ref() else {
-        return Vec::new();
-    };
-    let Node::SelectStmt(sel) = root else {
-        return Vec::new();
-    };
-    if sel.op != SetOperation::SetopNone
-        || sel.with_clause.is_some()
-        || sel.into_clause.is_some()
-        || !sel.locking_clause.is_empty()
-        || !sel.values_lists.is_empty()
-        || ctx.catalog.fk_checks_bypassed
-    {
-        return Vec::new();
-    }
-    let stmt = &raw.stmt;
-    // Views and row locking count as volatile there too.
-    if has_volatile(ctx, stmt.as_ref()) || has_using_or_natural(root) {
+    if ctx.catalog.fk_checks_bypassed {
         return Vec::new();
     }
     let Some(tokens) = Tokens::scan(ctx.sql) else {
@@ -106,6 +90,147 @@ pub(crate) fn candidates(ctx: &Ctx<'_>) -> Vec<Candidate> {
         }
     }
     out
+}
+
+/// What proves a [`RedundantJoin`] keeps every row exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundantJoinProof {
+    /// An INNER join to a parent through a foreign key every child row
+    /// has (the [`Rule::FkJoin`] proof).
+    ForeignKey,
+    /// A LEFT join on a full unique key of the joined table: each row
+    /// matches at most one of its rows.
+    UniqueKey,
+}
+
+/// A join of a plain SELECT that can't change the rows — it neither drops
+/// nor repeats one — and whose table nothing else reads: what the
+/// `redundant_join` lint rule reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedundantJoin {
+    /// From the join's first keyword to the end of its ON condition, in
+    /// [`QueryView::sql`].
+    pub span: std::ops::Range<usize>,
+    /// The name the joined table is referenced by (its alias, or its name).
+    pub relation: String,
+    pub proof: RedundantJoinProof,
+    /// The range deleting the join (from the end of its left-hand side),
+    /// or `None` when a comment is in the way.
+    pub fix: Option<std::ops::Range<usize>>,
+}
+
+impl QueryView {
+    /// The joins of the statement that keep every row exactly once and
+    /// whose table nothing else reads: an INNER join through a foreign key
+    /// (exactly the joins the `fk_join` simplification removes, in their
+    /// JOIN form), or a LEFT join equating every column of a full unique
+    /// key of the joined table. Only a plain SELECT's FROM is read, as by
+    /// the simplification; anything the proofs can't see through is left
+    /// out.
+    pub fn redundant_joins(&self, catalog: &PgCatalog) -> Vec<RedundantJoin> {
+        if !self.analyzed.spreads.is_empty() {
+            return Vec::new();
+        }
+        let ctx = Ctx {
+            sql: &self.sql,
+            tree: &self.tree,
+            catalog,
+            analyzed: &self.analyzed,
+        };
+        let Some((root, sel)) = plain_select(&ctx) else {
+            return Vec::new();
+        };
+        let Some(tokens) = Tokens::scan(ctx.sql) else {
+            return Vec::new();
+        };
+        let site = Site {
+            ctx: &ctx,
+            root: root.to_ref(),
+            tokens,
+        };
+        let mut found = Vec::new();
+        for item in &sel.from_clause {
+            site.redundant_joins(sel, item.as_ref(), &mut found);
+        }
+        if found.is_empty() {
+            return Vec::new();
+        }
+        let Ok(original) = crate::resolve::analyze_static(catalog, &self.sql, &[]) else {
+            return Vec::new();
+        };
+        found
+            .into_iter()
+            .filter(|(_, cut)| {
+                let mut edited = self.sql.clone();
+                edited.replace_range(cut.clone(), "");
+                proves_the_same(catalog, &original, &edited)
+            })
+            .map(|(join, _)| join)
+            .collect()
+    }
+}
+
+/// Whether the analysis of `edited` proves the same of its result as
+/// `original`, the analysis of the query before the join was cut: the same
+/// columns — name, type, nullability and refinement — and parameters. A
+/// join through a foreign key can refine a column (the referencing column
+/// takes the values a CHECK allows the parent's key): the join then isn't
+/// dead text to typedpg, and the rule leaves it alone.
+fn proves_the_same(
+    catalog: &PgCatalog,
+    original: &(
+        Vec<crate::AnalyzedColumn>,
+        Vec<crate::resolve::ParamInfo>,
+        bool,
+    ),
+    edited: &str,
+) -> bool {
+    let Ok((columns, params, can_run_as_subquery)) =
+        crate::resolve::analyze_static(catalog, edited, &[])
+    else {
+        return false;
+    };
+    columns.len() == original.0.len()
+        && columns.iter().zip(&original.0).all(|(a, b)| {
+            a.name == b.name
+                && a.pg_type == b.pg_type
+                && a.nullable == b.nullable
+                && a.refinement == b.refinement
+                && a.elem_refinement == b.elem_refinement
+        })
+        && params.len() == original.1.len()
+        && params
+            .iter()
+            .zip(&original.1)
+            .all(|(a, b)| a.pg_type == b.pg_type && a.nullable == b.nullable)
+        && can_run_as_subquery == original.2
+}
+
+/// The statement, when it is a plain SELECT the rewrites can reason about:
+/// one statement, no WITH, set operation, `INTO`, `VALUES`, `FOR UPDATE` /
+/// `FOR SHARE` (the join's lock on the parent is observable), volatile
+/// function (views count) nor `USING` / `NATURAL` join.
+fn plain_select<'a>(ctx: &Ctx<'a>) -> Option<(&'a Node, &'a ast::SelectStmt)> {
+    let [raw] = ctx.tree.stmts.as_slice() else {
+        return None;
+    };
+    let root = raw.stmt.as_ref()?;
+    let Node::SelectStmt(sel) = root else {
+        return None;
+    };
+    if sel.op != SetOperation::SetopNone
+        || sel.with_clause.is_some()
+        || sel.into_clause.is_some()
+        || !sel.locking_clause.is_empty()
+        || !sel.values_lists.is_empty()
+    {
+        return None;
+    }
+    // Views and row locking count as volatile there too.
+    if has_volatile(ctx, Some(root)) || has_using_or_natural(root) {
+        return None;
+    }
+    Some((root, sel))
 }
 
 // ─── Text ─────────────────────────────────────────────────────────────────
@@ -373,6 +498,12 @@ fn has_using_or_natural(root: &Node) -> bool {
     )
 }
 
+/// A join without `USING`, `NATURAL` or an alias (which hides the names
+/// inside it).
+fn plain_join(j: &ast::JoinExpr) -> bool {
+    !j.is_natural && j.using_clause.is_empty() && j.alias.is_none() && j.join_using_alias.is_none()
+}
+
 /// System columns, which every table has.
 const SYSTEM_COLUMNS: &[&str] = &["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
 
@@ -520,6 +651,53 @@ fn join_is_identity(
     fk_equalities_hold(catalog, child.oid, parent.oid, &checked)
 }
 
+/// Whether each row of the left-hand side of `… LEFT JOIN joined ON
+/// <equalities>` matches at most one row of `joined`: its scan holds only
+/// the rows its unique indexes cover, and the equalities — every conjunct
+/// of the condition, each `joined.k = other.c` with `other.c` a column of
+/// the same type as `k` under a deterministic collation, compared through
+/// a btree equality — equate every column of a full unique key of it
+/// through that key's own operator family
+/// ([`dedup::equalities_cover_unique_key`]). A NULL never equals anything,
+/// so the key's NULLs don't matter, and row security only hides rows.
+fn left_join_matches_at_most_one(
+    ctx: &Ctx<'_>,
+    sel: &ast::SelectStmt,
+    joined: &Rel<'_>,
+    equalities: &[KeyEquality<'_>],
+) -> bool {
+    if !scans_own_rows(ctx, joined) {
+        return false;
+    }
+    let catalog = ctx.catalog;
+    let scope = FromScope::of_select(ctx, sel, None);
+    let mut equated = Vec::with_capacity(equalities.len());
+    for e in equalities {
+        let Some(attr) = catalog.attribute_by_name(joined.oid, e.parent_col) else {
+            return false;
+        };
+        let other = if e.parent_left { e.right } else { e.left };
+        let Some((other_type, deterministic)) = scope.resolve_value(ctx, other) else {
+            return false;
+        };
+        if other_type != attr.atttypid || !deterministic {
+            return false;
+        }
+        let Some(op) = catalog.find_operator("=", Some(attr.atttypid), attr.atttypid) else {
+            return false;
+        };
+        let btree_equality = catalog
+            .pg_amop
+            .iter()
+            .any(|a| a.amopmethod == "btree" && a.amopstrategy == 3 && a.amopopr == op.oid);
+        if !btree_equality {
+            return false;
+        }
+        equated.push((attr.attnum, op.oid));
+    }
+    dedup::equalities_cover_unique_key(ctx, joined.oid, &equated)
+}
+
 /// Whether `child` has a foreign key into `parent` over exactly the
 /// `(child column, parent column)` pairs `wanted` that PG enforces at every
 /// statement: enforced, validated, NOT DEFERRABLE, not temporal — and so is
@@ -627,13 +805,68 @@ impl Site<'_, '_> {
         }
     }
 
+    /// The [`RedundantJoin`]s of every JoinExpr of the tree `node`.
+    fn redundant_joins(
+        &self,
+        sel: &ast::SelectStmt,
+        node: Option<&ast::Node>,
+        out: &mut Vec<(RedundantJoin, std::ops::Range<usize>)>,
+    ) {
+        let Some(Node::JoinExpr(j)) = node else {
+            return;
+        };
+        for side in [&j.larg, &j.rarg] {
+            self.redundant_joins(sel, side.as_ref(), out);
+        }
+        let fk = if self.ctx.catalog.fk_checks_bypassed {
+            None
+        } else {
+            self.fk_join(j)
+                .map(|(rv, eqs)| (rv, eqs, RedundantJoinProof::ForeignKey))
+        };
+        let Some((rv, equalities, proof)) = fk.or_else(|| {
+            self.unique_left_join(sel, j)
+                .map(|(rv, eqs)| (rv, eqs, RedundantJoinProof::UniqueKey))
+        }) else {
+            return;
+        };
+        let left = proof == RedundantJoinProof::UniqueKey;
+        let Some((first, edit)) = self.join_cut(rv, &equalities, left) else {
+            return;
+        };
+        let Some(start) = self.tokens.start(first) else {
+            return;
+        };
+        let fix = self
+            .tokens
+            .clear_of_comments(std::slice::from_ref(&edit))
+            .then(|| edit.range.clone());
+        out.push((
+            RedundantJoin {
+                span: start..edit.range.end,
+                relation: refname(rv).to_owned(),
+                proof,
+                fix,
+            },
+            edit.range,
+        ));
+    }
+
     fn join_site(&self, j: &ast::JoinExpr) -> Option<Vec<Edit>> {
-        if j.jointype != JoinType::JoinInner
-            || j.is_natural
-            || !j.using_clause.is_empty()
-            || j.alias.is_some()
-            || j.join_using_alias.is_some()
-        {
+        let (prv, equalities) = self.fk_join(j)?;
+        let (_, edit) = self.join_cut(prv, &equalities, false)?;
+        Some(vec![edit])
+    }
+
+    /// The parent and the key equalities of an INNER JoinExpr whose
+    /// right-hand side is a parent its left-hand side has a foreign key to,
+    /// when the join keeps every child row exactly once
+    /// ([`join_is_identity`]) and nothing else reads the parent.
+    fn fk_join<'j>(
+        &self,
+        j: &'j ast::JoinExpr,
+    ) -> Option<(&'j ast::RangeVar, Vec<KeyEquality<'j>>)> {
+        if j.jointype != JoinType::JoinInner || !plain_join(j) {
             return None;
         }
         let Some(Node::RangeVar(prv)) = j.rarg.as_ref() else {
@@ -654,24 +887,85 @@ impl Site<'_, '_> {
         if parent_used(self.ctx, self.root, &parent, &skip) {
             return None;
         }
-        // Cut from the end of the left-hand side to the end of the ON.
+        Some((prv, equalities))
+    }
+
+    /// The joined table and the equalities of a LEFT JoinExpr whose
+    /// right-hand side is a table each left-hand row matches at most one
+    /// row of ([`left_join_matches_at_most_one`]), when nothing else reads
+    /// it: the join then keeps every left-hand row exactly once, and adds
+    /// nothing to it.
+    fn unique_left_join<'j>(
+        &self,
+        sel: &ast::SelectStmt,
+        j: &'j ast::JoinExpr,
+    ) -> Option<(&'j ast::RangeVar, Vec<KeyEquality<'j>>)> {
+        if j.jointype != JoinType::JoinLeft || !plain_join(j) {
+            return None;
+        }
+        let Some(Node::RangeVar(prv)) = j.rarg.as_ref() else {
+            return None;
+        };
+        let joined = relation(self.ctx, prv)?;
+        j.quals.as_ref()?;
+        let equalities = conjuncts(j.quals.as_ref())
+            .into_iter()
+            .map(|q| key_equality(q, refname(prv)))
+            .collect::<Option<Vec<_>>>()?;
+        if equalities.is_empty()
+            || !left_join_matches_at_most_one(self.ctx, sel, &joined, &equalities)
+        {
+            return None;
+        }
+        let skip: Vec<i32> = equalities.iter().map(|e| e.location).collect();
+        if parent_used(self.ctx, self.root, &joined, &skip) {
+            return None;
+        }
+        Some((prv, equalities))
+    }
+
+    /// The edit cutting the join of `prv` on `equalities`, from the end of
+    /// the left-hand side through the end of the ON, with the index of the
+    /// join's first keyword: `[INNER] JOIN`, or `LEFT [OUTER] JOIN` when
+    /// `left`.
+    fn join_cut(
+        &self,
+        prv: &ast::RangeVar,
+        equalities: &[KeyEquality<'_>],
+        left: bool,
+    ) -> Option<(usize, Edit)> {
         let t = &self.tokens;
         let mut first = self.relation_first_token(prv)?;
         if !t.is(first.checked_sub(1)?, "join") {
             return None;
         }
         first -= 1;
-        // `INNER`, unless it is the left-hand side's alias (`AS inner`).
-        if t.is(first.checked_sub(1)?, "inner") && !t.is(first.checked_sub(2)?, "as") {
+        // A keyword before it, unless it is the left-hand side's alias (`AS
+        // inner`).
+        let keyword = |first: usize, word: &str| {
+            Some(t.is(first.checked_sub(1)?, word) && !t.is(first.checked_sub(2)?, "as"))
+        };
+        if left {
+            if keyword(first, "outer")? {
+                first -= 1;
+            }
+            if !keyword(first, "left")? {
+                return None;
+            }
+            first -= 1;
+        } else if keyword(first, "inner")? {
             first -= 1;
         }
         let start = t.end(first.checked_sub(1)?)?;
         let on = (first..t.spans.len()).find(|&i| t.is(i, "on"))?;
-        let end = self.conjuncts_end(on, &equalities)?;
-        Some(vec![Edit {
-            range: start..end,
-            text: String::new(),
-        }])
+        let end = self.conjuncts_end(on, equalities)?;
+        Some((
+            first,
+            Edit {
+                range: start..end,
+                text: String::new(),
+            },
+        ))
     }
 
     /// The comma form: from item `i` the parent, and key equalities among

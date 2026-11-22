@@ -132,6 +132,8 @@ pub enum Rule {
     /// A `LIKE` pattern built from a parameter whose `%` and `_` are not
     /// escaped.
     LikeUnescapedParam,
+    /// A join that can't change the rows and whose table nothing reads.
+    RedundantJoin,
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
@@ -184,7 +186,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 46] = [
+    pub const ALL: [Rule; 47] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -212,6 +214,7 @@ impl Rule {
         Rule::UnusedCte,
         Rule::SimplifiableCase,
         Rule::LikeUnescapedParam,
+        Rule::RedundantJoin,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
         Rule::DropIndexBlocking,
@@ -264,6 +267,7 @@ impl Rule {
             Rule::UnusedCte => "unused_cte",
             Rule::SimplifiableCase => "simplifiable_case",
             Rule::LikeUnescapedParam => "like_unescaped_param",
+            Rule::RedundantJoin => "redundant_join",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
@@ -337,6 +341,9 @@ impl Rule {
             Rule::SimplifiableCase => "a CASE that is a COALESCE or its own condition",
             Rule::LikeUnescapedParam => {
                 "a LIKE pattern built from a parameter whose % and _ are not escaped"
+            }
+            Rule::RedundantJoin => {
+                "a join that can't change the rows and whose table nothing else reads"
             }
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
@@ -429,6 +436,7 @@ impl Rule {
             | Rule::RedundantCast
             | Rule::RedundantAlias
             | Rule::SimplifiableCase
+            | Rule::RedundantJoin
             | Rule::FetchAllSingleRow
             | Rule::RlsNoPolicy
             | Rule::UnusedReturning => Some(Severity::Info),

@@ -253,6 +253,15 @@
               }
             },
             {
+              "id": "redundant_join",
+              "shortDescription": {
+                "text": "a join that can't change the rows and whose table nothing else reads"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
               "id": "fk_type_mismatch",
               "shortDescription": {
                 "text": "a foreign key whose column types differ from the referenced columns"

@@ -124,8 +124,8 @@ pub use resolve::{
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
 pub use simplify::{
-    AppliedSimplification, Rule, SimplifyOptions, redundant_distinct_spans, select_at_most_one_row,
-    statement_at_most_one_row,
+    AppliedSimplification, RedundantJoin, RedundantJoinProof, Rule, SimplifyOptions,
+    redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
 };
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the

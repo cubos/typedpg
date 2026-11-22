@@ -43,8 +43,8 @@
 //! `unreachable_case_branch`, `case_without_else`, `redundant_cast`,
 //! `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`,
 //! `insert_without_columns`, `self_assignment`, `unused_cte`,
-//! `simplifiable_case`, `like_unescaped_param`, `fetch_may_return_many`,
-//! `fetch_all_single_row` and `unused_returning`;
+//! `simplifiable_case`, `like_unescaped_param`, `redundant_join`,
+//! `fetch_may_return_many`, `fetch_all_single_row` and `unused_returning`;
 //! the migration rules `create_index_blocking`, `constraint_validating`,
 //! `set_not_null_scan`, `table_rewrite`, `missing_lock_timeout`,
 //! `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`,
@@ -211,6 +211,7 @@ pub const LINT_RULES: &[&str] = &[
     "unused_cte",
     "simplifiable_case",
     "like_unescaped_param",
+    "redundant_join",
     "fk_type_mismatch",
     "missing_lock_timeout",
     "drop_index_blocking",
@@ -1737,7 +1738,8 @@ event_data = "crate::EventData"
              `redundant_cast`, \
              `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`, \
              `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, \
-             `like_unescaped_param`, `fk_type_mismatch`, `missing_lock_timeout`, \
+             `like_unescaped_param`, `redundant_join`, `fk_type_mismatch`, \
+             `missing_lock_timeout`, \
              `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`, \
              `validate_in_same_transaction`, `attach_partition_scan`, `missing_primary_key`, \
              `rls_policy_not_enforced`, `rls_no_policy`, `security_definer_search_path`, \

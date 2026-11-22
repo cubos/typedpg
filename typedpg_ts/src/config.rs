@@ -24,8 +24,8 @@
 //! `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`,
 //! `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`,
 //! `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`,
-//! `simplifiableCase`, `likeUnescapedParam` and the call-site rules `fetchMayReturnMany`,
-//! `fetchAllSingleRow` and `unusedReturning`; the migration rules
+//! `simplifiableCase`, `likeUnescapedParam`, `redundantJoin` and the call-site rules
+//! `fetchMayReturnMany`, `fetchAllSingleRow` and `unusedReturning`; the migration rules
 //! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
 //! `tableRewrite`, `missingLockTimeout`, `dropIndexBlocking`,
 //! `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`

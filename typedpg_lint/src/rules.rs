@@ -21,6 +21,7 @@ mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
 mod redundant_distinct;
+mod redundant_join;
 mod redundant_limit;
 mod redundant_null_check;
 mod self_assignment;
@@ -53,6 +54,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::UnusedCte => unused_cte::findings(ctx),
         Rule::SimplifiableCase => simplifiable_case::findings(ctx),
         Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
+        Rule::RedundantJoin => redundant_join::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking

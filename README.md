@@ -130,6 +130,7 @@ and lints the migrations themselves:
 | `unused_cte` | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
 | `simplifiable_case` | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
 | `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| `redundant_join` | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
 | `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
 | `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
 | `drop_index_blocking` | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
@@ -188,8 +189,8 @@ the SQL literal to `$v`), and applies the SQL edits some rules offer:
 `redundant_null_check`'s `COALESCE`, `redundant_limit`,
 `redundant_distinct`, `constant_condition`, `case_without_else`,
 `redundant_cast`, `redundant_alias`, `insert_without_columns`,
-`self_assignment`, `unused_cte`, `simplifiable_case` and `unused_returning`.
-It writes the files, then
+`self_assignment`, `unused_cte`, `simplifiable_case`, `redundant_join` and
+`unused_returning`. It writes the files, then
 reports what remains; only edits that keep the query's meaning are applied.
 Each fix is checked once more before it is offered: the edited query must
 analyze to the same columns and parameters. A fix that doesn't is a typedpg

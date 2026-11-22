@@ -2678,6 +2678,40 @@ fn default_btree_family(catalog: &PgCatalog, typ: PgTypeOid) -> Option<(String, 
 
 // ── Unique keys ─────────────────────────────────────────────────────────────
 
+/// Whether the equalities `equated` — each a column of table `relid` (by
+/// attnum) compared through operator `op` with a value of the column's own
+/// type under a deterministic collation — cover every column of a full
+/// unique key of `relid`: a non-partial one (see [`unique_keys`]) whose
+/// columns' collations are deterministic, each column compared through the
+/// btree equality of its index's operator family on operands the column's
+/// type is (binary coercible to). At most one row of `relid` then matches
+/// a given value of the other sides.
+pub(super) fn equalities_cover_unique_key(
+    ctx: &Ctx<'_>,
+    relid: PgClassOid,
+    equated: &[(i16, PgOperatorOid)],
+) -> bool {
+    unique_keys(ctx, relid).iter().any(|key| {
+        key.predicate.is_none()
+            && !key.columns.is_empty()
+            && key.columns.iter().all(|column| {
+                column.deterministic
+                    && equated.iter().any(|&(attnum, op)| {
+                        attnum == column.attnum
+                            && in_btree_equality(ctx, &column.family, op)
+                            && ctx.catalog.pg_operator.get(&op).is_some_and(|declared| {
+                                operand_type_matches(ctx, column.typ, declared.oprleft)
+                                    && operand_type_matches(
+                                        ctx,
+                                        column.typ,
+                                        Some(declared.oprright),
+                                    )
+                            })
+                    })
+            })
+    })
+}
+
 struct KeyColumn {
     attnum: i16,
     typ: PgTypeOid,
