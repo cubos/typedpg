@@ -10700,48 +10700,69 @@ const COPY_IN_SETUP: &str = "CREATE ROLE qp_ci_app;
          FOR EACH ROW EXECUTE FUNCTION qp_ci_trg();
      GRANT INSERT ON qp_ci_v TO qp_ci_app;";
 
-#[track_caller]
-fn copy_in_denied(db: &PgCatalog, role: &str, target: &str, prefix: &str) {
-    match db.analyze_copy_in_as(target, role) {
-        Ok(_) => panic!("expected {role} to be denied COPY {target} FROM STDIN"),
-        Err(e) => assert!(
-            e.to_string().starts_with(prefix),
-            "{role} copying into {target}\n  expected prefix: {prefix}\n             got: {e}"
-        ),
-    }
+/// The `copy_in!` schema, its roles named with `tag` (roles are the
+/// cluster's, shared by the tests the oracle runs at once), and the
+/// role-checked analysis of a COPY over it.
+struct CopyIn {
+    db: PgCatalog,
+    tag: &'static str,
 }
 
-#[track_caller]
-fn copy_in_allowed(db: &PgCatalog, role: &str, target: &str) {
-    if let Err(e) = db.analyze_copy_in_as(target, role) {
-        panic!("expected {role} to be allowed COPY {target} FROM STDIN\n{e}");
+impl CopyIn {
+    fn new(tag: &'static str) -> Self {
+        let setup = COPY_IN_SETUP.replace("qp_ci_", &format!("qp_ci{tag}_"));
+        CopyIn {
+            db: build_db(&[("0001.sql", &setup)]),
+            tag,
+        }
+    }
+
+    fn named(&self, s: &str) -> String {
+        s.replace("qp_ci_", &format!("qp_ci{}_", self.tag))
+    }
+
+    #[track_caller]
+    fn denied(&self, role: &str, target: &str, prefix: &str) {
+        let (role, target, prefix) = (self.named(role), self.named(target), self.named(prefix));
+        match self.db.analyze_copy_in_as(&target, &role) {
+            Ok(_) => panic!("expected {role} to be denied COPY {target} FROM STDIN"),
+            Err(e) => assert!(
+                e.to_string().starts_with(&prefix),
+                "{role} copying into {target}\n  expected prefix: {prefix}\n             got: {e}"
+            ),
+        }
+    }
+
+    #[track_caller]
+    fn allowed(&self, role: &str, target: &str) {
+        let (role, target) = (self.named(role), self.named(target));
+        if let Err(e) = self.db.analyze_copy_in_as(&target, &role) {
+            panic!("expected {role} to be allowed COPY {target} FROM STDIN\n{e}");
+        }
     }
 }
 
 #[test]
 fn copy_in_needs_insert_on_the_columns_it_copies() {
-    let db = build_db(&[("0001.sql", COPY_IN_SETUP)]);
-    copy_in_allowed(&db, "qp_ci_app", "qp_ci_t");
-    copy_in_allowed(&db, "qp_ci_cols", "qp_ci_t (a)");
-    copy_in_denied(
-        &db,
+    let c = CopyIn::new("a");
+    c.allowed("qp_ci_app", "qp_ci_t");
+    c.allowed("qp_ci_cols", "qp_ci_t (a)");
+    c.denied(
         "qp_ci_cols",
         "qp_ci_t (a, b)",
         "permission denied for table qp_ci_t",
     );
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_cols",
         "qp_ci_t",
         "permission denied for table qp_ci_t",
     );
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_cols",
         "qp_ci_log",
         "permission denied for table qp_ci_log",
     );
-    let err = db.analyze_copy_in_as("qp_ci_t", "nobody").unwrap_err();
+    let err = c.db.analyze_copy_in_as("qp_ci_t", "nobody").unwrap_err();
     assert!(
         err.to_string()
             .starts_with("role \"nobody\" does not exist"),
@@ -10753,21 +10774,18 @@ fn copy_in_needs_insert_on_the_columns_it_copies() {
 fn copy_in_refuses_row_level_security() {
     // DoCopy: ExecCheckPermissions, then check_enable_rls — which raises
     // itself under row_security off.
-    let db = build_db(&[("0001.sql", COPY_IN_SETUP)]);
-    copy_in_denied(
-        &db,
+    let c = CopyIn::new("b");
+    c.denied(
         "qp_ci_app",
         "qp_ci_rls",
         "COPY FROM not supported with row-level security",
     );
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_off",
         "qp_ci_rls",
         "query would be affected by row-level security policy for table \"qp_ci_rls\"",
     );
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_cols",
         "qp_ci_rls",
         "permission denied for table qp_ci_rls",
@@ -10776,30 +10794,27 @@ fn copy_in_refuses_row_level_security() {
 
 #[test]
 fn copy_in_runs_the_triggers_and_defaults_of_an_insert() {
-    let db = build_db(&[("0001.sql", COPY_IN_SETUP)]);
+    let c = CopyIn::new("c");
     // The trigger function runs as the role, and inserts into qp_ci_log.
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_app",
         "qp_ci_trig",
         "permission denied for table qp_ci_log",
     );
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_app",
         "qp_ci_v (a)",
         "permission denied for table qp_ci_log",
     );
     // A column it leaves to its default runs nextval.
-    copy_in_denied(
-        &db,
+    c.denied(
         "qp_ci_app",
         "qp_ci_def (a)",
         "permission denied for sequence qp_ci_seq",
     );
-    copy_in_allowed(&db, "qp_ci_app", "qp_ci_def (id, a)");
+    c.allowed("qp_ci_app", "qp_ci_def (id, a)");
     // An identity column's sequence isn't checked.
-    copy_in_allowed(&db, "qp_ci_app", "qp_ci_id (a)");
+    c.allowed("qp_ci_app", "qp_ci_id (a)");
 }
 
 #[test]

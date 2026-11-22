@@ -628,9 +628,9 @@ fn bound_value(
             err.raw(None).finalize_implicit().to_string(),
         ));
     }
-    let datum = v
-        .as_ref()
-        .map_or(Datum::Opaque, |v| normalize(interp, v, key));
+    let datum = v.as_ref().map_or(Datum::Opaque, |v| {
+        normalize(interp, v, key, interp.timezone_utc.get())
+    });
     // The value coerced to a `varchar(n)` / `char(n)` key: too long is an
     // error unless the excess is blanks, which go.
     if let Datum::Text(t) | Datum::CodePoints(t) = &datum
@@ -670,7 +670,15 @@ const UUID: PgTypeOid = PgTypeOid::from_raw(2950);
 /// The comparable form of a bound constant (or of a row's value, read as
 /// the key's type): the value evaluate_expr gives the expression coerced
 /// to the key's type, where the analyzer computes it exactly.
-fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &PartKey) -> Datum {
+/// `session_utc`: the session reading the value has TimeZone UTC — the
+/// migration's, creating a bound (`PgCatalog::timezone_utc`); never an
+/// application's, whose zone the analyzer can't know.
+fn normalize(
+    interp: &PgCatalog,
+    v: &typedpg_pg_query::ast::Node,
+    part_key: &PartKey,
+    session_utc: bool,
+) -> Datum {
     use crate::pg_catalog::oid;
     if !part_key.builtin_order {
         return Datum::Opaque;
@@ -684,7 +692,7 @@ fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &Par
         // date_in drops the time of day; timestamp(p) rounds the
         // fraction (AdjustTimestampForTypmod); timestamptz_in reads a
         // value without a zone in the session's TimeZone, known only
-        // while it is UTC (taken as the server's, `timezone_utc`). What
+        // while it is UTC (`session_utc`). What
         // `now` / `today` read depends on when the migration runs: never
         // known.
         oid::DATE => key_literal(interp, v, key)
@@ -692,11 +700,7 @@ fn normalize(interp: &PgCatalog, v: &typedpg_pg_query::ast::Node, part_key: &Par
             .map(Datum::Int),
         oid::TIMESTAMP | oid::TIMESTAMPTZ => key_literal(interp, v, key)
             .and_then(|s| {
-                crate::datetime_input::datetime_value(
-                    s,
-                    Some(key == oid::TIMESTAMPTZ),
-                    interp.timezone_utc.get(),
-                )
+                crate::datetime_input::datetime_value(s, Some(key == oid::TIMESTAMPTZ), session_utc)
             })
             .map(|t| match part_key.typmod {
                 Some(p) => crate::datetime_input::round_timestamp(t, p),
@@ -1260,7 +1264,8 @@ fn route_row_opt<'a>(
             None => None,
             // A domain's CHECK may reject the value as the row is built.
             Some(_) if interp.domain_has_checks(key.type_oid) => return None,
-            Some(v) => match normalize(interp, v, key) {
+            // A row's value is read in the application session's TimeZone.
+            Some(v) => match normalize(interp, v, key, false) {
                 Datum::Opaque => return None,
                 // Out of the key type's range: PG fails on that first
                 // (`integer out of range`).
