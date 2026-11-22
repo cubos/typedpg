@@ -95,6 +95,23 @@ pub fn redundant_distinct_spans(
         .collect()
 }
 
+/// Whether the `ORDER BY` keys of `select` — a node borrowed from
+/// `view.tree` at any nesting depth — can tie: two rows the schema allows
+/// sharing every key (see [`dedup::OrderTies`]). `Unknown` for a query
+/// with spreads.
+pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> dedup::OrderTies {
+    if !view.analyzed.spreads.is_empty() {
+        return dedup::OrderTies::Unknown;
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    dedup::order_ties(&ctx, &dedup::cte_names(&view.tree), select)
+}
+
 /// Whether `select`, a node borrowed from `view.tree` at any nesting depth,
 /// provably yields at most one row per evaluation.
 ///

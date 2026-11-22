@@ -433,13 +433,32 @@ pub(crate) fn transform_array_expr(
     params: &mut ParamCollector,
     target: Option<ArrayTarget>,
 ) -> Result<ExprType, AnalyzeError> {
+    transform_array_expr_typed(arr, ctx, params, target).map(|(t, _)| t)
+}
+
+/// [`transform_array_expr`], and whether the array was already of the
+/// target's type without it: it has elements, and each is of the type the
+/// target converts it to on its own (no untyped literal, parameter or
+/// `ROW(…)` the target types). Without a target, whether it has elements.
+pub(crate) fn transform_array_expr_typed(
+    arr: &ast::AArrayExpr,
+    ctx: Ctx<'_>,
+    params: &mut ParamCollector,
+    target: Option<ArrayTarget>,
+) -> Result<(ExprType, bool), AnalyzeError> {
     let Ctx { snapshot, .. } = ctx;
     let mut elems = Vec::with_capacity(arr.elements.len());
+    // Per element: `Some(typed)` for a sub-array, `None` for an element
+    // typed on its own (judged against the converted-to type below), and
+    // `Some(false)` for one the target types.
+    let mut typed_alone: Vec<Option<bool>> = Vec::with_capacity(arr.elements.len());
     let mut multidims = false;
     for elem in &arr.elements {
         let t = if let Some(ast::Node::AArrayExpr(sub)) = elem.as_ref() {
             multidims = true;
-            transform_array_expr(sub, ctx, params, target)?
+            let (t, typed) = transform_array_expr_typed(sub, ctx, params, target)?;
+            typed_alone.push(Some(typed));
+            t
         } else {
             // coerce_record_to_complex: a `ROW(...)` element of a cast to
             // an array of composites is converted field by field, so its
@@ -456,7 +475,16 @@ pub(crate) fn transform_array_expr(
                 }
                 _ => TypeGoal::NONE,
             };
+            let by_target = goal.type_oid != TypeGoal::NONE.type_oid
+                || matches!(elem.as_ref(), Some(ast::Node::ParamRef(_)));
             let t = infer_expr(elem.as_ref(), ctx, params, goal)?;
+            typed_alone.push(
+                if by_target || t.unknown_value || t.type_oid == oid::UNKNOWN {
+                    Some(false)
+                } else {
+                    None
+                },
+            );
             if is_sub_array_type(t.type_oid, snapshot) {
                 multidims = true;
             }
@@ -680,10 +708,20 @@ pub(crate) fn transform_array_expr(
         })
         .collect();
     let elem_refine = crate::refine::Refinement::either(&parts);
-    Ok(ExprType::scalar_with_typmod(array_type, false, typmod)
-        .with_collation(state)
-        .with_elem_nullable(elem_nullable)
-        .with_elem_refine(elem_refine))
+    // A target's typmod converts every element (`ARRAY[…]::varchar(3)[]`).
+    let typed = !elems.is_empty()
+        && target.is_none_or(|tg| tg.typmod.is_none())
+        && typed_alone
+            .iter()
+            .zip(&elems)
+            .all(|(alone, t)| alone.unwrap_or(t.type_oid == coerce_type));
+    Ok((
+        ExprType::scalar_with_typmod(array_type, false, typmod)
+            .with_collation(state)
+            .with_elem_nullable(elem_nullable)
+            .with_elem_refine(elem_refine),
+        typed,
+    ))
 }
 
 /// Whether an `ARRAY[…]` element of type `t` is a sub-array, making the

@@ -329,7 +329,7 @@ fn a_column_holds_what_its_type_and_checks_allow() {
             ("kind", Some(&["a", "b"])),
             ("n", Some(&["1", "2"])),
             ("m", Some(&["happy", "ok", "sad"])),
-            ("flag", Some(&["false", "true"])),
+            ("flag", None),
             ("free", None),
             // `char(3)` stores `'a  '`; `numeric` 1 may be `1.0`.
             ("padded", None),
@@ -1501,7 +1501,8 @@ fn element_values_travel_through_queries_and_conditionals() {
             ("a", Some(&["a", "b"])),
             ("m", Some(&["1", "2"])),
             ("w", Some(&["a", "b", "c"])),
-            ("x", Some(&["a", "b", "d"])),
+            // `k` is never NULL: the COALESCE never reaches `{d}`.
+            ("x", Some(&["a", "b"])),
             ("y", Some(&["a", "b"])),
             ("z", None),
         ],

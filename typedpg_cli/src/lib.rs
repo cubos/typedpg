@@ -123,7 +123,7 @@ fn write_new(path: &Path) -> std::io::Result<()> {
 }
 
 /// The files among `files` whose content is identical to their version at
-/// git ref `reference` (`--ignore-migrations-from`).
+/// git ref `reference` (`--previous-deployment`).
 ///
 /// `reference` is resolved to a commit; a file absent from it, or different
 /// from it, is not returned. Files are compared by blob id, so the same
@@ -134,24 +134,8 @@ pub fn unchanged_from_ref(reference: &str, files: &[PathBuf]) -> Result<HashSet<
         .first()
         .and_then(|file| file.parent())
         .unwrap_or(Path::new("."));
-    let top = git_text(base, &["rev-parse", "--show-toplevel"]).map_err(|error| {
-        format!(
-            "{} is not in a git repository (needed by --ignore-migrations-from): {error}",
-            base.display()
-        )
-    })?;
-    let top = PathBuf::from(top.trim_end());
-    let top = fs::canonicalize(&top).map_err(|error| {
-        format!(
-            "failed to resolve the git work tree {}: {error}",
-            top.display()
-        )
-    })?;
-    let commit = git_text(
-        &top,
-        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
-    )
-    .map_err(|_| format!("unknown git ref `{reference}`"))?;
+    let top = work_tree(base)?;
+    let commit = resolve_commit(&top, reference)?;
 
     // Each file's path relative to the work tree root, as git writes it (with
     // forward slashes), mapped back to the path the caller passed.
@@ -246,6 +230,125 @@ pub fn unchanged_from_ref(reference: &str, files: &[PathBuf]) -> Result<HashSet<
         }
     }
     Ok(unchanged)
+}
+
+/// The root of the git work tree `dir` is in, canonical.
+fn work_tree(dir: &Path) -> Result<PathBuf, String> {
+    let top = git_text(dir, &["rev-parse", "--show-toplevel"]).map_err(|error| {
+        format!(
+            "{} is not in a git repository (needed by --previous-deployment): {error}",
+            dir.display()
+        )
+    })?;
+    let top = PathBuf::from(top.trim_end());
+    fs::canonicalize(&top).map_err(|error| {
+        format!(
+            "failed to resolve the git work tree {}: {error}",
+            top.display()
+        )
+    })
+}
+
+/// The commit `reference` names, in the repository of work tree `top`.
+fn resolve_commit(top: &Path, reference: &str) -> Result<String, String> {
+    git_text(
+        top,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )
+    .map(|commit| commit.trim().to_owned())
+    .map_err(|_| format!("unknown git ref `{reference}`"))
+}
+
+/// The tree of a git ref, checked out in a temporary directory that is
+/// removed when the snapshot is dropped: the code `--previous-deployment`
+/// names, whose queries `breaks_deployed_queries` checks.
+pub struct Snapshot {
+    dir: tempfile::TempDir,
+    /// The root of the work tree the snapshot's paths map from.
+    top: PathBuf,
+}
+
+impl Snapshot {
+    /// Check out `reference`'s whole tree, from the repository whose work
+    /// tree holds `inside`.
+    ///
+    /// The files are written by `git checkout-index` from a temporary index,
+    /// so the work tree, its index and its HEAD are left alone, and the same
+    /// filters a checkout applies are applied.
+    pub fn new(reference: &str, inside: &Path) -> Result<Snapshot, String> {
+        let dir = if inside.is_dir() {
+            inside
+        } else {
+            match inside.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            }
+        };
+        let top = work_tree(dir)?;
+        let commit = resolve_commit(&top, reference)?;
+        let temp = tempfile::Builder::new()
+            .prefix("typedpg-deployed-")
+            .tempdir()
+            .map_err(|error| format!("failed to create a temporary directory: {error}"))?;
+        let index = temp.path().join("index");
+        let tree = temp.path().join("tree");
+        let run = |args: &[OsString]| -> Result<(), String> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&top)
+                .env("GIT_INDEX_FILE", &index)
+                .output()
+                .map_err(|error| format!("failed to run git: {error}"))?;
+            if !output.status.success() {
+                let command = args
+                    .iter()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return Err(git_error(&command, &output.stderr));
+            }
+            Ok(())
+        };
+        run(&["read-tree".into(), commit.into()])?;
+        // `--prefix` is a string prefix: the separator makes it a directory.
+        let mut prefix = tree.into_os_string();
+        prefix.push(std::path::MAIN_SEPARATOR_STR);
+        let mut argument = OsString::from("--prefix=");
+        argument.push(prefix);
+        run(&["checkout-index".into(), "-a".into(), "-f".into(), argument])?;
+        Ok(Snapshot { dir: temp, top })
+    }
+
+    /// Where `path`, a path in the work tree, is in the snapshot (whether
+    /// or not the ref has it).
+    pub fn path(&self, path: &Path) -> Result<PathBuf, String> {
+        let absolute = std::path::absolute(path)
+            .map_err(|error| format!("failed to resolve {}: {error}", path.display()))?;
+        // Canonical as far as the path exists: the work tree root does.
+        let mut existing = absolute.as_path();
+        let mut rest = Vec::new();
+        let mut canonical = loop {
+            if let Ok(canonical) = fs::canonicalize(existing) {
+                break canonical;
+            }
+            match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    existing = parent;
+                }
+                _ => break absolute.clone(),
+            }
+        };
+        canonical.extend(rest.iter().rev());
+        let relative = canonical.strip_prefix(&self.top).map_err(|_| {
+            format!(
+                "{} is outside the git work tree {}",
+                path.display(),
+                self.top.display()
+            )
+        })?;
+        Ok(self.dir.path().join("tree").join(relative))
+    }
 }
 
 /// Run git in `dir` and return its stdout, or its stderr as the error.

@@ -40,6 +40,7 @@ mod array_input;
 mod builtin_nullability;
 mod clause;
 mod coerce;
+mod condition;
 mod datetime_input;
 mod ddl;
 mod decimal;
@@ -83,6 +84,7 @@ mod stack;
 mod suggest;
 mod template;
 mod tsearch_input;
+mod type_facts;
 mod types;
 mod typmod;
 mod xml_input;
@@ -111,26 +113,28 @@ pub use pg_catalog::{
 };
 
 pub use analysis_diff::{AnalysisDifference, first_difference};
+pub use condition::{AssignmentViolation, ConditionFact, ConditionReason};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
-    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement, PgCatalog,
-    QueryView, SublinkNullability, UserObjectCounts,
+    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement,
+    NullifiedJoin, PgCatalog, QueryView, SublinkNullability, UserObjectCounts,
 };
-pub use refine::{IntRange, Refinement};
+pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
 pub use simplify::{
-    AppliedSimplification, Rule, SimplifyOptions, redundant_distinct_spans, select_at_most_one_row,
-    statement_at_most_one_row,
+    AppliedSimplification, OrderTies, RedundantJoin, RedundantJoinProof, Rule, SimplifyOptions,
+    order_ties, redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
 };
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the
 /// macros' own errors (an unknown `sql!` argument name).
 pub use suggest::suggest_similar;
 pub use template::{TemplateParam, template_params};
+pub use type_facts::{OperatorTypes, ValueConversion};
 pub use typedpg_core::{ParseQualifiedNameError, QualifiedName};
 pub use types::{RecordField, Type};

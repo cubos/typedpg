@@ -1689,12 +1689,14 @@ impl PgCatalog {
             collecting_null_check_facts(|| {
                 collecting_sublink_nullability(|| {
                     collecting_lint_facts(|| {
-                        crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                        crate::type_facts::collecting(|| {
+                            crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                        })
                     })
                 })
             })
         });
-        let ((analysis, result), lint_facts) = analysis;
+        let (((analysis, result), type_facts), lint_facts) = analysis;
         let analyzed = result.map_err(LocatedError::new)?;
         let tree = analysis.tree.map(|tree| tree.tree).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
@@ -1714,6 +1716,19 @@ impl PgCatalog {
             case_else_reachable,
             column_ref_bindings: lint_facts.column_ref_bindings,
             case_condition_not_null: lint_facts.case_condition_not_null,
+            type_facts,
+            condition_facts: lint_facts
+                .condition_facts
+                .into_iter()
+                .filter_map(|(k, v)| Some((k, v?)))
+                .collect(),
+            nullified_joins: lint_facts
+                .nullified_joins
+                .into_iter()
+                .filter_map(|(k, v)| Some((k, v?)))
+                .collect(),
+            case_when_reached: lint_facts.case_when_reached,
+            case_when_passed: lint_facts.case_when_passed,
         })
     }
 
@@ -2915,6 +2930,98 @@ pub struct ColumnRefBinding {
 struct LintFacts {
     column_ref_bindings: HashMap<i32, ColumnRefBinding>,
     case_condition_not_null: HashMap<i32, bool>,
+    condition_facts: HashMap<i32, Option<crate::condition::ConditionFact>>,
+    nullified_joins: HashMap<i32, Option<Vec<NullifiedJoin>>>,
+    case_when_reached: HashMap<i32, bool>,
+    case_when_passed: HashMap<i32, bool>,
+}
+
+/// Record whether a row may take the branch of the searched `CASE` `WHEN`
+/// at `location`: the `WHEN`s before it not TRUE and it TRUE, with what
+/// holds there. OR-merged with a fact already recorded there.
+pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.case_when_reached.entry(location).or_insert(false) |= reached;
+        }
+    });
+}
+
+/// Record whether a row may get past the searched `CASE` `WHEN` at
+/// `location`: it and every `WHEN` before it not TRUE, with what holds
+/// there. OR-merged with a fact already recorded there.
+pub(crate) fn note_case_when_passed(location: i32, passed: bool) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.case_when_passed.entry(location).or_insert(false) |= passed;
+        }
+    });
+}
+
+/// An outer join a `WHERE` condition makes an inner one (see
+/// [`QueryView::nullified_joins`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NullifiedJoin {
+    /// The FROM entry on the join's nullable side the condition proves is
+    /// never null-extended (its alias, or the relation's name).
+    pub entry: String,
+    /// The join's kind as it would behave without the condition: `"LEFT"`,
+    /// `"RIGHT"` or `"FULL"`.
+    pub written: &'static str,
+    /// What the condition leaves of it: `"INNER"`, `"LEFT"` or `"RIGHT"`.
+    pub reduced: &'static str,
+}
+
+/// Record what the comparison or `IN` list at `location` was decided to
+/// be (`None`: nothing), AND-merged with a fact already recorded there:
+/// two inferences that disagree decide nothing.
+pub(crate) fn note_condition_fact(location: i32, fact: Option<crate::condition::ConditionFact>) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            match facts.condition_facts.entry(location) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &fact {
+                        entry.insert(None);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(fact);
+                }
+            }
+        }
+    });
+}
+
+/// Record the outer joins the `WHERE` conjunct at `location` makes inner
+/// ones, AND-merged like [`note_condition_fact`].
+pub(crate) fn note_nullified_joins(location: i32, joins: Vec<NullifiedJoin>) {
+    if location < 0 {
+        return;
+    }
+    let joins = (!joins.is_empty()).then_some(joins);
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            match facts.nullified_joins.entry(location) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if entry.get() != &joins {
+                        entry.insert(None);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(joins);
+                }
+            }
+        }
+    });
 }
 
 thread_local! {
@@ -3178,9 +3285,58 @@ pub struct QueryView {
     /// Whether each searched `CASE`'s `WHEN` condition is a plain boolean
     /// that is never NULL, by the `WHEN`'s location in [`Self::sql`].
     case_condition_not_null: HashMap<i32, bool>,
+    /// The conversions of the expressions' values and the operators' types.
+    type_facts: crate::type_facts::TypeFacts,
+    /// The comparisons and `IN` lists proved always or never true, by
+    /// location in [`Self::sql`].
+    condition_facts: HashMap<i32, crate::condition::ConditionFact>,
+    /// The outer joins each `WHERE` conjunct makes inner ones, by the
+    /// conjunct's location in [`Self::sql`].
+    nullified_joins: HashMap<i32, Vec<NullifiedJoin>>,
+    /// Whether a row may take each searched `CASE` branch, by its `WHEN`'s
+    /// location in [`Self::sql`].
+    case_when_reached: HashMap<i32, bool>,
+    /// Whether a row may get past each searched `CASE` `WHEN`, by its
+    /// location in [`Self::sql`].
+    case_when_passed: HashMap<i32, bool>,
 }
 
 impl QueryView {
+    /// Whether a row may take the branch of the searched `CASE` `WHEN` at
+    /// `location` (a byte offset in [`Self::sql`]: the `CaseWhen`'s
+    /// location): with what holds there — the `WHEN`s before it not TRUE,
+    /// the conditions around the `CASE`, the CHECK constraints — the
+    /// `WHEN` can be TRUE. `None` when no such `WHEN` was inferred there.
+    pub fn case_when_reached(&self, location: i32) -> Option<bool> {
+        self.case_when_reached.get(&location).copied()
+    }
+
+    /// Whether a row may get past the searched `CASE` `WHEN` at `location`
+    /// (see [`Self::case_when_reached`]): it and every `WHEN` before it can
+    /// all be not TRUE. `false`: the branches after it are never taken.
+    pub fn case_when_passed(&self, location: i32) -> Option<bool> {
+        self.case_when_passed.get(&location).copied()
+    }
+
+    /// What the analyzer proved of the comparison or `IN` list at
+    /// `location` (a byte offset in [`Self::sql`]: the `A_Expr`'s own
+    /// location) where it is evaluated — always TRUE, or never TRUE — and
+    /// why (see [`crate::ConditionFact`]). `None` when nothing was proved
+    /// there, or two inferences of it disagree.
+    pub fn condition_fact(&self, location: i32) -> Option<&crate::condition::ConditionFact> {
+        self.condition_facts.get(&location)
+    }
+
+    /// The outer joins of its query level the `WHERE` conjunct at
+    /// `location` (a byte offset in [`Self::sql`]: the conjunct node's own
+    /// location) makes inner ones: it is never TRUE for a row whose entry
+    /// on the join's nullable side is null-extended. Joins already never
+    /// null-extending that side (a foreign key's parent, `ON true` to a
+    /// row always there) are not listed. `None` when there is none.
+    pub fn nullified_joins(&self, location: i32) -> Option<&[NullifiedJoin]> {
+        self.nullified_joins.get(&location).map(Vec::as_slice)
+    }
+
     /// What the analyzer proved about the `= ANY` / `IN` sublink at
     /// `location` (a byte offset in [`Self::sql`]): whether some left-hand
     /// expression and whether some subquery output column may be NULL.
@@ -3229,6 +3385,28 @@ impl QueryView {
     /// column, a SQL function parameter).
     pub fn column_ref_binding(&self, location: i32) -> Option<&ColumnRefBinding> {
         self.column_ref_bindings.get(&location)
+    }
+
+    /// How the value of `node` — a node of [`Self::tree`] — is converted to
+    /// the type its context takes: an operator's or function's declared
+    /// argument type, the common type of a `CASE`, `COALESCE`, `GREATEST` /
+    /// `LEAST` or a `UNION` column, an `INSERT` / `UPDATE` column's type, or
+    /// a written cast. `None` when it is not converted (an untyped literal
+    /// or parameter typed by its context included), when the analyzer saw
+    /// no such site, or when it inferred the site two ways.
+    pub fn value_conversion(
+        &self,
+        node: typedpg_pg_query::NodeRef<'_>,
+    ) -> Option<crate::ValueConversion> {
+        self.type_facts.conversion(node)
+    }
+
+    /// The operand and result types of the operator call (`A_Expr`) at
+    /// `location` (a byte offset in [`Self::sql`]: the operator's own
+    /// location). `None` when no operator was resolved there, or when the
+    /// site was inferred with different types.
+    pub fn operator_types(&self, location: i32) -> Option<crate::OperatorTypes> {
+        self.type_facts.operator(location)
     }
 
     /// Whether the `WHEN` condition of a searched `CASE`, at `location` (a

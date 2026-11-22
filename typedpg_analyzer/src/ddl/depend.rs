@@ -360,7 +360,8 @@ pub(crate) fn note_ts_object(interp: &PgCatalog, kind: &str, schema: Option<&str
 pub(crate) fn collect<R>(f: impl FnOnce() -> R) -> (R, Vec<Reference>) {
     let outer = COLLECTOR.with(|c| c.replace(Some(Vec::new())));
     // What an internal analysis reads isn't the statement's range table.
-    let result = crate::privileges::suspended(f);
+    // Nor are its nodes the query's: their offsets are in another text.
+    let result = crate::type_facts::suspended(|| crate::privileges::suspended(f));
     let refs = COLLECTOR.with(|c| c.replace(outer)).unwrap_or_default();
     (result, refs)
 }

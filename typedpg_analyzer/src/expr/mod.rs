@@ -1770,7 +1770,8 @@ fn infer_expr_unlocated(
             }
             // Each argument is coerced to the common type, which may map it
             // to NULL.
-            let kept = conditional::coerce_branches(&mut args, resolved_type, snapshot);
+            let nodes: Vec<Option<&ast::Node>> = mm.args.iter().map(Option::as_ref).collect();
+            let kept = conditional::coerce_branches(&mut args, &nodes, resolved_type, snapshot);
             // GREATEST/LEAST over ≥1 NOT NULL arg are never NULL.
             let nullable = args.is_empty()
                 || (args.iter().all(|t| t.nullable)
@@ -2099,6 +2100,15 @@ fn infer_expr_unlocated(
     // Verify result is compatible with the goal type. Pass the location
     // of the offending expression so a `TypeMismatch` carries a snippet.
     check_goal_compatibility(&result, &goal, snapshot, crate::error::node_location(node))?;
+    if goal.has_expectation() {
+        crate::type_facts::note_conversion(
+            node,
+            result.type_oid,
+            goal.type_oid,
+            goal.coercion == CoercionContext::Explicit,
+            snapshot,
+        );
+    }
 
     Ok(result)
 }

@@ -249,7 +249,7 @@ pub(crate) fn infer_coalesce(
     let nodes: Vec<Option<&ast::Node>> = expr.args.iter().map(Option::as_ref).collect();
     let type_oid = select_common_type("COALESCE", &types, &nodes, snapshot)?;
     // Each argument is coerced to the common type, which may map it to NULL.
-    let kept = coerce_branches(&mut args, type_oid, snapshot);
+    let kept = coerce_branches(&mut args, &nodes, type_oid, snapshot);
     // NULL only when every argument is — not when the quals or CHECK
     // constraints say one of its (uncoerced) columns isn't.
     let all_nullable = args.iter().all(|t| t.nullable)
@@ -300,8 +300,21 @@ pub(crate) fn infer_coalesce(
             .all(|t| t.type_oid == type_oid || t.type_oid == oid::UNKNOWN),
     );
 
-    let branches: Vec<(Option<&ast::Node>, &ExprType)> =
-        expr.args.iter().map(Option::as_ref).zip(&args).collect();
+    // The arguments the result can come from: none after the first that is
+    // never NULL (its coercion to the common type included), which is
+    // never reached.
+    let reached = args_nullable
+        .iter()
+        .zip(&kept)
+        .position(|(&nullable, &kept)| !nullable && kept)
+        .map_or(args.len(), |i| i + 1);
+    let branches: Vec<(Option<&ast::Node>, &ExprType)> = expr
+        .args
+        .iter()
+        .map(Option::as_ref)
+        .zip(&args)
+        .take(reached)
+        .collect();
     let typmod = agreed_typmod(&args, type_oid);
     ctx.note_strict(
         expr.location,
@@ -328,9 +341,15 @@ pub(crate) fn infer_coalesce(
 /// is kept as it is — no cast function can map it to NULL.
 pub(crate) fn coerce_branches(
     branches: &mut [ExprType],
+    nodes: &[Option<&ast::Node>],
     common: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Vec<bool> {
+    if nodes.len() == branches.len() {
+        for (node, t) in nodes.iter().zip(branches.iter()) {
+            crate::type_facts::note_conversion(*node, t.type_oid, common, false, snapshot);
+        }
+    }
     branches
         .iter_mut()
         .map(|t| {
@@ -695,7 +714,11 @@ pub(crate) fn infer_case(
             // A WHEN the facts refute is never TRUE: its result is still
             // analyzed and takes part in the result type, but is never the
             // CASE's value.
-            reached.push(!unreachable(not_taken.clone().union(taken.clone())));
+            let when_reached = !unreachable(not_taken.clone().union(taken.clone()));
+            if expr.arg.is_none() {
+                crate::pg_catalog::note_case_when_reached(when.location, when_reached);
+            }
+            reached.push(when_reached);
             let facts = not_taken.clone().union(taken).restricted_to(&own);
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
             // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
@@ -730,6 +753,12 @@ pub(crate) fn infer_case(
                 &log,
                 snapshot,
             ));
+            if crate::pg_catalog::collecting_column_ref_bindings() {
+                crate::pg_catalog::note_case_when_passed(
+                    when.location,
+                    !unreachable(not_taken.clone()),
+                );
+            }
         }
         // The WHEN is part of whatever expression the caller logs.
         if let Some(outer) = ctx.strict_log {
@@ -793,7 +822,7 @@ pub(crate) fn infer_case(
         }
     }
     // Each result is coerced to the common type, which may map it to NULL.
-    coerce_branches(&mut inputs, type_oid, snapshot);
+    coerce_branches(&mut inputs, &nodes, type_oid, snapshot);
 
     // Which inputs can be the result: the ELSE (input 0) unless no row
     // reaches it, each THEN unless its WHEN is refuted. The others still

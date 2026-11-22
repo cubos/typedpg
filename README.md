@@ -118,8 +118,8 @@ and lints the migrations themselves:
 | `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
 | `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
 | `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
-| `constant_condition` | warning | A `WHERE`, `JOIN … ON` or `HAVING` condition (or an `AND` argument of one) that is always true or never true. The fix removes a `WHERE` that is always true from a `SELECT`. |
-| `unreachable_case_branch` | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is. |
+| `constant_condition` | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
+| `unreachable_case_branch` | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
 | `case_without_else` | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
 | `redundant_cast` | info | A cast to the type (and type modifier) its operand already has. |
 | `redundant_alias` | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
@@ -130,6 +130,13 @@ and lints the migrations themselves:
 | `unused_cte` | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
 | `simplifiable_case` | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
 | `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| `redundant_join` | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
+| `scalar_subquery_may_return_many` | warning | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
+| `timestamp_timezone_mix` | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
+| `integer_division` | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
+| `left_join_nullified` | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
+| `check_violation` | warning | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
+| `unstable_order` | warning | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
 | `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
 | `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
 | `drop_index_blocking` | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
@@ -149,6 +156,7 @@ and lints the migrations themselves:
 | `fetch_may_return_many` | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
 | `fetch_all_single_row` | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
 | `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
+| `breaks_deployed_queries` | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
 
 The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
 `unused_returning`) run in both CLIs: a query can be called directly on the
@@ -175,7 +183,7 @@ ignore = ["tests/**"]   # paths whose statement findings are not reported
 forward slashes. Findings in a matching query file are dropped. A matching
 migration file is still applied and its schema rules still report — on the
 statement that created the object — but its statement rules are skipped, like
-a migration unchanged from `--ignore-migrations-from`: its history cannot be
+a migration unchanged from `--previous-deployment`: its history cannot be
 changed. Failures are never dropped: a query in an ignored file that does not
 compile still fails lint, as it still fails the build.
 
@@ -188,24 +196,43 @@ the SQL literal to `$v`), and applies the SQL edits some rules offer:
 `redundant_null_check`'s `COALESCE`, `redundant_limit`,
 `redundant_distinct`, `constant_condition`, `case_without_else`,
 `redundant_cast`, `redundant_alias`, `insert_without_columns`,
-`self_assignment`, `unused_cte`, `simplifiable_case` and `unused_returning`.
-It writes the files, then
+`self_assignment`, `unused_cte`, `simplifiable_case`, `redundant_join` and
+`unused_returning`. It writes the files, then
 reports what remains; only edits that keep the query's meaning are applied.
 Each fix is checked once more before it is offered: the edited query must
 analyze to the same columns and parameters. A fix that doesn't is a typedpg
 bug; it is withheld, and an `internal_error` warning asks you to report it.
 
-Migrations already applied in production cannot be changed, so `cargo typedpg
-lint --ignore-migrations-from <ref>` (for example `origin/main`) skips the
-statement rules of every migration file identical to its version at that git
-ref: it is applied for the schema, but its locks, scans and rewrites are not
+`cargo typedpg lint --previous-deployment <ref>` names the git ref of what is
+deployed now (for example `origin/main`): its code and its migrations.
+Migrations already applied in production cannot be changed, so it skips the
+statement rules of every migration file identical to its version at that ref:
+it is applied for the schema, but its locks, scans and rewrites are not
 reported. The schema rules (`fk_without_index`, `redundant_index`) still
 report problems of the current schema, placed on the statement that created
 the object, with a help line that puts the fix in a new migration; its allow
 comments are honored and validated. A file absent from the ref, or changed by
-the branch, is linted as usual. Queries are unaffected. The summary states how
-many files skipped the statement rules, e.g.
+the branch, is linted as usual. The summary states how many files skipped the
+statement rules, e.g.
 `300 unchanged from origin/main: statement rules skipped`.
+(`--ignore-migrations-from`, its former name, still works.)
+
+A deploy applies the new migrations while the code at the ref keeps running,
+and it keeps running until the rollout ends. `breaks_deployed_queries`
+analyzes that code's queries — read from the ref, so a query the branch
+changed or removed is still checked — against both schemas, and reports each
+one that analyzed against the old schema but breaks against the new: it no
+longer analyzes (PostgreSQL's error is quoted), a result column is gone,
+changes type or may now be NULL, the result's column list changes, a
+parameter changes type or no longer accepts NULL, an `INSERT … SELECT` leaves
+out a column that is now `NOT NULL` without a default, or a result value may
+now be one the code doesn't know (a new enum label, a `CHECK` that admits
+more values or a wider range). The finding is placed on the migration
+statement that makes the change and names the query's file and line at the
+ref. The fix is expand/contract: first deploy code that works with both
+schemas, then the migration. A `-- typedpg-lint:
+allow(breaks_deployed_queries)` comment on the statement, or in the deployed
+query, suppresses it.
 
 Findings go to stdout, the summary to stderr, and the run exits non-zero when
 a finding reaches `fail_on` or a query or migration fails analysis. Human is

@@ -30,6 +30,27 @@ pub(crate) fn branch_column_span(
         .and_then(|n| crate::error::expr_span(n.as_ref()))
 }
 
+/// The expression of output column `i` of a set operation's arm, when the
+/// arm is a plain `SELECT` whose target list has no `*` (a nested set
+/// operation's column, or a `VALUES` list's, is already a common type).
+fn arm_column_node(arm: &ast::SelectStmt, i: usize) -> Option<&ast::Node> {
+    if arm.op != ast::SetOperation::SetopNone || !arm.values_lists.is_empty() {
+        return None;
+    }
+    let star = arm.target_list.iter().any(|target| {
+        matches!(target, Some(ast::Node::ResTarget(rt))
+            if matches!(rt.val.as_ref(), Some(ast::Node::ColumnRef(c))
+                if c.fields.iter().any(|f| matches!(f, Some(ast::Node::AStar(_))))))
+    });
+    if star {
+        return None;
+    }
+    match arm.target_list.get(i)?.as_ref()? {
+        ast::Node::ResTarget(rt) => rt.val.as_ref(),
+        _ => None,
+    }
+}
+
 pub(crate) fn analyze_set_operation(
     sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
@@ -226,6 +247,17 @@ pub(crate) fn analyze_set_operation(
             (Err(_), false) => target,
         };
         let typmod = if l.typmod == r.typmod { l.typmod } else { None };
+        for (arm, c) in [(left, &l), (right, &r)] {
+            if let Some(node) = arm_column_node(arm, i) {
+                crate::type_facts::note_conversion(
+                    Some(node),
+                    c.type_oid,
+                    type_oid,
+                    false,
+                    snapshot,
+                );
+            }
+        }
         // Each arm's column is coerced to the common type, which may map a
         // value — or an array's element — to NULL.
         for c in [&mut l, &mut r] {

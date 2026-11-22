@@ -115,6 +115,22 @@ struct Database {
 }
 
 impl Database {
+    /// Set a catalog built from the database's migrations up for analyzing
+    /// its queries.
+    fn prepare_catalog(&self, catalog: &mut PgCatalog) -> Result<(), String> {
+        // Parameters bound from a Temporal value are never infinite.
+        let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
+            .iter()
+            .map(|t| QualifiedName::new("pg_catalog", *t))
+            .filter(|q| !self.overrides.contains_key(q))
+            .collect();
+        catalog.assume_finite_parameters(&finite)?;
+        catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
+            &self.config.simplify,
+        ));
+        Ok(())
+    }
+
     /// Read `source`, one of the database's `.sql` files.
     fn parse_sql(&self, source: &str) -> SqlFile {
         let sql = self
@@ -258,6 +274,13 @@ impl Project {
     /// find the calls on the `.sql` queries they import.
     pub fn for_lint(config: Config) -> Result<Project, String> {
         Self::open(config, true, true, true)
+    }
+
+    /// A project `typedpg lint` reads the previous deployment's queries
+    /// from: [`Self::for_lint`] over a checkout of it, writing a missing
+    /// generated module (empty) so that sources importing it resolve.
+    pub fn for_deployed(config: Config) -> Result<Project, String> {
+        Self::open(config, false, true, true)
     }
 
     /// A project that compiles `.sql` files alone: it scans no TypeScript
@@ -692,16 +715,7 @@ impl Project {
         }
         db.catalog =
             build_catalog(&migrations, db.config.runner.use_transaction).and_then(|mut catalog| {
-                // Parameters bound from a Temporal value are never infinite.
-                let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
-                    .iter()
-                    .map(|t| QualifiedName::new("pg_catalog", *t))
-                    .filter(|q| !db.overrides.contains_key(q))
-                    .collect();
-                catalog.assume_finite_parameters(&finite)?;
-                catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
-                    &db.config.simplify,
-                ));
+                db.prepare_catalog(&mut catalog)?;
                 Ok(catalog)
             });
         db.migrations = migrations;
@@ -1220,6 +1234,12 @@ impl Project {
                 },
             })
             .collect())
+    }
+
+    /// Set a catalog built from database `i`'s migrations up for analyzing
+    /// its queries, as [`Self::catalog`] was.
+    pub fn prepare_catalog(&self, i: usize, catalog: &mut PgCatalog) -> Result<(), String> {
+        self.dbs[i].prepare_catalog(catalog)
     }
 
     /// How many databases the project has.

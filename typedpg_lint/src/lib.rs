@@ -21,11 +21,13 @@
 //! SARIF.
 
 mod call_site;
+mod deployed;
 mod ignore;
 mod migrations;
 pub mod report;
 mod rules;
 
+pub use deployed::{DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
 pub use ignore::IgnoreSet;
 pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
@@ -132,6 +134,25 @@ pub enum Rule {
     /// A `LIKE` pattern built from a parameter whose `%` and `_` are not
     /// escaped.
     LikeUnescapedParam,
+    /// A join that can't change the rows and whose table nothing reads.
+    RedundantJoin,
+    /// A scalar subquery used as a value that may return more than one row.
+    ScalarSubqueryMayReturnMany,
+    /// An implicit conversion between `timestamp` (or `date`) and
+    /// `timestamptz`, whose result depends on the session's `TimeZone`.
+    TimestampTimezoneMix,
+    /// An integer division whose truncated result is then used as a
+    /// non-integer value.
+    IntegerDivision,
+    /// An outer join whose nullable side the `WHERE` clause rejects when
+    /// null-extended: it behaves as an inner join.
+    LeftJoinNullified,
+    /// An `INSERT` or `UPDATE` storing a constant a `CHECK` constraint
+    /// rejects: it fails for every row it writes.
+    CheckViolation,
+    /// An `ORDER BY` whose keys can tie under `LIMIT` / `OFFSET` / `DISTINCT
+    /// ON`: which of the tied rows come back is arbitrary.
+    UnstableOrder,
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
@@ -173,6 +194,9 @@ pub enum Rule {
     FetchAllSingleRow,
     /// `execute()` on a statement whose `RETURNING` rows are discarded.
     UnusedReturning,
+    /// A migration that breaks a query of the code deployed at
+    /// `--previous-deployment`, which keeps running while it is applied.
+    BreaksDeployedQueries,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
@@ -184,7 +208,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 46] = [
+    pub const ALL: [Rule; 54] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -212,6 +236,13 @@ impl Rule {
         Rule::UnusedCte,
         Rule::SimplifiableCase,
         Rule::LikeUnescapedParam,
+        Rule::RedundantJoin,
+        Rule::ScalarSubqueryMayReturnMany,
+        Rule::TimestampTimezoneMix,
+        Rule::IntegerDivision,
+        Rule::LeftJoinNullified,
+        Rule::CheckViolation,
+        Rule::UnstableOrder,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
         Rule::DropIndexBlocking,
@@ -231,6 +262,7 @@ impl Rule {
         Rule::FetchMayReturnMany,
         Rule::FetchAllSingleRow,
         Rule::UnusedReturning,
+        Rule::BreaksDeployedQueries,
     ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
@@ -264,6 +296,13 @@ impl Rule {
             Rule::UnusedCte => "unused_cte",
             Rule::SimplifiableCase => "simplifiable_case",
             Rule::LikeUnescapedParam => "like_unescaped_param",
+            Rule::RedundantJoin => "redundant_join",
+            Rule::ScalarSubqueryMayReturnMany => "scalar_subquery_may_return_many",
+            Rule::TimestampTimezoneMix => "timestamp_timezone_mix",
+            Rule::IntegerDivision => "integer_division",
+            Rule::LeftJoinNullified => "left_join_nullified",
+            Rule::CheckViolation => "check_violation",
+            Rule::UnstableOrder => "unstable_order",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
@@ -283,6 +322,7 @@ impl Rule {
             Rule::FetchMayReturnMany => "fetch_may_return_many",
             Rule::FetchAllSingleRow => "fetch_all_single_row",
             Rule::UnusedReturning => "unused_returning",
+            Rule::BreaksDeployedQueries => "breaks_deployed_queries",
             Rule::InvalidAllow => "invalid_allow",
             Rule::InternalError => "internal_error",
         }
@@ -338,6 +378,28 @@ impl Rule {
             Rule::LikeUnescapedParam => {
                 "a LIKE pattern built from a parameter whose % and _ are not escaped"
             }
+            Rule::RedundantJoin => {
+                "a join that can't change the rows and whose table nothing else reads"
+            }
+            Rule::ScalarSubqueryMayReturnMany => {
+                "a scalar subquery used as a value that may return more than one row"
+            }
+            Rule::TimestampTimezoneMix => {
+                "an implicit timestamp/timestamptz conversion that depends on the session's TimeZone"
+            }
+            Rule::IntegerDivision => {
+                "an integer division whose truncated result is used as a non-integer value"
+            }
+            Rule::LeftJoinNullified => {
+                "an outer join the WHERE clause turns into an inner join by rejecting its \
+                 null-extended rows"
+            }
+            Rule::CheckViolation => {
+                "an INSERT or UPDATE storing a constant a CHECK constraint rejects"
+            }
+            Rule::UnstableOrder => {
+                "an ORDER BY with LIMIT, OFFSET or DISTINCT ON whose keys can tie"
+            }
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
             }
@@ -375,6 +437,9 @@ impl Rule {
             }
             Rule::FetchAllSingleRow => "fetch_all on a query that returns at most one row",
             Rule::UnusedReturning => "execute() on a statement whose RETURNING rows are discarded",
+            Rule::BreaksDeployedQueries => {
+                "a migration that breaks a query of the code deployed at --previous-deployment"
+            }
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
             Rule::InternalError => "a typedpg bug: a fix that would have changed the query",
         }
@@ -421,7 +486,14 @@ impl Rule {
             | Rule::CartesianJoin
             | Rule::InsertWithoutColumns
             | Rule::SelfAssignment
-            | Rule::UnusedCte => Some(Severity::Warning),
+            | Rule::UnusedCte
+            | Rule::BreaksDeployedQueries
+            | Rule::ScalarSubqueryMayReturnMany
+            | Rule::TimestampTimezoneMix
+            | Rule::IntegerDivision
+            | Rule::LeftJoinNullified
+            | Rule::CheckViolation
+            | Rule::UnstableOrder => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit
@@ -429,6 +501,7 @@ impl Rule {
             | Rule::RedundantCast
             | Rule::RedundantAlias
             | Rule::SimplifiableCase
+            | Rule::RedundantJoin
             | Rule::FetchAllSingleRow
             | Rule::RlsNoPolicy
             | Rule::UnusedReturning => Some(Severity::Info),
@@ -808,7 +881,8 @@ pub fn lint_query_called(
 }
 
 /// Whether `sql` with `fix` applied still analyzes to the same query shape
-/// as `original`: the same output columns (name, type, nullability), the
+/// as `original`: the same output columns (name, type, nullability, and
+/// the values they are known to take, which the generated types show), the
 /// same parameters (name, type, nullability) and the same embeddability.
 /// The error says what would have changed.
 ///
@@ -836,7 +910,11 @@ fn fix_keeps_shape(
                     .iter()
                     .zip(&original.columns)
                     .all(|(a, b)| {
-                        a.name == b.name && a.pg_type == b.pg_type && a.nullable == b.nullable
+                        a.name == b.name
+                            && a.pg_type == b.pg_type
+                            && a.nullable == b.nullable
+                            && a.refinement == b.refinement
+                            && a.elem_refinement == b.elem_refinement
                     })
         }
     };

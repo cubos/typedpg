@@ -528,6 +528,33 @@ fn handle_in_list(
     {
         ctx.note_cooked_in_list(expr, fold, comparisons);
     }
+    {
+        let target = snapshot.unwrap_domain(left.type_oid);
+        let int =
+            |t: PgTypeOid| [oid::INT2, oid::INT4, oid::INT8].contains(&snapshot.unwrap_domain(t));
+        let same_kind = items.iter().all(|(_, t, _)| {
+            t.type_oid == oid::UNKNOWN
+                || snapshot.unwrap_domain(t.type_oid) == target
+                || (int(t.type_oid) && int(target))
+        });
+        let builtin = same_kind
+            && left_row.is_none()
+            && untyped_param.is_none()
+            && snapshot
+                .find_operator(op, Some(target), target)
+                .is_some_and(|o| {
+                    is_builtin_operator(snapshot, &o) && o.result_type_oid == oid::BOOL
+                });
+        let types: Vec<&ExprType> = items.iter().map(|(_, t, _)| t).collect();
+        let collation = derive_collation(
+            std::iter::once(&left).chain(types.iter().copied()),
+            oid::TEXT,
+            snapshot,
+        )
+        .ok()
+        .map(|d| d.collation);
+        crate::condition::note_in_list(expr, op == "<>", &left, &types, collation, builtin, ctx);
+    }
     Ok(Some(ExprType::scalar(oid::BOOL, nullable)))
 }
 
@@ -683,7 +710,7 @@ fn infer_synthetic_op_resolved(
         rexpr_list_end: -1,
         location,
     };
-    let t = infer_a_expr(&e, ctx, params)?;
+    let t = crate::condition::synthetic(|| infer_a_expr(&e, ctx, params))?;
     Ok((t, ctx.cook_log.and_then(|log| log.take_operator(&e))))
 }
 
@@ -711,7 +738,7 @@ fn infer_plain_op(
         rexpr_list_end: -1,
         location,
     };
-    infer_generic_binary_op(&e, op, ctx, params)
+    crate::condition::synthetic(|| infer_generic_binary_op(&e, op, ctx, params))
 }
 
 /// A `NULL::T` node standing for "some value of type T" (the folded array
@@ -1356,6 +1383,21 @@ fn infer_generic_binary_op(
             if ctx.strict_log.is_some() {
                 note_std_compare(expr.location, op_name, &op, &left, &right, ctx);
             }
+            if let (Some(l), Some(r)) = (left.as_ref(), right.as_ref()) {
+                let collation = derive_collation([l, r], oid::TEXT, snapshot)
+                    .ok()
+                    .map(|d| d.collation);
+                crate::condition::note_comparison(
+                    expr,
+                    op_name,
+                    is_builtin_operator(snapshot, &op) && op.result_type_oid == oid::BOOL,
+                    (op.left_type_oid, op.right_type_oid),
+                    l,
+                    r,
+                    collation,
+                    ctx,
+                );
+            }
             // The operands as the operator's function receives them, coerced
             // to its declared types: a cast function may map one (or an
             // array's element) to NULL.
@@ -1374,8 +1416,31 @@ fn infer_generic_binary_op(
                 .collect();
             if let (Some(actual), Some(declared)) = (left_oid_resolved, op.left_type_oid) {
                 ctx.note_coercion(actual, declared);
+                crate::type_facts::note_conversion(
+                    expr.lexpr.as_ref(),
+                    actual,
+                    declared,
+                    false,
+                    snapshot,
+                );
             }
             ctx.note_coercion(right_oid_resolved, op.right_type_oid);
+            crate::type_facts::note_conversion(
+                expr.rexpr.as_ref(),
+                right_oid_resolved,
+                op.right_type_oid,
+                false,
+                snapshot,
+            );
+            crate::type_facts::note_operator(
+                expr.location,
+                crate::type_facts::OperatorTypes {
+                    left: left_oid_resolved,
+                    right: right_oid_resolved,
+                    result: op.result_type_oid,
+                },
+                snapshot,
+            );
             // Pass 2: back-fill still-UNKNOWN sides with the operator's
             // *declared* argument types — the coercion PG performs (this is
             // what pins `$1` in `prefs -> $1` to text, and validates literal

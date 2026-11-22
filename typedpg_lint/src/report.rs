@@ -99,11 +99,11 @@ pub struct Report {
     /// How many migration files were applied.
     pub migrations: usize,
     /// How many of [`Self::migrations`] had their statement rules skipped
-    /// because they are unchanged from [`Self::migrations_unchanged_from`].
+    /// because they are unchanged from [`Self::previous_deployment`].
     /// Their schema rules still run.
     pub migrations_unchanged: usize,
-    /// The git ref `--ignore-migrations-from` named, when it was given.
-    pub migrations_unchanged_from: Option<String>,
+    /// The git ref `--previous-deployment` named, when it was given.
+    pub previous_deployment: Option<String>,
     /// The text of each file the human renderer shows a finding in, keyed
     /// by the path the entry shows.
     pub sources: BTreeMap<String, String>,
@@ -211,7 +211,7 @@ impl Report {
             plural(self.queries, "query", "queries"),
             plural(self.migrations, "migration", "migrations"),
         ));
-        if let Some(reference) = &self.migrations_unchanged_from {
+        if let Some(reference) = &self.previous_deployment {
             out.push_str(&format!(
                 " ({} unchanged from {reference}: statement rules skipped)",
                 self.migrations_unchanged
@@ -1408,7 +1408,7 @@ mod tests {
             queries: 8,
             migrations: 310,
             migrations_unchanged: 300,
-            migrations_unchanged_from: Some("origin/main".to_owned()),
+            previous_deployment: Some("origin/main".to_owned()),
             elapsed: Duration::from_millis(2200),
             ..Report::default()
         };

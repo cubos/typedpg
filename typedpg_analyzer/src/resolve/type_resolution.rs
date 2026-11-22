@@ -38,8 +38,8 @@ pub(crate) fn build_column(
         name,
         pg_type,
         nullable,
-        refinement: enumerated(rc.refine),
-        elem_refinement: enumerated(rc.elem_refine),
+        refinement: enumerated(rc.refine).normalized(rc.type_oid, snapshot),
+        elem_refinement: elems_normalized(enumerated(rc.elem_refine), rc.type_oid, snapshot),
     })
 }
 
@@ -48,6 +48,19 @@ fn enumerated(refine: crate::refine::Refinement) -> crate::refine::Refinement {
     crate::refine::Refinement {
         values: refine.enumerated(),
         ..refine
+    }
+}
+
+/// `refine`, of the elements of an array of type `t`, without what every
+/// element is ([`crate::refine::Refinement::normalized`]).
+fn elems_normalized(
+    refine: crate::refine::Refinement,
+    t: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> crate::refine::Refinement {
+    match crate::expr::array_element_type(snapshot, t) {
+        Some(elem) => refine.normalized(elem, snapshot),
+        None => refine,
     }
 }
 
@@ -77,8 +90,12 @@ fn resolve_type_with_shape(
                     snapshot,
                 )?,
                 nullable: f.ty.nullable,
-                refinement: enumerated(f.ty.refine.clone()),
-                elem_refinement: enumerated(f.ty.elem_refine.clone()),
+                refinement: enumerated(f.ty.refine.clone()).normalized(f.ty.type_oid, snapshot),
+                elem_refinement: elems_normalized(
+                    enumerated(f.ty.elem_refine.clone()),
+                    f.ty.type_oid,
+                    snapshot,
+                ),
             });
         }
         return Ok(Type::AnonymousRecord { fields: out });

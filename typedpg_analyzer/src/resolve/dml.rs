@@ -2247,6 +2247,15 @@ fn analyze_insert_select(
             }
             continue;
         }
+        if let Some(ast::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.as_ref()) {
+            crate::type_facts::note_conversion(
+                rt.val.as_ref(),
+                sel_col.type_oid,
+                target_oid,
+                false,
+                snapshot,
+            );
+        }
         // The SELECT's outputs reach the INSERT as Vars of its subquery:
         // a `record` one is no row coerce_record_to_complex can take apart
         // (not a ROW(...) nor a whole-row reference), whatever it holds.
@@ -2964,10 +2973,16 @@ fn analyze_update_here(
         let log = crate::nonnull::StrictLog::default();
         // `estimate_expression_value` reduces a pseudoconstant side of a
         // restriction while estimating it.
+        let where_null_ctx = with_target_checks(&null_ctx, &scope, alias, table_oid, snapshot);
         expr::plan_fold::with_estimated_qual(where_clause.as_ref(), &scope, snapshot, || {
             crate::clause::coerce_clause_expr(
                 where_clause.as_ref(),
-                expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+                expr::Ctx::new(
+                    &scope,
+                    where_null_ctx.as_ref().unwrap_or(&null_ctx),
+                    snapshot,
+                )
+                .logging_strictness(&log),
                 params,
                 crate::clause::ClauseKind::Where,
             )
@@ -3225,10 +3240,16 @@ fn analyze_delete_here(
     let mut old_facts: Option<crate::nonnull::Facts> = None;
     if let where_clause @ Some(_) = &del.where_clause {
         let log = crate::nonnull::StrictLog::default();
+        let where_null_ctx = with_target_checks(&null_ctx, &scope, alias, table_oid, snapshot);
         expr::plan_fold::with_estimated_qual(where_clause.as_ref(), &scope, snapshot, || {
             crate::clause::coerce_clause_expr(
                 where_clause.as_ref(),
-                expr::Ctx::new(&scope, &null_ctx, snapshot).logging_strictness(&log),
+                expr::Ctx::new(
+                    &scope,
+                    where_null_ctx.as_ref().unwrap_or(&null_ctx),
+                    snapshot,
+                )
+                .logging_strictness(&log),
                 params,
                 crate::clause::ClauseKind::Where,
             )
@@ -3582,4 +3603,134 @@ fn check_current_of_on_view(
         .finalize_implicit());
     }
     Ok(())
+}
+
+/// For the lint: the error storing the constant `value` into column
+/// `column` of relation `relid` by an INSERT (`update` false) or an UPDATE
+/// raises for every row written — a domain CHECK of the column's type or a
+/// CHECK constraint of the relation (`NOT VALID` ones included: they bind
+/// new rows) is FALSE for it whatever the row's other columns are — and
+/// the name of that constraint when it is the relation's. `None` when no
+/// such error is certain: the relation is no plain or partitioned table, a
+/// rule or a BEFORE ROW trigger may change the row, the column has a type
+/// modifier that may change the value, or the value isn't a constant
+/// stored as written.
+pub(crate) fn assignment_violation(
+    snapshot: &PgCatalog,
+    relid: crate::oid::PgClassOid,
+    column: &str,
+    value: &ast::Node,
+    update: bool,
+) -> Option<(String, Option<String>)> {
+    use crate::nonnull::checks::{Knowledge, RelationChecks};
+    let class = snapshot.pg_class.get(&relid)?;
+    if !matches!(
+        class.relkind,
+        crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+    ) {
+        return None;
+    }
+    let event = if update {
+        DmlEvent::Update
+    } else {
+        DmlEvent::Insert
+    };
+    if returning_rewritten(snapshot, relid, &[event])
+        || super::written_row::before_row_trigger_rewrites(snapshot, relid, event)
+    {
+        return None;
+    }
+    let attr = snapshot
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attname == column && a.attnum > 0)?;
+    let literal = crate::nonnull::literal_for(Some(value), attr.atttypid, snapshot)?;
+    if let Some(typmod) = snapshot.effective_typmod(attr.atttypid, attr.atttypmod) {
+        // `varchar(n)` stores a string of at most n characters as is.
+        let fits = snapshot.unwrap_domain(attr.atttypid) == oid::VARCHAR
+            && literal.kind == crate::nonnull::LitKind::String
+            && i64::try_from(literal.text.chars().count())
+                .is_ok_and(|n| n <= i64::from(typmod) - 4);
+        if !fits {
+            return None;
+        }
+    }
+    if let Some(message) = snapshot.domain_value_violation_at_execution(attr.atttypid, &literal) {
+        return Some((message, None));
+    }
+    let has_children = snapshot.pg_inherits.iter().any(|i| i.inhparent == relid);
+    let is_column = |c: &str| c == column;
+    let not_null = |_: &str| false;
+    let equals = |c: &str| is_column(c).then(|| literal.clone());
+    let no_preds = |_: &str| Vec::new();
+    let k = Knowledge {
+        non_null: &is_column,
+        null: &not_null,
+        equals: &equals,
+        preds: &no_preds,
+    };
+    let mut constraints: Vec<&crate::pg_catalog::PgConstraint> = snapshot
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == relid && c.contype == crate::pg_catalog::ConType::Check && c.conenforced
+        })
+        .collect();
+    constraints.sort_by(|a, b| a.conname.cmp(&b.conname));
+    for con in constraints {
+        let Some(def) = snapshot.check_defs.get(&con.oid) else {
+            continue;
+        };
+        // An UPDATE of a parent also updates its children's rows, which a
+        // NO INHERIT constraint doesn't bind.
+        if def.no_inherit && has_children && update {
+            continue;
+        }
+        let (crate::ddl::tables::check_inherit::StoredExpr::Written(expr), Some(trust)) =
+            (&def.expr, &def.trusted)
+        else {
+            continue;
+        };
+        if RelationChecks::surely_false(snapshot, relid, (**expr).as_ref(), trust, &k) {
+            return Some((
+                crate::pgmsg::check_constraint_violation(&class.relname, &con.conname).to_string(),
+                Some(con.conname.clone()),
+            ));
+        }
+    }
+    None
+}
+
+/// For the lint (while [`crate::PgCatalog::query_view`] collects its
+/// facts): `null_ctx` with the CHECK constraints of the UPDATE / DELETE
+/// target `table_oid` (entry `alias`) registered, which every row the
+/// WHERE reads satisfies — what the condition facts judge the WHERE with.
+/// `None` otherwise, or when the target has none (or isn't a table).
+fn with_target_checks(
+    null_ctx: &NullabilityContext,
+    scope: &Scope,
+    alias: &str,
+    table_oid: crate::oid::PgClassOid,
+    snapshot: &PgCatalog,
+) -> Option<NullabilityContext> {
+    if !crate::pg_catalog::collecting_column_ref_bindings() {
+        return None;
+    }
+    let class = snapshot.pg_class.get(&table_oid)?;
+    if !matches!(
+        class.relkind,
+        crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+    ) {
+        return None;
+    }
+    let checks = crate::nonnull::checks::RelationChecks::of(snapshot, table_oid)?;
+    let src = scope.sources.iter().find(|s| s.alias == alias)?;
+    let base: HashMap<String, bool> = src
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.base_not_null))
+        .collect();
+    let mut narrowed = null_ctx.clone();
+    narrowed.register_checks(alias, checks, base);
+    Some(narrowed)
 }

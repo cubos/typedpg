@@ -52,11 +52,13 @@ enum Command {
         /// How to print the report: `human`, `json` or `sarif`.
         #[arg(long, default_value = "human")]
         format: Format,
-        /// A git ref (e.g. `origin/main`): migrations identical to it skip
-        /// the statement rules; the schema rules still report on the
-        /// statements that created their objects.
-        #[arg(long)]
-        ignore_migrations_from: Option<String>,
+        /// The git ref of the code and migrations deployed now (e.g.
+        /// `origin/main`): migrations identical to it skip the statement
+        /// rules (the schema rules still report on the statements that
+        /// created their objects), and `breaks_deployed_queries` checks the
+        /// queries of its code against the new migrations.
+        #[arg(long, alias = "ignore-migrations-from")]
+        previous_deployment: Option<String>,
         /// Apply the findings' SQL fixes to the sources and `.sql` files,
         /// then lint again.
         #[arg(long)]
@@ -106,9 +108,9 @@ fn main() -> ExitCode {
         Command::Lint {
             config,
             format,
-            ignore_migrations_from,
+            previous_deployment,
             fix,
-        } => lint(&config, format, ignore_migrations_from.as_deref(), fix),
+        } => lint(&config, format, previous_deployment.as_deref(), fix),
         Command::Build { config, json } => build(&config, json),
         Command::Serve { idle_timeout } => typedpg_ts::serve::run(idle_timeout).map(|()| true),
         Command::Migrate {
@@ -173,20 +175,22 @@ fn relative(path: &Path, root: &Path) -> String {
 /// Lint every query; whether no analysis failed and no finding reaches
 /// `fail_on`.
 ///
-/// With `ignore_migrations_from`, migration files identical to that git ref
+/// With `previous_deployment`, migration files identical to that git ref
 /// have their statement rules skipped; the schema rules still report on the
-/// statements that created the schema's objects.
+/// statements that created the schema's objects. The queries of the code at
+/// that ref are checked against the new migrations
+/// (`breaks_deployed_queries`).
 ///
 /// With `fix`, the findings that have edits are applied to their files, and
 /// the report is built again from the fixed text so its positions match.
 fn lint(
     config: &Path,
     format: Format,
-    ignore_migrations_from: Option<&str>,
+    previous_deployment: Option<&str>,
     fix: bool,
 ) -> Result<bool, String> {
     let start = Instant::now();
-    let (report, options, pending, root) = build_lint(config, ignore_migrations_from, start)?;
+    let (report, options, pending, root) = build_lint(config, previous_deployment, start)?;
     if !fix || pending.is_empty() {
         return Ok(finish(&report, &options, format));
     }
@@ -204,7 +208,7 @@ fn lint(
     );
     // The findings' positions were in the text before the fixes; build the
     // report from the files as they are now.
-    let (mut report, options, _, _) = build_lint(config, ignore_migrations_from, start)?;
+    let (mut report, options, _, _) = build_lint(config, previous_deployment, start)?;
     report.failures.extend(outcome.failures);
     report.load_failure_sources(&root);
     report.sort();
@@ -214,11 +218,11 @@ fn lint(
 /// Lint the project, returning the report, the options it was built with,
 /// the fixes its findings could apply, and the project root.
 fn build_lint(
-    config: &Path,
-    ignore_migrations_from: Option<&str>,
+    config_path: &Path,
+    previous_deployment: Option<&str>,
     start: Instant,
 ) -> Result<(Report, LintOptions, Vec<PendingFix>, PathBuf), String> {
-    let config = Config::load(config)?;
+    let config = Config::load(config_path)?;
     let options = LintOptions::from_config(&config.lint);
     let ignore = IgnoreSet::new(&config.lint.ignore)?;
     let mut project = Project::for_lint(config)?;
@@ -229,7 +233,7 @@ fn build_lint(
     // generated modules only need `typedpg gen`.
     let sync = project.sync(true);
     let mut report = Report {
-        migrations_unchanged_from: ignore_migrations_from.map(str::to_owned),
+        previous_deployment: previous_deployment.map(str::to_owned),
         ..Report::default()
     };
     for diagnostic in &sync.diagnostics {
@@ -247,7 +251,12 @@ fn build_lint(
     let mut cache: HashMap<(usize, String, Vec<typedpg_lint::Call>, bool), LintResult> =
         HashMap::new();
     let mut migration_paths = HashSet::new();
+    // Per database: its migrations as linted, and the first one the
+    // previous deployment doesn't have as is.
+    let mut new_migrations: Vec<Option<(Vec<typedpg_lint::MigrationFile>, Option<usize>)>> =
+        Vec::new();
     for db in 0..project.database_count() {
+        new_migrations.push(None);
         let files = match project.lint_migration_files(db) {
             Ok(files) => files,
             Err(_) => continue,
@@ -261,7 +270,8 @@ fn build_lint(
                 lint: file.lint,
             })
             .collect();
-        if let Some(reference) = ignore_migrations_from {
+        let mut first_new = None;
+        if let Some(reference) = previous_deployment {
             let candidates: Vec<PathBuf> = files
                 .iter()
                 .filter(|file| file.lint == MigrationLint::All)
@@ -269,10 +279,15 @@ fn build_lint(
                 .collect();
             if !candidates.is_empty() {
                 let unchanged = typedpg_cli::unchanged_from_ref(reference, &candidates)?;
-                for (file, lint_file) in files.iter().zip(&mut lint_files) {
-                    if lint_file.lint == MigrationLint::All && unchanged.contains(&file.path) {
+                for (index, (file, lint_file)) in files.iter().zip(&mut lint_files).enumerate() {
+                    if lint_file.lint != MigrationLint::All {
+                        continue;
+                    }
+                    if unchanged.contains(&file.path) {
                         lint_file.lint = MigrationLint::SchemaOnly;
                         report.migrations_unchanged += 1;
+                    } else if first_new.is_none() {
+                        first_new = Some(index);
                     }
                 }
             }
@@ -302,6 +317,82 @@ fn build_lint(
                     finding: migration.finding,
                 });
             }
+        }
+        new_migrations[db] = Some((lint_files, first_new));
+    }
+    if let Some(reference) = previous_deployment
+        && options.level(Rule::BreaksDeployedQueries).is_some()
+    {
+        match deployed_project(reference, config_path) {
+            Ok(Some((_snapshot, deployed))) => {
+                let deployed_root = deployed.config.root.clone();
+                let mut queries: Vec<Vec<typedpg_lint::DeployedQuery>> =
+                    vec![Vec::new(); deployed.database_count()];
+                for query in deployed.lint_queries() {
+                    let location = format!(
+                        "{}:{}",
+                        relative(query.file, &deployed_root),
+                        query.pos.line
+                    );
+                    let queries = &mut queries[query.db];
+                    match queries.iter_mut().find(|q| q.sql == query.text) {
+                        Some(q) => q.locations.push(location),
+                        None => queries.push(typedpg_lint::DeployedQuery {
+                            sql: query.text,
+                            locations: vec![location],
+                        }),
+                    }
+                }
+                for (db, migrations) in new_migrations.iter().enumerate() {
+                    let Some((files, Some(first_new))) = migrations else {
+                        continue;
+                    };
+                    let name = &project.config.databases[db].name;
+                    let Some(old) = deployed
+                        .config
+                        .databases
+                        .iter()
+                        .position(|database| database.name == *name)
+                    else {
+                        continue;
+                    };
+                    let (Ok(catalog), Ok(old_catalog)) =
+                        (project.catalog(db), deployed.catalog(old))
+                    else {
+                        continue;
+                    };
+                    let findings = typedpg_lint::breaks_deployed_queries(
+                        &typedpg_lint::Deployment {
+                            reference,
+                            catalog: old_catalog,
+                            queries: &queries[old],
+                        },
+                        &typedpg_lint::NewSchema {
+                            files,
+                            first_new: *first_new,
+                            use_transaction: project.migrations_use_transaction(db),
+                            catalog,
+                            prepare: &|catalog| project.prepare_catalog(db, catalog),
+                        },
+                        &options,
+                    );
+                    for migration in findings {
+                        let file = &files[migration.file];
+                        report.entries.push(Entry {
+                            path: file.path.clone(),
+                            start: position(&file.sql, migration.finding.span.start),
+                            end: position(&file.sql, migration.finding.span.end),
+                            finding: migration.finding,
+                        });
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(message) => report.failures.push(Failure {
+                path: relative(config_path, &root),
+                start: None,
+                message,
+            }),
         }
     }
     let queries = project.lint_queries();
@@ -392,6 +483,28 @@ fn build_lint(
     report.sort();
     report.elapsed = start.elapsed();
     Ok((report, options, pending, root))
+}
+
+/// The project as git ref `reference` has it, read from a checkout of the
+/// ref exactly as the project itself is read: the previous deployment, whose
+/// queries `breaks_deployed_queries` checks. The checkout lives as long as
+/// the snapshot. `None` when the ref has no typedpg configuration there.
+fn deployed_project(
+    reference: &str,
+    config: &Path,
+) -> Result<Option<(typedpg_cli::Snapshot, Project)>, String> {
+    let snapshot = typedpg_cli::Snapshot::new(reference, config)?;
+    let deployed = snapshot.path(config)?;
+    if !deployed.is_file() {
+        return Ok(None);
+    }
+    let Ok(config) = Config::load(&deployed) else {
+        return Ok(None);
+    };
+    let Ok(project) = Project::for_deployed(config) else {
+        return Ok(None);
+    };
+    Ok(Some((snapshot, project)))
 }
 
 fn finish(report: &Report, options: &LintOptions, format: Format) -> bool {

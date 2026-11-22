@@ -24,7 +24,9 @@
 //! `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`,
 //! `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`,
 //! `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`,
-//! `simplifiableCase`, `likeUnescapedParam` and the call-site rules `fetchMayReturnMany`,
+//! `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMayReturnMany`,
+//! `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`,
+//! `unstableOrder` and the call-site rules `fetchMayReturnMany`,
 //! `fetchAllSingleRow` and `unusedReturning`; the migration rules
 //! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
 //! `tableRewrite`, `missingLockTimeout`, `dropIndexBlocking`,
@@ -33,7 +35,9 @@
 //! `redundantIndex`, `fkTypeMismatch`, `missingPrimaryKey`,
 //! `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`,
 //! `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk` and
-//! `preferJsonb`. `likeUnescapedParam`
+//! `preferJsonb`; and `breaksDeployedQueries`, which runs with
+//! `--previous-deployment <ref>` only, and reports on a new migration the
+//! queries of the code at that ref it breaks. `likeUnescapedParam`
 //! and the `prefer*` rules are off by default; set them to a level to enable
 //! them. The call-site rules check how a query is called (`fetchOne`,
 //! `fetchValue`, `fetchOptional`, `fetchAll`, `execute`) against what the
