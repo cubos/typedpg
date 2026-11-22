@@ -15,6 +15,7 @@ mod cartesian_join;
 mod case_without_else;
 mod constant_condition;
 mod insert_without_columns;
+mod integer_division;
 mod like_unescaped_param;
 mod limit_without_order;
 mod outer_reference_in_subquery;
@@ -24,8 +25,10 @@ mod redundant_distinct;
 mod redundant_join;
 mod redundant_limit;
 mod redundant_null_check;
+mod scalar_subquery_may_return_many;
 mod self_assignment;
 mod simplifiable_case;
+mod timestamp_timezone_mix;
 mod unreachable_case_branch;
 mod unused_cte;
 
@@ -57,6 +60,9 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::SimplifiableCase => simplifiable_case::findings(ctx),
         Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
         Rule::RedundantJoin => redundant_join::findings(ctx),
+        Rule::ScalarSubqueryMayReturnMany => scalar_subquery_may_return_many::findings(ctx),
+        Rule::TimestampTimezoneMix => timestamp_timezone_mix::findings(ctx),
+        Rule::IntegerDivision => integer_division::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
@@ -396,6 +402,72 @@ pub(super) fn leftmost_start(node: &Node) -> Option<usize> {
             .or_else(|| location(test.location)),
         _ => node_start(node),
     }
+}
+
+/// The bytes `node` covers: from the first to the last token its subtree
+/// has a location for, widened so the parentheses, brackets and `CASE …
+/// END` opened or closed in between are balanced (`f(x)` ends at its `)`,
+/// the `(a + b) * 2` of a product starts at its `(`). A trailing keyword no
+/// node locates (`IS NULL`'s `NULL`) is not included.
+pub(super) fn node_span(ctx: &Ctx<'_>, node: NodeRef<'_>) -> Option<std::ops::Range<usize>> {
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    let mut stack = vec![node];
+    while let Some(inner) = stack.pop() {
+        if let Some(at) = inner.location().and_then(|at| usize::try_from(at).ok()) {
+            first = Some(first.map_or(at, |first| first.min(at)));
+            last = Some(last.map_or(at, |last| last.max(at)));
+        }
+        stack.extend(inner.children());
+    }
+    let (first, last) = (first?, last?);
+    let opens = |text: &str| text == "(" || text == "[" || text.eq_ignore_ascii_case("CASE");
+    let closes = |text: &str| text == ")" || text == "]" || text.eq_ignore_ascii_case("END");
+    let start_index = ctx.tokens.iter().position(|token| token.start >= first)?;
+    let mut depth = 0isize;
+    let mut lowest = 0isize;
+    let mut end = first;
+    let mut index = start_index;
+    while let Some(token) = ctx.tokens.get(index) {
+        let text = &ctx.sql[token.start..token.end];
+        if token.start > last && depth <= lowest {
+            // A name no node locates past the last one: the rest of a
+            // qualified function name, a call's parenthesized arguments
+            // (`count(*)`'s star has no location).
+            if text == "." && index + 1 < ctx.tokens.len() {
+                end = ctx.tokens[index + 1].end;
+                index += 2;
+                continue;
+            }
+            if text != "(" {
+                break;
+            }
+        }
+        if opens(text) {
+            depth += 1;
+        } else if closes(text) {
+            depth -= 1;
+            lowest = lowest.min(depth);
+        }
+        end = token.end;
+        index += 1;
+    }
+    // Parentheses closed after `first` that opened before it.
+    let mut start = first;
+    let mut missing = -lowest;
+    let mut index = start_index;
+    while missing > 0 && index > 0 {
+        index -= 1;
+        let token = ctx.tokens[index];
+        let text = &ctx.sql[token.start..token.end];
+        if closes(text) {
+            missing += 1;
+        } else if opens(text) {
+            missing -= 1;
+        }
+        start = token.start;
+    }
+    Some(start..end.max(start))
 }
 
 /// Scan the tokens starting at byte `from`, keeping track of parentheses,

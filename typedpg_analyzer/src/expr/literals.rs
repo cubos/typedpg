@@ -509,6 +509,7 @@ pub(crate) fn infer_type_cast(
     // the `redundant_cast` lint rule reads it. A parameter's cast types the
     // parameter, and an untyped operand has no type of its own.
     let typmod_of = |t: Option<i32>| t.filter(|t| *t >= 0);
+    crate::type_facts::note_conversion(inner, inner_type.type_oid, target_oid, true, snapshot);
     crate::pg_catalog::note_cast_redundant(
         cast.location,
         inner_type.type_oid == target_oid

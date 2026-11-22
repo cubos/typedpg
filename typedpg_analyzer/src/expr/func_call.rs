@@ -392,6 +392,15 @@ pub(crate) fn infer_func_call(
     for (&actual, &declared) in args.types.iter().zip(&resolved.arg_types) {
         ctx.note_coercion(actual, declared);
     }
+    // The direct arguments as written, each converted to its parameter's
+    // type (a column-notation call's argument is no node of `func.args`).
+    if args.direct_count == func.args.len() {
+        for ((arg, &actual), &declared) in
+            func.args.iter().zip(&args.types).zip(&resolved.arg_types)
+        {
+            crate::type_facts::note_conversion(arg.as_ref(), actual, declared, false, snapshot);
+        }
+    }
 
     if func.over.is_some() {
         check_no_nested_windows(func, snapshot)?;

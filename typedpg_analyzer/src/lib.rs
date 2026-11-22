@@ -83,6 +83,7 @@ mod stack;
 mod suggest;
 mod template;
 mod tsearch_input;
+mod type_facts;
 mod types;
 mod typmod;
 mod xml_input;
@@ -132,5 +133,6 @@ pub use sql_text::strip_trailing_junk;
 /// macros' own errors (an unknown `sql!` argument name).
 pub use suggest::suggest_similar;
 pub use template::{TemplateParam, template_params};
+pub use type_facts::{OperatorTypes, ValueConversion};
 pub use typedpg_core::{ParseQualifiedNameError, QualifiedName};
 pub use types::{RecordField, Type};

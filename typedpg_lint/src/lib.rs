@@ -136,6 +136,14 @@ pub enum Rule {
     LikeUnescapedParam,
     /// A join that can't change the rows and whose table nothing reads.
     RedundantJoin,
+    /// A scalar subquery used as a value that may return more than one row.
+    ScalarSubqueryMayReturnMany,
+    /// An implicit conversion between `timestamp` (or `date`) and
+    /// `timestamptz`, whose result depends on the session's `TimeZone`.
+    TimestampTimezoneMix,
+    /// An integer division whose truncated result is then used as a
+    /// non-integer value.
+    IntegerDivision,
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
@@ -191,7 +199,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 48] = [
+    pub const ALL: [Rule; 51] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -220,6 +228,9 @@ impl Rule {
         Rule::SimplifiableCase,
         Rule::LikeUnescapedParam,
         Rule::RedundantJoin,
+        Rule::ScalarSubqueryMayReturnMany,
+        Rule::TimestampTimezoneMix,
+        Rule::IntegerDivision,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
         Rule::DropIndexBlocking,
@@ -274,6 +285,9 @@ impl Rule {
             Rule::SimplifiableCase => "simplifiable_case",
             Rule::LikeUnescapedParam => "like_unescaped_param",
             Rule::RedundantJoin => "redundant_join",
+            Rule::ScalarSubqueryMayReturnMany => "scalar_subquery_may_return_many",
+            Rule::TimestampTimezoneMix => "timestamp_timezone_mix",
+            Rule::IntegerDivision => "integer_division",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
@@ -351,6 +365,15 @@ impl Rule {
             }
             Rule::RedundantJoin => {
                 "a join that can't change the rows and whose table nothing else reads"
+            }
+            Rule::ScalarSubqueryMayReturnMany => {
+                "a scalar subquery used as a value that may return more than one row"
+            }
+            Rule::TimestampTimezoneMix => {
+                "an implicit timestamp/timestamptz conversion that depends on the session's TimeZone"
+            }
+            Rule::IntegerDivision => {
+                "an integer division whose truncated result is used as a non-integer value"
             }
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
@@ -439,7 +462,10 @@ impl Rule {
             | Rule::InsertWithoutColumns
             | Rule::SelfAssignment
             | Rule::UnusedCte
-            | Rule::BreaksDeployedQueries => Some(Severity::Warning),
+            | Rule::BreaksDeployedQueries
+            | Rule::ScalarSubqueryMayReturnMany
+            | Rule::TimestampTimezoneMix
+            | Rule::IntegerDivision => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit

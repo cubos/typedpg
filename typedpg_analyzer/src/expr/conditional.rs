@@ -249,7 +249,7 @@ pub(crate) fn infer_coalesce(
     let nodes: Vec<Option<&ast::Node>> = expr.args.iter().map(Option::as_ref).collect();
     let type_oid = select_common_type("COALESCE", &types, &nodes, snapshot)?;
     // Each argument is coerced to the common type, which may map it to NULL.
-    let kept = coerce_branches(&mut args, type_oid, snapshot);
+    let kept = coerce_branches(&mut args, &nodes, type_oid, snapshot);
     // NULL only when every argument is — not when the quals or CHECK
     // constraints say one of its (uncoerced) columns isn't.
     let all_nullable = args.iter().all(|t| t.nullable)
@@ -341,9 +341,15 @@ pub(crate) fn infer_coalesce(
 /// is kept as it is — no cast function can map it to NULL.
 pub(crate) fn coerce_branches(
     branches: &mut [ExprType],
+    nodes: &[Option<&ast::Node>],
     common: PgTypeOid,
     snapshot: &PgCatalog,
 ) -> Vec<bool> {
+    if nodes.len() == branches.len() {
+        for (node, t) in nodes.iter().zip(branches.iter()) {
+            crate::type_facts::note_conversion(*node, t.type_oid, common, false, snapshot);
+        }
+    }
     branches
         .iter_mut()
         .map(|t| {
@@ -806,7 +812,7 @@ pub(crate) fn infer_case(
         }
     }
     // Each result is coerced to the common type, which may map it to NULL.
-    coerce_branches(&mut inputs, type_oid, snapshot);
+    coerce_branches(&mut inputs, &nodes, type_oid, snapshot);
 
     // Which inputs can be the result: the ELSE (input 0) unless no row
     // reaches it, each THEN unless its WHEN is refuted. The others still

@@ -1689,12 +1689,14 @@ impl PgCatalog {
             collecting_null_check_facts(|| {
                 collecting_sublink_nullability(|| {
                     collecting_lint_facts(|| {
-                        crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                        crate::type_facts::collecting(|| {
+                            crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                        })
                     })
                 })
             })
         });
-        let ((analysis, result), lint_facts) = analysis;
+        let (((analysis, result), type_facts), lint_facts) = analysis;
         let analyzed = result.map_err(LocatedError::new)?;
         let tree = analysis.tree.map(|tree| tree.tree).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
@@ -1714,6 +1716,7 @@ impl PgCatalog {
             case_else_reachable,
             column_ref_bindings: lint_facts.column_ref_bindings,
             case_condition_not_null: lint_facts.case_condition_not_null,
+            type_facts,
         })
     }
 
@@ -3178,6 +3181,8 @@ pub struct QueryView {
     /// Whether each searched `CASE`'s `WHEN` condition is a plain boolean
     /// that is never NULL, by the `WHEN`'s location in [`Self::sql`].
     case_condition_not_null: HashMap<i32, bool>,
+    /// The conversions of the expressions' values and the operators' types.
+    type_facts: crate::type_facts::TypeFacts,
 }
 
 impl QueryView {
@@ -3229,6 +3234,28 @@ impl QueryView {
     /// column, a SQL function parameter).
     pub fn column_ref_binding(&self, location: i32) -> Option<&ColumnRefBinding> {
         self.column_ref_bindings.get(&location)
+    }
+
+    /// How the value of `node` — a node of [`Self::tree`] — is converted to
+    /// the type its context takes: an operator's or function's declared
+    /// argument type, the common type of a `CASE`, `COALESCE`, `GREATEST` /
+    /// `LEAST` or a `UNION` column, an `INSERT` / `UPDATE` column's type, or
+    /// a written cast. `None` when it is not converted (an untyped literal
+    /// or parameter typed by its context included), when the analyzer saw
+    /// no such site, or when it inferred the site two ways.
+    pub fn value_conversion(
+        &self,
+        node: typedpg_pg_query::NodeRef<'_>,
+    ) -> Option<crate::ValueConversion> {
+        self.type_facts.conversion(node)
+    }
+
+    /// The operand and result types of the operator call (`A_Expr`) at
+    /// `location` (a byte offset in [`Self::sql`]: the operator's own
+    /// location). `None` when no operator was resolved there, or when the
+    /// site was inferred with different types.
+    pub fn operator_types(&self, location: i32) -> Option<crate::OperatorTypes> {
+        self.type_facts.operator(location)
     }
 
     /// Whether the `WHEN` condition of a searched `CASE`, at `location` (a

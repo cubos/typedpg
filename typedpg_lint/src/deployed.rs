@@ -473,6 +473,13 @@ fn output(old: &AnalyzedColumn, new: &AnalyzedColumn, out: &mut Vec<Change>) {
             text: format!("result column \"{name}\" {text}"),
         });
     }
+    record_fields(
+        &old.pg_type,
+        &new.pg_type,
+        &format!("result column \"{name}\""),
+        &subject,
+        out,
+    );
     if let (Some(old_element), Some(new_element)) =
         (array_element(&old.pg_type), array_element(&new.pg_type))
     {
@@ -488,6 +495,48 @@ fn output(old: &AnalyzedColumn, new: &AnalyzedColumn, out: &mut Vec<Change>) {
                 text: format!("the elements of result column \"{name}\" {text}"),
             });
         }
+    }
+}
+
+/// What changes in the fields of a record the deployed code reads (`of`:
+/// the value they are fields of, as the message names it): a field that
+/// may now be NULL, or may now be a value the deployed code does not know.
+/// The types match ([`shape`]); nested records are followed.
+fn record_fields(
+    old: &Type,
+    new: &Type,
+    of: &str,
+    subject: &dyn Fn(&str) -> String,
+    out: &mut Vec<Change>,
+) {
+    let fields = |ty: &Type| match ty {
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => Some(fields.clone()),
+        _ => None,
+    };
+    let (Some(old_fields), Some(new_fields)) = (fields(old), fields(new)) else {
+        return;
+    };
+    for (a, b) in old_fields.iter().zip(&new_fields) {
+        let field = format!("field \"{}\" of {of}", a.name);
+        if !a.nullable && b.nullable {
+            out.push(Change {
+                subject: subject(&format!("{field} null")),
+                text: format!("{field} may now be NULL"),
+            });
+        }
+        if let Some(text) = widened(&a.refinement, &b.refinement) {
+            out.push(Change {
+                subject: subject(&format!("{field} refinement")),
+                text: format!("{field} {text}"),
+            });
+        }
+        if let Some(text) = widened(&a.elem_refinement, &b.elem_refinement) {
+            out.push(Change {
+                subject: subject(&format!("{field} element refinement")),
+                text: format!("the elements of {field} {text}"),
+            });
+        }
+        record_fields(&a.ty, &b.ty, &field, subject, out);
     }
 }
 
@@ -708,6 +757,8 @@ fn shape_fields(fields: &[typedpg_analyzer::RecordField]) -> Vec<typedpg_analyze
             name: field.name.clone(),
             ty: shape(&field.ty),
             nullable: false,
+            refinement: Refinement::NONE,
+            elem_refinement: Refinement::NONE,
         })
         .collect()
 }
@@ -1081,6 +1132,25 @@ mod tests {
             [
                 "this migration breaks the deployed query at src/q.rs:1 (origin/main): the \
               elements of result column \"tags\" may now be NULL"
+            ]
+        );
+    }
+
+    #[test]
+    fn record_field_widenings() {
+        let findings = check(
+            &[
+                "CREATE TABLE r (kind text NOT NULL CHECK (kind IN ('a', 'b')), n integer NOT NULL);",
+            ],
+            &["ALTER TABLE r DROP CONSTRAINT r_kind_check, ALTER COLUMN n DROP NOT NULL;"],
+            &["SELECT r FROM r"],
+        );
+        assert_eq!(
+            messages(&findings),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): field \
+                 \"kind\" of result column \"r\" may now be another value than 'a', 'b'; field \
+                 \"n\" of result column \"r\" may now be NULL"
             ]
         );
     }

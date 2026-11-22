@@ -1374,8 +1374,31 @@ fn infer_generic_binary_op(
                 .collect();
             if let (Some(actual), Some(declared)) = (left_oid_resolved, op.left_type_oid) {
                 ctx.note_coercion(actual, declared);
+                crate::type_facts::note_conversion(
+                    expr.lexpr.as_ref(),
+                    actual,
+                    declared,
+                    false,
+                    snapshot,
+                );
             }
             ctx.note_coercion(right_oid_resolved, op.right_type_oid);
+            crate::type_facts::note_conversion(
+                expr.rexpr.as_ref(),
+                right_oid_resolved,
+                op.right_type_oid,
+                false,
+                snapshot,
+            );
+            crate::type_facts::note_operator(
+                expr.location,
+                crate::type_facts::OperatorTypes {
+                    left: left_oid_resolved,
+                    right: right_oid_resolved,
+                    result: op.result_type_oid,
+                },
+                snapshot,
+            );
             // Pass 2: back-fill still-UNKNOWN sides with the operator's
             // *declared* argument types — the coercion PG performs (this is
             // what pins `$1` in `prefs -> $1` to text, and validates literal

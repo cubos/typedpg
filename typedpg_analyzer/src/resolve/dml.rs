@@ -2247,6 +2247,15 @@ fn analyze_insert_select(
             }
             continue;
         }
+        if let Some(ast::Node::ResTarget(rt)) = direct_targets.get(i).and_then(|t| t.as_ref()) {
+            crate::type_facts::note_conversion(
+                rt.val.as_ref(),
+                sel_col.type_oid,
+                target_oid,
+                false,
+                snapshot,
+            );
+        }
         // The SELECT's outputs reach the INSERT as Vars of its subquery:
         // a `record` one is no row coerce_record_to_complex can take apart
         // (not a ROW(...) nor a whole-row reference), whatever it holds.
