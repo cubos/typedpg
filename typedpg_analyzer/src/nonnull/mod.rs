@@ -1394,6 +1394,15 @@ pub(crate) fn nonnullable_unless_false(
                 _ => Facts::default(),
             },
         },
+        // A comparison with constants not FALSE: what it says holds of its
+        // column unless that is NULL (`kind = 'a'` not FALSE: `kind` is
+        // NULL or `'a'`).
+        Some(ast::Node::ColumnRef(_) | ast::Node::AExpr(_)) => {
+            match value_pred(node, scope, log, snapshot) {
+                Some((col, p)) => Facts::pred(col, p),
+                None => Facts::default(),
+            }
+        }
         _ => Facts::default(),
     };
     if !is_and_or(node) {

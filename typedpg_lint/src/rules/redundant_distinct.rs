@@ -160,7 +160,13 @@ mod tests {
             "SELECT DISTINCT ON (name) id FROM users ORDER BY name",
             "SELECT DISTINCT user_id FROM posts",
         ] {
-            assert!(lint(&db, sql).is_empty(), "{sql}");
+            // (`unstable_order` reports the DISTINCT ON's ties.)
+            assert!(
+                lint(&db, sql)
+                    .iter()
+                    .all(|finding| finding.rule != Rule::RedundantDistinct),
+                "{sql}"
+            );
         }
     }
 

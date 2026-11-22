@@ -144,6 +144,15 @@ pub enum Rule {
     /// An integer division whose truncated result is then used as a
     /// non-integer value.
     IntegerDivision,
+    /// An outer join whose nullable side the `WHERE` clause rejects when
+    /// null-extended: it behaves as an inner join.
+    LeftJoinNullified,
+    /// An `INSERT` or `UPDATE` storing a constant a `CHECK` constraint
+    /// rejects: it fails for every row it writes.
+    CheckViolation,
+    /// An `ORDER BY` whose keys can tie under `LIMIT` / `OFFSET` / `DISTINCT
+    /// ON`: which of the tied rows come back is arbitrary.
+    UnstableOrder,
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
@@ -199,7 +208,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 51] = [
+    pub const ALL: [Rule; 54] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -231,6 +240,9 @@ impl Rule {
         Rule::ScalarSubqueryMayReturnMany,
         Rule::TimestampTimezoneMix,
         Rule::IntegerDivision,
+        Rule::LeftJoinNullified,
+        Rule::CheckViolation,
+        Rule::UnstableOrder,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
         Rule::DropIndexBlocking,
@@ -288,6 +300,9 @@ impl Rule {
             Rule::ScalarSubqueryMayReturnMany => "scalar_subquery_may_return_many",
             Rule::TimestampTimezoneMix => "timestamp_timezone_mix",
             Rule::IntegerDivision => "integer_division",
+            Rule::LeftJoinNullified => "left_join_nullified",
+            Rule::CheckViolation => "check_violation",
+            Rule::UnstableOrder => "unstable_order",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
@@ -374,6 +389,16 @@ impl Rule {
             }
             Rule::IntegerDivision => {
                 "an integer division whose truncated result is used as a non-integer value"
+            }
+            Rule::LeftJoinNullified => {
+                "an outer join the WHERE clause turns into an inner join by rejecting its \
+                 null-extended rows"
+            }
+            Rule::CheckViolation => {
+                "an INSERT or UPDATE storing a constant a CHECK constraint rejects"
+            }
+            Rule::UnstableOrder => {
+                "an ORDER BY with LIMIT, OFFSET or DISTINCT ON whose keys can tie"
             }
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
@@ -465,7 +490,10 @@ impl Rule {
             | Rule::BreaksDeployedQueries
             | Rule::ScalarSubqueryMayReturnMany
             | Rule::TimestampTimezoneMix
-            | Rule::IntegerDivision => Some(Severity::Warning),
+            | Rule::IntegerDivision
+            | Rule::LeftJoinNullified
+            | Rule::CheckViolation
+            | Rule::UnstableOrder => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit

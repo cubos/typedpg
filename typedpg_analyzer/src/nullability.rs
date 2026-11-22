@@ -473,6 +473,83 @@ impl NullabilityContext {
         facts
     }
 
+    /// For the lint: record, per top-level `AND` argument of `where_clause`
+    /// (about to be added with [`Self::add_where_facts`]), the outer joins
+    /// of this level it alone reduces (see
+    /// [`crate::pg_catalog::QueryView::nullified_joins`]): joins whose
+    /// nullable side holds an entry the conjunct proves not null-extended,
+    /// as the joins behave before WHERE — reduced already by a foreign key,
+    /// an `ON true` to a row always there or a join above.
+    pub(crate) fn note_nullified_joins(
+        &self,
+        where_clause: &typedpg_pg_query::ast::Node,
+        scope: &crate::scope::Scope,
+        log: &crate::nonnull::StrictLog,
+        snapshot: &crate::pg_catalog::PgCatalog,
+    ) {
+        use typedpg_pg_query::ast::{BoolExprType, Node};
+        let conjuncts: Vec<&Node> = match where_clause {
+            Node::BoolExpr(b) if b.boolop == BoolExprType::AndExpr => {
+                b.args.iter().flatten().collect()
+            }
+            n => vec![n],
+        };
+        let own = crate::nonnull::own_aliases(scope);
+        let name = |k: JoinKind| match k {
+            JoinKind::Inner => "INNER",
+            JoinKind::Left => "LEFT",
+            JoinKind::Right => "RIGHT",
+            JoinKind::Full => "FULL",
+        };
+        for c in conjuncts {
+            let Some(location) = c.to_ref().location() else {
+                continue;
+            };
+            let facts = self.translated(
+                crate::nonnull::nonnullable(Some(c), true, scope, log, snapshot)
+                    .restricted_to(&own),
+            );
+            let mut out = Vec::new();
+            for (idx, j) in self.joins.iter().enumerate() {
+                let Some(&kind) = self.final_kinds.get(idx) else {
+                    continue;
+                };
+                let forced_in = |side: &HashSet<String>| -> Option<String> {
+                    let mut names: Vec<String> = side_with_inner(side, &self.aliased)
+                        .into_iter()
+                        .filter(|a| facts.rels.contains(a) && !crate::scope::is_hidden_alias(a))
+                        .collect();
+                    names.sort();
+                    names.into_iter().next()
+                };
+                let (l, r) = (forced_in(&j.left), forced_in(&j.right));
+                let reduced = match (kind, &l, &r) {
+                    (JoinKind::Left, _, Some(_)) | (JoinKind::Right, Some(_), _) => JoinKind::Inner,
+                    (JoinKind::Full, Some(_), Some(_)) => JoinKind::Inner,
+                    (JoinKind::Full, Some(_), None) => JoinKind::Left,
+                    (JoinKind::Full, None, Some(_)) => JoinKind::Right,
+                    (k, _, _) => k,
+                };
+                if reduced == kind {
+                    continue;
+                }
+                let entry = match kind {
+                    JoinKind::Left => r,
+                    JoinKind::Right => l,
+                    _ => r.or(l),
+                };
+                if let Some(entry) = entry {
+                    out.push(crate::pg_catalog::NullifiedJoin {
+                        entry,
+                        written: name(kind),
+                        reduced: name(reduced),
+                    });
+                }
+            }
+            crate::pg_catalog::note_nullified_joins(location, out);
+        }
+    }
+
     /// Add what the WHERE clause proves non-NULL.
     pub fn add_where_facts(&mut self, facts: Facts) {
         let facts = self.translated(facts);

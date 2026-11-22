@@ -45,7 +45,8 @@
 //! `insert_without_columns`, `self_assignment`, `unused_cte`,
 //! `simplifiable_case`, `like_unescaped_param`, `redundant_join`,
 //! `scalar_subquery_may_return_many`, `timestamp_timezone_mix`,
-//! `integer_division`, `fetch_may_return_many`, `fetch_all_single_row` and
+//! `integer_division`, `left_join_nullified`, `check_violation`,
+//! `unstable_order`, `fetch_may_return_many`, `fetch_all_single_row` and
 //! `unused_returning`;
 //! the migration rules `create_index_blocking`, `constraint_validating`,
 //! `set_not_null_scan`, `table_rewrite`, `missing_lock_timeout`,
@@ -220,6 +221,9 @@ pub const LINT_RULES: &[&str] = &[
     "scalar_subquery_may_return_many",
     "timestamp_timezone_mix",
     "integer_division",
+    "left_join_nullified",
+    "check_violation",
+    "unstable_order",
     "fk_type_mismatch",
     "missing_lock_timeout",
     "drop_index_blocking",
@@ -1748,7 +1752,8 @@ event_data = "crate::EventData"
              `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`, \
              `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, \
              `like_unescaped_param`, `redundant_join`, `scalar_subquery_may_return_many`, \
-             `timestamp_timezone_mix`, `integer_division`, `fk_type_mismatch`, \
+             `timestamp_timezone_mix`, `integer_division`, `left_join_nullified`, \
+             `check_violation`, `unstable_order`, `fk_type_mismatch`, \
              `missing_lock_timeout`, \
              `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`, \
              `validate_in_same_transaction`, `attach_partition_scan`, `missing_primary_key`, \

@@ -262,6 +262,60 @@
               }
             },
             {
+              "id": "scalar_subquery_may_return_many",
+              "shortDescription": {
+                "text": "a scalar subquery used as a value that may return more than one row"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "timestamp_timezone_mix",
+              "shortDescription": {
+                "text": "an implicit timestamp/timestamptz conversion that depends on the session's TimeZone"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "integer_division",
+              "shortDescription": {
+                "text": "an integer division whose truncated result is used as a non-integer value"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "left_join_nullified",
+              "shortDescription": {
+                "text": "an outer join the WHERE clause turns into an inner join by rejecting its null-extended rows"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "check_violation",
+              "shortDescription": {
+                "text": "an INSERT or UPDATE storing a constant a CHECK constraint rejects"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "unstable_order",
+              "shortDescription": {
+                "text": "an ORDER BY with LIMIT, OFFSET or DISTINCT ON whose keys can tie"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
               "id": "fk_type_mismatch",
               "shortDescription": {
                 "text": "a foreign key whose column types differ from the referenced columns"

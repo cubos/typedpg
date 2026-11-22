@@ -40,6 +40,7 @@ mod array_input;
 mod builtin_nullability;
 mod clause;
 mod coerce;
+mod condition;
 mod datetime_input;
 mod ddl;
 mod decimal;
@@ -112,11 +113,12 @@ pub use pg_catalog::{
 };
 
 pub use analysis_diff::{AnalysisDifference, first_difference};
+pub use condition::{AssignmentViolation, ConditionFact, ConditionReason};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
-    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement, PgCatalog,
-    QueryView, SublinkNullability, UserObjectCounts,
+    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement,
+    NullifiedJoin, PgCatalog, QueryView, SublinkNullability, UserObjectCounts,
 };
 pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
@@ -125,8 +127,8 @@ pub use resolve::{
     AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
 };
 pub use simplify::{
-    AppliedSimplification, RedundantJoin, RedundantJoinProof, Rule, SimplifyOptions,
-    redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
+    AppliedSimplification, OrderTies, RedundantJoin, RedundantJoinProof, Rule, SimplifyOptions,
+    order_ties, redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
 };
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the

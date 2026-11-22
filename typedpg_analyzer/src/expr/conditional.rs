@@ -714,7 +714,11 @@ pub(crate) fn infer_case(
             // A WHEN the facts refute is never TRUE: its result is still
             // analyzed and takes part in the result type, but is never the
             // CASE's value.
-            reached.push(!unreachable(not_taken.clone().union(taken.clone())));
+            let when_reached = !unreachable(not_taken.clone().union(taken.clone()));
+            if expr.arg.is_none() {
+                crate::pg_catalog::note_case_when_reached(when.location, when_reached);
+            }
+            reached.push(when_reached);
             let facts = not_taken.clone().union(taken).restricted_to(&own);
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
             // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
@@ -749,6 +753,12 @@ pub(crate) fn infer_case(
                 &log,
                 snapshot,
             ));
+            if crate::pg_catalog::collecting_column_ref_bindings() {
+                crate::pg_catalog::note_case_when_passed(
+                    when.location,
+                    !unreachable(not_taken.clone()),
+                );
+            }
         }
         // The WHEN is part of whatever expression the caller logs.
         if let Some(outer) = ctx.strict_log {

@@ -3500,3 +3500,411 @@ pub(super) fn column_ref_fields(cr: &ast::ColumnRef) -> Fields<'_> {
     }
     Fields::Names(names)
 }
+
+// ── ORDER BY ties ───────────────────────────────────────────────────────────
+
+/// Whether a `SELECT`'s `ORDER BY` keys can tie (see
+/// [`crate::order_ties`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderTies {
+    /// The keys determine one row: no two rows tie.
+    Unique,
+    /// Two rows the schema allows may share every key: the FROM items
+    /// whose row the keys don't determine, each with its primary key's
+    /// columns (empty when it has none).
+    Ties(Vec<(String, Vec<String>)>),
+    /// The proof can't tell (a FROM item it can't see through, a key that
+    /// is an expression index, a set-returning call, …).
+    Unknown,
+}
+
+/// [`OrderTies`] of `s`'s `ORDER BY` over the rows its FROM, WHERE and
+/// grouping make — before `LIMIT` / `OFFSET` / `DISTINCT ON` pick some.
+///
+/// The keys determine a row when, with the columns `WHERE` equates to
+/// constants or parameters, they cover a unique key of every relation, or
+/// of the relations the others then determine through equalities to a key
+/// (the `DISTINCT` proof's closure, see the module docs). A grouped query
+/// (`GROUP BY` of plain columns, or a plain `DISTINCT` of them) yields one
+/// row per group: its keys determine a row when they cover, or determine,
+/// every grouping column.
+///
+/// `Ties` is only claimed when the FROM clause is base tables and joins the
+/// proof models, none with a partial, expression or deferrable unique index
+/// (which may make the keys unique in a way not followed).
+pub(super) fn order_ties(ctx: &Ctx<'_>, ctes: &HashSet<String>, s: &ast::SelectStmt) -> OrderTies {
+    if s.op != SetOperation::SetopNone
+        || s.into_clause.is_some()
+        || s.sort_clause.is_empty()
+        || s.from_clause.is_empty()
+        || !s.values_lists.is_empty()
+        || s.group_distinct
+        || has_set_returning_call(ctx, s)
+    {
+        return OrderTies::Unknown;
+    }
+    let Some(scope) = Scope::build(ctx, ctes, &s.from_clause) else {
+        return OrderTies::Unknown;
+    };
+    let n = scope.rels.len();
+    if n == 0 || n > MAX_RELATIONS {
+        return OrderTies::Unknown;
+    }
+    for rel in &scope.rels {
+        let Some(oid) = rel.oid else {
+            return OrderTies::Unknown;
+        };
+        let unmodelled_key = ctx.catalog.pg_index.values().any(|i| {
+            i.indrelid == oid
+                && i.indisunique
+                && (i.indpred.is_some()
+                    || i.indkey.contains(&0)
+                    || ctx.catalog.nonimmediate_indexes.contains(&i.indexrelid))
+        });
+        if unmodelled_key {
+            return OrderTies::Unknown;
+        }
+    }
+
+    // The ORDER BY keys that are plain columns.
+    let mut cols: HashSet<(usize, i16)> = HashSet::new();
+    for item in &s.sort_clause {
+        let Some(Node::SortBy(sort)) = item else {
+            return OrderTies::Unknown;
+        };
+        let Some(key) = sort_key(s, sort.node.as_ref()) else {
+            continue;
+        };
+        let Node::ColumnRef(cr) = key else {
+            continue;
+        };
+        let Fields::Names(names) = column_ref_fields(cr) else {
+            continue;
+        };
+        match scope.resolve(&names) {
+            Col::Rel(r, attnum) => {
+                cols.insert((r, attnum));
+            }
+            Col::Opaque => return OrderTies::Unknown,
+            Col::Other => {}
+        }
+    }
+
+    // The grouping columns, when the query yields one row per group.
+    let grouping: Option<Vec<(usize, i16)>> = if !s.group_clause.is_empty() {
+        let mut g = Vec::new();
+        for item in &s.group_clause {
+            let Some(Node::ColumnRef(cr)) = item.as_ref() else {
+                return OrderTies::Unknown;
+            };
+            let Fields::Names(names) = column_ref_fields(cr) else {
+                return OrderTies::Unknown;
+            };
+            match scope.resolve(&names) {
+                Col::Rel(r, attnum) => g.push((r, attnum)),
+                _ => return OrderTies::Unknown,
+            }
+        }
+        Some(g)
+    } else if is_plain_distinct(s) {
+        let mut g = Vec::new();
+        for target in &s.target_list {
+            let Some(Node::ResTarget(rt)) = target else {
+                return OrderTies::Unknown;
+            };
+            let Some(Node::ColumnRef(cr)) = rt.val.as_ref() else {
+                return OrderTies::Unknown;
+            };
+            let Fields::Names(names) = column_ref_fields(cr) else {
+                return OrderTies::Unknown;
+            };
+            match scope.resolve(&names) {
+                Col::Rel(r, attnum) => g.push((r, attnum)),
+                _ => return OrderTies::Unknown,
+            }
+        }
+        Some(g)
+    } else {
+        // An aggregate (or HAVING) without GROUP BY yields one row.
+        if s.having_clause.is_some() || has_aggregate(ctx, s) {
+            return OrderTies::Unknown;
+        }
+        None
+    };
+
+    let all: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let where_facts = conjuncts(s.where_clause.as_ref())
+        .into_iter()
+        .flat_map(|c| scope.equality_facts(ctx, c, None))
+        .collect::<Vec<_>>();
+    let mut deps: Vec<(u64, usize)> = Vec::new();
+    for b in 0..n {
+        if let Some(det) = scope.key_equated(ctx, b, &where_facts, all & !(1 << b)) {
+            deps.push((det, b));
+        }
+    }
+    for join in &scope.joins {
+        let mut facts: Vec<EqFact> = Vec::new();
+        for c in conjuncts(join.quals) {
+            facts.extend(scope.equality_facts(ctx, c, None));
+        }
+        for name in &join.using {
+            facts.extend(scope.using_facts(ctx, name, join.left, join.right));
+        }
+        match join.kind {
+            JoinType::JoinInner => {
+                for b in (0..n).filter(|&b| join.rels() & (1 << b) != 0) {
+                    let others = join.rels() & !(1 << b);
+                    if let Some(det) = scope.key_equated(ctx, b, &facts, others) {
+                        deps.push((if join.nullable { others } else { det }, b));
+                    }
+                }
+            }
+            JoinType::JoinLeft => {
+                if let Some(b) = join.right_rel
+                    && scope.key_equated(ctx, b, &facts, join.left).is_some()
+                {
+                    deps.push((join.left, b));
+                }
+            }
+            JoinType::JoinRight => {
+                if let Some(a) = join.left_rel
+                    && scope.key_equated(ctx, a, &facts, join.right).is_some()
+                {
+                    deps.push((join.right, a));
+                }
+            }
+            _ => {}
+        }
+    }
+    let covered = |r: usize, attnum: i16, known: u64| {
+        cols.contains(&(r, attnum))
+            || scope.column_fixed_by_facts(ctx, r, attnum, &where_facts, known)
+    };
+    // The columns WHERE and the joins' conditions read.
+    let mut read: HashSet<(usize, i16)> = HashSet::new();
+    let mut quals: Vec<&Node> = s.where_clause.iter().collect();
+    quals.extend(scope.joins.iter().filter_map(|j| j.quals));
+    let mut stack: Vec<NodeRef<'_>> = quals.iter().map(|q| q.to_ref()).collect();
+    while let Some(n) = stack.pop() {
+        if let NodeRef::ColumnRef(cr) = n
+            && let Fields::Names(names) = column_ref_fields(cr)
+            && let Col::Rel(r, attnum) = scope.resolve(&names)
+        {
+            read.insert((r, attnum));
+        }
+        stack.extend(n.children());
+    }
+    let conditions_read = |r: usize, attnum: i16| read.contains(&(r, attnum));
+    let mut uncertain = false;
+    let mut known: u64 = 0;
+    loop {
+        let before = known;
+        for (r, rel) in scope.rels.iter().enumerate() {
+            if known & (1 << r) != 0 {
+                continue;
+            }
+            let Some(oid) = rel.oid else {
+                continue;
+            };
+            let keys = unique_keys(ctx, oid);
+            let covering = |key: &&UniqueKey| {
+                key.predicate.is_none()
+                    && key
+                        .columns
+                        .iter()
+                        .all(|c| c.deterministic && c.default_family && covered(r, c.attnum, known))
+            };
+            let determined = singleton_table(ctx, oid)
+                || keys.iter().filter(covering).any(|key| {
+                    key.columns.iter().all(|c| c.notnull)
+                        || (key.nulls_not_distinct && !rel.nullable)
+                });
+            // A covered key whose NULLs may tie, but whose nullable column
+            // a condition reads (`WHERE nick IS NOT NULL`): it may be
+            // proven non-NULL there.
+            if !determined
+                && keys.iter().filter(covering).any(|key| {
+                    key.columns
+                        .iter()
+                        .any(|c| !c.notnull && conditions_read(r, c.attnum))
+                })
+            {
+                uncertain = true;
+            }
+            if determined {
+                known |= 1 << r;
+            }
+        }
+        for &(det, b) in &deps {
+            if det & !known == 0 {
+                known |= 1 << b;
+            }
+        }
+        if known == before {
+            break;
+        }
+    }
+    if known & all == all {
+        return OrderTies::Unique;
+    }
+    if let Some(groups) = &grouping
+        && groups
+            .iter()
+            .all(|&(r, attnum)| known & (1 << r) != 0 || covered(r, attnum, known))
+    {
+        return OrderTies::Unique;
+    }
+    if uncertain {
+        return OrderTies::Unknown;
+    }
+    let undetermined = (0..n)
+        .filter(|&r| known & (1 << r) == 0)
+        .filter(|&r| {
+            // Grouped: only a relation with a grouping column left
+            // uncovered makes groups tie.
+            grouping.as_ref().is_none_or(|groups| {
+                groups
+                    .iter()
+                    .any(|&(g, attnum)| g == r && !covered(g, attnum, known))
+            })
+        })
+        .map(|r| {
+            let rel = &scope.rels[r];
+            (
+                rel.refname.clone(),
+                rel.oid
+                    .map(|oid| primary_key_columns(ctx, oid))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    OrderTies::Ties(undetermined)
+}
+
+/// The expression an `ORDER BY` item sorts by: an output column's
+/// expression for a bare name the select list outputs (SQL92's rule, which
+/// PG tries first) or for an ordinal, else the item itself.
+fn sort_key<'a>(s: &'a ast::SelectStmt, node: Option<&'a Node>) -> Option<&'a Node> {
+    let targets = || {
+        s.target_list.iter().filter_map(|t| match t {
+            Some(Node::ResTarget(rt)) => Some(rt),
+            _ => None,
+        })
+    };
+    match node? {
+        Node::AConst(c) => {
+            let Some(AConstValue::Integer(i)) = &c.val else {
+                return None;
+            };
+            let index = usize::try_from(i.ival).ok()?.checked_sub(1)?;
+            targets().nth(index)?.val.as_ref()
+        }
+        n @ Node::ColumnRef(cr) => {
+            if let Fields::Names(names) = column_ref_fields(cr)
+                && let [name] = names.as_slice()
+            {
+                let mut named = targets().filter(|rt| {
+                    rt.name == *name
+                        || (rt.name.is_empty()
+                            && matches!(rt.val.as_ref(), Some(Node::ColumnRef(c))
+                                if matches!(column_ref_fields(c), Fields::Names(ns) if ns.last() == Some(name))))
+                });
+                if let Some(rt) = named.next() {
+                    return if named.next().is_some() {
+                        None
+                    } else {
+                        rt.val.as_ref()
+                    };
+                }
+            }
+            Some(n)
+        }
+        n => Some(n),
+    }
+}
+
+/// A set-returning function or operator anywhere in `s` (any overload of
+/// the name counts).
+fn has_set_returning_call(ctx: &Ctx<'_>, s: &ast::SelectStmt) -> bool {
+    let mut stack = vec![NodeRef::SelectStmt(s)];
+    while let Some(n) = stack.pop() {
+        match n {
+            NodeRef::FuncCall(f) => {
+                let names = string_list(&f.funcname);
+                let (schema, name) = match names.as_slice() {
+                    [name] => (None, *name),
+                    [schema, name] => (Some(*schema), *name),
+                    _ => return true,
+                };
+                let procs = ctx.catalog.find_functions(schema, name);
+                if procs.is_empty() || procs.iter().any(|p| p.proretset) {
+                    return true;
+                }
+            }
+            NodeRef::AExpr(e) => {
+                if let Some(name) = string_list(&e.name).last() {
+                    let set_returning = ctx.catalog.pg_operator.values().any(|o| {
+                        o.oprname == *name
+                            && o.oprcode
+                                .and_then(|code| ctx.catalog.pg_proc.get(&code))
+                                .is_none_or(|p| p.proretset)
+                    });
+                    if set_returning {
+                        return true;
+                    }
+                }
+            }
+            // A nested query's own calls don't multiply this level's rows.
+            NodeRef::SubLink(_) | NodeRef::RangeSubselect(_) => continue,
+            _ => {}
+        }
+        stack.extend(n.children());
+    }
+    false
+}
+
+/// An aggregate call (without `OVER`) in `s`'s own select list, outside
+/// nested queries — any overload of the name being one counts.
+fn has_aggregate(ctx: &Ctx<'_>, s: &ast::SelectStmt) -> bool {
+    let mut stack: Vec<NodeRef<'_>> = s.target_list.iter().flatten().map(|n| n.to_ref()).collect();
+    while let Some(n) = stack.pop() {
+        match n {
+            NodeRef::FuncCall(f) if f.over.is_none() => {
+                let names = string_list(&f.funcname);
+                let name = names.last().copied().unwrap_or_default();
+                let schema = (names.len() == 2).then(|| names[0]);
+                if f.agg_star
+                    || ctx
+                        .catalog
+                        .find_functions(schema, name)
+                        .iter()
+                        .any(|p| p.prokind == ProKind::Aggregate)
+                {
+                    return true;
+                }
+            }
+            NodeRef::SubLink(_) => continue,
+            _ => {}
+        }
+        stack.extend(n.children());
+    }
+    false
+}
+
+/// The names of relation `relid`'s primary key columns, in key order.
+fn primary_key_columns(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<String> {
+    let attrs = ctx.catalog.attributes_of(relid);
+    ctx.catalog
+        .pg_constraint
+        .values()
+        .find(|c| c.conrelid == relid && c.contype == ConType::PrimaryKey)
+        .map(|c| {
+            c.conkey
+                .iter()
+                .filter_map(|k| attrs.iter().find(|a| a.attnum == *k))
+                .map(|a| a.attname.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}

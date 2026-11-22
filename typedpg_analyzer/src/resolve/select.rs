@@ -443,6 +443,9 @@ fn analyze_select_here(
             if crate::nonnull::own_wanted(sel) {
                 own_facts = Some(facts.clone().restricted_to(&own));
             }
+            if crate::pg_catalog::collecting_column_ref_bindings() {
+                null_ctx.note_nullified_joins(where_clause, &scope, &log, snapshot);
+            }
             null_ctx.add_where_facts(facts.restricted_to(&own));
             Ok(())
         })?;

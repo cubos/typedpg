@@ -80,7 +80,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
 /// (`DELETE … WHERE id IN (SELECT … LIMIT 1000)`) deliberately takes any
 /// batch. An `IN` elsewhere (a `SELECT`'s WHERE, a projection) does care:
 /// the limit changes which values the outer query sees.
-fn batched_subqueries(ctx: &Ctx<'_>) -> HashSet<*const SelectStmt> {
+pub(super) fn batched_subqueries(ctx: &Ctx<'_>) -> HashSet<*const SelectStmt> {
     let mut batched = HashSet::new();
     // The EXISTS exemption propagates through FROM subqueries an
     // existence-only select reads; the DML batching exemption does not (the
@@ -266,7 +266,7 @@ fn where_contains(node: NodeRef<'_>, target: *const ast::SubLink) -> bool {
     }
 }
 
-fn has_skip_locked(select: &SelectStmt) -> bool {
+pub(super) fn has_skip_locked(select: &SelectStmt) -> bool {
     select.locking_clause.iter().any(|node| {
         matches!(node, Some(Node::LockingClause(locking))
             if locking.wait_policy == LockWaitPolicy::LockWaitSkip)
@@ -274,7 +274,7 @@ fn has_skip_locked(select: &SelectStmt) -> bool {
 }
 
 /// Whether the clause is a literal `LIMIT 0` / `FETCH FIRST 0 ROWS`.
-fn limit_is_zero(select: &SelectStmt) -> bool {
+pub(super) fn limit_is_zero(select: &SelectStmt) -> bool {
     matches!(
         select.limit_count.as_ref(),
         Some(Node::AConst(value))
@@ -286,7 +286,7 @@ fn limit_is_zero(select: &SelectStmt) -> bool {
 /// Whether every output row carries the same values: the target list reads
 /// no column (anywhere, sublinks included) and calls nothing that may vary
 /// per row. Whichever rows the plan picks, the output is then the same.
-fn constant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+pub(super) fn constant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     // A set operation's rows come from its arms; there is no target list.
     if select.op != typedpg_pg_query::ast::SetOperation::SetopNone || select.target_list.is_empty()
     {
@@ -351,7 +351,7 @@ fn constant_expression(ctx: &Ctx<'_>, expression: Option<&ast::Node>) -> bool {
 /// conjunct fixes to a parameter or constant through its type's default
 /// btree equality under a deterministic collation. Whichever rows a LIMIT
 /// or OFFSET picks then project the same values.
-fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+pub(super) fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     if select.op != typedpg_pg_query::ast::SetOperation::SetopNone
         || select.target_list.is_empty()
         || !select.locking_clause.is_empty()
@@ -633,7 +633,10 @@ fn no_volatile_functions(ctx: &Ctx<'_>, select: NodeRef<'_>) -> bool {
 }
 
 /// The `DISTINCT ON (…)` part when it has expressions.
-fn distinct_on_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Range<usize>> {
+pub(super) fn distinct_on_span(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+) -> Option<std::ops::Range<usize>> {
     // Plain `DISTINCT` is a one-NIL list; `DISTINCT ON (…)` parses as the
     // expressions themselves.
     if select.distinct_clause.is_empty() || select.distinct_clause[0].is_none() {
@@ -678,7 +681,7 @@ fn distinct_on_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Rang
 
 /// The `LIMIT …` / `FETCH …` clause, when there is one (`LIMIT ALL` and
 /// `LIMIT NULL` don't pick rows).
-fn limit_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Range<usize>> {
+pub(super) fn limit_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Range<usize>> {
     let count = select.limit_count.as_ref()?;
     if is_null_literal(count) {
         return None;
@@ -711,7 +714,7 @@ fn fetch_end(ctx: &Ctx<'_>, index: usize, count_start: usize) -> usize {
 }
 
 /// The `OFFSET …` clause, when there is one that skips rows.
-fn offset_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Range<usize>> {
+pub(super) fn offset_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops::Range<usize>> {
     let offset = select.limit_offset.as_ref()?;
     // `OFFSET NULL` is no offset at all, and `OFFSET 0` is the
     // optimization-fence idiom: neither skips rows.

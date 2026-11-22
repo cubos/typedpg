@@ -25,8 +25,9 @@ pub(crate) mod proof;
 mod safe_builtins;
 
 pub use cardinality::{
-    redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
+    order_ties, redundant_distinct_spans, select_at_most_one_row, statement_at_most_one_row,
 };
+pub use dedup::OrderTies;
 pub use fk_join::{RedundantJoin, RedundantJoinProof};
 
 /// A text edit on the post-lex SQL ([`AnalyzedQuery::sql`], with `$n`

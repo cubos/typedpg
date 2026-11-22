@@ -13,9 +13,11 @@ use crate::{Ctx, RawFinding, Rule};
 
 mod cartesian_join;
 mod case_without_else;
+mod check_violation;
 mod constant_condition;
 mod insert_without_columns;
 mod integer_division;
+mod left_join_nullified;
 mod like_unescaped_param;
 mod limit_without_order;
 mod outer_reference_in_subquery;
@@ -30,6 +32,7 @@ mod self_assignment;
 mod simplifiable_case;
 mod timestamp_timezone_mix;
 mod unreachable_case_branch;
+mod unstable_order;
 mod unused_cte;
 
 pub(crate) use insert_without_columns::width as insert_width;
@@ -63,6 +66,9 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::ScalarSubqueryMayReturnMany => scalar_subquery_may_return_many::findings(ctx),
         Rule::TimestampTimezoneMix => timestamp_timezone_mix::findings(ctx),
         Rule::IntegerDivision => integer_division::findings(ctx),
+        Rule::LeftJoinNullified => left_join_nullified::findings(ctx),
+        Rule::CheckViolation => check_violation::findings(ctx),
+        Rule::UnstableOrder => unstable_order::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
@@ -504,6 +510,35 @@ pub(super) fn scan_until(
 
 /// Whether `text` is a keyword that starts a clause after a select list, a
 /// condition or a `RETURNING` list.
+/// The span of boolean expression `node`: from its first token to the
+/// clause keyword or closing parenthesis that ends it — or, unless
+/// `whole`, to the `AND` (outside a `BETWEEN … AND`) or `OR` after it at
+/// its own depth, when it is an argument of one (an `OR` itself only ends
+/// at an `AND`).
+pub(super) fn condition_span(
+    ctx: &Ctx<'_>,
+    node: &Node,
+    whole: bool,
+) -> Option<std::ops::Range<usize>> {
+    let start = leftmost_start(node)?;
+    let or = matches!(node, N::BoolExpr(b) if b.boolop == BoolExprType::OrExpr);
+    let mut between = false;
+    let (end, _) = scan_until(ctx, start, |text| {
+        if text.eq_ignore_ascii_case("BETWEEN") {
+            between = true;
+            return false;
+        }
+        if text.eq_ignore_ascii_case("AND") && between {
+            between = false;
+            return false;
+        }
+        starts_clause(text)
+            || (!whole
+                && (text.eq_ignore_ascii_case("AND") || (!or && text.eq_ignore_ascii_case("OR"))))
+    });
+    Some(start..end.max(start + 1))
+}
+
 pub(super) fn starts_clause(text: &str) -> bool {
     [
         "FROM",

@@ -1840,6 +1840,7 @@ mod copy_in;
 mod cte;
 mod deferred;
 mod dml;
+pub(crate) use dml::assignment_violation;
 mod failing_rows;
 mod from;
 mod merge;
