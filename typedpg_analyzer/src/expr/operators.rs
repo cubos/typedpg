@@ -895,6 +895,21 @@ fn handle_any_all(
         // coercion of the left operand or of an element to the operator's
         // declared types.
         note_builtin_compare(expr.location, &op_name, &op, ctx);
+        // What the array's elements are, for what `x op ANY (arr)` TRUE
+        // says of `x` (an untyped literal's are read from its text).
+        if let Some(r) = right.as_ref().filter(|_| right_oid != oid::UNKNOWN) {
+            ctx.note_array_elements(
+                expr.location,
+                crate::nonnull::ArrayElements {
+                    elem_type: rtype,
+                    refine: if crate::refine::deterministic(r.collation, snapshot) {
+                        r.elem_refine.clone()
+                    } else {
+                        crate::refine::Refinement::NONE
+                    },
+                },
+            );
+        }
         // A `ScalarArrayOpExpr` folds when both arguments are constants
         // (`eval_const_expressions`), running the comparison function; it is
         // never inlined.

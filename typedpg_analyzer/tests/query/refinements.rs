@@ -1601,3 +1601,309 @@ fn element_bounds_and_finiteness() {
         ]
     );
 }
+
+// ── Comparisons with arrays ─────────────────────────────────────────────────
+//
+// `x op ANY (arr)` / `x op ALL (arr)`. Under `pg_sanity` every value set,
+// range and bound below is checked against the rows PG returns, over rows
+// seeded with the queries' constants (dates 2000-01-01 and 2001-01-01).
+
+fn arrays_setup() -> PgCatalog {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+         CREATE DOMAIN ab AS text CHECK (VALUE IN ('a', 'b'));
+         CREATE TABLE a (id int PRIMARY KEY, kind text NOT NULL CHECK (kind IN ('a', 'b')),
+                         free text, i int, big int8, small int CHECK (small BETWEEN 1 AND 3),
+                         n numeric, d date,
+                         e date CHECK (e BETWEEN '2000-01-01' AND '2001-12-31'),
+                         m mood, tags ab[], ns int[]);",
+    )
+    .unwrap();
+    db
+}
+
+/// Each column's (name, nullable, value set).
+#[track_caller]
+fn assert_nullable_values(db: &PgCatalog, sql: &str, expected: &[(&str, bool, Option<&[&str]>)]) {
+    let s = db.analyze(sql).unwrap();
+    let actual: Vec<(&str, bool, Option<Vec<&str>>)> = s
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.nullable,
+                c.refinement
+                    .values
+                    .as_ref()
+                    .map(|vs| vs.iter().map(String::as_str).collect()),
+            )
+        })
+        .collect();
+    let expected: Vec<(&str, bool, Option<Vec<&str>>)> = expected
+        .iter()
+        .map(|(n, nullable, v)| (*n, *nullable, v.map(<[&str]>::to_vec)))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "(name, nullable, values) mismatch for `{sql}`"
+    );
+}
+
+#[test]
+fn equal_to_any_constant_narrows_as_in_does() {
+    let db = arrays_setup();
+    assert_nullable_values(
+        &db,
+        "SELECT free, i, m, big FROM a
+         WHERE free = ANY(ARRAY['x', 'y']) AND i = ANY('{1, 2}') AND m = ANY('{ok,happy}')
+           AND big = ANY('{3,NULL}'::int8[])",
+        &[
+            ("free", false, Some(&["x", "y"])),
+            ("i", false, Some(&["1", "2"])),
+            ("m", false, Some(&["happy", "ok"])),
+            // A NULL element never matches.
+            ("big", false, Some(&["3"])),
+        ],
+    );
+    // An array literal as `array_in` reads it: quotes, escapes, a quoted
+    // "NULL" (a string), explicit bounds, nesting.
+    assert_nullable_values(
+        &db,
+        r#"SELECT free, i, big FROM a
+           WHERE free = ANY('{"x y", "a\"b", "NULL", " c "}'::text[])
+             AND i = ANY('[0:1]={3,4}') AND big = ANY('{{1},{5}}')"#,
+        &[
+            ("free", false, Some(&[" c ", "NULL", "a\"b", "x y"])),
+            ("i", false, Some(&["3", "4"])),
+            ("big", false, Some(&["1", "5"])),
+        ],
+    );
+    // The same as the IN list.
+    for (any, list) in [
+        (
+            "SELECT free FROM a WHERE free = ANY(ARRAY['x', 'y'])",
+            "SELECT free FROM a WHERE free IN ('x', 'y')",
+        ),
+        (
+            "SELECT kind FROM a WHERE kind <> ALL(ARRAY['a'])",
+            "SELECT kind FROM a WHERE kind NOT IN ('a')",
+        ),
+        (
+            "SELECT CASE WHEN m = ANY('{ok}') THEN m END AS m FROM a",
+            "SELECT CASE WHEN m IN ('ok') THEN m END AS m FROM a",
+        ),
+    ] {
+        let (a, l) = (db.analyze(any).unwrap(), db.analyze(list).unwrap());
+        assert_eq!(a.columns[0].refinement, l.columns[0].refinement, "{any}");
+        assert_eq!(a.columns[0].nullable, l.columns[0].nullable, "{any}");
+    }
+    assert_bounds(
+        &db,
+        "SELECT n, d FROM a
+         WHERE n = ANY(ARRAY[1.5, 2]) AND d = ANY('{2000-01-01, 2001-01-01}'::date[])",
+        &[("n", Some("[1.5, 2]")), ("d", Some("[0, 366]"))],
+    );
+}
+
+#[test]
+fn empty_and_null_arrays() {
+    let db = arrays_setup();
+    for (sql, nullable, values) in [
+        // `= ANY` of nothing is FALSE: no row.
+        (
+            "SELECT free FROM a WHERE free = ANY('{}'::text[])",
+            false,
+            Some(&[][..]),
+        ),
+        // `<> ALL` of nothing is TRUE, even for a NULL.
+        (
+            "SELECT free FROM a WHERE free <> ALL('{}'::text[])",
+            true,
+            None,
+        ),
+        (
+            "SELECT free FROM a WHERE free <> ALL(ARRAY[]::text[])",
+            true,
+            None,
+        ),
+        ("SELECT free FROM a WHERE free <> ALL('{{}}')", true, None),
+        // Of one known element, NULL makes it NULL.
+        ("SELECT free FROM a WHERE free <> ALL('{x}')", false, None),
+        (
+            "SELECT free FROM a WHERE free <> ALL(ARRAY['x', NULL])",
+            false,
+            None,
+        ),
+        // A NULL element: never TRUE, and no value is excluded.
+        (
+            "SELECT kind FROM a WHERE kind <> ALL('{a,NULL}')",
+            false,
+            Some(&["a", "b"][..]),
+        ),
+        (
+            "SELECT kind FROM a WHERE kind <> ALL('{a}')",
+            false,
+            Some(&["b"][..]),
+        ),
+        // NOT of `= ANY` of nothing is TRUE for a NULL too.
+        (
+            "SELECT free FROM a WHERE NOT (free = ANY('{}'::text[]))",
+            true,
+            None,
+        ),
+        (
+            "SELECT free FROM a WHERE NOT (free = ANY(ARRAY['x']))",
+            false,
+            None,
+        ),
+        (
+            "SELECT kind FROM a WHERE NOT (kind = ANY(ARRAY['a']))",
+            false,
+            Some(&["b"][..]),
+        ),
+        (
+            "SELECT kind FROM a WHERE NOT (kind <> ALL(ARRAY['a']))",
+            false,
+            Some(&["a"][..]),
+        ),
+        // A parameter's elements are unknown, but a NULL `x` never matches.
+        ("SELECT free FROM a WHERE free = ANY($1)", false, None),
+        ("SELECT free FROM a WHERE free <> ALL($1)", true, None),
+    ] {
+        assert_nullable_values(&db, sql, &[(sql_column(sql), nullable, values)]);
+    }
+    for (sql, nullable) in [
+        ("SELECT i FROM a WHERE i < ALL('{}'::int[])", true),
+        ("SELECT i FROM a WHERE i < ALL(ARRAY[ARRAY[]::int[]])", true),
+        ("SELECT i FROM a WHERE i < ALL(ARRAY[small])", true),
+        ("SELECT i FROM a WHERE i < ALL('{5}')", false),
+        ("SELECT i FROM a WHERE i > ANY('{}'::int[])", false),
+        ("SELECT i FROM a WHERE NOT (i > ANY('{}'::int[]))", true),
+        ("SELECT i FROM a WHERE NOT (i > ANY('{5}'::int[]))", false),
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_eq!(s.columns[0].nullable, nullable, "{sql}");
+    }
+}
+
+/// The column a one-column test query selects (`SELECT x FROM …`).
+fn sql_column(sql: &str) -> &str {
+    sql.strip_prefix("SELECT ")
+        .and_then(|s| s.split_whitespace().next())
+        .unwrap()
+}
+
+#[test]
+fn equal_to_any_element_takes_what_the_elements_are() {
+    let db = arrays_setup();
+    assert_nullable_values(
+        &db,
+        "SELECT free, big FROM a WHERE free = ANY(ARRAY[kind]) AND big = ANY(ARRAY[small, 7])",
+        &[
+            ("free", false, Some(&["a", "b"])),
+            ("big", false, Some(&["1", "2", "3", "7"])),
+        ],
+    );
+    assert_nullable_values(
+        &db,
+        "SELECT free FROM a WHERE free = ANY(tags[1:2])",
+        &[("free", false, Some(&["a", "b"]))],
+    );
+    assert_nullable_values(
+        &db,
+        "SELECT x.free FROM a x, a y WHERE x.free = ANY(y.tags)",
+        &[("free", false, Some(&["a", "b"]))],
+    );
+    // In a CASE branch and an OR, as a constant list.
+    assert_nullable_values(
+        &db,
+        "SELECT CASE WHEN free = ANY(ARRAY[kind]) THEN free END AS c,
+                CASE WHEN free = ANY(ARRAY[kind]) OR free = 'z' THEN free END AS o
+         FROM a",
+        &[
+            ("c", true, Some(&["a", "b"])),
+            ("o", true, Some(&["a", "b", "z"])),
+        ],
+    );
+    // Unknown elements, a nondeterministic collation (`'A'` matches
+    // `'a'`), or a negation narrow nothing.
+    assert_nullable_values(
+        &db,
+        "SELECT i, free FROM a WHERE i = ANY(ns) AND free = ANY(ARRAY[kind] COLLATE ci)",
+        &[("i", false, None), ("free", false, None)],
+    );
+    assert_nullable_values(
+        &db,
+        "SELECT free FROM a WHERE NOT (free = ANY(ARRAY[kind]))",
+        &[("free", true, None)],
+    );
+    assert_nullable_values(
+        &db,
+        "SELECT free FROM a WHERE free <> ALL(ARRAY[kind])",
+        &[("free", true, None)],
+    );
+    assert_bounds(
+        &db,
+        "SELECT d, n FROM a WHERE d = ANY(ARRAY[e]) AND n = ANY(ARRAY[1, n])",
+        &[("d", Some("[0, 730]")), ("n", None)],
+    );
+}
+
+#[test]
+fn ordered_against_any_or_all_elements() {
+    let db = arrays_setup();
+    assert_ranges(
+        &db,
+        "SELECT i, big, small FROM a
+         WHERE i < ANY('{5,7}') AND big > ALL(ARRAY[5, 7]) AND small <= ALL('{2,3}')",
+        &[
+            ("i", false, None, Some(6)),
+            ("big", false, Some(8), None),
+            ("small", false, Some(1), Some(2)),
+        ],
+    );
+    assert_ranges(
+        &db,
+        "SELECT i, big FROM a WHERE i >= ANY(ARRAY[5, NULL]) AND big < ALL('{5,NULL}')",
+        // A NULL element: `< ALL` is never TRUE, and nothing is read of it.
+        &[("i", false, Some(5), None), ("big", false, None, None)],
+    );
+    // Against the elements' bounds.
+    assert_ranges(
+        &db,
+        "SELECT i, big FROM a WHERE i < ANY(ARRAY[small]) AND big >= ANY(ARRAY[small])",
+        &[("i", false, None, Some(2)), ("big", false, Some(1), None)],
+    );
+    // Not TRUE: none of the comparisons is (ANY), or one isn't (ALL).
+    assert_ranges(
+        &db,
+        "SELECT i, big FROM a WHERE NOT (i < ALL('{5,7}')) AND NOT (big < ANY('{5,7}'))",
+        &[("i", false, Some(5), None), ("big", false, Some(7), None)],
+    );
+    assert_ranges(
+        &db,
+        "SELECT CASE WHEN i < ANY('{3,5}') THEN 0 ELSE i END AS c,
+                CASE WHEN i < ANY('{1}') OR i = ANY(ARRAY[10]) THEN i END AS o
+         FROM a",
+        &[("c", true, Some(0), None), ("o", true, None, Some(10))],
+    );
+    assert_bounds(
+        &db,
+        "SELECT n, d, e FROM a
+         WHERE n < ANY(ARRAY[1.5, 2]) AND d >= ALL('{2000-01-01,2001-01-01}'::date[])
+           AND e > ANY(ARRAY['2001-01-01'::date])",
+        &[
+            ("n", Some("(, 2)")),
+            ("d", Some("[366, )")),
+            ("e", Some("(366, 730]")),
+        ],
+    );
+    assert_bounds(
+        &db,
+        "SELECT x.d, y.d AS f FROM a x, a y WHERE x.d > ANY(ARRAY[x.e]) AND y.d <= ANY(ARRAY[y.e])",
+        &[("d", Some("(0, )")), ("f", Some("(, 730]"))],
+    );
+}

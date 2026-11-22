@@ -196,17 +196,57 @@ impl Trust for TrustedNodes {
 
 /// Per-node strictness recorded while a qual is typed, plus what the
 /// `EXISTS` sublinks in it prove of the enclosing level's columns (keyed
-/// by the sublink's location; see [`capture_correlation`]), and the type
-/// each untyped string literal was coerced to (by its location).
+/// by the sublink's location; see [`capture_correlation`]), the type
+/// each untyped string literal was coerced to (by its location), and what
+/// is known of the elements of the array an `op ANY / ALL (array)` reads
+/// (by the expression's location; see [`StrictLog::note_array_elements`]).
 #[derive(Debug, Default)]
 pub(crate) struct StrictLog(
     RefCell<HashMap<(i32, StrictNode), bool>>,
     RefCell<HashMap<i32, Facts>>,
     RefCell<HashMap<i32, crate::oid::PgTypeOid>>,
     RefCell<HashMap<i32, crate::oid::PgProcOid>>,
+    RefCell<HashMap<i32, ArrayElements>>,
 );
 
+/// The elements of the array an `x op ANY / ALL (array)` reads: their type
+/// and what every non-NULL one of them is (nothing when the array's
+/// collation is nondeterministic: its equality then holds between
+/// different strings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArrayElements {
+    pub elem_type: crate::oid::PgTypeOid,
+    pub refine: crate::refine::Refinement,
+}
+
 impl StrictLog {
+    /// Record what the elements of the array the `op ANY / ALL (array)` at
+    /// `location` reads are. A node typed several times keeps only what
+    /// holds of every reading.
+    pub fn note_array_elements(&self, location: i32, elems: ArrayElements) {
+        if location < 0 {
+            return;
+        }
+        let mut map = self.4.borrow_mut();
+        let merged = match map.remove(&location) {
+            Some(before) if before.elem_type == elems.elem_type => ArrayElements {
+                elem_type: elems.elem_type,
+                refine: crate::refine::Refinement::either([&before.refine, &elems.refine]),
+            },
+            Some(before) => ArrayElements {
+                elem_type: before.elem_type,
+                refine: crate::refine::Refinement::NONE,
+            },
+            None => elems,
+        };
+        map.insert(location, merged);
+    }
+
+    /// What [`StrictLog::note_array_elements`] recorded at `location`.
+    fn array_elements(&self, location: i32) -> Option<ArrayElements> {
+        self.4.borrow().get(&location).cloned()
+    }
+
     /// Record that the plain function call at `location` resolved to
     /// `proc`.
     pub fn note_call(&self, location: i32, proc: crate::oid::PgProcOid) {
@@ -235,6 +275,9 @@ impl StrictLog {
         self.3
             .borrow_mut()
             .extend(other.3.borrow().iter().map(|(k, v)| (*k, *v)));
+        for (&location, elems) in other.4.borrow().iter() {
+            self.note_array_elements(location, elems.clone());
+        }
     }
 
     /// What this log trusts, kept apart from it.
@@ -389,6 +432,11 @@ pub(crate) enum LitKind {
     /// `int4` (`1.5`, `1e3`, `3000000000`: a `numeric` or `int8`
     /// constant, as the lexer leaves it).
     Numeric,
+    /// Not written in the query: a point of an ordered type (see
+    /// [`crate::refine_bounds`]), from what is known of other values (the
+    /// bound of an array's elements `x < ANY (arr)` compares with). Its
+    /// text is [`Literal::point`]'s, read only in that type's order.
+    Point(crate::refine_bounds::OrdKind),
 }
 
 /// A constant a column is compared with: its text and how it was written.
@@ -408,6 +456,40 @@ impl Literal {
 
     pub fn is_integer(&self) -> bool {
         self.kind == LitKind::Integer
+    }
+
+    /// Point `p` of an ordered type of kind `kind`.
+    pub fn point(
+        kind: crate::refine_bounds::OrdKind,
+        p: crate::refine_bounds::OrdPoint,
+    ) -> Literal {
+        use crate::refine_bounds::OrdPoint;
+        Literal {
+            text: match p {
+                OrdPoint::NegInfinity => "-inf".to_owned(),
+                OrdPoint::Infinity => "inf".to_owned(),
+                OrdPoint::NaN => "nan".to_owned(),
+                OrdPoint::Finite(n) => n.to_string(),
+            },
+            kind: LitKind::Point(kind),
+        }
+    }
+
+    /// The point a [`Literal::point`] of kind `kind` is.
+    pub fn as_point(
+        &self,
+        kind: crate::refine_bounds::OrdKind,
+    ) -> Option<crate::refine_bounds::OrdPoint> {
+        use crate::refine_bounds::{Num, OrdPoint};
+        if self.kind != LitKind::Point(kind) {
+            return None;
+        }
+        Some(match self.text.as_str() {
+            "-inf" => OrdPoint::NegInfinity,
+            "inf" => OrdPoint::Infinity,
+            "nan" => OrdPoint::NaN,
+            n => OrdPoint::Finite(Num::parse(n)?),
+        })
     }
 }
 
@@ -1143,11 +1225,14 @@ fn nonnullable_node(
                 | K::AexprNotBetweenSym => walk_opt(e.lexpr.as_ref(), false),
                 // `is_strict_saop(expr, falseOK)`: `x op ANY(array)` is NULL
                 // or FALSE when an input is NULL, enough at the top level.
-                // `ALL` over an empty array is TRUE whatever `x` is.
+                // `ALL` over an empty array is TRUE whatever `x` is (over
+                // one known to have an element, see `nonempty_array_facts`).
                 K::AexprOpAny if top_level => walk_opt(e.lexpr.as_ref(), false)
                     .union(walk_opt(e.rexpr.as_ref(), false))
                     .union(comparison_facts(e, scope, log, snapshot)),
-                K::AexprOpAll if top_level => comparison_facts(e, scope, log, snapshot),
+                K::AexprOpAll if top_level => comparison_facts(e, scope, log, snapshot)
+                    .union(nonempty_array_facts(e, scope, snapshot)),
+                K::AexprOpAny | K::AexprOpAll => nonempty_array_facts(e, scope, snapshot),
                 _ => Facts::default(),
             }
         }
@@ -1627,21 +1712,173 @@ pub(crate) fn cast_target(
     .then_some(target)
 }
 
-/// `col op constant` (either way round), `col IN (…)`, `col = ANY (…)`
-/// and `col <> ALL (…)` over constants, TRUE: what it says of the column
-/// (equal to a constant, one or none of several, ordered against one).
+/// `col op constant` (either way round), `col IN (…)`, `col op ANY (…)`
+/// and `col op ALL (…)` over constants, TRUE: what it says of the column
+/// (equal to a constant, one or none of several, ordered against one) —
+/// or, over an array of other elements, what [`element_preds`] says.
 fn comparison_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCatalog) -> Facts {
-    let Some((c, p)) = column_pred(e, scope, log, snapshot) else {
-        return Facts::default();
+    let (c, preds) = match column_pred(e, scope, log, snapshot) {
+        Some((c, p)) => (c, vec![p]),
+        None => match element_preds(e, scope, log, snapshot) {
+            Some(found) => found,
+            None => return Facts::default(),
+        },
     };
     let mut f = Facts::default();
-    if let ValPred::In(vs) = &p
-        && let [v] = vs.as_slice()
-    {
-        f.equals.insert(c.clone(), v.clone());
+    for p in preds {
+        if let ValPred::In(vs) = &p
+            && let [v] = vs.as_slice()
+        {
+            f.equals.insert(c.clone(), v.clone());
+        }
+        f.preds.push((c.clone(), p));
     }
-    f.preds.push((c, p));
     f
+}
+
+/// `c op ANY (arr)` TRUE over an array whose elements are known
+/// ([`StrictLog::note_array_elements`]: `ARRAY[kind]`, a column of an
+/// array of a domain, …) but are not constants: `c` is equal, or ordered
+/// against, one of them. `= ANY` leaves `c` what every element is (its
+/// values and bounds), `< ANY` / `<= ANY` below the elements' upper bound,
+/// `> ANY` / `>= ANY` above their lower bound. Only for a column whose
+/// values compare with the elements as they are: of one type (domains
+/// read as their base type), both integers, or both `text` / `varchar`.
+/// Nothing of `op ALL` (TRUE over an empty array whatever `c` is), nor
+/// read under a negation: `c` equal to no element says nothing of what
+/// the elements may be.
+fn element_preds(
+    e: &ast::AExpr,
+    scope: &Scope,
+    log: &StrictLog,
+    snapshot: &PgCatalog,
+) -> Option<(Col, Vec<ValPred>)> {
+    use crate::pg_catalog::oid;
+    if e.kind != ast::AExprKind::AexprOpAny || !log.trusts(e.location, StrictNode::BuiltinCompare) {
+        return None;
+    }
+    let (c, t) = plain_column(e.lexpr.as_ref()?, scope)?;
+    let elems = log.array_elements(e.location)?;
+    let (ct, et) = (
+        snapshot.unwrap_domain(t),
+        snapshot.unwrap_domain(elems.elem_type),
+    );
+    let int = |t| [oid::INT2, oid::INT4, oid::INT8].contains(&t);
+    let string = |t| [oid::TEXT, oid::VARCHAR].contains(&t);
+    if !(ct == et || (int(ct) && int(et)) || (string(ct) && string(et))) {
+        return None;
+    }
+    let r = &elems.refine;
+    // The elements' bounds: `(bound, inclusive)`.
+    let (lo, hi) = if int(et) {
+        let b = r.int_bounds().unwrap_or_default();
+        let lit = |v: i128| {
+            (
+                Literal {
+                    text: v.to_string(),
+                    kind: LitKind::Integer,
+                },
+                true,
+            )
+        };
+        (b.lo.map(lit), b.hi.map(lit))
+    } else if let Some(kind) = crate::refine_bounds::OrdKind::of(et, snapshot)
+        && let Some(b) = r.bounds.filter(|b| b.kind == kind)
+    {
+        let lit = |b: crate::refine_bounds::OrdBound| (Literal::point(kind, b.point), b.inclusive);
+        (b.lo.map(lit), b.hi.map(lit))
+    } else {
+        (None, None)
+    };
+    let below = |(v, inclusive): (Literal, bool)| {
+        ValPred::Cmp(if inclusive { CmpOp::Le } else { CmpOp::Lt }, v)
+    };
+    let above = |(v, inclusive): (Literal, bool)| {
+        ValPred::Cmp(if inclusive { CmpOp::Ge } else { CmpOp::Gt }, v)
+    };
+    let op = crate::expr::extract_string_fields(&e.name).join(".");
+    let mut preds = Vec::new();
+    match op.as_str() {
+        "=" => {
+            // (The collation was deterministic: see `ArrayElements`.)
+            let kind = match crate::refine::Exact::of(elems.elem_type, None, snapshot) {
+                Some(crate::refine::Exact::Int) => Some(LitKind::Integer),
+                Some(crate::refine::Exact::Bool) => Some(LitKind::Boolean),
+                Some(crate::refine::Exact::Text) => Some(LitKind::String),
+                None => None,
+            };
+            if let (Some(vs), Some(kind)) = (&r.values, kind) {
+                preds.push(ValPred::In(
+                    vs.iter()
+                        .map(|v| Literal {
+                            text: v.clone(),
+                            kind,
+                        })
+                        .collect(),
+                ));
+            }
+            preds.extend(lo.map(above));
+            preds.extend(hi.map(below));
+        }
+        // Below some element: below their upper bound (strictly, for `<`).
+        "<" => preds.extend(hi.map(|(v, _)| ValPred::Cmp(CmpOp::Lt, v))),
+        "<=" => preds.extend(hi.map(below)),
+        ">" => preds.extend(lo.map(|(v, _)| ValPred::Cmp(CmpOp::Gt, v))),
+        ">=" => preds.extend(lo.map(above)),
+        _ => {}
+    }
+    (!preds.is_empty()).then_some((c, preds))
+}
+
+/// `x op ANY / ALL (arr)` non-NULL over an array that surely has an
+/// element (of a non-array `x`): `x op e` is strict, so `x` is non-NULL —
+/// `is_strict_saop` over a non-empty array constant. (Over an empty array
+/// ANY is FALSE and ALL TRUE even for a NULL `x`.)
+fn nonempty_array_facts(e: &ast::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
+    let Some((c, t)) = e.lexpr.as_ref().and_then(|l| plain_column(l, scope)) else {
+        return Facts::default();
+    };
+    if crate::expr::array_element_type(snapshot, t).is_some() || !array_nonempty(e.rexpr.as_ref()) {
+        return Facts::default();
+    }
+    Facts::column(&c.0, &c.1)
+}
+
+/// Whether the array of scalars `n` (an `ARRAY[…]` or an array literal,
+/// cast or not) surely has an element. `ARRAY[ARRAY[]::int[]]` has none,
+/// nor may `ARRAY[a]` over an array `a`: only constants that are no
+/// arrays count as elements of a constructor.
+fn array_nonempty(n: Option<&ast::Node>) -> bool {
+    use typedpg_pg_query::ast::AConstValue;
+    match n {
+        Some(ast::Node::AArrayExpr(a)) => {
+            let scalar = |i: &Option<ast::Node>| match i {
+                Some(ast::Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
+                    Some(
+                        AConstValue::Integer(_) | AConstValue::Float(_) | AConstValue::Boolean(_),
+                    ) => true,
+                    // A string beside only constants is an element, not an
+                    // array literal of a sub-array.
+                    Some(AConstValue::String(_)) => a
+                        .elements
+                        .iter()
+                        .all(|i| matches!(i, Some(ast::Node::AConst(_)))),
+                    _ => false,
+                },
+                Some(n @ ast::Node::AArrayExpr(_)) => array_nonempty(Some(n)),
+                _ => false,
+            };
+            a.elements.iter().any(scalar)
+        }
+        Some(ast::Node::TypeCast(tc)) => array_nonempty(tc.arg.as_ref()),
+        Some(ast::Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
+            Some(AConstValue::String(s)) => {
+                crate::array_input::array_dimensions(&s.sval, b',').is_some_and(|d| !d.is_empty())
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// `a.x = b.y` over two plain columns, TRUE: each is the other's value
@@ -1724,8 +1961,8 @@ fn between_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCa
 /// What a comparison of a plain column with constants, TRUE, says of the
 /// column's value ([`literal_for`] says which constants qualify): `c = v`,
 /// `c <> v`, `c < v` (and `v > c`), `c IN (…)`, `c NOT IN (…)`,
-/// `c = ANY (…)` and `c <> ALL (…)` over an `ARRAY[…]` of constants or an
-/// array literal (`'{a,b}'`). A NULL in an IN list or an `ANY` array
+/// `c op ANY (…)` and `c op ALL (…)` over an `ARRAY[…]` of constants or
+/// an array literal (`'{a,b}'`). A NULL in an IN list or an `ANY` array
 /// never makes it TRUE and is dropped; one in a NOT IN list or an `ALL`
 /// array makes it never TRUE, and nothing is said. Only for the built-in
 /// comparisons (`trust` says which the expression resolved to): a
@@ -1779,22 +2016,38 @@ pub(crate) fn column_pred(
                 },
             ))
         }
+        // `c op ANY (arr)` is an OR of `c op v` over the array's non-NULL
+        // elements (a NULL one is never TRUE: TRUE exactly when some other
+        // element makes it so); `c op ALL (arr)` the AND of them, when no
+        // element is NULL. An empty array makes ANY FALSE and ALL TRUE, as
+        // an empty OR and an empty AND are.
         kind @ (K::AexprOpAny | K::AexprOpAll) => {
             let (c, t) = plain_column(l, scope)?;
-            let positive = match (kind, op.as_str()) {
-                (K::AexprOpAny, "=") => true,
-                (K::AexprOpAll, "<>") => false,
-                _ => return None,
+            let any = kind == K::AexprOpAny;
+            let cmp = match op.as_str() {
+                "=" | "<>" => None,
+                other => Some(CmpOp::parse(other)?),
             };
-            let vs = array_constants(e.rexpr.as_ref(), t, positive, snapshot)?;
-            Some((
-                c,
-                if positive {
-                    ValPred::In(vs)
-                } else {
-                    ValPred::NotIn(vs)
-                },
-            ))
+            let one = |v: Literal| match cmp {
+                Some(cmp) => ValPred::Cmp(cmp, v),
+                None if op == "=" => ValPred::In(vec![v]),
+                None => ValPred::NotIn(vec![v]),
+            };
+            let vs = array_constants(e.rexpr.as_ref(), t, any, snapshot)?;
+            let p = match (any, op.as_str()) {
+                (true, "=") => ValPred::In(vs),
+                (false, "<>") => ValPred::NotIn(vs),
+                _ => {
+                    let mut ps: Vec<ValPred> = vs.into_iter().map(one).collect();
+                    match ps.len() {
+                        1 => ps.pop()?,
+                        n if any && n > MAX_ARMS => return None,
+                        _ if any => ValPred::AnyOf(ps.into_iter().map(|p| vec![p]).collect()),
+                        _ => ValPred::AnyOf(vec![ps]),
+                    }
+                }
+            };
+            Some((c, p))
         }
         _ => None,
     }
@@ -1828,11 +2081,10 @@ pub(crate) fn constants<'n>(
 
 /// The elements of `ARRAY[…]` over constants, or of an array literal
 /// (`'{a,b}'`, bare or cast to the array type of the column's type),
-/// compared with a column of type `t`. An array literal is read only in
-/// its plain form — comma-separated unquoted elements, no nesting or
-/// escapes — and for a column whose type reads it that way (text,
-/// varchar, enums, integers: `array_in` with `,` as the delimiter,
-/// trimming the blanks around an element).
+/// compared with a column of type `t`. An array literal is read as
+/// `array_in` reads it (quotes, escapes, nesting, explicit bounds, the
+/// type's delimiter), each element as the string constant its input
+/// function gets; `None` when it doesn't parse.
 pub(crate) fn array_constants(
     n: Option<&ast::Node>,
     t: crate::oid::PgTypeOid,
@@ -1861,54 +2113,29 @@ pub(crate) fn array_constants(
             let Some(AConstValue::String(s)) = c.val.as_ref() else {
                 return None;
             };
-            let base = snapshot.unwrap_domain(t);
-            let plain = matches!(
-                base,
-                crate::pg_catalog::oid::TEXT
-                    | crate::pg_catalog::oid::VARCHAR
-                    | crate::pg_catalog::oid::INT2
-                    | crate::pg_catalog::oid::INT4
-                    | crate::pg_catalog::oid::INT8
-            ) || snapshot
-                .pg_type
-                .get(&base)
-                .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Enum);
-            if !plain {
-                return None;
-            }
-            let blank = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c');
-            let inner = s
-                .sval
-                .trim_matches(blank)
-                .strip_prefix('{')?
-                .strip_suffix('}')?;
-            if inner.contains(['{', '}', '"', '\\']) {
-                return None;
-            }
+            // `array_in`'s walk: each element de-quoted and de-escaped, as
+            // the element type's input function gets it — what the same
+            // text written as a string constant of that type is.
+            let delim = crate::literal_input::array_delimiter(t, snapshot)?;
             let mut out = Vec::new();
-            if inner.trim_matches(blank).is_empty() {
-                return Some(out);
-            }
-            for item in inner.split(',') {
-                let item = item.trim_matches(blank);
-                if item.is_empty() {
-                    return None;
-                }
-                if item.eq_ignore_ascii_case("null") {
-                    if drop_nulls {
-                        continue;
+            let mut null = false;
+            crate::array_input::parse_array(&s.sval, delim, &mut |e| {
+                match e {
+                    None => null = true,
+                    Some(text) => {
+                        let v = Literal {
+                            text: text.to_owned(),
+                            kind: LitKind::String,
+                        };
+                        if !out.contains(&v) {
+                            out.push(v);
+                        }
                     }
-                    return None;
                 }
-                let v = Literal {
-                    text: item.to_owned(),
-                    kind: LitKind::String,
-                };
-                if !out.contains(&v) {
-                    out.push(v);
-                }
-            }
-            Some(out)
+                Ok(())
+            })
+            .ok()?;
+            (drop_nulls || !null).then_some(out)
         }
         _ => None,
     }
