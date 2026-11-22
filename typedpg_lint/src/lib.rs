@@ -105,6 +105,30 @@ pub enum Rule {
     RedundantLimit,
     /// A `DISTINCT` on rows that are already distinct.
     RedundantDistinct,
+    /// A `WHERE`, `JOIN … ON` or `HAVING` condition (or an `AND` argument of
+    /// one) that is always true or never true.
+    ConstantCondition,
+    /// A `CASE` branch that is never taken.
+    UnreachableCaseBranch,
+    /// A `CASE` without `ELSE` whose `WHEN`s may all fail: it is NULL then.
+    CaseWithoutElse,
+    /// A cast to the type its operand already has.
+    RedundantCast,
+    /// An output column alias naming the column what it already is.
+    RedundantAlias,
+    /// An unqualified column reference in a subquery that resolves to an
+    /// outer query's relation.
+    OuterReferenceInSubquery,
+    /// FROM items joined with no condition connecting them.
+    CartesianJoin,
+    /// An `INSERT` without a column list.
+    InsertWithoutColumns,
+    /// An `UPDATE` assigning a column its own value.
+    SelfAssignment,
+    /// A `WITH` query nothing references.
+    UnusedCte,
+    /// A `CASE` that is a `COALESCE` or its own condition.
+    SimplifiableCase,
     /// A `LIKE` pattern built from a parameter whose `%` and `_` are not
     /// escaped.
     LikeUnescapedParam,
@@ -112,6 +136,26 @@ pub enum Rule {
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
     MissingLockTimeout,
+    /// A `DROP INDEX` without `CONCURRENTLY` on an existing table.
+    DropIndexBlocking,
+    /// A `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or
+    /// `REPACK` without `CONCURRENTLY` on an existing table.
+    BlockingRebuild,
+    /// A `DETACH PARTITION` without `CONCURRENTLY` on an existing table.
+    DetachPartitionBlocking,
+    /// A `VALIDATE CONSTRAINT` in the transaction that added the constraint
+    /// `NOT VALID`.
+    ValidateInSameTransaction,
+    /// An `ATTACH PARTITION` that scans the partition to check its bound.
+    AttachPartitionScan,
+    /// A table without a primary key.
+    MissingPrimaryKey,
+    /// Row-level security policies on a table that does not enable it.
+    RlsPolicyNotEnforced,
+    /// Row-level security enabled on a table with no policy.
+    RlsNoPolicy,
+    /// A `SECURITY DEFINER` routine without `SET search_path`.
+    SecurityDefinerSearchPath,
     /// A `timestamp without time zone` column.
     PreferTimestamptz,
     /// A `serial` column instead of an identity column.
@@ -120,6 +164,8 @@ pub enum Rule {
     PreferText,
     /// An `int2` or `int4` primary key.
     PreferBigintPk,
+    /// A `json` column instead of `jsonb`.
+    PreferJsonb,
     /// `fetch_one` / `fetch_optional` on a query not proven to return at most
     /// one row.
     FetchMayReturnMany,
@@ -138,7 +184,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 25] = [
+    pub const ALL: [Rule; 46] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -154,13 +200,34 @@ impl Rule {
         Rule::LimitWithoutOrder,
         Rule::RedundantLimit,
         Rule::RedundantDistinct,
+        Rule::ConstantCondition,
+        Rule::UnreachableCaseBranch,
+        Rule::CaseWithoutElse,
+        Rule::RedundantCast,
+        Rule::RedundantAlias,
+        Rule::OuterReferenceInSubquery,
+        Rule::CartesianJoin,
+        Rule::InsertWithoutColumns,
+        Rule::SelfAssignment,
+        Rule::UnusedCte,
+        Rule::SimplifiableCase,
         Rule::LikeUnescapedParam,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
+        Rule::DropIndexBlocking,
+        Rule::BlockingRebuild,
+        Rule::DetachPartitionBlocking,
+        Rule::ValidateInSameTransaction,
+        Rule::AttachPartitionScan,
+        Rule::MissingPrimaryKey,
+        Rule::RlsPolicyNotEnforced,
+        Rule::RlsNoPolicy,
+        Rule::SecurityDefinerSearchPath,
         Rule::PreferTimestamptz,
         Rule::PreferIdentity,
         Rule::PreferText,
         Rule::PreferBigintPk,
+        Rule::PreferJsonb,
         Rule::FetchMayReturnMany,
         Rule::FetchAllSingleRow,
         Rule::UnusedReturning,
@@ -185,13 +252,34 @@ impl Rule {
             Rule::LimitWithoutOrder => "limit_without_order",
             Rule::RedundantLimit => "redundant_limit",
             Rule::RedundantDistinct => "redundant_distinct",
+            Rule::ConstantCondition => "constant_condition",
+            Rule::UnreachableCaseBranch => "unreachable_case_branch",
+            Rule::CaseWithoutElse => "case_without_else",
+            Rule::RedundantCast => "redundant_cast",
+            Rule::RedundantAlias => "redundant_alias",
+            Rule::OuterReferenceInSubquery => "outer_reference_in_subquery",
+            Rule::CartesianJoin => "cartesian_join",
+            Rule::InsertWithoutColumns => "insert_without_columns",
+            Rule::SelfAssignment => "self_assignment",
+            Rule::UnusedCte => "unused_cte",
+            Rule::SimplifiableCase => "simplifiable_case",
             Rule::LikeUnescapedParam => "like_unescaped_param",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
+            Rule::DropIndexBlocking => "drop_index_blocking",
+            Rule::BlockingRebuild => "blocking_rebuild",
+            Rule::DetachPartitionBlocking => "detach_partition_blocking",
+            Rule::ValidateInSameTransaction => "validate_in_same_transaction",
+            Rule::AttachPartitionScan => "attach_partition_scan",
+            Rule::MissingPrimaryKey => "missing_primary_key",
+            Rule::RlsPolicyNotEnforced => "rls_policy_not_enforced",
+            Rule::RlsNoPolicy => "rls_no_policy",
+            Rule::SecurityDefinerSearchPath => "security_definer_search_path",
             Rule::PreferTimestamptz => "prefer_timestamptz",
             Rule::PreferIdentity => "prefer_identity",
             Rule::PreferText => "prefer_text",
             Rule::PreferBigintPk => "prefer_bigint_pk",
+            Rule::PreferJsonb => "prefer_jsonb",
             Rule::FetchMayReturnMany => "fetch_may_return_many",
             Rule::FetchAllSingleRow => "fetch_all_single_row",
             Rule::UnusedReturning => "unused_returning",
@@ -230,6 +318,23 @@ impl Rule {
             }
             Rule::RedundantLimit => "a LIMIT on a query that returns at most one row",
             Rule::RedundantDistinct => "a DISTINCT on rows that are already distinct",
+            Rule::ConstantCondition => "a condition that is always true or never true",
+            Rule::UnreachableCaseBranch => "a CASE branch that is never taken",
+            Rule::CaseWithoutElse => {
+                "a CASE without ELSE whose WHENs may all be false, which makes it NULL"
+            }
+            Rule::RedundantCast => "a cast to the type its operand already has",
+            Rule::RedundantAlias => {
+                "an output column alias that names the column what it already is"
+            }
+            Rule::OuterReferenceInSubquery => {
+                "an unqualified column reference in a subquery that resolves to an outer query"
+            }
+            Rule::CartesianJoin => "FROM items joined with no condition connecting them",
+            Rule::InsertWithoutColumns => "an INSERT without a column list",
+            Rule::SelfAssignment => "an UPDATE that assigns a column its own value",
+            Rule::UnusedCte => "a WITH query nothing references",
+            Rule::SimplifiableCase => "a CASE that is a COALESCE or its own condition",
             Rule::LikeUnescapedParam => {
                 "a LIKE pattern built from a parameter whose % and _ are not escaped"
             }
@@ -239,10 +344,32 @@ impl Rule {
             Rule::MissingLockTimeout => {
                 "a migration taking a blocking lock on an existing table without SET lock_timeout"
             }
+            Rule::DropIndexBlocking => {
+                "DROP INDEX without CONCURRENTLY on a table that already has rows"
+            }
+            Rule::BlockingRebuild => {
+                "REINDEX, VACUUM FULL, CLUSTER or REPACK holding a blocking lock for the whole rebuild"
+            }
+            Rule::DetachPartitionBlocking => {
+                "DETACH PARTITION without CONCURRENTLY on a table that already has rows"
+            }
+            Rule::ValidateInSameTransaction => {
+                "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
+            }
+            Rule::AttachPartitionScan => {
+                "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+            }
+            Rule::MissingPrimaryKey => "a table without a primary key",
+            Rule::RlsPolicyNotEnforced => {
+                "row-level security policies on a table that does not enable row-level security"
+            }
+            Rule::RlsNoPolicy => "row-level security enabled on a table with no policy",
+            Rule::SecurityDefinerSearchPath => "a SECURITY DEFINER routine without SET search_path",
             Rule::PreferTimestamptz => "a timestamp without time zone column",
             Rule::PreferIdentity => "a serial column instead of an identity column",
             Rule::PreferText => "a varchar(n) or char(n) column instead of text",
             Rule::PreferBigintPk => "an int2 or int4 primary key",
+            Rule::PreferJsonb => "a json column instead of jsonb",
             Rule::FetchMayReturnMany => {
                 "fetch_one / fetch_optional on a query not proven to return at most one row"
             }
@@ -263,9 +390,10 @@ impl Rule {
     /// or `None` when the rule is off by default.
     pub fn default_level(self) -> Option<Severity> {
         match self {
-            Rule::NullComparison | Rule::UnboundedWrite | Rule::InvalidAllow => {
-                Some(Severity::Error)
-            }
+            Rule::NullComparison
+            | Rule::UnboundedWrite
+            | Rule::RlsPolicyNotEnforced
+            | Rule::InvalidAllow => Some(Severity::Error),
             Rule::NotInNullable
             | Rule::CreateIndexBlocking
             | Rule::ConstraintValidating
@@ -278,19 +406,39 @@ impl Rule {
             | Rule::LimitWithoutOrder
             | Rule::FkTypeMismatch
             | Rule::MissingLockTimeout
-            | Rule::FetchMayReturnMany => Some(Severity::Warning),
+            | Rule::DropIndexBlocking
+            | Rule::BlockingRebuild
+            | Rule::DetachPartitionBlocking
+            | Rule::ValidateInSameTransaction
+            | Rule::AttachPartitionScan
+            | Rule::MissingPrimaryKey
+            | Rule::SecurityDefinerSearchPath
+            | Rule::FetchMayReturnMany
+            | Rule::ConstantCondition
+            | Rule::UnreachableCaseBranch
+            | Rule::CaseWithoutElse
+            | Rule::OuterReferenceInSubquery
+            | Rule::CartesianJoin
+            | Rule::InsertWithoutColumns
+            | Rule::SelfAssignment
+            | Rule::UnusedCte => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit
             | Rule::RedundantDistinct
+            | Rule::RedundantCast
+            | Rule::RedundantAlias
+            | Rule::SimplifiableCase
             | Rule::FetchAllSingleRow
+            | Rule::RlsNoPolicy
             | Rule::UnusedReturning => Some(Severity::Info),
             // Off by default: enabled with a level, they report at info.
             Rule::LikeUnescapedParam
             | Rule::PreferTimestamptz
             | Rule::PreferIdentity
             | Rule::PreferText
-            | Rule::PreferBigintPk => None,
+            | Rule::PreferBigintPk
+            | Rule::PreferJsonb => None,
         }
     }
 }
@@ -1550,6 +1698,7 @@ mod tests {
             Rule::PreferIdentity,
             Rule::PreferText,
             Rule::PreferBigintPk,
+            Rule::PreferJsonb,
         ] {
             assert_eq!(rule.default_level(), None, "{rule}");
             assert_eq!(rule.default_severity(), Severity::Info, "{rule}");
@@ -2549,6 +2698,15 @@ mod tests {
             (Rule::TableRewrite, Severity::Warning),
             (Rule::FkWithoutIndex, Severity::Warning),
             (Rule::RedundantIndex, Severity::Info),
+            (Rule::DropIndexBlocking, Severity::Warning),
+            (Rule::BlockingRebuild, Severity::Warning),
+            (Rule::DetachPartitionBlocking, Severity::Warning),
+            (Rule::ValidateInSameTransaction, Severity::Warning),
+            (Rule::AttachPartitionScan, Severity::Warning),
+            (Rule::MissingPrimaryKey, Severity::Warning),
+            (Rule::RlsPolicyNotEnforced, Severity::Error),
+            (Rule::RlsNoPolicy, Severity::Info),
+            (Rule::SecurityDefinerSearchPath, Severity::Warning),
         ] {
             assert_eq!(rule.default_severity(), severity, "{rule}");
         }

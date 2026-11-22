@@ -604,7 +604,7 @@ pub(crate) fn infer_case(
                 // `argument of CASE/WHEN must be type boolean, not type X` —
                 // wording and ordering live in the shared clause walker.
                 _ => {
-                    super::plan_fold::unless_dropped(literal_cond_dropped, || {
+                    let cond_type = super::plan_fold::unless_dropped(literal_cond_dropped, || {
                         super::plan_fold::unless_dead(cond_dead, || {
                             crate::clause::coerce_clause_expr(
                                 cond.as_ref(),
@@ -614,6 +614,16 @@ pub(crate) fn infer_case(
                             )
                         })
                     })?;
+                    // Whether the condition is a plain boolean never NULL:
+                    // the `simplifiable_case` lint rule reads it. A
+                    // parameter may be passed NULL whatever its inferred
+                    // nullability.
+                    crate::pg_catalog::note_case_condition_not_null(
+                        when.location,
+                        cond_type.type_oid == oid::BOOL
+                            && !cond_type.nullable
+                            && !super::has_param_ref(cond.as_ref()),
+                    );
                     taken =
                         crate::nonnull::nonnullable(cond.as_ref(), true, ctx.scope, &log, snapshot);
                 }
@@ -690,6 +700,14 @@ pub(crate) fn infer_case(
         };
         null_ctx.unreachable(&column)
     };
+    // Whether an omitted ELSE may be the result: the `case_without_else`
+    // lint rule reads it.
+    if expr.defresult.is_none() {
+        crate::pg_catalog::note_case_else_reachable(
+            expr.location,
+            !(else_unreachable || literal_else_dropped),
+        );
+    }
     // The ELSE result (or PG's implicit `ELSE NULL`) leads the list.
     let default = match &expr.defresult {
         d @ Some(_) => {

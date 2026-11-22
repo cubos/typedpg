@@ -74,6 +74,30 @@ pub(crate) fn collation_clause(
     .map(|c| c.oid)
 }
 
+/// The column names a partition key reads (`partattrs`, and the columns
+/// each key expression is strict in), in key order. `None` when `relid`
+/// is not a partitioned table.
+pub(crate) fn key_column_names(interp: &PgCatalog, relid: PgClassOid) -> Option<Vec<String>> {
+    let spec = interp.partition_specs.get(&relid)?;
+    let mut names = Vec::new();
+    for key in &spec.keys {
+        if let Some(name) = &key.name {
+            names.push(name.clone());
+            continue;
+        }
+        for &attnum in &key.strict_attnums {
+            if let Some(attribute) = interp
+                .attributes_of(relid)
+                .iter()
+                .find(|attribute| attribute.attnum == attnum)
+            {
+                names.push(attribute.attname.clone());
+            }
+        }
+    }
+    Some(names)
+}
+
 /// The partition key's collations (`partcollation`), in key order.
 pub(crate) fn partition_key_collations(
     interp: &PgCatalog,

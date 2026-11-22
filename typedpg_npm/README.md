@@ -573,13 +573,34 @@ npx typedpg build          # compile the .sql files into the loaders' cache
 | `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
 | `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
 | `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
+| `constant_condition` | warning | A `WHERE`, `JOIN … ON` or `HAVING` condition (or an `AND` argument of one) that is always true or never true. The fix removes a `WHERE` that is always true from a `SELECT`. |
+| `unreachable_case_branch` | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is. |
+| `case_without_else` | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
+| `redundant_cast` | info | A cast to the type (and type modifier) its operand already has. |
+| `redundant_alias` | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
+| `outer_reference_in_subquery` | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
+| `cartesian_join` | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
+| `insert_without_columns` | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
+| `self_assignment` | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
+| `unused_cte` | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
+| `simplifiable_case` | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
 | `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
 | `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
 | `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| `drop_index_blocking` | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
+| `blocking_rebuild` | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
+| `detach_partition_blocking` | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
+| `validate_in_same_transaction` | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
+| `attach_partition_scan` | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
+| `missing_primary_key` | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
+| `rls_policy_not_enforced` | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
+| `rls_no_policy` | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
+| `security_definer_search_path` | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
 | `prefer_timestamptz` | off | A `timestamp without time zone` column. |
 | `prefer_identity` | off | A `serial` column instead of an identity column. |
 | `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
 | `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
+| `prefer_jsonb` | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
 | `fetch_may_return_many` | warning | `fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` on a query not proven to return at most one row. |
 | `fetch_all_single_row` | info | `fetchAll` on a query that returns at most one row. |
 | `unused_returning` | info | `execute` on a statement whose `RETURNING` rows are discarded. |
@@ -968,7 +989,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
-| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `likeUnescapedParam`, `fkTypeMismatch`, `missingLockTimeout`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`, `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`, `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`, `simplifiableCase`, `likeUnescapedParam`, `fkTypeMismatch`, `missingLockTimeout`, `dropIndexBlocking`, `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`, `attachPartitionScan`, `missingPrimaryKey`, `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `preferJsonb`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
 

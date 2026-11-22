@@ -1679,12 +1679,22 @@ impl PgCatalog {
     /// wrote rather than one a simplification rewrote.
     pub fn query_view(&self, sql: &str) -> Result<QueryView, LocatedError> {
         crate::diagnostic::clear_last_primary();
-        let (((analysis, result), sublink_nullability), null_test_arg_nullable, coalesce_facts) =
+        let (
+            (
+                ((analysis, sublink_nullability), null_test_arg_nullable, coalesce_facts),
+                redundant_casts,
+            ),
+            case_else_reachable,
+        ) = collecting_redundant_casts(|| {
             collecting_null_check_facts(|| {
                 collecting_sublink_nullability(|| {
-                    crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                    collecting_lint_facts(|| {
+                        crate::stack::with_stack(|| self.analyze_parts_here(sql, false))
+                    })
                 })
-            });
+            })
+        });
+        let ((analysis, result), lint_facts) = analysis;
         let analyzed = result.map_err(LocatedError::new)?;
         let tree = analysis.tree.map(|tree| tree.tree).ok_or_else(|| {
             LocatedError::new(AnalyzeError::Internal(format!(
@@ -1700,7 +1710,22 @@ impl PgCatalog {
             sublink_nullability,
             null_test_arg_nullable,
             coalesce_facts,
+            redundant_casts,
+            case_else_reachable,
+            column_ref_bindings: lint_facts.column_ref_bindings,
+            case_condition_not_null: lint_facts.case_condition_not_null,
         })
+    }
+
+    /// Whether the planner certainly folds condition `node` — a WHERE, JOIN
+    /// ON or HAVING qual, an AND argument of one, a CASE WHEN — to a
+    /// constant (`eval_const_expressions` over immutable operators and
+    /// functions of constants): `Some(true)`, or `Some(false)` for FALSE or
+    /// NULL (neither is true). `None` when it may depend on the row, a
+    /// parameter or the session. Names resolve along this catalog's search
+    /// path.
+    pub fn condition_constant(&self, node: &typedpg_pg_query::ast::Node) -> Option<bool> {
+        crate::expr::plan_fold::certainly_true(Some(node), self)
     }
 
     /// Inner analyze that also returns the rewritten SQL handed to the
@@ -2857,6 +2882,155 @@ thread_local! {
     /// each `COALESCE` call, by its location. `None` outside `query_view`.
     static COALESCE_FACTS: std::cell::RefCell<Option<HashMap<i32, CoalesceFact>>> =
         const { std::cell::RefCell::new(None) };
+    /// Set while [`PgCatalog::query_view`] analyzes a query: whether each
+    /// explicit cast, by its location, changes nothing (see
+    /// [`note_cast_redundant`]). `None` outside `query_view`.
+    static REDUNDANT_CASTS: std::cell::RefCell<Option<HashMap<i32, bool>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set while [`PgCatalog::query_view`] analyzes a query: whether the
+    /// omitted ELSE of each `CASE`, by its location, may be the result
+    /// (see [`note_case_else_reachable`]). `None` outside `query_view`.
+    static CASE_ELSE_REACHABLE: std::cell::RefCell<Option<HashMap<i32, bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What one column reference resolved to (its `location` is an offset in
+/// [`QueryView::sql`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRefBinding {
+    /// Whether the reference bound to a FROM entry of an enclosing query
+    /// level (a correlated outer reference, or a `LATERAL` item's
+    /// reference to the items on its left) rather than one of its own
+    /// level. AND-merged when the reference is inferred more than once.
+    pub outer: bool,
+    /// The name of the FROM entry it bound to (its alias, or the
+    /// relation's name). `None` when the entry has no name a query can
+    /// write (a join's merged `USING` columns, an unaliased subquery) or
+    /// when two inferences of the reference disagree.
+    pub source: Option<String>,
+}
+
+/// The facts [`collecting_lint_facts`] gathers.
+#[derive(Default)]
+struct LintFacts {
+    column_ref_bindings: HashMap<i32, ColumnRefBinding>,
+    case_condition_not_null: HashMap<i32, bool>,
+}
+
+thread_local! {
+    /// Set while [`PgCatalog::query_view`] analyzes a query: what the
+    /// column references resolved to and whether each searched `CASE`'s
+    /// `WHEN` condition is a plain boolean that is never NULL. `None`
+    /// outside `query_view`.
+    static LINT_FACTS: std::cell::RefCell<Option<LintFacts>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, collecting the column-binding and `CASE` condition facts it
+/// records.
+fn collecting_lint_facts<R>(f: impl FnOnce() -> R) -> (R, LintFacts) {
+    let before = LINT_FACTS.with(|facts| facts.replace(Some(LintFacts::default())));
+    let out = f();
+    let collected = LINT_FACTS
+        .with(|facts| facts.replace(before))
+        .unwrap_or_default();
+    (out, collected)
+}
+
+/// Whether [`note_column_ref_binding`] records anything: callers skip
+/// working out a binding otherwise.
+pub(crate) fn collecting_column_ref_bindings() -> bool {
+    LINT_FACTS.with(|facts| facts.borrow().is_some())
+}
+
+/// Record that the column reference at `location` bound to the FROM entry
+/// `source`, of an enclosing level when `outer`.
+pub(crate) fn note_column_ref_binding(location: i32, outer: bool, source: &str) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            let source = (!crate::scope::is_hidden_alias(source)).then(|| source.to_owned());
+            match facts.column_ref_bindings.entry(location) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let fact = entry.get_mut();
+                    fact.outer &= outer;
+                    if fact.source != source {
+                        fact.source = None;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(ColumnRefBinding { outer, source });
+                }
+            }
+        }
+    });
+}
+
+/// Record whether the `WHEN` condition at `location` (the `WHEN`
+/// keyword's) of a searched `CASE` is of type `boolean` itself and never
+/// NULL. AND-merged with a fact already recorded there.
+pub(crate) fn note_case_condition_not_null(location: i32, not_null: bool) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts
+                .case_condition_not_null
+                .entry(location)
+                .or_insert(true) &= not_null;
+        }
+    });
+}
+
+/// Run `f`, collecting the redundant-cast and omitted-ELSE facts it
+/// records.
+fn collecting_redundant_casts<R>(
+    f: impl FnOnce() -> R,
+) -> ((R, HashMap<i32, bool>), HashMap<i32, bool>) {
+    let before = REDUNDANT_CASTS.with(|facts| facts.replace(Some(HashMap::new())));
+    let before_else = CASE_ELSE_REACHABLE.with(|facts| facts.replace(Some(HashMap::new())));
+    let out = f();
+    let collected = REDUNDANT_CASTS
+        .with(|facts| facts.replace(before))
+        .unwrap_or_default();
+    let else_reachable = CASE_ELSE_REACHABLE
+        .with(|facts| facts.replace(before_else))
+        .unwrap_or_default();
+    ((out, collected), else_reachable)
+}
+
+/// Record whether the omitted ELSE of the `CASE` at `location` may be its
+/// result: no WHEN certainly folds to TRUE, and the constraints and the
+/// conditions around it don't prove some WHEN true for every row.
+/// OR-merged with a fact already recorded there.
+pub(crate) fn note_case_else_reachable(location: i32, reachable: bool) {
+    if location < 0 {
+        return;
+    }
+    CASE_ELSE_REACHABLE.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.entry(location).or_insert(false) |= reachable;
+        }
+    });
+}
+
+/// Record whether the explicit cast at `location` changes nothing: its
+/// operand already has the target type and type modifier, so coerce_type
+/// adds no node and the result is the operand itself. AND-merged with a
+/// fact already recorded there (a site may be inferred more than once, and
+/// a stored body's cast may share the offset).
+pub(crate) fn note_cast_redundant(location: i32, redundant: bool) {
+    if location < 0 {
+        return;
+    }
+    REDUNDANT_CASTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.entry(location).or_insert(true) &= redundant;
+        }
+    });
 }
 
 /// Run `f`, collecting the sublink nullability facts it records.
@@ -2992,6 +3166,18 @@ pub struct QueryView {
     null_test_arg_nullable: HashMap<i32, bool>,
     /// The facts of each `COALESCE` call, by its location in [`Self::sql`].
     coalesce_facts: HashMap<i32, CoalesceFact>,
+    /// Whether each explicit cast changes nothing, by its location in
+    /// [`Self::sql`].
+    redundant_casts: HashMap<i32, bool>,
+    /// Whether the omitted ELSE of each `CASE` may be its result, by its
+    /// location in [`Self::sql`].
+    case_else_reachable: HashMap<i32, bool>,
+    /// What each column reference resolved to, by its location in
+    /// [`Self::sql`].
+    column_ref_bindings: HashMap<i32, ColumnRefBinding>,
+    /// Whether each searched `CASE`'s `WHEN` condition is a plain boolean
+    /// that is never NULL, by the `WHEN`'s location in [`Self::sql`].
+    case_condition_not_null: HashMap<i32, bool>,
 }
 
 impl QueryView {
@@ -3015,6 +3201,43 @@ impl QueryView {
     /// [`Self::sql`]), or `None` when none was inferred there.
     pub fn coalesce_fact(&self, location: i32) -> Option<CoalesceFact> {
         self.coalesce_facts.get(&location).cloned()
+    }
+
+    /// Whether the explicit cast at `location` (a byte offset in
+    /// [`Self::sql`]: a `TypeCast`'s own location) changes nothing — its
+    /// operand, neither an untyped literal nor a parameter, already has the
+    /// target type and type modifier. `None` when no cast was inferred
+    /// there.
+    pub fn cast_is_redundant(&self, location: i32) -> Option<bool> {
+        self.redundant_casts.get(&location).copied()
+    }
+
+    /// Whether the `CASE` at `location` (a byte offset in [`Self::sql`]),
+    /// which has no ELSE, may result in its implicit NULL: no WHEN
+    /// certainly folds to TRUE and the analyzer doesn't prove the WHENs
+    /// cover every row (`CASE WHEN active THEN … WHEN NOT active THEN …`
+    /// over a NOT NULL column does). `None` when no such `CASE` was
+    /// inferred there.
+    pub fn case_else_reachable(&self, location: i32) -> Option<bool> {
+        self.case_else_reachable.get(&location).copied()
+    }
+
+    /// What the column reference at `location` (a byte offset in
+    /// [`Self::sql`]: a `ColumnRef`'s own location) resolved to: a column
+    /// or the whole row of a FROM entry. `None` when no reference was
+    /// resolved there (an output-column name in `ORDER BY`, a system
+    /// column, a SQL function parameter).
+    pub fn column_ref_binding(&self, location: i32) -> Option<&ColumnRefBinding> {
+        self.column_ref_bindings.get(&location)
+    }
+
+    /// Whether the `WHEN` condition of a searched `CASE`, at `location` (a
+    /// byte offset in [`Self::sql`]: the `CaseWhen`'s location), is of type
+    /// `boolean` (not a domain over it) and never NULL: it holds no
+    /// parameter, and the analyzer proves it NOT NULL. `None` when no such
+    /// condition was inferred there.
+    pub fn case_condition_not_null(&self, location: i32) -> Option<bool> {
+        self.case_condition_not_null.get(&location).copied()
     }
 
     /// The byte offset in the original query text of `offset_in_sql`, a

@@ -83,3 +83,10 @@ warning[unbounded_write]: UPDATE without WHERE changes every row of users
     · ────────────
     ╰────
    help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
+
+warning[self_assignment]: assigning name its own value changes nothing
+    ╭─[src/writes.sql:12:18]
+ 12 │ UPDATE users SET name = name;
+    ·                  ───────────
+    ╰────
+   help: remove the assignment, or assign the value meant

@@ -145,6 +145,105 @@
               }
             },
             {
+              "id": "constant_condition",
+              "shortDescription": {
+                "text": "a condition that is always true or never true"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "unreachable_case_branch",
+              "shortDescription": {
+                "text": "a CASE branch that is never taken"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "case_without_else",
+              "shortDescription": {
+                "text": "a CASE without ELSE whose WHENs may all be false, which makes it NULL"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "redundant_cast",
+              "shortDescription": {
+                "text": "a cast to the type its operand already has"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "redundant_alias",
+              "shortDescription": {
+                "text": "an output column alias that names the column what it already is"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "outer_reference_in_subquery",
+              "shortDescription": {
+                "text": "an unqualified column reference in a subquery that resolves to an outer query"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "cartesian_join",
+              "shortDescription": {
+                "text": "FROM items joined with no condition connecting them"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "insert_without_columns",
+              "shortDescription": {
+                "text": "an INSERT without a column list"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "self_assignment",
+              "shortDescription": {
+                "text": "an UPDATE that assigns a column its own value"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "unused_cte",
+              "shortDescription": {
+                "text": "a WITH query nothing references"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "simplifiable_case",
+              "shortDescription": {
+                "text": "a CASE that is a COALESCE or its own condition"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
               "id": "like_unescaped_param",
               "shortDescription": {
                 "text": "a LIKE pattern built from a parameter whose % and _ are not escaped"
@@ -166,6 +265,87 @@
               "id": "missing_lock_timeout",
               "shortDescription": {
                 "text": "a migration taking a blocking lock on an existing table without SET lock_timeout"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "drop_index_blocking",
+              "shortDescription": {
+                "text": "DROP INDEX without CONCURRENTLY on a table that already has rows"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "blocking_rebuild",
+              "shortDescription": {
+                "text": "REINDEX, VACUUM FULL, CLUSTER or REPACK holding a blocking lock for the whole rebuild"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "detach_partition_blocking",
+              "shortDescription": {
+                "text": "DETACH PARTITION without CONCURRENTLY on a table that already has rows"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "validate_in_same_transaction",
+              "shortDescription": {
+                "text": "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "attach_partition_scan",
+              "shortDescription": {
+                "text": "ATTACH PARTITION scanning the partition because no CHECK implies its bound"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "missing_primary_key",
+              "shortDescription": {
+                "text": "a table without a primary key"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "rls_policy_not_enforced",
+              "shortDescription": {
+                "text": "row-level security policies on a table that does not enable row-level security"
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            },
+            {
+              "id": "rls_no_policy",
+              "shortDescription": {
+                "text": "row-level security enabled on a table with no policy"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
+              "id": "security_definer_search_path",
+              "shortDescription": {
+                "text": "a SECURITY DEFINER routine without SET search_path"
               },
               "defaultConfiguration": {
                 "level": "warning"
@@ -202,6 +382,15 @@
               "id": "prefer_bigint_pk",
               "shortDescription": {
                 "text": "an int2 or int4 primary key"
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              }
+            },
+            {
+              "id": "prefer_jsonb",
+              "shortDescription": {
+                "text": "a json column instead of jsonb"
               },
               "defaultConfiguration": {
                 "level": "none"

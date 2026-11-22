@@ -113,8 +113,8 @@ pub use analysis_diff::{AnalysisDifference, first_difference};
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
-    CoalesceFact, LocatedError, MigrationObserver, MigrationStatement, PgCatalog, QueryView,
-    SublinkNullability, UserObjectCounts,
+    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement, PgCatalog,
+    QueryView, SublinkNullability, UserObjectCounts,
 };
 pub use refine::Refinement;
 pub use resolve::{

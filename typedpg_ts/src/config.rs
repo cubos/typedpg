@@ -21,12 +21,19 @@
 //! `"info"` or `"off"`. The query rules are `nullComparison`,
 //! `unboundedWrite`, `notInNullable`, `redundantNullCheck`,
 //! `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`,
-//! `likeUnescapedParam` and the call-site rules `fetchMayReturnMany`,
+//! `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`,
+//! `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`,
+//! `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`,
+//! `simplifiableCase`, `likeUnescapedParam` and the call-site rules `fetchMayReturnMany`,
 //! `fetchAllSingleRow` and `unusedReturning`; the migration rules
 //! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
-//! `tableRewrite` and `missingLockTimeout`; the schema rules
-//! `fkWithoutIndex`, `redundantIndex`, `fkTypeMismatch`, `preferTimestamptz`,
-//! `preferIdentity`, `preferText` and `preferBigintPk`. `likeUnescapedParam`
+//! `tableRewrite`, `missingLockTimeout`, `dropIndexBlocking`,
+//! `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`
+//! and `attachPartitionScan`; the schema rules `fkWithoutIndex`,
+//! `redundantIndex`, `fkTypeMismatch`, `missingPrimaryKey`,
+//! `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`,
+//! `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk` and
+//! `preferJsonb`. `likeUnescapedParam`
 //! and the `prefer*` rules are off by default; set them to a level to enable
 //! them. The call-site rules check how a query is called (`fetchOne`,
 //! `fetchValue`, `fetchOptional`, `fetchAll`, `execute`) against what the

@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use typedpg_analyzer::{
     ConType, DdlError, MigrationObserver, MigrationStatement, PgAttribute, PgCatalog, PgClass,
-    PgClassOid, PgConstraintOid, PgIndex, PgTypeOid, RelKind, TypCategory,
+    PgClassOid, PgConstraintOid, PgIndex, PgProcOid, PgTypeOid, ProKind, RelKind, TypCategory,
 };
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::ast::{
@@ -109,6 +109,12 @@ pub fn lint_migrations(
         transaction_snapshot: None,
         savepoints: Vec::new(),
         lock_timeout_reported: false,
+        created_relations: HashMap::new(),
+        created_policies: HashMap::new(),
+        rls_enablers: HashMap::new(),
+        created_routines: HashMap::new(),
+        before_routines: HashSet::new(),
+        not_valid_in_transaction: HashSet::new(),
     };
     for (file, migration) in files.iter().enumerate() {
         linter.begin_file(file, &catalog);
@@ -158,6 +164,16 @@ enum CreatedObject {
     Constraint(PgConstraintOid),
     Index(PgClassOid),
     Column(PgClassOid, i16),
+    /// A table: the statement that created it.
+    Relation(PgClassOid),
+    /// A policy on a table: the `CREATE POLICY` that created it, else the
+    /// table's creator.
+    Policy(PgClassOid, String),
+    /// A table's row-level security: the `ALTER TABLE … ENABLE ROW LEVEL
+    /// SECURITY` that turned it on, else the table's creator.
+    RowSecurity(PgClassOid),
+    /// A function or procedure: the `CREATE [OR REPLACE]` that defined it.
+    Routine(PgProcOid),
 }
 
 /// A schema rule's finding, before it is placed on its creator's statement.
@@ -229,6 +245,22 @@ struct MigrationLinter<'a> {
     /// Whether `missing_lock_timeout` already reported a statement of the
     /// current file: at most one finding per file.
     lock_timeout_reported: bool,
+    /// The statement that created each table (`CREATE TABLE`, `CREATE
+    /// TABLE AS`).
+    created_relations: HashMap<PgClassOid, Creator>,
+    /// The `CREATE POLICY` of each policy, by table and policy name.
+    created_policies: HashMap<(PgClassOid, String), Creator>,
+    /// The last `ALTER TABLE … ENABLE ROW LEVEL SECURITY` of each table.
+    rls_enablers: HashMap<PgClassOid, Creator>,
+    /// The last `CREATE [OR REPLACE] FUNCTION / PROCEDURE` of each routine.
+    created_routines: HashMap<PgProcOid, Creator>,
+    /// The migrations' routines before a `CREATE FUNCTION`, to find the one
+    /// it creates.
+    before_routines: HashSet<PgProcOid>,
+    /// The constraints the open transaction added `NOT VALID` to a table
+    /// that existed before the file: their `ADD CONSTRAINT` still holds its
+    /// lock until the transaction ends.
+    not_valid_in_transaction: HashSet<PgConstraintOid>,
 }
 
 impl MigrationLinter<'_> {
@@ -247,6 +279,7 @@ impl MigrationLinter<'_> {
         self.transaction_snapshot = self.transaction_open.then_some((false, None));
         self.savepoints.clear();
         self.lock_timeout_reported = false;
+        self.not_valid_in_transaction.clear();
     }
 
     /// Report the invalid allow comments of a file whose statements never
@@ -412,12 +445,22 @@ impl MigrationLinter<'_> {
         if self.files[self.current].lint != MigrationLint::All {
             return;
         }
+        // A `SET`/`RESET`/`set_config` of `lock_timeout` changes it for the
+        // statements that follow, and `BEGIN`/`COMMIT` decide how long a
+        // LOCAL setting — and an `ADD CONSTRAINT`'s lock — lasts, whichever
+        // rules are enabled.
+        self.track_lock_timeout(catalog, statement.node);
         for rule in [
             Rule::CreateIndexBlocking,
             Rule::ConstraintValidating,
             Rule::SetNotNullScan,
             Rule::TableRewrite,
             Rule::MissingLockTimeout,
+            Rule::DropIndexBlocking,
+            Rule::BlockingRebuild,
+            Rule::DetachPartitionBlocking,
+            Rule::ValidateInSameTransaction,
+            Rule::AttachPartitionScan,
         ] {
             if self.options.level(rule).is_none() || self.current_suppressed.contains(&rule) {
                 continue;
@@ -439,6 +482,19 @@ impl MigrationLinter<'_> {
                     self.table_rewrite(catalog, alter)
                 }
                 (Rule::MissingLockTimeout, _) => self.missing_lock_timeout(catalog, statement.node),
+                (Rule::DropIndexBlocking, N::DropStmt(drop)) => {
+                    self.drop_index_blocking(catalog, drop)
+                }
+                (Rule::BlockingRebuild, _) => self.blocking_rebuild(catalog, statement.node),
+                (Rule::DetachPartitionBlocking, N::AlterTableStmt(alter)) => {
+                    self.detach_partition_blocking(catalog, alter)
+                }
+                (Rule::ValidateInSameTransaction, N::AlterTableStmt(alter)) => {
+                    self.validate_in_same_transaction(catalog, alter)
+                }
+                (Rule::AttachPartitionScan, N::AlterTableStmt(alter)) => {
+                    self.attach_partition_scan(catalog, alter)
+                }
                 _ => Vec::new(),
             };
             for raw in findings {
@@ -676,7 +732,18 @@ impl MigrationLinter<'_> {
         let Some((relid, table)) = self.table(catalog, relation) else {
             return Vec::new();
         };
+        // SET LOGGED / UNLOGGED, SET ACCESS METHOD and SET TABLESPACE act
+        // on the table's storage: a partitioned table has none (they only
+        // set what its future partitions get), a foreign table neither.
+        let has_storage = catalog
+            .class_row(relid)
+            .is_some_and(|class| class.relkind == RelKind::Table);
+        // A rewrite a column change causes (ALTER TYPE, a volatile or
+        // identity default, a stored generated column), and one of the whole
+        // table (persistence, access method).
         let mut found = false;
+        let mut table_level = false;
+        let mut moved = false;
         for command in &alter.cmds {
             let Some(command) = alter_command(command.as_ref()) else {
                 continue;
@@ -722,7 +789,19 @@ impl MigrationLinter<'_> {
                     {
                         continue;
                     }
-                    let mut volatile_default = false;
+                    // `serial` expands to a `nextval()` DEFAULT, volatile:
+                    // every existing row gets its own value.
+                    let mut volatile_default = column_type_name(column).is_some_and(|name| {
+                        matches!(
+                            name,
+                            "smallserial"
+                                | "serial2"
+                                | "serial"
+                                | "serial4"
+                                | "bigserial"
+                                | "serial8"
+                        )
+                    });
                     let mut generated_stored = column.generated == "s";
                     for constraint in &column.constraints {
                         let Some(N::Constraint(constraint)) = constraint.as_ref() else {
@@ -732,6 +811,10 @@ impl MigrationLinter<'_> {
                             ConstrType::ConstrDefault => {
                                 volatile_default |= volatile(catalog, constraint.raw_expr.as_ref());
                             }
+                            // An identity column's default is the
+                            // sequence's next value (`NextValueExpr`),
+                            // volatile like `nextval()` (ATExecAddColumn).
+                            ConstrType::ConstrIdentity => volatile_default = true,
                             ConstrType::ConstrGenerated => {
                                 // `generated_kind` is `s` for a stored
                                 // column (`v` is virtual, with no storage to
@@ -745,17 +828,54 @@ impl MigrationLinter<'_> {
                         found = true;
                     }
                 }
+                // ATPrepChangePersistence: setting the persistence the table
+                // already has does nothing; changing it rewrites the table.
+                AlterTableType::AtSetLogged if has_storage => {
+                    table_level |= catalog.lint_relation_persistence(relid) == 'u';
+                }
+                AlterTableType::AtSetUnLogged if has_storage => {
+                    table_level |= catalog.lint_relation_persistence(relid) == 'p';
+                }
+                // ATPrepSetAccessMethod: a new access method rewrites the
+                // table. The catalog does not track a table's access method,
+                // so every table is taken to use `heap` (the default
+                // `default_table_access_method`): `SET ACCESS METHOD heap`
+                // and `SET ACCESS METHOD DEFAULT` change nothing.
+                AlterTableType::AtSetAccessMethod if has_storage => {
+                    table_level |= !command.name.is_empty() && command.name != "heap";
+                }
+                // ATExecSetTableSpace copies every block of the table and
+                // its indexes. Tablespaces are not tracked, so a move to the
+                // tablespace the table is already in (a no-op) is reported
+                // too.
+                AlterTableType::AtSetTableSpace if has_storage => moved = true,
                 _ => {}
             }
         }
-        if found {
+        if found || table_level {
+            let help = if found {
+                "rewrite in steps: add a new column, backfill it in batches, then swap"
+            } else {
+                "create a new table with the new setting, copy the rows in batches, then swap the \
+                 tables"
+            };
             vec![RawFinding {
                 span: 0..0,
                 message: format!(
                     "ALTER TABLE rewrites every row of {table} under an ACCESS EXCLUSIVE lock"
                 ),
+                help: Some(help.to_owned()),
+                fix: Vec::new(),
+            }]
+        } else if moved {
+            vec![RawFinding {
+                span: 0..0,
+                message: format!(
+                    "SET TABLESPACE copies every block of {table} under an ACCESS EXCLUSIVE lock"
+                ),
                 help: Some(
-                    "rewrite in steps: add a new column, backfill it in batches, then swap"
+                    "create a new table in the new tablespace, copy the rows in batches, then swap \
+                     the tables"
                         .to_owned(),
                 ),
                 fix: Vec::new(),
@@ -765,11 +885,390 @@ impl MigrationLinter<'_> {
         }
     }
 
+    /// `DROP INDEX` without `CONCURRENTLY` takes ACCESS EXCLUSIVE on the
+    /// index's table (RemoveRelations → RangeVarCallbackForDropRelation),
+    /// held until the transaction ends.
+    fn drop_index_blocking(
+        &self,
+        catalog: &PgCatalog,
+        drop: &typedpg_pg_query::ast::DropStmt,
+    ) -> Vec<RawFinding> {
+        if drop.remove_type != ObjectType::ObjectIndex || drop.concurrent {
+            return Vec::new();
+        }
+        let mut table = None;
+        for object in &drop.objects {
+            let Some(index) = object_relation(catalog, object.as_ref()) else {
+                continue;
+            };
+            // A partitioned index cannot be dropped concurrently ("cannot
+            // drop partitioned index concurrently"): there is nothing
+            // better to suggest.
+            if index.relkind != RelKind::Index || !self.pre_existing.contains(&index.oid) {
+                continue;
+            }
+            let Some(parent) = catalog
+                .iter_indexes()
+                .find(|row| row.indexrelid == index.oid)
+                .and_then(|row| catalog.class_row(row.indrelid))
+            else {
+                continue;
+            };
+            if self.pre_existing.contains(&parent.oid) {
+                table = Some(qualified_name(catalog, parent));
+                break;
+            }
+        }
+        let Some(table) = table else {
+            return Vec::new();
+        };
+        // DROP INDEX CONCURRENTLY drops one index per statement, without
+        // CASCADE.
+        let help = if drop.objects.len() > 1 {
+            "use one DROP INDEX CONCURRENTLY per index, in a migration whose first line is \
+             -- no-transaction"
+        } else {
+            "use DROP INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+        };
+        vec![RawFinding {
+            span: 0..0,
+            message: format!(
+                "DROP INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on {table}, \
+                 blocking every query on the table"
+            ),
+            help: Some(help.to_owned()),
+            fix: Vec::new(),
+        }]
+    }
+
+    /// `REINDEX` without `CONCURRENTLY` (SHARE on the table, ACCESS
+    /// EXCLUSIVE on each index), `VACUUM FULL`, `CLUSTER` and `REPACK`
+    /// without `CONCURRENTLY` (ACCESS EXCLUSIVE on the table) hold their
+    /// lock for the whole rebuild.
+    fn blocking_rebuild(&self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
+        let (kind, target) = match node {
+            N::ReindexStmt(reindex) => {
+                if option_enabled(&reindex.params, "concurrently") {
+                    return Vec::new();
+                }
+                use typedpg_pg_query::ast::ReindexObjectType as R;
+                let target = match reindex.kind {
+                    R::ReindexObjectIndex | R::ReindexObjectTable => reindex
+                        .relation
+                        .as_ref()
+                        .and_then(|relation| self.rebuilt_table(catalog, relation)),
+                    R::ReindexObjectSchema => self
+                        .any_pre_existing_table(catalog, Some(&reindex.name))
+                        .then(|| {
+                            format!("every table of schema {}", quote_identifier(&reindex.name))
+                        }),
+                    R::ReindexObjectDatabase => self
+                        .any_pre_existing_table(catalog, None)
+                        .then(|| "every table of the database".to_owned()),
+                    // Only the system catalogs.
+                    R::ReindexObjectSystem => None,
+                };
+                let Some(target) = target else {
+                    return Vec::new();
+                };
+                return vec![RawFinding {
+                    span: 0..0,
+                    message: format!(
+                        "REINDEX without CONCURRENTLY blocks writes on {target}, and reads that \
+                         use the indexes it rebuilds, for the whole rebuild"
+                    ),
+                    help: Some(
+                        "use REINDEX CONCURRENTLY, in a migration whose first line is \
+                         -- no-transaction"
+                            .to_owned(),
+                    ),
+                    fix: Vec::new(),
+                }];
+            }
+            N::VacuumStmt(vacuum) => {
+                if !vacuum.is_vacuumcmd || !option_enabled(&vacuum.options, "full") {
+                    return Vec::new();
+                }
+                let target = if vacuum.rels.is_empty() {
+                    self.any_pre_existing_table(catalog, None)
+                        .then(|| "every table".to_owned())
+                } else {
+                    vacuum
+                        .rels
+                        .iter()
+                        .find_map(|relation| match relation.as_ref()? {
+                            N::VacuumRelation(relation) => {
+                                self.rebuilt_table(catalog, relation.relation.as_ref()?)
+                            }
+                            _ => None,
+                        })
+                };
+                ("VACUUM FULL", target)
+            }
+            N::RepackStmt(repack) => {
+                if option_enabled(&repack.params, "concurrently") {
+                    return Vec::new();
+                }
+                let kind = if repack.command == typedpg_pg_query::ast::RepackCommand::Cluster {
+                    "CLUSTER"
+                } else {
+                    "REPACK"
+                };
+                let target = match repack
+                    .relation
+                    .as_ref()
+                    .and_then(|relation| relation.relation.as_ref())
+                {
+                    Some(relation) => self.rebuilt_table(catalog, relation),
+                    None => self
+                        .any_pre_existing_table(catalog, None)
+                        .then(|| "every table".to_owned()),
+                };
+                (kind, target)
+            }
+            _ => return Vec::new(),
+        };
+        let Some(target) = target else {
+            return Vec::new();
+        };
+        vec![RawFinding {
+            span: 0..0,
+            message: format!(
+                "{kind} rewrites {target} under an ACCESS EXCLUSIVE lock, blocking every query on \
+                 it for the whole rebuild"
+            ),
+            help: Some(
+                "use REPACK (CONCURRENTLY), in a migration whose first line is -- no-transaction"
+                    .to_owned(),
+            ),
+            fix: Vec::new(),
+        }]
+    }
+
+    /// The table a rebuild of `relation` (a table, a materialized view or an
+    /// index) locks, when it existed before the file.
+    fn rebuilt_table(
+        &self,
+        catalog: &PgCatalog,
+        relation: &typedpg_pg_query::ast::RangeVar,
+    ) -> Option<String> {
+        let class = resolve_relation(catalog, relation)?;
+        if !self.pre_existing.contains(&class.oid) {
+            return None;
+        }
+        let table = match class.relkind {
+            RelKind::Index | RelKind::PartitionedIndex => catalog
+                .iter_indexes()
+                .find(|row| row.indexrelid == class.oid)
+                .and_then(|row| catalog.class_row(row.indrelid))?,
+            RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView => class,
+            _ => return None,
+        };
+        Some(qualified_name(catalog, table))
+    }
+
+    /// Whether a table (or materialized view) of a user schema — of
+    /// `schema` when given — existed before the file.
+    fn any_pre_existing_table(&self, catalog: &PgCatalog, schema: Option<&str>) -> bool {
+        catalog.iter_classes().any(|class| {
+            matches!(class.relkind, RelKind::Table | RelKind::MaterializedView)
+                && self.pre_existing.contains(&class.oid)
+                && catalog
+                    .namespace_name(class.relnamespace)
+                    .is_some_and(|name| match schema {
+                        Some(schema) => name == schema,
+                        None => name != "information_schema" && !name.starts_with("pg_"),
+                    })
+        })
+    }
+
+    /// `DETACH PARTITION` without `CONCURRENTLY` takes ACCESS EXCLUSIVE on
+    /// the partitioned table and the partition (AlterTableGetLockLevel).
+    fn detach_partition_blocking(
+        &self,
+        catalog: &PgCatalog,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
+    ) -> Vec<RawFinding> {
+        let detaches = alter.cmds.iter().any(|command| {
+            alter_command(command.as_ref()).is_some_and(|command| {
+                command.subtype == AlterTableType::AtDetachPartition
+                    && matches!(
+                        command.def.as_ref(),
+                        Some(N::PartitionCmd(partition)) if !partition.concurrent
+                    )
+            })
+        });
+        if !detaches {
+            return Vec::new();
+        }
+        let Some((relid, table)) = alter
+            .relation
+            .as_ref()
+            .and_then(|relation| self.table(catalog, relation))
+        else {
+            return Vec::new();
+        };
+        // DETACH PARTITION … CONCURRENTLY is refused while the table has a
+        // default partition (ATExecDetachPartition).
+        let help = if catalog.lint_has_default_partition(relid) {
+            format!(
+                "CONCURRENTLY is not allowed while {table} has a default partition: set a short \
+                 lock_timeout and retry the detach on timeout"
+            )
+        } else {
+            "use DETACH PARTITION … CONCURRENTLY, in a migration whose first line is \
+             -- no-transaction"
+                .to_owned()
+        };
+        vec![RawFinding {
+            span: 0..0,
+            message: format!(
+                "DETACH PARTITION without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on {table}, \
+                 blocking every query on the partitioned table"
+            ),
+            help: Some(help),
+            fix: Vec::new(),
+        }]
+    }
+
+    /// `VALIDATE CONSTRAINT` of a constraint the same transaction added `NOT
+    /// VALID`: `ADD CONSTRAINT`'s lock (ACCESS EXCLUSIVE for a CHECK, SHARE
+    /// ROW EXCLUSIVE for a foreign key) is held until the transaction ends,
+    /// so the validation scan runs under it, as a plain `ADD CONSTRAINT`'s
+    /// would.
+    fn validate_in_same_transaction(
+        &self,
+        catalog: &PgCatalog,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
+    ) -> Vec<RawFinding> {
+        let Some((relid, table)) = alter
+            .relation
+            .as_ref()
+            .and_then(|relation| self.table(catalog, relation))
+        else {
+            return Vec::new();
+        };
+        // The constraints this statement adds NOT VALID, for a VALIDATE in
+        // the same statement.
+        let mut added_here = HashSet::new();
+        for command in &alter.cmds {
+            let Some(command) = alter_command(command.as_ref()) else {
+                continue;
+            };
+            match (command.subtype, command.def.as_ref()) {
+                (AlterTableType::AtAddConstraint, Some(N::Constraint(constraint)))
+                    if constraint.skip_validation && !constraint.conname.is_empty() =>
+                {
+                    added_here.insert(constraint.conname.as_str());
+                }
+                (AlterTableType::AtValidateConstraint, _) => {
+                    let earlier = catalog.iter_constraints().any(|constraint| {
+                        constraint.conrelid == relid
+                            && constraint.conname == command.name
+                            && self.not_valid_in_transaction.contains(&constraint.oid)
+                    });
+                    if !earlier && !added_here.contains(command.name.as_str()) {
+                        continue;
+                    }
+                    return vec![RawFinding {
+                        span: 0..0,
+                        message: format!(
+                            "VALIDATE CONSTRAINT {} runs in the transaction that added it NOT \
+                             VALID: ADD CONSTRAINT's lock on {table} is still held, so the scan \
+                             blocks writes on the table",
+                            quote_identifier(&command.name)
+                        ),
+                        help: Some(
+                            "validate it in a later migration (or after a COMMIT), where VALIDATE \
+                             CONSTRAINT only takes a SHARE UPDATE EXCLUSIVE lock"
+                                .to_owned(),
+                        ),
+                        fix: Vec::new(),
+                    }];
+                }
+                _ => {}
+            }
+        }
+        Vec::new()
+    }
+
+    /// `ATTACH PARTITION` scans the partition (under ACCESS EXCLUSIVE) to
+    /// check every row fits the bound, unless its constraints imply the
+    /// partition constraint (PartConstraintImpliedByRelConstraint). The
+    /// lint does not build the partition constraint from the bound to prove
+    /// the implication: it takes any valid, enforced CHECK on the partition
+    /// that reads a partition key column as one that implies it, and
+    /// reports only a partition with none.
+    fn attach_partition_scan(
+        &self,
+        catalog: &PgCatalog,
+        alter: &typedpg_pg_query::ast::AlterTableStmt,
+    ) -> Vec<RawFinding> {
+        let Some(parent) = alter
+            .relation
+            .as_ref()
+            .and_then(|relation| resolve_relation(catalog, relation))
+        else {
+            return Vec::new();
+        };
+        let Some(keys) = catalog.lint_partition_key_columns(parent.oid) else {
+            return Vec::new();
+        };
+        for command in &alter.cmds {
+            let Some(command) = alter_command(command.as_ref()) else {
+                continue;
+            };
+            if command.subtype != AlterTableType::AtAttachPartition {
+                continue;
+            }
+            let Some(N::PartitionCmd(partition)) = command.def.as_ref() else {
+                continue;
+            };
+            let Some(class) = partition
+                .name
+                .as_ref()
+                .and_then(|relation| resolve_relation(catalog, relation))
+            else {
+                continue;
+            };
+            if !self.pre_existing.contains(&class.oid)
+                || !matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
+            {
+                continue;
+            }
+            let checked = catalog.iter_constraints().any(|constraint| {
+                constraint.conrelid == class.oid
+                    && constraint.contype == ConType::Check
+                    && constraint.convalidated
+                    && constraint.conenforced
+                    && catalog
+                        .check_expression(constraint.oid)
+                        .is_some_and(|expr| reads_any_column(expr, &keys))
+            });
+            if checked {
+                continue;
+            }
+            let name = qualified_name(catalog, class);
+            return vec![RawFinding {
+                span: 0..0,
+                message: format!(
+                    "ATTACH PARTITION scans every row of {name} under an ACCESS EXCLUSIVE lock to \
+                     check it fits the partition bound"
+                ),
+                help: Some(format!(
+                    "first add a CHECK constraint on {name} that matches the bound (NOT VALID, \
+                     then VALIDATE CONSTRAINT in an earlier migration): PostgreSQL then skips the \
+                     scan"
+                )),
+                fix: Vec::new(),
+            }];
+        }
+        Vec::new()
+    }
+
     fn missing_lock_timeout(&mut self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
-        // A `SET`/`RESET`/`set_config` of the setting changes it for the
-        // statements that follow, whether or not it is this rule's finding,
-        // and `BEGIN`/`COMMIT` decide how long a LOCAL setting lasts.
-        self.track_lock_timeout(catalog, node);
+        // `statement_rules` already followed the statement's own `SET` /
+        // `BEGIN` / `COMMIT`.
         if self.lock_timeout_effective() || self.lock_timeout_reported {
             return Vec::new();
         }
@@ -903,6 +1402,7 @@ impl MigrationLinter<'_> {
         self.lock_timeout_local = None;
         self.transaction_snapshot = None;
         self.savepoints.clear();
+        self.not_valid_in_transaction.clear();
     }
 
     /// Start a new transaction after `COMMIT AND CHAIN` / `ROLLBACK AND
@@ -915,6 +1415,7 @@ impl MigrationLinter<'_> {
         self.transaction_snapshot = Some((self.lock_timeout_set, None));
         self.lock_timeout_local = None;
         self.savepoints.clear();
+        self.not_valid_in_transaction.clear();
     }
 
     /// Forget every proof that a timeout is set: a statement this tracker
@@ -926,6 +1427,7 @@ impl MigrationLinter<'_> {
         self.transaction_open = false;
         self.transaction_snapshot = None;
         self.savepoints.clear();
+        self.not_valid_in_transaction.clear();
     }
 
     /// Apply a `SET` (session) or `SET LOCAL` / `set_config(…, true)`
@@ -1089,6 +1591,23 @@ impl MigrationLinter<'_> {
         self.schema_rule(catalog, Rule::PreferBigintPk, |linter, catalog| {
             linter.prefer_bigint_pk(catalog)
         });
+        self.schema_rule(catalog, Rule::PreferJsonb, |linter, catalog| {
+            linter.prefer_jsonb(catalog)
+        });
+        self.schema_rule(catalog, Rule::MissingPrimaryKey, |linter, catalog| {
+            linter.missing_primary_key(catalog)
+        });
+        self.schema_rule(catalog, Rule::RlsPolicyNotEnforced, |linter, catalog| {
+            linter.rls_policy_not_enforced(catalog)
+        });
+        self.schema_rule(catalog, Rule::RlsNoPolicy, |linter, catalog| {
+            linter.rls_no_policy(catalog)
+        });
+        self.schema_rule(
+            catalog,
+            Rule::SecurityDefinerSearchPath,
+            |linter, catalog| linter.security_definer_search_path(catalog),
+        );
     }
 
     fn schema_rule(
@@ -1110,6 +1629,16 @@ impl MigrationLinter<'_> {
                 CreatedObject::Constraint(oid) => self.created_constraints.get(&oid),
                 CreatedObject::Index(oid) => self.created_indexes.get(&oid),
                 CreatedObject::Column(relid, attnum) => self.column_creators.get(&(relid, attnum)),
+                CreatedObject::Relation(relid) => self.created_relations.get(&relid),
+                CreatedObject::Policy(relid, name) => self
+                    .created_policies
+                    .get(&(relid, name))
+                    .or_else(|| self.created_relations.get(&relid)),
+                CreatedObject::RowSecurity(relid) => self
+                    .rls_enablers
+                    .get(&relid)
+                    .or_else(|| self.created_relations.get(&relid)),
+                CreatedObject::Routine(oid) => self.created_routines.get(&oid),
             };
             let Some(creator) = creator else {
                 continue;
@@ -1457,6 +1986,220 @@ impl MigrationLinter<'_> {
         out
     }
 
+    fn prefer_jsonb(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for class in reportable_tables(catalog) {
+            let table = qualified_name(catalog, class);
+            for attribute in columns(catalog, class) {
+                if !is_pg_catalog_type(catalog, inner_type(catalog, attribute.atttypid), "json") {
+                    continue;
+                }
+                let column = quote_identifier(&attribute.attname);
+                out.push(SchemaFinding {
+                    object: CreatedObject::Column(class.oid, attribute.attnum),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message: format!(
+                            "{table}.{column} is json: it has no equality operator, so DISTINCT, \
+                             GROUP BY, UNION and = fail on it, and every read parses the text again"
+                        ),
+                        help: Some(
+                            "use jsonb, unless the exact text (key order, duplicate keys, \
+                             whitespace) must be kept"
+                                .to_owned(),
+                        ),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some("use jsonb in a new migration".to_owned()),
+                });
+            }
+        }
+        out
+    }
+
+    /// Tables without a primary key. A partition is skipped: it gets its
+    /// partitioned table's primary key, and when that has none the parent
+    /// is the one reported. An inheritance child is reported: a primary key
+    /// is not inherited (only partitions clone their parent's). Temporary
+    /// tables are skipped.
+    fn missing_primary_key(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let with_primary_key: HashSet<PgClassOid> = catalog
+            .iter_constraints()
+            .filter(|constraint| constraint.contype == ConType::PrimaryKey)
+            .map(|constraint| constraint.conrelid)
+            .collect();
+        let mut tables: Vec<&PgClass> = catalog
+            .iter_classes()
+            .filter(|class| {
+                matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
+                    && !with_primary_key.contains(&class.oid)
+                    && catalog.lint_relation_persistence(class.oid) != 't'
+                    && catalog
+                        .namespace_name(class.relnamespace)
+                        .is_some_and(|name| {
+                            name != "information_schema" && !name.starts_with("pg_")
+                        })
+                    && !is_partition(catalog, class.oid)
+            })
+            .collect();
+        tables.sort_by_key(|class| class.oid);
+        tables
+            .into_iter()
+            .map(|class| {
+                let table = qualified_name(catalog, class);
+                SchemaFinding {
+                    object: CreatedObject::Relation(class.oid),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message: format!("{table} has no primary key"),
+                        help: Some(
+                            "add a PRIMARY KEY: without one, rows have no identity (duplicates go \
+                             unnoticed, and logical replication cannot publish UPDATEs and \
+                             DELETEs of the table)"
+                                .to_owned(),
+                        ),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some(
+                        "in a new migration, CREATE UNIQUE INDEX CONCURRENTLY on the key, then \
+                         ADD PRIMARY KEY USING INDEX"
+                            .to_owned(),
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    /// Policies on a table whose row-level security is off: PostgreSQL
+    /// ignores them.
+    fn rls_policy_not_enforced(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for class in policy_tables(catalog) {
+            if catalog.lint_relation_has_row_security(class.oid) {
+                continue;
+            }
+            let policies = catalog.lint_relation_policies(class.oid);
+            let Some(first) = policies.first() else {
+                continue;
+            };
+            let table = qualified_name(catalog, class);
+            let names = policies
+                .iter()
+                .map(|name| quote_identifier(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let subject = if policies.len() == 1 {
+                format!("policy {names} on {table} does nothing")
+            } else {
+                format!("policies {names} on {table} do nothing")
+            };
+            out.push(SchemaFinding {
+                object: CreatedObject::Policy(class.oid, (*first).to_owned()),
+                raw: RawFinding {
+                    span: 0..0,
+                    message: format!("{subject}: row-level security is not enabled on the table"),
+                    help: Some(format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")),
+                    fix: Vec::new(),
+                },
+                help_in_new_migration: Some(format!(
+                    "ALTER TABLE {table} ENABLE ROW LEVEL SECURITY, in a new migration"
+                )),
+            });
+        }
+        out
+    }
+
+    /// Row-level security enabled on a table with no policy: PostgreSQL
+    /// then applies a default-deny policy (`get_row_security_policies`).
+    fn rls_no_policy(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut tables: Vec<&PgClass> = catalog
+            .iter_classes()
+            .filter(|class| {
+                matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
+                    && catalog.lint_relation_has_row_security(class.oid)
+                    && catalog.lint_relation_policies(class.oid).is_empty()
+            })
+            .collect();
+        tables.sort_by_key(|class| class.oid);
+        tables
+            .into_iter()
+            .map(|class| {
+                let table = qualified_name(catalog, class);
+                let exempt = if catalog.lint_relation_forces_row_security(class.oid) {
+                    "superusers and BYPASSRLS roles"
+                } else {
+                    "its owner, superusers and BYPASSRLS roles"
+                };
+                SchemaFinding {
+                    object: CreatedObject::RowSecurity(class.oid),
+                    raw: RawFinding {
+                        span: 0..0,
+                        message: format!(
+                            "row-level security is enabled on {table}, which has no policy: every \
+                             role but {exempt} sees no rows and can write none"
+                        ),
+                        help: Some(format!(
+                            "CREATE POLICY for the roles that use {table}, or leave it as is if \
+                             denying them is the intent"
+                        )),
+                        fix: Vec::new(),
+                    },
+                    help_in_new_migration: Some(format!(
+                        "CREATE POLICY for the roles that use {table} in a new migration, or \
+                         leave it as is if denying them is the intent"
+                    )),
+                }
+            })
+            .collect()
+    }
+
+    /// `SECURITY DEFINER` routines that resolve names along the caller's
+    /// search path: a caller who can create objects in a schema on it (or
+    /// in `pg_temp`) can shadow a table, function or operator the body uses,
+    /// and run code with the owner's privileges.
+    fn security_definer_search_path(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+        let mut out = Vec::new();
+        for (oid, security_definer, caller_search_path) in catalog.lint_routine_security() {
+            if !security_definer || !caller_search_path {
+                continue;
+            }
+            let Some(proc) = catalog.pg_proc().get(&oid) else {
+                continue;
+            };
+            let schema = catalog
+                .namespace_name(proc.pronamespace)
+                .unwrap_or("public");
+            let name = QualifiedName::new(schema, &proc.proname).to_string();
+            let kind = if proc.prokind == ProKind::Procedure {
+                "procedure"
+            } else {
+                "function"
+            };
+            out.push(SchemaFinding {
+                object: CreatedObject::Routine(oid),
+                raw: RawFinding {
+                    span: 0..0,
+                    message: format!(
+                        "SECURITY DEFINER {kind} {name} has no SET search_path: it runs with its \
+                         owner's privileges but resolves names along the caller's search_path, \
+                         where the caller can shadow them"
+                    ),
+                    help: Some(format!(
+                        "add SET search_path = pg_catalog, pg_temp to the {kind}, and qualify the \
+                         objects it uses with their schema"
+                    )),
+                    fix: Vec::new(),
+                },
+                help_in_new_migration: Some(format!(
+                    "in a new migration, ALTER {} {name} SET search_path = pg_catalog, pg_temp, \
+                     and qualify the objects it uses with their schema",
+                    kind.to_ascii_uppercase()
+                )),
+            });
+        }
+        out
+    }
+
     fn redundant_index(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut indexes: Vec<&PgIndex> = catalog.iter_indexes().collect();
         indexes.sort_by_key(|index| index.indexrelid);
@@ -1550,6 +2293,13 @@ impl MigrationObserver for MigrationLinter<'_> {
             .iter_constraints()
             .map(|constraint| constraint.oid)
             .collect();
+        if let N::CreateFunctionStmt(_) = statement.node {
+            self.before_routines = catalog
+                .lint_routine_security()
+                .into_iter()
+                .map(|(oid, _, _)| oid)
+                .collect();
+        }
         if self.files[self.current].lint == MigrationLint::All {
             self.statement_rules(catalog, statement);
         }
@@ -1596,6 +2346,125 @@ impl MigrationObserver for MigrationLinter<'_> {
                     suppressed: self.current_suppressed.clone(),
                 },
             );
+        }
+        // A constraint added NOT VALID inside an open transaction keeps its
+        // ADD CONSTRAINT lock until that transaction ends.
+        if self.files[self.current].lint == MigrationLint::All
+            && self.transaction_open
+            && matches!(statement.node, N::AlterTableStmt(_))
+        {
+            for constraint in catalog.iter_constraints() {
+                if !constraint.convalidated
+                    && !self.before_constraints.contains(&constraint.oid)
+                    && self.pre_existing.contains(&constraint.conrelid)
+                {
+                    self.not_valid_in_transaction.insert(constraint.oid);
+                }
+            }
+        }
+        self.track_object_creators(catalog, statement);
+    }
+}
+
+impl MigrationLinter<'_> {
+    fn creator(&self) -> Creator {
+        Creator {
+            file: self.current,
+            span: self.current_span.clone(),
+            suppressed: self.current_suppressed.clone(),
+        }
+    }
+
+    /// Record the statement that created a table, a policy or a routine, or
+    /// enabled a table's row-level security, for the schema rules that
+    /// report on them.
+    fn track_object_creators(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
+        match statement.node {
+            N::CreateStmt(stmt) => {
+                if let Some(class) = stmt
+                    .relation
+                    .as_ref()
+                    .and_then(|relation| resolve_relation(catalog, relation))
+                    && !self.before_classes.contains(&class.oid)
+                {
+                    self.created_relations.insert(class.oid, self.creator());
+                }
+            }
+            N::CreateTableAsStmt(stmt) if stmt.objtype == ObjectType::ObjectTable => {
+                if let Some(class) = stmt
+                    .into
+                    .as_ref()
+                    .and_then(|into| into.rel.as_ref())
+                    .and_then(|relation| resolve_relation(catalog, relation))
+                    && !self.before_classes.contains(&class.oid)
+                {
+                    self.created_relations.insert(class.oid, self.creator());
+                }
+            }
+            N::CreatePolicyStmt(stmt) => {
+                if let Some(class) = stmt
+                    .table
+                    .as_ref()
+                    .and_then(|relation| resolve_relation(catalog, relation))
+                {
+                    self.created_policies
+                        .insert((class.oid, stmt.policy_name.clone()), self.creator());
+                }
+            }
+            N::AlterTableStmt(alter) => {
+                let enables = alter.cmds.iter().any(|command| {
+                    alter_command(command.as_ref()).is_some_and(|command| {
+                        command.subtype == AlterTableType::AtEnableRowSecurity
+                    })
+                });
+                if enables
+                    && let Some(class) = alter
+                        .relation
+                        .as_ref()
+                        .and_then(|relation| resolve_relation(catalog, relation))
+                {
+                    self.rls_enablers.insert(class.oid, self.creator());
+                }
+            }
+            N::CreateFunctionStmt(stmt) => {
+                let routines: Vec<PgProcOid> = catalog
+                    .lint_routine_security()
+                    .into_iter()
+                    .map(|(oid, _, _)| oid)
+                    .collect();
+                let mut created: Vec<PgProcOid> = routines
+                    .iter()
+                    .copied()
+                    .filter(|oid| !self.before_routines.contains(oid))
+                    .collect();
+                // `CREATE OR REPLACE` of an existing routine keeps its OID:
+                // find it by name, when the name alone tells.
+                if created.is_empty() && stmt.replace {
+                    let names: Vec<&str> = stmt
+                        .funcname
+                        .iter()
+                        .filter_map(|n| string_node(n.as_ref()))
+                        .collect();
+                    let (schema, name) = match names.as_slice() {
+                        [name] => (None, *name),
+                        [schema, name] => (Some(*schema), *name),
+                        _ => return,
+                    };
+                    let candidates: Vec<PgProcOid> = catalog
+                        .find_functions(schema, name)
+                        .into_iter()
+                        .map(|proc| proc.oid)
+                        .filter(|oid| routines.contains(oid))
+                        .collect();
+                    if let [oid] = candidates.as_slice() {
+                        created.push(*oid);
+                    }
+                }
+                for oid in created {
+                    self.created_routines.insert(oid, self.creator());
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1689,6 +2558,29 @@ fn is_reportable_table(catalog: &PgCatalog, class: &PgClass) -> bool {
             .pg_inherits()
             .iter()
             .any(|inherits| inherits.inhrelid == class.oid)
+}
+
+/// Whether `relid` is a partition: a child of a partitioned table.
+fn is_partition(catalog: &PgCatalog, relid: PgClassOid) -> bool {
+    catalog.pg_inherits().iter().any(|inherits| {
+        inherits.inhrelid == relid
+            && catalog
+                .class_row(inherits.inhparent)
+                .is_some_and(|parent| parent.relkind == RelKind::Partitioned)
+    })
+}
+
+/// The tables with row-level security policies, by OID.
+fn policy_tables(catalog: &PgCatalog) -> Vec<&PgClass> {
+    let mut tables: Vec<&PgClass> = catalog
+        .iter_classes()
+        .filter(|class| {
+            matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
+                && !catalog.lint_relation_policies(class.oid).is_empty()
+        })
+        .collect();
+    tables.sort_by_key(|class| class.oid);
+    tables
 }
 
 fn columns<'a>(catalog: &'a PgCatalog, class: &PgClass) -> Vec<&'a PgAttribute> {
@@ -2361,6 +3253,35 @@ fn drop_lock_target(
         }
     }
     None
+}
+
+/// The relation a `DROP` object (a `[schema.]name` list) names.
+fn object_relation<'a>(catalog: &'a PgCatalog, object: Option<&Node>) -> Option<&'a PgClass> {
+    let Some(N::List(list)) = object else {
+        return None;
+    };
+    let names: Vec<&str> = list
+        .items
+        .iter()
+        .filter_map(|n| string_node(n.as_ref()))
+        .collect();
+    match names.as_slice() {
+        [name] => catalog.resolve_table(None, name),
+        [schema, name] => catalog.resolve_table(Some(schema), name),
+        _ => None,
+    }
+}
+
+/// Whether `node` references one of `columns`.
+fn reads_any_column(node: &Node, columns: &[String]) -> bool {
+    node.nodes().any(|(node, _)| match node {
+        typedpg_pg_query::NodeRef::ColumnRef(column) => column
+            .fields
+            .last()
+            .and_then(|field| string_node(field.as_ref()))
+            .is_some_and(|name| columns.iter().any(|column| column == name)),
+        _ => false,
+    })
 }
 
 fn string_node(node: Option<&Node>) -> Option<&str> {
@@ -3789,5 +4710,861 @@ mod tests {
             assert_eq!(found.len(), 1, "{rule}: {findings:?}");
             assert!(found[0].finding.help.is_some(), "{rule}: {findings:?}");
         }
+    }
+
+    // ── table_rewrite: storage changes and filled columns ──────────────────
+
+    #[test]
+    fn table_rewrite_reports_persistence_changes() {
+        let found = only(
+            &second("ALTER TABLE users SET UNLOGGED;"),
+            Rule::TableRewrite,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "ALTER TABLE rewrites every row of public.users under an ACCESS EXCLUSIVE lock"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "create a new table with the new setting, copy the rows in batches, then swap the tables"
+            )
+        );
+        // Setting the persistence the table already has does nothing.
+        assert!(only(&second("ALTER TABLE users SET LOGGED;"), Rule::TableRewrite).is_empty());
+        let findings = lint(
+            &[
+                (
+                    "001_base.sql",
+                    "CREATE UNLOGGED TABLE scratch (id integer PRIMARY KEY);",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_logged.sql",
+                    "ALTER TABLE scratch SET LOGGED;",
+                    MigrationLint::All,
+                ),
+                (
+                    "003_unlogged.sql",
+                    "ALTER TABLE scratch SET UNLOGGED;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::TableRewrite);
+        assert_eq!(found.len(), 2, "{findings:?}");
+        assert_eq!((found[0].file, found[1].file), (1, 2), "{findings:?}");
+        let findings = lint(
+            &[
+                (
+                    "001_base.sql",
+                    "CREATE UNLOGGED TABLE scratch (id integer PRIMARY KEY);",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_unlogged.sql",
+                    "ALTER TABLE scratch SET UNLOGGED;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::TableRewrite).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn table_rewrite_reports_a_new_access_method_and_tablespace() {
+        // Tables are taken to use heap, the default access method.
+        for sql in [
+            "ALTER TABLE users SET ACCESS METHOD heap;",
+            "ALTER TABLE users SET ACCESS METHOD DEFAULT;",
+        ] {
+            assert!(only(&second(sql), Rule::TableRewrite).is_empty(), "{sql}");
+        }
+        let findings = second(
+            "CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;
+             ALTER TABLE users SET ACCESS METHOD heap2;",
+        );
+        assert_eq!(only(&findings, Rule::TableRewrite).len(), 1, "{findings:?}");
+
+        let found = only(
+            &second("ALTER TABLE users SET TABLESPACE fast;"),
+            Rule::TableRewrite,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "SET TABLESPACE copies every block of public.users under an ACCESS EXCLUSIVE lock"
+        );
+        // A partitioned table has no storage: these only set what its future
+        // partitions get.
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                (
+                    "002_move.sql",
+                    "ALTER TABLE measurements SET TABLESPACE fast;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::TableRewrite).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn table_rewrite_reports_identity_and_serial_columns() {
+        for sql in [
+            "ALTER TABLE users ADD COLUMN seq integer GENERATED ALWAYS AS IDENTITY;",
+            "ALTER TABLE users ADD COLUMN seq bigint GENERATED BY DEFAULT AS IDENTITY;",
+            "ALTER TABLE users ADD COLUMN seq serial;",
+            "ALTER TABLE users ADD COLUMN seq bigserial;",
+            "ALTER TABLE users ADD COLUMN seq integer DEFAULT nextval('users_seq');",
+        ] {
+            let sql = if sql.contains("users_seq") {
+                format!("CREATE SEQUENCE users_seq; {sql}")
+            } else {
+                sql.to_owned()
+            };
+            let findings = second(&sql);
+            assert_eq!(
+                only(&findings, Rule::TableRewrite).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+        // A plain column, a constant default and a virtual generated column
+        // are only catalog changes.
+        for sql in [
+            "ALTER TABLE users ADD COLUMN seq integer;",
+            "ALTER TABLE users ADD COLUMN seq integer DEFAULT 7;",
+            "ALTER TABLE users ADD COLUMN twice integer GENERATED ALWAYS AS (id * 2) VIRTUAL;",
+        ] {
+            assert!(only(&second(sql), Rule::TableRewrite).is_empty(), "{sql}");
+        }
+        // A table created in the same file has no rows to rewrite.
+        let findings = second(
+            "CREATE TABLE fresh (id integer PRIMARY KEY);
+             ALTER TABLE fresh ADD COLUMN seq serial, SET UNLOGGED, SET TABLESPACE fast;",
+        );
+        assert!(
+            only(&findings, Rule::TableRewrite).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── drop_index_blocking ────────────────────────────────────────────────
+
+    #[test]
+    fn drop_index_blocking_reports_a_non_concurrent_drop() {
+        let found = only(
+            &second("DROP INDEX users_email_idx;"),
+            Rule::DropIndexBlocking,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "DROP INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on public.users, \
+             blocking every query on the table"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "use DROP INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+            )
+        );
+        let found = only(
+            &second(
+                "CREATE INDEX posts_author_idx ON posts (author_id);
+                 DROP INDEX users_email_idx, posts_author_idx;",
+            ),
+            Rule::DropIndexBlocking,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .finding
+                .help
+                .as_deref()
+                .unwrap()
+                .starts_with("use one DROP INDEX CONCURRENTLY per index"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn drop_index_blocking_ignores_concurrent_new_and_schema_only_drops() {
+        let findings = second_with(
+            "-- no-transaction\nDROP INDEX CONCURRENTLY users_email_idx;",
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::DropIndexBlocking).is_empty(),
+            "{findings:?}"
+        );
+        let findings = second(
+            "CREATE INDEX posts_author_idx ON posts (author_id);
+             DROP INDEX posts_author_idx;",
+        );
+        assert!(
+            only(&findings, Rule::DropIndexBlocking).is_empty(),
+            "{findings:?}"
+        );
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_drop.sql",
+                    "DROP INDEX users_email_idx;",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::DropIndexBlocking).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── blocking_rebuild ───────────────────────────────────────────────────
+
+    #[test]
+    fn blocking_rebuild_reports_rebuilds_of_existing_tables() {
+        for (sql, message) in [
+            (
+                "REINDEX TABLE users;",
+                "REINDEX without CONCURRENTLY blocks writes on public.users, and reads that use \
+                 the indexes it rebuilds, for the whole rebuild",
+            ),
+            (
+                "REINDEX INDEX users_email_idx;",
+                "REINDEX without CONCURRENTLY blocks writes on public.users, and reads that use \
+                 the indexes it rebuilds, for the whole rebuild",
+            ),
+            (
+                "REINDEX SCHEMA public;",
+                "REINDEX without CONCURRENTLY blocks writes on every table of schema public, and \
+                 reads that use the indexes it rebuilds, for the whole rebuild",
+            ),
+            (
+                "VACUUM FULL users;",
+                "VACUUM FULL rewrites public.users under an ACCESS EXCLUSIVE lock, blocking every \
+                 query on it for the whole rebuild",
+            ),
+            (
+                "VACUUM (FULL) users;",
+                "VACUUM FULL rewrites public.users under an ACCESS EXCLUSIVE lock, blocking every \
+                 query on it for the whole rebuild",
+            ),
+            (
+                "VACUUM FULL;",
+                "VACUUM FULL rewrites every table under an ACCESS EXCLUSIVE lock, blocking every \
+                 query on it for the whole rebuild",
+            ),
+            (
+                "CLUSTER users USING users_email_idx;",
+                "CLUSTER rewrites public.users under an ACCESS EXCLUSIVE lock, blocking every \
+                 query on it for the whole rebuild",
+            ),
+            (
+                "REPACK users;",
+                "REPACK rewrites public.users under an ACCESS EXCLUSIVE lock, blocking every \
+                 query on it for the whole rebuild",
+            ),
+        ] {
+            let findings = second_with(sql, false, &LintOptions::default());
+            let found = only(&findings, Rule::BlockingRebuild);
+            assert_eq!(found.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(found[0].finding.message, message, "{sql}");
+        }
+    }
+
+    #[test]
+    fn blocking_rebuild_ignores_concurrent_and_new_rebuilds() {
+        for sql in [
+            "REINDEX (CONCURRENTLY) TABLE users;",
+            "REINDEX TABLE CONCURRENTLY users;",
+            "REPACK (CONCURRENTLY) users;",
+            "VACUUM users;",
+            "VACUUM (FULL false) users;",
+            "CREATE TABLE fresh (id integer PRIMARY KEY); REINDEX TABLE fresh;",
+            "CREATE TABLE fresh (id integer PRIMARY KEY); VACUUM FULL fresh;",
+        ] {
+            let findings = second_with(sql, false, &LintOptions::default());
+            assert!(
+                only(&findings, Rule::BlockingRebuild).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_rebuild.sql",
+                    "REINDEX TABLE users;",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::BlockingRebuild).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── detach_partition_blocking ──────────────────────────────────────────
+
+    #[test]
+    fn detach_partition_blocking_reports_a_non_concurrent_detach() {
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                (
+                    "002_detach.sql",
+                    "ALTER TABLE measurements DETACH PARTITION measurements_1;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::DetachPartitionBlocking);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "DETACH PARTITION without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on \
+             public.measurements, blocking every query on the partitioned table"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "use DETACH PARTITION … CONCURRENTLY, in a migration whose first line is -- no-transaction"
+            )
+        );
+        // With a default partition, CONCURRENTLY is refused.
+        let findings = lint(
+            &[
+                (
+                    "001_base.sql",
+                    &format!(
+                        "{PARTITIONED} CREATE TABLE measurements_other PARTITION OF measurements DEFAULT;"
+                    ),
+                    MigrationLint::All,
+                ),
+                (
+                    "002_detach.sql",
+                    "ALTER TABLE measurements DETACH PARTITION measurements_1;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::DetachPartitionBlocking);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert!(
+            found[0].finding.help.as_deref().unwrap().starts_with(
+                "CONCURRENTLY is not allowed while public.measurements has a default partition"
+            ),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn detach_partition_blocking_ignores_concurrent_and_new_detaches() {
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                (
+                    "002_detach.sql",
+                    "ALTER TABLE measurements DETACH PARTITION measurements_1 CONCURRENTLY;",
+                    MigrationLint::All,
+                ),
+            ],
+            false,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::DetachPartitionBlocking).is_empty(),
+            "{findings:?}"
+        );
+        let findings = lint(
+            &[(
+                "001_all.sql",
+                &format!("{PARTITIONED} ALTER TABLE measurements DETACH PARTITION measurements_1;"),
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::DetachPartitionBlocking).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── validate_in_same_transaction ───────────────────────────────────────
+
+    #[test]
+    fn validate_in_same_transaction_reports_a_validate_under_the_add_lock() {
+        let text = "ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0) NOT VALID;
+                    ALTER TABLE users VALIDATE CONSTRAINT users_id_positive;";
+        let found = only(&second(text), Rule::ValidateInSameTransaction);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            &text[found[0].finding.span.clone()],
+            "ALTER TABLE users VALIDATE CONSTRAINT users_id_positive"
+        );
+        assert_eq!(
+            found[0].finding.message,
+            "VALIDATE CONSTRAINT users_id_positive runs in the transaction that added it NOT \
+             VALID: ADD CONSTRAINT's lock on public.users is still held, so the scan blocks \
+             writes on the table"
+        );
+        // A foreign key, both in one statement (ADD CONSTRAINT runs in an
+        // earlier ALTER TABLE pass than VALIDATE), and an explicit
+        // transaction in a file the runner does not wrap.
+        for (sql, use_transaction) in [
+            (
+                "ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0) NOT VALID, \
+                 VALIDATE CONSTRAINT users_id_positive;",
+                false,
+            ),
+            (
+                "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) \
+                 REFERENCES users (id) NOT VALID;
+                 ALTER TABLE posts VALIDATE CONSTRAINT posts_author_fk;",
+                true,
+            ),
+            (
+                "BEGIN;
+                 ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0) NOT VALID;
+                 ALTER TABLE users VALIDATE CONSTRAINT users_id_positive;
+                 COMMIT;",
+                false,
+            ),
+        ] {
+            let findings = second_with(sql, use_transaction, &LintOptions::default());
+            assert_eq!(
+                only(&findings, Rule::ValidateInSameTransaction).len(),
+                1,
+                "{sql}: {findings:?}"
+            );
+        }
+        // The transaction is tracked whether or not missing_lock_timeout
+        // runs.
+        let mut config = LintConfig::default();
+        config
+            .levels
+            .insert("missing_lock_timeout".to_owned(), LintLevel::Off);
+        let findings = second_with(text, true, &LintOptions::from_config(&config));
+        assert_eq!(
+            only(&findings, Rule::ValidateInSameTransaction).len(),
+            1,
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_in_same_transaction_ignores_a_validate_after_the_commit() {
+        let add = "ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0) NOT VALID;";
+        let validate = "ALTER TABLE users VALIDATE CONSTRAINT users_id_positive;";
+        // A later migration.
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                ("002_add.sql", add, MigrationLint::All),
+                ("003_validate.sql", validate, MigrationLint::All),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::ValidateInSameTransaction).is_empty(),
+            "{findings:?}"
+        );
+        for (sql, use_transaction) in [
+            // Each statement commits on its own.
+            (format!("{add}\n{validate}"), false),
+            (format!("-- no-transaction\n{add}\n{validate}"), true),
+            (format!("BEGIN; {add} COMMIT;\n{validate}"), false),
+            // A constraint the file validates while adding it was not added
+            // NOT VALID.
+            (
+                "ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0);
+                 ALTER TABLE users VALIDATE CONSTRAINT users_id_positive;"
+                    .to_owned(),
+                true,
+            ),
+            // A table created in the same file.
+            (
+                "CREATE TABLE fresh (id integer PRIMARY KEY);
+                 ALTER TABLE fresh ADD CONSTRAINT fresh_id_positive CHECK (id > 0) NOT VALID;
+                 ALTER TABLE fresh VALIDATE CONSTRAINT fresh_id_positive;"
+                    .to_owned(),
+                true,
+            ),
+        ] {
+            let findings = second_with(&sql, use_transaction, &LintOptions::default());
+            assert!(
+                only(&findings, Rule::ValidateInSameTransaction).is_empty(),
+                "{sql}: {findings:?}"
+            );
+        }
+    }
+
+    // ── attach_partition_scan ──────────────────────────────────────────────
+
+    #[test]
+    fn attach_partition_scan_reports_a_partition_without_a_check() {
+        let attach = "ALTER TABLE measurements ATTACH PARTITION measurements_new \
+                      FOR VALUES FROM (100) TO (200);";
+        let attach_with = |before: &str| {
+            lint(
+                &[
+                    ("001_base.sql", PARTITIONED, MigrationLint::All),
+                    ("002_check.sql", before, MigrationLint::All),
+                    ("003_attach.sql", attach, MigrationLint::All),
+                ],
+                true,
+                &LintOptions::default(),
+            )
+        };
+        let findings = attach_with("SELECT 1;");
+        let found = only(&findings, Rule::AttachPartitionScan);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(found[0].file, 2);
+        assert_eq!(
+            found[0].finding.message,
+            "ATTACH PARTITION scans every row of public.measurements_new under an ACCESS \
+             EXCLUSIVE lock to check it fits the partition bound"
+        );
+        // A CHECK that proves nothing: not validated, not enforced, or not
+        // on the key.
+        for check in [
+            "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 100 AND id < 200) NOT VALID;",
+            "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 100 AND id < 200) NOT ENFORCED;",
+            "ALTER TABLE measurements_new ADD CONSTRAINT recent CHECK (at > '2020-01-01');",
+        ] {
+            let findings = attach_with(check);
+            assert_eq!(
+                only(&findings, Rule::AttachPartitionScan).len(),
+                1,
+                "{check}: {findings:?}"
+            );
+        }
+        // A validated CHECK on the key lets PostgreSQL skip the scan.
+        let findings = attach_with(
+            "ALTER TABLE measurements_new ADD CONSTRAINT bound CHECK (id >= 100 AND id < 200);",
+        );
+        assert!(
+            only(&findings, Rule::AttachPartitionScan).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn attach_partition_scan_ignores_a_new_table() {
+        let findings = lint(
+            &[
+                ("001_base.sql", PARTITIONED, MigrationLint::All),
+                (
+                    "002_attach.sql",
+                    "CREATE TABLE measurements_2 (id integer, at timestamp);
+                     ALTER TABLE measurements ATTACH PARTITION measurements_2 \
+                     FOR VALUES FROM (200) TO (300);",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::AttachPartitionScan).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── missing_primary_key ────────────────────────────────────────────────
+
+    #[test]
+    fn missing_primary_key_reports_tables_without_one() {
+        let text = "CREATE TABLE events (id integer, at timestamptz);
+                    CREATE TABLE later (id integer);
+                    ALTER TABLE later ADD PRIMARY KEY (id);
+                    CREATE TEMP TABLE scratch (id integer);
+                    CREATE TABLE logs (id integer) PARTITION BY RANGE (id);
+                    CREATE TABLE logs_1 PARTITION OF logs FOR VALUES FROM (0) TO (10);
+                    CREATE TABLE keyed (id integer PRIMARY KEY);
+                    CREATE TABLE keyed_child (extra integer) INHERITS (keyed);";
+        let findings = lint(
+            &[("001_all.sql", text, MigrationLint::All)],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::MissingPrimaryKey);
+        let spans: Vec<&str> = found
+            .iter()
+            .map(|f| &text[f.finding.span.clone()])
+            .collect();
+        assert_eq!(
+            spans,
+            [
+                "CREATE TABLE events (id integer, at timestamptz)",
+                "CREATE TABLE logs (id integer) PARTITION BY RANGE (id)",
+                "CREATE TABLE keyed_child (extra integer) INHERITS (keyed)",
+            ],
+            "{findings:?}"
+        );
+        assert_eq!(found[0].finding.message, "public.events has no primary key");
+        assert_eq!(found[0].finding.severity, Severity::Warning);
+    }
+
+    #[test]
+    fn missing_primary_key_points_schema_only_files_at_a_new_migration() {
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                (
+                    "002_unchanged.sql",
+                    "CREATE TABLE events (id integer);",
+                    MigrationLint::SchemaOnly,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::MissingPrimaryKey);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(found[0].file, 1);
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some(
+                "in a new migration, CREATE UNIQUE INDEX CONCURRENTLY on the key, then ADD PRIMARY KEY USING INDEX"
+            )
+        );
+        let findings = lint(
+            &[(
+                "001_all.sql",
+                "-- typedpg-lint: allow(missing_primary_key)\nCREATE TABLE events (id integer);",
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::MissingPrimaryKey).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── rls_policy_not_enforced / rls_no_policy ────────────────────────────
+
+    #[test]
+    fn rls_policy_not_enforced_reports_policies_on_a_table_without_rls() {
+        let text = "CREATE TABLE notes (id integer PRIMARY KEY, owner text);
+                    CREATE POLICY notes_owner ON notes USING (owner = current_user);
+                    CREATE POLICY notes_read ON notes FOR SELECT USING (true);";
+        let findings = lint(
+            &[("001_all.sql", text, MigrationLint::All)],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::RlsPolicyNotEnforced);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(found[0].finding.severity, Severity::Error);
+        assert_eq!(
+            &text[found[0].finding.span.clone()],
+            "CREATE POLICY notes_owner ON notes USING (owner = current_user)"
+        );
+        assert_eq!(
+            found[0].finding.message,
+            "policies notes_owner, notes_read on public.notes do nothing: row-level security is \
+             not enabled on the table"
+        );
+        assert_eq!(
+            found[0].finding.help.as_deref(),
+            Some("ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY")
+        );
+        let findings = lint(
+            &[(
+                "001_all.sql",
+                &format!("{text} ALTER TABLE notes ENABLE ROW LEVEL SECURITY;"),
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::RlsPolicyNotEnforced).is_empty(),
+            "{findings:?}"
+        );
+        assert!(
+            only(&findings, Rule::RlsNoPolicy).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn rls_no_policy_reports_rls_without_a_policy() {
+        let text = "CREATE TABLE notes (id integer PRIMARY KEY);
+                    ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+                    CREATE TABLE secrets (id integer PRIMARY KEY);
+                    ALTER TABLE secrets ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;";
+        let findings = lint(
+            &[("001_all.sql", text, MigrationLint::All)],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::RlsNoPolicy);
+        assert_eq!(found.len(), 2, "{findings:?}");
+        assert_eq!(found[0].finding.severity, Severity::Info);
+        assert_eq!(
+            &text[found[0].finding.span.clone()],
+            "ALTER TABLE notes ENABLE ROW LEVEL SECURITY"
+        );
+        assert_eq!(
+            found[0].finding.message,
+            "row-level security is enabled on public.notes, which has no policy: every role but \
+             its owner, superusers and BYPASSRLS roles sees no rows and can write none"
+        );
+        assert!(
+            found[1]
+                .finding
+                .message
+                .contains("every role but superusers and BYPASSRLS roles"),
+            "{found:?}"
+        );
+        // Disabled again: nothing to report.
+        let findings = lint(
+            &[(
+                "001_all.sql",
+                "CREATE TABLE notes (id integer PRIMARY KEY);
+                 ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+                 ALTER TABLE notes DISABLE ROW LEVEL SECURITY;",
+                MigrationLint::All,
+            )],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::RlsNoPolicy).is_empty(),
+            "{findings:?}"
+        );
+    }
+
+    // ── security_definer_search_path ───────────────────────────────────────
+
+    #[test]
+    fn security_definer_search_path_reports_definers_without_a_search_path() {
+        let text = "CREATE FUNCTION count_users() RETURNS bigint SECURITY DEFINER
+                        LANGUAGE sql AS $$ SELECT count(*) FROM users $$;
+                    CREATE FUNCTION pinned() RETURNS bigint SECURITY DEFINER
+                        SET search_path = pg_catalog, pg_temp
+                        LANGUAGE sql AS $$ SELECT count(*) FROM public.users $$;
+                    CREATE FUNCTION invoker() RETURNS bigint
+                        LANGUAGE sql AS $$ SELECT count(*) FROM users $$;
+                    CREATE FUNCTION atomic() RETURNS bigint SECURITY DEFINER
+                        LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM users; END;
+                    CREATE PROCEDURE touch() SECURITY DEFINER
+                        LANGUAGE plpgsql AS $$ BEGIN UPDATE users SET email = email; END $$;
+                    CREATE FUNCTION altered() RETURNS bigint SECURITY DEFINER
+                        LANGUAGE sql AS $$ SELECT count(*) FROM users $$;
+                    ALTER FUNCTION altered() SET search_path = pg_catalog, pg_temp;";
+        let findings = lint(
+            &[
+                ("001_base.sql", BASE, MigrationLint::All),
+                ("002_functions.sql", text, MigrationLint::All),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::SecurityDefinerSearchPath);
+        let messages: Vec<&str> = found.iter().map(|f| f.finding.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "SECURITY DEFINER function public.count_users has no SET search_path: it runs \
+                 with its owner's privileges but resolves names along the caller's search_path, \
+                 where the caller can shadow them",
+                "SECURITY DEFINER procedure public.touch has no SET search_path: it runs with \
+                 its owner's privileges but resolves names along the caller's search_path, where \
+                 the caller can shadow them",
+            ],
+            "{findings:?}"
+        );
+        assert!(
+            text[found[0].finding.span.clone()].starts_with("CREATE FUNCTION count_users()"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn security_definer_search_path_follows_create_or_replace() {
+        let findings = lint(
+            &[
+                (
+                    "001_function.sql",
+                    "CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_definer.sql",
+                    "CREATE OR REPLACE FUNCTION f() RETURNS integer SECURITY DEFINER
+                         LANGUAGE sql AS $$ SELECT 1 $$;",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+            &LintOptions::default(),
+        );
+        let found = only(&findings, Rule::SecurityDefinerSearchPath);
+        assert_eq!(found.len(), 1, "{findings:?}");
+        assert_eq!(found[0].file, 1, "{findings:?}");
+    }
+
+    // ── prefer_jsonb ───────────────────────────────────────────────────────
+
+    #[test]
+    fn prefer_jsonb_reports_json_columns_when_enabled() {
+        let text =
+            "CREATE TABLE docs (id integer PRIMARY KEY, body json, bodies json[], fine jsonb);";
+        let findings = lint(
+            &[("001_docs.sql", text, MigrationLint::All)],
+            true,
+            &LintOptions::default(),
+        );
+        assert!(
+            only(&findings, Rule::PreferJsonb).is_empty(),
+            "{findings:?}"
+        );
+        let findings = lint(
+            &[("001_docs.sql", text, MigrationLint::All)],
+            true,
+            &opinion_options(&[Rule::PreferJsonb]),
+        );
+        let found = only(&findings, Rule::PreferJsonb);
+        assert_eq!(found.len(), 2, "{findings:?}");
+        assert_eq!(
+            found[0].finding.message,
+            "public.docs.body is json: it has no equality operator, so DISTINCT, GROUP BY, UNION \
+             and = fail on it, and every read parses the text again"
+        );
     }
 }

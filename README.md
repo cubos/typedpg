@@ -118,13 +118,34 @@ and lints the migrations themselves:
 | `limit_without_order` | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
 | `redundant_limit` | info | A `LIMIT` on a query that returns at most one row. |
 | `redundant_distinct` | info | A `DISTINCT` on rows that are already distinct. |
+| `constant_condition` | warning | A `WHERE`, `JOIN … ON` or `HAVING` condition (or an `AND` argument of one) that is always true or never true. The fix removes a `WHERE` that is always true from a `SELECT`. |
+| `unreachable_case_branch` | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is. |
+| `case_without_else` | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
+| `redundant_cast` | info | A cast to the type (and type modifier) its operand already has. |
+| `redundant_alias` | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
+| `outer_reference_in_subquery` | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
+| `cartesian_join` | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
+| `insert_without_columns` | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
+| `self_assignment` | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
+| `unused_cte` | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
+| `simplifiable_case` | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
 | `like_unescaped_param` | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
 | `fk_type_mismatch` | warning | A foreign key whose column types differ from the referenced columns. |
 | `missing_lock_timeout` | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| `drop_index_blocking` | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
+| `blocking_rebuild` | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
+| `detach_partition_blocking` | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
+| `validate_in_same_transaction` | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
+| `attach_partition_scan` | warning | `ATTACH PARTITION` of an existing table with no valid `CHECK` on the partition key, so PostgreSQL scans it under lock to check the bound. A `CHECK` that reads a key column is taken to imply the bound (the lint does not prove it does). |
+| `missing_primary_key` | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
+| `rls_policy_not_enforced` | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
+| `rls_no_policy` | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
+| `security_definer_search_path` | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
 | `prefer_timestamptz` | off | A `timestamp without time zone` column. |
 | `prefer_identity` | off | A `serial` column instead of an identity column. |
 | `prefer_text` | off | A `varchar(n)` or `char(n)` column instead of `text`. |
 | `prefer_bigint_pk` | off | An `int2` or `int4` primary key. |
+| `prefer_jsonb` | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
 | `fetch_may_return_many` | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
 | `fetch_all_single_row` | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
 | `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
@@ -165,7 +186,10 @@ A comment suppresses a rule for the query or migration statement it is in:
 `redundant_binding` (and, for a `renaming_binding`, rewrites every `$p` of
 the SQL literal to `$v`), and applies the SQL edits some rules offer:
 `redundant_null_check`'s `COALESCE`, `redundant_limit`,
-`redundant_distinct` and `unused_returning`. It writes the files, then
+`redundant_distinct`, `constant_condition`, `case_without_else`,
+`redundant_cast`, `redundant_alias`, `insert_without_columns`,
+`self_assignment`, `unused_cte`, `simplifiable_case` and `unused_returning`.
+It writes the files, then
 reports what remains; only edits that keep the query's meaning are applied.
 Each fix is checked once more before it is offered: the edited query must
 analyze to the same columns and parameters. A fix that doesn't is a typedpg

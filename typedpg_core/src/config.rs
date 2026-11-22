@@ -39,13 +39,21 @@
 //!
 //! The query rules are `null_comparison`, `unbounded_write`,
 //! `not_in_nullable`, `redundant_null_check`, `limit_without_order`,
-//! `redundant_limit`, `redundant_distinct`, `like_unescaped_param`,
-//! `fetch_may_return_many`, `fetch_all_single_row` and `unused_returning`;
+//! `redundant_limit`, `redundant_distinct`, `constant_condition`,
+//! `unreachable_case_branch`, `case_without_else`, `redundant_cast`,
+//! `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`,
+//! `insert_without_columns`, `self_assignment`, `unused_cte`,
+//! `simplifiable_case`, `like_unescaped_param`, `fetch_may_return_many`,
+//! `fetch_all_single_row` and `unused_returning`;
 //! the migration rules `create_index_blocking`, `constraint_validating`,
-//! `set_not_null_scan`, `table_rewrite` and `missing_lock_timeout`; and the
+//! `set_not_null_scan`, `table_rewrite`, `missing_lock_timeout`,
+//! `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`,
+//! `validate_in_same_transaction` and `attach_partition_scan`; and the
 //! schema rules `fk_without_index`, `redundant_index`, `fk_type_mismatch`,
-//! `prefer_timestamptz`, `prefer_identity`, `prefer_text` and
-//! `prefer_bigint_pk`, evaluated over the migrations' final schema.
+//! `missing_primary_key`, `rls_policy_not_enforced`, `rls_no_policy`,
+//! `security_definer_search_path`, `prefer_timestamptz`, `prefer_identity`,
+//! `prefer_text`, `prefer_bigint_pk` and `prefer_jsonb`, evaluated over the
+//! migrations' final schema.
 //! `like_unescaped_param` and the `prefer_*` rules are off by default; set
 //! them to a level to enable them. [`LINT_RULES`] is the one list of their
 //! keys. The call-site rules (`fetch_may_return_many`,
@@ -191,13 +199,34 @@ pub const LINT_RULES: &[&str] = &[
     "limit_without_order",
     "redundant_limit",
     "redundant_distinct",
+    "constant_condition",
+    "unreachable_case_branch",
+    "case_without_else",
+    "redundant_cast",
+    "redundant_alias",
+    "outer_reference_in_subquery",
+    "cartesian_join",
+    "insert_without_columns",
+    "self_assignment",
+    "unused_cte",
+    "simplifiable_case",
     "like_unescaped_param",
     "fk_type_mismatch",
     "missing_lock_timeout",
+    "drop_index_blocking",
+    "blocking_rebuild",
+    "detach_partition_blocking",
+    "validate_in_same_transaction",
+    "attach_partition_scan",
+    "missing_primary_key",
+    "rls_policy_not_enforced",
+    "rls_no_policy",
+    "security_definer_search_path",
     "prefer_timestamptz",
     "prefer_identity",
     "prefer_text",
     "prefer_bigint_pk",
+    "prefer_jsonb",
     "fetch_may_return_many",
     "fetch_all_single_row",
     "unused_returning",
@@ -1704,8 +1733,16 @@ event_data = "crate::EventData"
              `create_index_blocking`, `constraint_validating`, `set_not_null_scan`, \
              `table_rewrite`, `fk_without_index`, `redundant_index`, `redundant_null_check`, \
              `limit_without_order`, `redundant_limit`, `redundant_distinct`, \
+             `constant_condition`, `unreachable_case_branch`, `case_without_else`, \
+             `redundant_cast`, \
+             `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`, \
+             `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, \
              `like_unescaped_param`, `fk_type_mismatch`, `missing_lock_timeout`, \
+             `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`, \
+             `validate_in_same_transaction`, `attach_partition_scan`, `missing_primary_key`, \
+             `rls_policy_not_enforced`, `rls_no_policy`, `security_definer_search_path`, \
              `prefer_timestamptz`, `prefer_identity`, `prefer_text`, `prefer_bigint_pk`, \
+             `prefer_jsonb`, \
              `fetch_may_return_many`, `fetch_all_single_row`, `unused_returning`, \
              `redundant_binding`, `renaming_binding`"
         );

@@ -470,6 +470,17 @@ pub(crate) fn infer_type_cast(
     // length coercion may be planned into a relabeling of its input
     // (`varchar_support`), collated like that; any other node keeps its
     // collation.
+    // A cast to the type and typmod its operand already has adds no node:
+    // the `redundant_cast` lint rule reads it. A parameter's cast types the
+    // parameter, and an untyped operand has no type of its own.
+    let typmod_of = |t: Option<i32>| t.filter(|t| *t >= 0);
+    crate::pg_catalog::note_cast_redundant(
+        cast.location,
+        inner_type.type_oid == target_oid
+            && typmod_of(written_typmod) == typmod_of(inner_type.typmod)
+            && !inner_type.unknown_value
+            && !matches!(inner, Some(ast::Node::ParamRef(_))),
+    );
     let planned = if inner_type.type_oid == target_oid
         && written_typmod.is_none()
         && inner_type.typmod.is_none()
