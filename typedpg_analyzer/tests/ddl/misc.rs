@@ -8942,3 +8942,419 @@ fn lock_refuses_a_foreign_table() {
         "got: {err}"
     );
 }
+
+#[test]
+fn copy_checks_the_values_and_directions_of_its_options() {
+    // PG 19 ProcessCopyOptions: ON_ERROR (stop / ignore / set_null) is COPY
+    // FROM only and must be STOP in BINARY mode; REJECT_LIMIT needs ON_ERROR
+    // IGNORE; FREEZE is COPY FROM only; FORCE_QUOTE / FORCE_NOT_NULL need
+    // CSV; LOG_VERBOSITY takes a known level; DELIMITER is one byte.
+    let setup = "CREATE TABLE t (a int, b text);";
+    for (stmt, msg) in [
+        (
+            "COPY t TO STDOUT (ON_ERROR ignore);",
+            "COPY ON_ERROR cannot be used with COPY TO",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT json, ON_ERROR stop);",
+            "COPY ON_ERROR cannot be used with COPY TO",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR foo);",
+            "COPY ON_ERROR \"foo\" not recognized",
+        ),
+        (
+            "COPY t FROM STDIN (FORMAT binary, ON_ERROR ignore);",
+            "only ON_ERROR STOP is allowed in BINARY mode",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR set_null, REJECT_LIMIT 5);",
+            "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+        ),
+        (
+            "COPY t TO STDOUT (FREEZE);",
+            "COPY FREEZE cannot be used with COPY TO",
+        ),
+        (
+            "COPY t TO STDOUT (FORCE_QUOTE (a));",
+            "COPY FORCE_QUOTE requires CSV mode",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT json, FORCE_QUOTE *);",
+            "COPY FORCE_QUOTE requires CSV mode",
+        ),
+        (
+            "COPY t FROM STDIN (LOG_VERBOSITY bogus);",
+            "COPY LOG_VERBOSITY \"bogus\" not recognized",
+        ),
+        (
+            "COPY t TO STDOUT (DELIMITER 'ab');",
+            "COPY delimiter must be a single one-byte character",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
+fn copy_options_follow_process_copy_options() {
+    // PG 19 ProcessCopyOptions, the rest of it: each option once, the
+    // values each takes, then DELIMITER / NULL / DEFAULT / QUOTE / ESCAPE
+    // against each other, the format and the direction.
+    let setup = "CREATE TABLE t (a int, b text);";
+    let conflicting = "conflicting or redundant options";
+    for (stmt, msg) in [
+        ("COPY t TO STDOUT (FORMAT csv, FORMAT text);", conflicting),
+        (
+            "COPY t TO STDOUT (DELIMITER ',', DELIMITER ';');",
+            conflicting,
+        ),
+        ("COPY t TO STDOUT (HEADER, HEADER false);", conflicting),
+        ("COPY t TO STDOUT (FREEZE, FREEZE);", conflicting),
+        (
+            "COPY t TO STDOUT (FORMAT csv, FORCE_QUOTE (a), FORCE_QUOTE (b));",
+            conflicting,
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR stop, ON_ERROR ignore);",
+            conflicting,
+        ),
+        (
+            "COPY t TO STDOUT (ENCODING 'utf8', ENCODING 'latin1');",
+            conflicting,
+        ),
+        (
+            "COPY t TO STDOUT (ENCODING 'nosuch');",
+            "argument to option \"encoding\" must be a valid encoding name",
+        ),
+        (
+            "COPY t FROM STDIN (ENCODING '');",
+            "argument to option \"encoding\" must be a valid encoding name",
+        ),
+        (
+            "COPY t TO STDOUT (FORCE_QUOTE 'x');",
+            "argument to option \"force_quote\" must be a list of column names",
+        ),
+        (
+            "COPY t TO STDOUT (ON_ERROR);",
+            "on_error requires a parameter",
+        ),
+        (
+            "COPY t FROM STDIN (REJECT_LIMIT);",
+            "reject_limit requires a numeric value",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 0);",
+            "REJECT_LIMIT (0) must be greater than zero",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT -1);",
+            "REJECT_LIMIT (-1) must be greater than zero",
+        ),
+        (
+            "COPY t FROM STDIN (ON_ERROR ignore, REJECT_LIMIT 'abc');",
+            "invalid input syntax for type bigint: \"abc\"",
+        ),
+        (
+            "COPY t TO STDOUT (DELIMITER E'\\n');",
+            "COPY delimiter cannot be newline or carriage return",
+        ),
+        (
+            "COPY t TO STDOUT (DELIMITER 'a');",
+            "COPY delimiter cannot be \"a\"",
+        ),
+        (
+            "COPY t FROM STDIN (DELIMITER E'\\\\');",
+            "COPY delimiter cannot be \"\\\"",
+        ),
+        (
+            "COPY t TO STDOUT (DELIMITER 'é');",
+            "COPY delimiter must be a single one-byte character",
+        ),
+        (
+            "COPY t TO STDOUT (NULL E'x\\ny');",
+            "COPY null representation cannot use newline or carriage return",
+        ),
+        (
+            "COPY t FROM STDIN (DEFAULT E'a\\rb');",
+            "COPY default representation cannot use newline or carriage return",
+        ),
+        (
+            "COPY t TO STDOUT (QUOTE '\"');",
+            "COPY QUOTE requires CSV mode",
+        ),
+        (
+            "COPY t TO STDOUT (ESCAPE '\"');",
+            "COPY ESCAPE requires CSV mode",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, QUOTE 'ab');",
+            "COPY quote must be a single one-byte character",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, ESCAPE '');",
+            "COPY escape must be a single one-byte character",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, DELIMITER '\"');",
+            "COPY delimiter and quote must be different",
+        ),
+        (
+            "COPY t FROM STDIN (FORMAT csv, FORCE_QUOTE *);",
+            "COPY FORCE_QUOTE cannot be used with COPY FROM",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, FORCE_NOT_NULL (a));",
+            "COPY FORCE_NOT_NULL cannot be used with COPY TO",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, FORCE_NULL (a));",
+            "COPY FORCE_NULL cannot be used with COPY TO",
+        ),
+        (
+            "COPY t TO STDOUT (NULL 'a|b', DELIMITER '|');",
+            "COPY delimiter character must not appear in the NULL specification",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT csv, NULL 'a\"b');",
+            "CSV quote character must not appear in the NULL specification",
+        ),
+        (
+            "COPY t TO STDOUT (DEFAULT 'x');",
+            "COPY DEFAULT cannot be used with COPY TO",
+        ),
+        (
+            "COPY t FROM STDIN (DEFAULT 'x|y', DELIMITER '|');",
+            "COPY delimiter character must not appear in the DEFAULT specification",
+        ),
+        (
+            "COPY t FROM STDIN (FORMAT csv, DEFAULT '\"');",
+            "CSV quote character must not appear in the DEFAULT specification",
+        ),
+        (
+            "COPY t FROM STDIN (NULL 'x', DEFAULT 'x');",
+            "NULL specification and DEFAULT specification cannot be the same",
+        ),
+        (
+            "COPY t FROM STDIN (FORMAT binary, HEADER);",
+            "cannot specify HEADER in BINARY mode",
+        ),
+        (
+            "COPY t TO STDOUT (FORMAT json, NULL 'x');",
+            "cannot specify NULL in JSON mode",
+        ),
+        (
+            "COPY t FROM STDIN (FORMAT binary, ON_ERROR set_null);",
+            "only ON_ERROR STOP is allowed in BINARY mode",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "COPY t TO STDOUT (FORMAT csv, DELIMITER '|', NULL 'x', QUOTE '''', ESCAPE '\\', \
+               ENCODING 'Windows-1252', LOG_VERBOSITY verbose, FORCE_QUOTE (a));
+             COPY t TO STDOUT CSV QUOTE AS '''' FORCE QUOTE *;
+             COPY t TO STDOUT (DELIMITER 'A', HEADER false, FREEZE false);
+             COPY t TO STDOUT (FORMAT binary);",
+        ),
+    ]);
+}
+
+#[test]
+fn repack_analyze_rejects_a_column_named_twice() {
+    // PG 19 process_single_relation → analyze_rel (do_analyze_rel): a
+    // column listed twice is an error, as for a plain ANALYZE.
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE t (a int PRIMARY KEY, b int);",
+            "REPACK (ANALYZE) t (b, b);",
+            "column \"b\" of relation \"t\" appears more than once",
+        ),
+        (
+            "CREATE TABLE t (a int PRIMARY KEY, b int);",
+            "ANALYZE t (b, b);",
+            "column \"b\" of relation \"t\" appears more than once",
+        ),
+    ]);
+}
+
+#[test]
+fn drop_subscription_needs_its_servers_connection_function() {
+    // PG 19 DropSubscription: a subscription with a slot builds its
+    // conninfo from its server (construct_subserver_conninfo →
+    // ForeignServerConnectionString), which fails once the wrapper has no
+    // CONNECTION function.
+    assert_ddl_rejections(&[(
+        "CREATE EXTENSION postgres_fdw;
+         CREATE SERVER s FOREIGN DATA WRAPPER postgres_fdw;
+         CREATE SUBSCRIPTION sub SERVER s PUBLICATION p WITH (connect = false);
+         ALTER FOREIGN DATA WRAPPER postgres_fdw NO CONNECTION;",
+        "DROP SUBSCRIPTION sub;",
+        "foreign-data wrapper \"postgres_fdw\" does not support subscription connections",
+    )]);
+}
+
+/// [`assert_ddl_rejections`] for statements creating tablespaces, which the
+/// pg_sanity mirror can't follow: its server has no directory for them.
+#[track_caller]
+fn assert_tablespace_rejections(cases: &[(&str, &str, &str)]) {
+    for (setup, statement, message) in cases {
+        let mut db = PgCatalog::new().unwrap();
+        db.skip_pg_sanity();
+        if !setup.is_empty() {
+            db.apply_sql(setup)
+                .unwrap_or_else(|e| panic!("setup failed: {setup}\n  {e}"));
+        }
+        match db.apply_sql(statement) {
+            Err(err) => assert!(
+                err.to_string().starts_with(message),
+                "{statement}\n  expected: {message}\n  got: {err}"
+            ),
+            Ok(()) => panic!("{statement}\n  expected: {message}\n  got: Ok"),
+        }
+    }
+}
+
+#[test]
+fn renamed_tablespaces_and_databases_refuse_newlines() {
+    // PG 19 RenameTableSpace / RenameDatabase: no newline or carriage
+    // return in the new name (checked before the database is looked up).
+    assert_tablespace_rejections(&[
+        (
+            "CREATE TABLESPACE t LOCATION '/var/lib/postgresql/ts';",
+            "ALTER TABLESPACE t RENAME TO \"a\nb\";",
+            "tablespace name \"a\nb\" contains a newline or carriage return character",
+        ),
+        (
+            "",
+            "ALTER DATABASE nosuch RENAME TO \"a\nb\";",
+            "database name \"a\nb\" contains a newline or carriage return character",
+        ),
+    ]);
+}
+
+#[test]
+fn a_role_name_with_a_newline_never_exists() {
+    // PG 19 CreateRole / RenameRole refuse a newline or carriage return in
+    // a role name (and pg_upgrade refuses a cluster with one): no such
+    // role can exist, so naming one fails.
+    let missing = "role \"a\nb\" does not exist";
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE t (a int);",
+            "GRANT SELECT ON t TO \"a\nb\";",
+            missing,
+        ),
+        (
+            "CREATE TABLE t (a int);",
+            "ALTER TABLE t OWNER TO \"a\nb\";",
+            missing,
+        ),
+        ("", "SET ROLE \"a\nb\";", missing),
+        ("", "CREATE SCHEMA s AUTHORIZATION \"a\nb\";", missing),
+        (
+            "CREATE TABLE t (a int);",
+            "CREATE POLICY p ON t TO \"a\nb\" USING (true);",
+            missing,
+        ),
+        ("", "DROP ROLE \"a\nb\";", missing),
+    ]);
+}
+
+#[test]
+fn analyze_checks_the_column_list_of_any_relation() {
+    // PG 19 analyze_rel checks the column list (validate_va_cols_list)
+    // before the relation's kind, so a plain ANALYZE of a view or sequence
+    // checks it too; VACUUM (ANALYZE) skips what vacuum_rel can't vacuum
+    // before.
+    let setup = "CREATE TABLE t (a int, b int);
+                 CREATE VIEW v AS SELECT * FROM t;
+                 CREATE SEQUENCE s;";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "ANALYZE v (nosuch);",
+            "column \"nosuch\" of relation \"v\" does not exist",
+        ),
+        (
+            setup,
+            "ANALYZE v (a, a);",
+            "column \"a\" of relation \"v\" appears more than once",
+        ),
+        (
+            setup,
+            "ANALYZE s (nosuch);",
+            "column \"nosuch\" of relation \"s\" does not exist",
+        ),
+        (
+            setup,
+            "ANALYZE t (a, ctid);",
+            "column \"ctid\" of relation \"t\" does not exist",
+        ),
+        (
+            setup,
+            "VACUUM (ANALYZE) t (b, b);",
+            "column \"b\" of relation \"t\" appears more than once",
+        ),
+    ]);
+    build_db(&[
+        ("0001.sql", setup),
+        ("0002.sql", "VACUUM (ANALYZE) s (nosuch);"),
+        ("0003.sql", "VACUUM (ANALYZE) v (a, a);"),
+    ]);
+}
+
+#[test]
+fn tablespace_names_and_locations_follow_create_and_rename() {
+    // PG 19 CreateTableSpace / RenameTableSpace: an absolute location (an
+    // empty one is in-place, which allow_in_place_tablespaces permits), no
+    // reserved `pg_` name; a renamed tablespace goes by its new name — one
+    // the migrations didn't create too, assumed to exist as for placement.
+    let created = "CREATE TABLESPACE t LOCATION '/var/lib/postgresql/ts';";
+    assert_tablespace_rejections(&[
+        (
+            "",
+            "CREATE TABLESPACE pg_x LOCATION '/var/lib/postgresql/ts';",
+            "unacceptable tablespace name \"pg_x\"",
+        ),
+        (
+            "",
+            "CREATE TABLESPACE x LOCATION 'relative';",
+            "tablespace location must be an absolute path",
+        ),
+        (
+            created,
+            "ALTER TABLESPACE t RENAME TO pg_y;",
+            "unacceptable tablespace name \"pg_y\"",
+        ),
+        (
+            created,
+            "ALTER TABLESPACE pg_default RENAME TO t;",
+            "tablespace \"t\" already exists",
+        ),
+        (
+            created,
+            "ALTER TABLESPACE t RENAME TO u; COMMENT ON TABLESPACE t IS 'x';",
+            "tablespace \"t\" does not exist",
+        ),
+    ]);
+    let mut db = PgCatalog::new().unwrap();
+    db.skip_pg_sanity();
+    for sql in [
+        created,
+        "ALTER TABLESPACE t RENAME TO u;",
+        "COMMENT ON TABLESPACE u IS 'x';",
+        "DROP TABLESPACE u;",
+        "ALTER TABLESPACE dba RENAME TO v;",
+        "COMMENT ON TABLESPACE v IS 'x';",
+        "SET allow_system_table_mods = on;",
+        "CREATE TABLESPACE pg_w LOCATION '/var/lib/postgresql/ts';",
+    ] {
+        db.apply_sql(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

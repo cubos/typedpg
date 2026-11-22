@@ -405,48 +405,15 @@ pub(super) fn analyze_vacuum(
             continue;
         };
         let class = lookup(rv, snapshot)?;
-        // analyze_rel skips (with a WARNING) what it can't analyze and what
-        // the role may not; do_analyze_rel then checks the column list.
-        if !matches!(
-            class.relkind,
-            RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView
-        ) {
-            // A foreign table is analyzed only by a wrapper that can: which
-            // one serves it is the server's.
-            continue;
-        }
-        let mut seen: Vec<i16> = Vec::new();
-        for col in &vrel.va_cols {
-            let Some(name) = crate::ddl::util::node_string(col.as_ref()) else {
-                continue;
+        // analyze_rel checks the column list before the relation's kind
+        // (skipping, with a WARNING, what it can't analyze).
+        use crate::ddl::maintenance::{AnalyzeColumnError, analyze_columns};
+        if let Err(e) = analyze_columns(snapshot, class.oid, &vrel.va_cols) {
+            let error = match e {
+                AnalyzeColumnError::Undefined(msg) => AnalyzeError::UndefinedColumn(msg),
+                AnalyzeColumnError::Duplicate(msg) => AnalyzeError::DuplicateColumn(msg),
             };
-            let attnum = snapshot
-                .attribute_by_name(class.oid, name)
-                .filter(|a| a.attnum > 0)
-                .map(|a| a.attnum);
-            let Some(attnum) = attnum else {
-                return Err(RawError::new(
-                    AnalyzeError::UndefinedColumn(format!(
-                        "column \"{name}\" of relation \"{}\" does not exist",
-                        class.relname
-                    )),
-                    None,
-                    None,
-                )
-                .finalize_implicit());
-            };
-            if seen.contains(&attnum) {
-                return Err(RawError::new(
-                    AnalyzeError::DuplicateColumn(format!(
-                        "column \"{name}\" of relation \"{}\" appears more than once",
-                        class.relname
-                    )),
-                    None,
-                    None,
-                )
-                .finalize_implicit());
-            }
-            seen.push(attnum);
+            return Err(RawError::new(error, None, None).finalize_implicit());
         }
     }
     Ok(())

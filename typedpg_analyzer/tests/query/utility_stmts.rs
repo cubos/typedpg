@@ -281,6 +281,18 @@ fn analyze_reports_what_every_execution_raises() {
         AnalyzeError::DuplicateColumn(_),
         "column \"id\" of relation \"ut_parent\" appears more than once"
     );
+    // analyze_rel checks the column list before skipping what it can't
+    // analyze.
+    assert_err_prefix!(
+        db.analyze("ANALYZE ut_view (nope)"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"nope\" of relation \"ut_view\" does not exist"
+    );
+    assert_err_prefix!(
+        db.analyze("ANALYZE ut_view (id, id)"),
+        AnalyzeError::DuplicateColumn(_),
+        "column \"id\" of relation \"ut_view\" appears more than once"
+    );
     assert_err_prefix!(
         db.analyze("ANALYZE (FULL) ut_parent"),
         AnalyzeError::SyntaxError(_),

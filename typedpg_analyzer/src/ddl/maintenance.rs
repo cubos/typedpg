@@ -234,19 +234,9 @@ pub fn repack(interp: &mut PgCatalog, stmt: &RepackStmt) -> Result<(), DdlError>
                 super::tables::check_clusterable_index_oid(interp, relid, index)?;
             }
             repack_rel(interp, stmt.command, relid, index, concurrently)?;
+            // analyze_rel.
             if analyze {
-                for col in vr
-                    .va_cols
-                    .iter()
-                    .filter_map(|n| super::util::node_string(n.as_ref()))
-                {
-                    if interp.attribute_by_name(relid, col).is_none() {
-                        return Err(DdlError::Parse(format!(
-                            "column \"{col}\" of relation \"{}\" does not exist",
-                            rv.relname
-                        )));
-                    }
-                }
+                analyze_columns(interp, relid, &vr.va_cols)?;
             }
             return Ok(());
         }
@@ -647,6 +637,64 @@ fn reindex_move(
     Ok(())
 }
 
+/// pg_statistic, which analyze_rel never analyzes (update_attstats).
+const STATISTIC_RELATION_ID: PgClassOid = PgClassOid::from_raw(2619);
+
+/// What validate_va_cols_list refuses in an ANALYZE column list.
+pub(crate) enum AnalyzeColumnError {
+    /// `undefined_column`.
+    Undefined(String),
+    /// `duplicate_column`.
+    Duplicate(String),
+}
+
+impl From<AnalyzeColumnError> for DdlError {
+    fn from(e: AnalyzeColumnError) -> Self {
+        match e {
+            AnalyzeColumnError::Undefined(msg) => DdlError::Parse(msg),
+            AnalyzeColumnError::Duplicate(msg) => DdlError::DuplicateObject(msg),
+        }
+    }
+}
+
+/// analyze_rel → validate_va_cols_list (analyze.c, PostgreSQL 19), for
+/// ANALYZE, VACUUM (ANALYZE) and REPACK (ANALYZE): every column listed
+/// exists (no system column) and is listed once — whatever the relation's
+/// kind, which is checked after; pg_statistic is skipped before.
+pub(crate) fn analyze_columns(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    va_cols: &[Option<ast::Node>],
+) -> Result<(), AnalyzeColumnError> {
+    if relid == STATISTIC_RELATION_ID {
+        return Ok(());
+    }
+    let mut seen: Vec<i16> = Vec::new();
+    for col in va_cols
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+    {
+        let Some(attnum) = interp
+            .attribute_by_name(relid, col)
+            .filter(|a| a.attnum > 0)
+            .map(|a| a.attnum)
+        else {
+            return Err(AnalyzeColumnError::Undefined(format!(
+                "column \"{col}\" of relation \"{}\" does not exist",
+                relname(interp, relid)
+            )));
+        };
+        if seen.contains(&attnum) {
+            return Err(AnalyzeColumnError::Duplicate(format!(
+                "column \"{col}\" of relation \"{}\" appears more than once",
+                relname(interp, relid)
+            )));
+        }
+        seen.push(attnum);
+    }
+    Ok(())
+}
+
 /// FirstUnpinnedObjectId (transam.h): the system catalogs, their indexes
 /// and TOAST tables have smaller OIDs (IsCatalogRelationOid).
 const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
@@ -674,24 +722,23 @@ pub fn vacuum(interp: &mut PgCatalog, stmt: &VacuumStmt) -> Result<(), DdlError>
             continue;
         };
         let (_, relid) = super::util::lookup_relation(interp, rv)?;
-        if !matches!(
+        // vacuum(): VACUUM skips (with a WARNING) what vacuum_rel can't
+        // vacuum, its ANALYZE included; a plain ANALYZE goes straight to
+        // analyze_rel, which checks the column list whatever the
+        // relation's kind (a column list implies ANALYZE).
+        let vacuumable = matches!(
             relkind(interp, relid),
-            Some(RelKind::Table | RelKind::Partitioned | RelKind::MaterializedView)
-        ) {
+            Some(
+                RelKind::Table
+                    | RelKind::Partitioned
+                    | RelKind::MaterializedView
+                    | RelKind::ToastTable
+            )
+        );
+        if stmt.is_vacuumcmd && !vacuumable {
             continue;
         }
-        for col in vr
-            .va_cols
-            .iter()
-            .filter_map(|n| super::util::node_string(n.as_ref()))
-        {
-            if interp.attribute_by_name(relid, col).is_none() {
-                return Err(DdlError::Parse(format!(
-                    "column \"{col}\" of relation \"{}\" does not exist",
-                    rv.relname
-                )));
-            }
-        }
+        analyze_columns(interp, relid, &vr.va_cols)?;
         if full {
             rewritten.push(relid);
         }
@@ -906,87 +953,7 @@ pub fn security_label(stmt: &SecLabelStmt) -> Result<(), DdlError> {
 /// column list name its columns once; COPY (query) TO analyzes the query.
 /// The data itself (files, STDIN) isn't modeled.
 pub fn copy(interp: &PgCatalog, stmt: &typedpg_pg_query::ast::CopyStmt) -> Result<(), DdlError> {
-    const OPTIONS: &[&str] = &[
-        "format",
-        "freeze",
-        "delimiter",
-        "null",
-        "default",
-        "header",
-        "quote",
-        "escape",
-        "force_quote",
-        "force_not_null",
-        "force_null",
-        "convert_selectively",
-        "encoding",
-        "on_error",
-        "reject_limit",
-        "log_verbosity",
-        "force_array",
-    ];
-    // The options ProcessCopyOptions (PostgreSQL 19) checks against the
-    // format: JSON (COPY TO only, which FORCE_ARRAY needs) and BINARY take
-    // no DELIMITER, NULL, DEFAULT or HEADER; HEADER is a Boolean, "match"
-    // or a line count (one at most for COPY TO).
-    let mut format = "text".to_owned();
-    let (mut delimiter, mut null, mut default, mut header, mut force_array) =
-        (false, false, false, false, false);
-    for opt in &stmt.options {
-        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
-            continue;
-        };
-        if !OPTIONS.contains(&de.defname.as_str()) {
-            return Err(DdlError::Parse(format!(
-                "option \"{}\" not recognized",
-                de.defname
-            )));
-        }
-        if de.defname == "format"
-            && let Some(ast::Node::String(s)) = de.arg.as_ref()
-        {
-            if !matches!(s.sval.as_str(), "text" | "csv" | "binary" | "json") {
-                return Err(DdlError::UnsupportedDdl(format!(
-                    "COPY format \"{}\" not recognized",
-                    s.sval
-                )));
-            }
-            format.clone_from(&s.sval);
-        }
-        match de.defname.as_str() {
-            "delimiter" => delimiter = true,
-            "null" => null = true,
-            "default" => default = true,
-            "force_array" => force_array = super::session::def_get_boolean(de)?,
-            "header" => header = copy_header(de, stmt.is_from)?,
-            _ => {}
-        }
-    }
-    if matches!(format.as_str(), "binary" | "json") {
-        let mode = format.to_ascii_uppercase();
-        for (given, option) in [
-            (delimiter, "DELIMITER"),
-            (null, "NULL"),
-            (default, "DEFAULT"),
-            (header, "HEADER"),
-        ] {
-            if given {
-                return Err(DdlError::Parse(format!(
-                    "cannot specify {option} in {mode} mode"
-                )));
-            }
-        }
-    }
-    if format == "json" && stmt.is_from {
-        return Err(DdlError::Parse(
-            "COPY FORMAT JSON is not supported for COPY FROM".into(),
-        ));
-    }
-    if format != "json" && force_array {
-        return Err(DdlError::Parse(
-            "COPY FORCE_ARRAY can only be used with JSON mode".into(),
-        ));
-    }
+    process_copy_options(stmt.is_from, &stmt.options)?;
     // `COPY (query) TO` runs the query.
     if let Some(query) = stmt.query.as_ref() {
         return super::dml::check_executed(interp, query);
@@ -1227,6 +1194,393 @@ pub fn wait_for_lsn(stmt: &typedpg_pg_query::ast::WaitStmt) -> Result<(), DdlErr
     if mode.as_deref() != Some("primary_flush") && no_throw != Some(true) {
         return Err(DdlError::UnsupportedDdl(
             "recovery is not in progress".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// defGetString: an option's value as text, `%s requires a parameter`
+/// without one.
+fn copy_string(de: &typedpg_pg_query::ast::DefElem) -> Result<String, DdlError> {
+    match de.arg.as_ref() {
+        None => Err(DdlError::Parse(format!(
+            "{} requires a parameter",
+            de.defname
+        ))),
+        Some(ast::Node::AStar(_)) => Ok("*".into()),
+        Some(ast::Node::List(l)) => Ok(l
+            .items
+            .iter()
+            .filter_map(|n| super::util::node_string(n.as_ref()))
+            .collect::<Vec<_>>()
+            .join(".")),
+        Some(_) => Ok(def_string(de).unwrap_or_default()),
+    }
+}
+
+/// COPY's ON_ERROR (CopyOnErrorChoice).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CopyOnError {
+    Stop,
+    Ignore,
+    SetNull,
+}
+
+/// ProcessCopyOptions (copy.c, PostgreSQL 19), in its order: each option
+/// once and with a value it takes, then the options against each other,
+/// the format and the direction.
+fn process_copy_options(
+    is_from: bool,
+    options: &[Option<typedpg_pg_query::ast::Node>],
+) -> Result<(), DdlError> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Format {
+        Text,
+        Csv,
+        Binary,
+        Json,
+    }
+    let conflicting = || DdlError::Parse("conflicting or redundant options".into());
+    let column_list = |de: &typedpg_pg_query::ast::DefElem| {
+        DdlError::Parse(format!(
+            "argument to option \"{}\" must be a list of column names",
+            de.defname
+        ))
+    };
+    let mut format = Format::Text;
+    let (mut format_specified, mut freeze_specified, mut header_specified) = (false, false, false);
+    let (mut on_error_specified, mut log_verbosity_specified) = (false, false);
+    let (mut reject_limit_specified, mut force_array_specified) = (false, false);
+    let (mut freeze, mut header, mut force_array) = (false, false, false);
+    let mut delim: Option<String> = None;
+    let mut null_print: Option<String> = None;
+    let mut default_print: Option<String> = None;
+    let mut quote: Option<String> = None;
+    let mut escape: Option<String> = None;
+    let (mut force_quote, mut force_notnull, mut force_null) = (false, false, false);
+    let (mut convert_selectively, mut encoding) = (false, false);
+    let mut on_error = CopyOnError::Stop;
+    let mut reject_limit = 0;
+    for opt in options {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        match de.defname.as_str() {
+            "format" => {
+                let fmt = copy_string(de)?;
+                if format_specified {
+                    return Err(conflicting());
+                }
+                format_specified = true;
+                format = match fmt.as_str() {
+                    "text" => Format::Text,
+                    "csv" => Format::Csv,
+                    "binary" => Format::Binary,
+                    "json" => Format::Json,
+                    _ => {
+                        return Err(DdlError::UnsupportedDdl(format!(
+                            "COPY format \"{fmt}\" not recognized"
+                        )));
+                    }
+                };
+            }
+            "freeze" => {
+                if freeze_specified {
+                    return Err(conflicting());
+                }
+                freeze_specified = true;
+                freeze = super::session::def_get_boolean(de)?;
+            }
+            "delimiter" | "null" | "default" | "quote" | "escape" => {
+                let slot = match de.defname.as_str() {
+                    "delimiter" => &mut delim,
+                    "null" => &mut null_print,
+                    "default" => &mut default_print,
+                    "quote" => &mut quote,
+                    _ => &mut escape,
+                };
+                if slot.is_some() {
+                    return Err(conflicting());
+                }
+                *slot = Some(copy_string(de)?);
+            }
+            "header" => {
+                if header_specified {
+                    return Err(conflicting());
+                }
+                header_specified = true;
+                header = copy_header(de, is_from)?;
+            }
+            "force_quote" | "force_not_null" | "force_null" => {
+                let slot = match de.defname.as_str() {
+                    "force_quote" => &mut force_quote,
+                    "force_not_null" => &mut force_notnull,
+                    _ => &mut force_null,
+                };
+                if *slot {
+                    return Err(conflicting());
+                }
+                if !matches!(de.arg, Some(ast::Node::AStar(_) | ast::Node::List(_))) {
+                    return Err(column_list(de));
+                }
+                *slot = true;
+            }
+            "convert_selectively" => {
+                if convert_selectively {
+                    return Err(conflicting());
+                }
+                convert_selectively = true;
+                if !matches!(de.arg, None | Some(ast::Node::List(_))) {
+                    return Err(column_list(de));
+                }
+            }
+            "encoding" => {
+                if encoding {
+                    return Err(conflicting());
+                }
+                // pg_char_to_encoding: a name of NAMEDATALEN bytes or more
+                // is none.
+                let name = copy_string(de)?;
+                if name.len() >= 64 || super::conversions::encoding(&name).is_none() {
+                    return Err(DdlError::Parse(format!(
+                        "argument to option \"{}\" must be a valid encoding name",
+                        de.defname
+                    )));
+                }
+                encoding = true;
+            }
+            "force_array" => {
+                if force_array_specified {
+                    return Err(conflicting());
+                }
+                force_array_specified = true;
+                force_array = super::session::def_get_boolean(de)?;
+            }
+            "on_error" => {
+                if on_error_specified {
+                    return Err(conflicting());
+                }
+                on_error_specified = true;
+                // defGetCopyOnErrorChoice.
+                let sval = copy_string(de)?;
+                if !is_from {
+                    return Err(DdlError::Parse(
+                        "COPY ON_ERROR cannot be used with COPY TO".into(),
+                    ));
+                }
+                on_error = match sval.to_ascii_lowercase().as_str() {
+                    "stop" => CopyOnError::Stop,
+                    "ignore" => CopyOnError::Ignore,
+                    "set_null" => CopyOnError::SetNull,
+                    _ => {
+                        return Err(DdlError::Parse(format!(
+                            "COPY ON_ERROR \"{sval}\" not recognized"
+                        )));
+                    }
+                };
+            }
+            "log_verbosity" => {
+                if log_verbosity_specified {
+                    return Err(conflicting());
+                }
+                log_verbosity_specified = true;
+                // defGetCopyLogVerbosityChoice.
+                let sval = copy_string(de)?;
+                if !matches!(
+                    sval.to_ascii_lowercase().as_str(),
+                    "silent" | "default" | "verbose"
+                ) {
+                    return Err(DdlError::Parse(format!(
+                        "COPY LOG_VERBOSITY \"{sval}\" not recognized"
+                    )));
+                }
+            }
+            "reject_limit" => {
+                if reject_limit_specified {
+                    return Err(conflicting());
+                }
+                reject_limit_specified = true;
+                // defGetCopyRejectLimitOption: a number, or a string
+                // pg_strtoint64 reads.
+                let Some(limit) = super::seqparams::numeric_arg(de)? else {
+                    return Err(DdlError::Parse(format!(
+                        "{} requires a numeric value",
+                        de.defname
+                    )));
+                };
+                if limit <= 0 {
+                    return Err(DdlError::Parse(format!(
+                        "REJECT_LIMIT ({limit}) must be greater than zero"
+                    )));
+                }
+                reject_limit = limit;
+            }
+            other => {
+                return Err(DdlError::Parse(format!(
+                    "option \"{other}\" not recognized"
+                )));
+            }
+        }
+    }
+
+    // Options BINARY and JSON don't take (checked before the defaults).
+    let mode = match format {
+        Format::Binary => Some("BINARY"),
+        Format::Json => Some("JSON"),
+        _ => None,
+    };
+    if let Some(mode) = mode {
+        for (given, option) in [
+            (delim.is_some(), "DELIMITER"),
+            (null_print.is_some(), "NULL"),
+            (default_print.is_some(), "DEFAULT"),
+        ] {
+            if given {
+                return Err(DdlError::Parse(format!(
+                    "cannot specify {option} in {mode} mode"
+                )));
+            }
+        }
+    }
+    let csv = format == Format::Csv;
+    let delim = delim.unwrap_or_else(|| if csv { "," } else { "\t" }.into());
+    let null_print = null_print.unwrap_or_else(|| if csv { "" } else { "\\N" }.into());
+    let (quote_given, escape_given) = (quote.is_some(), escape.is_some());
+    let quote = quote.unwrap_or_else(|| "\"".into());
+    let escape = escape.unwrap_or_else(|| quote.clone());
+    let has_newline = |s: &str| s.contains(['\r', '\n']);
+
+    if delim.len() != 1 {
+        return Err(DdlError::UnsupportedDdl(
+            "COPY delimiter must be a single one-byte character".into(),
+        ));
+    }
+    let delim_byte = delim.as_bytes()[0];
+    if has_newline(&delim) {
+        return Err(DdlError::Parse(
+            "COPY delimiter cannot be newline or carriage return".into(),
+        ));
+    }
+    if has_newline(&null_print) {
+        return Err(DdlError::Parse(
+            "COPY null representation cannot use newline or carriage return".into(),
+        ));
+    }
+    if default_print.as_deref().is_some_and(has_newline) {
+        return Err(DdlError::Parse(
+            "COPY default representation cannot use newline or carriage return".into(),
+        ));
+    }
+    if !csv && b"\\.abcdefghijklmnopqrstuvwxyz0123456789".contains(&delim_byte) {
+        return Err(DdlError::Parse(format!(
+            "COPY delimiter cannot be \"{delim}\""
+        )));
+    }
+    if header && let Some(mode) = mode {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot specify HEADER in {mode} mode"
+        )));
+    }
+    if !csv && quote_given {
+        return Err(DdlError::UnsupportedDdl(
+            "COPY QUOTE requires CSV mode".into(),
+        ));
+    }
+    if csv && quote.len() != 1 {
+        return Err(DdlError::UnsupportedDdl(
+            "COPY quote must be a single one-byte character".into(),
+        ));
+    }
+    if csv && delim_byte == quote.as_bytes()[0] {
+        return Err(DdlError::Parse(
+            "COPY delimiter and quote must be different".into(),
+        ));
+    }
+    if !csv && escape_given {
+        return Err(DdlError::UnsupportedDdl(
+            "COPY ESCAPE requires CSV mode".into(),
+        ));
+    }
+    if csv && escape.len() != 1 {
+        return Err(DdlError::UnsupportedDdl(
+            "COPY escape must be a single one-byte character".into(),
+        ));
+    }
+    for (given, option, refused_from) in [
+        (force_quote, "FORCE_QUOTE", true),
+        (force_notnull, "FORCE_NOT_NULL", false),
+        (force_null, "FORCE_NULL", false),
+    ] {
+        if !given {
+            continue;
+        }
+        if !csv {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "COPY {option} requires CSV mode"
+            )));
+        }
+        if is_from == refused_from {
+            let direction = if is_from { "COPY FROM" } else { "COPY TO" };
+            return Err(DdlError::Parse(format!(
+                "COPY {option} cannot be used with {direction}"
+            )));
+        }
+    }
+    if null_print.as_bytes().contains(&delim_byte) {
+        return Err(DdlError::Parse(
+            "COPY delimiter character must not appear in the NULL specification".into(),
+        ));
+    }
+    if csv && null_print.as_bytes().contains(&quote.as_bytes()[0]) {
+        return Err(DdlError::Parse(
+            "CSV quote character must not appear in the NULL specification".into(),
+        ));
+    }
+    if freeze && !is_from {
+        return Err(DdlError::Parse(
+            "COPY FREEZE cannot be used with COPY TO".into(),
+        ));
+    }
+    if format == Format::Json && is_from {
+        return Err(DdlError::Parse(
+            "COPY FORMAT JSON is not supported for COPY FROM".into(),
+        ));
+    }
+    if format != Format::Json && force_array {
+        return Err(DdlError::Parse(
+            "COPY FORCE_ARRAY can only be used with JSON mode".into(),
+        ));
+    }
+    if let Some(default_print) = default_print {
+        if !is_from {
+            return Err(DdlError::UnsupportedDdl(
+                "COPY DEFAULT cannot be used with COPY TO".into(),
+            ));
+        }
+        if default_print.as_bytes().contains(&delim_byte) {
+            return Err(DdlError::UnsupportedDdl(
+                "COPY delimiter character must not appear in the DEFAULT specification".into(),
+            ));
+        }
+        if csv && default_print.as_bytes().contains(&quote.as_bytes()[0]) {
+            return Err(DdlError::UnsupportedDdl(
+                "CSV quote character must not appear in the DEFAULT specification".into(),
+            ));
+        }
+        if null_print == default_print {
+            return Err(DdlError::UnsupportedDdl(
+                "NULL specification and DEFAULT specification cannot be the same".into(),
+            ));
+        }
+    }
+    if format == Format::Binary && on_error != CopyOnError::Stop {
+        return Err(DdlError::Parse(
+            "only ON_ERROR STOP is allowed in BINARY mode".into(),
+        ));
+    }
+    if reject_limit != 0 && on_error != CopyOnError::Ignore {
+        return Err(DdlError::Parse(
+            "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE".into(),
         ));
     }
     Ok(())

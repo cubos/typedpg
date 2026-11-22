@@ -110,6 +110,29 @@ pub(crate) fn create_owned_sequence(
         .find(|a| a.attnum == attnum)
         .map(|a| a.attname.clone())
         .unwrap_or_default();
+    // generateSerialExtraStmts: SEQUENCE NAME and LOGGED / UNLOGGED once
+    // each (not sequence parameters, they are taken out first), and a
+    // temporary table's sequence is temporary.
+    let (mut name_given, mut logged_given) = (false, false);
+    for opt in options {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        let given = match de.defname.as_str() {
+            "sequence_name" => &mut name_given,
+            "logged" | "unlogged" => &mut logged_given,
+            _ => continue,
+        };
+        if *given {
+            return Err(DdlError::Parse("conflicting or redundant options".into()));
+        }
+        *given = true;
+    }
+    if logged_given && super::util::is_temp_relation(interp, relid) {
+        return Err(DdlError::Parse(
+            "cannot set logged status of a temporary sequence".into(),
+        ));
+    }
     // An identity's `SEQUENCE NAME` option names the sequence.
     let explicit_name = options.iter().find_map(|o| match o.as_ref() {
         Some(ast::Node::DefElem(de)) if de.defname == "sequence_name" => match de.arg.as_ref() {

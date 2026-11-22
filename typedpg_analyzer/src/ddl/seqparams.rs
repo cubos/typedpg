@@ -79,7 +79,7 @@ impl SeqParams {
 }
 
 /// `defGetInt64`: an integer, or a numeric literal `int8in` accepts.
-fn numeric_arg(de: &typedpg_pg_query::ast::DefElem) -> Result<Option<i128>, DdlError> {
+pub(crate) fn numeric_arg(de: &typedpg_pg_query::ast::DefElem) -> Result<Option<i128>, DdlError> {
     let text = match de.arg.as_ref() {
         Some(ast::Node::Integer(i)) => return Ok(Some(i128::from(i.ival))),
         Some(ast::Node::Float(f)) => f.fval.as_str(),
@@ -104,20 +104,21 @@ pub(crate) fn init_params(
     current: Option<SeqParams>,
 ) -> Result<SeqParams, DdlError> {
     match current {
-        Some(current) => apply(interp, options, current, false),
-        None => apply(interp, options, SeqParams::defaults(oid::INT8), true),
+        Some(current) => apply(interp, options, current, false, false),
+        None => apply(interp, options, SeqParams::defaults(oid::INT8), true, false),
     }
 }
 
 /// init_params for the new sequence of a serial / identity column of type
 /// `typ`; the identity's `SEQUENCE NAME` / `GENERATED` options aren't
-/// sequence parameters.
+/// sequence parameters. generateSerialExtraStmts prepends `AS <typ>` to the
+/// options, so an `AS` of their own is a second one.
 pub(crate) fn init_column_params(
     interp: &PgCatalog,
     options: &[Option<typedpg_pg_query::ast::Node>],
     typ: PgTypeOid,
 ) -> Result<SeqParams, DdlError> {
-    apply(interp, options, SeqParams::defaults(typ), true)
+    apply(interp, options, SeqParams::defaults(typ), true, true)
 }
 
 fn apply(
@@ -125,8 +126,9 @@ fn apply(
     options: &[Option<typedpg_pg_query::ast::Node>],
     old: SeqParams,
     is_init: bool,
+    implicit_as: bool,
 ) -> Result<SeqParams, DdlError> {
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<&str> = if implicit_as { vec!["as"] } else { Vec::new() };
     let mut as_type = None;
     let mut increment = None;
     let mut max: Option<Option<i128>> = None;

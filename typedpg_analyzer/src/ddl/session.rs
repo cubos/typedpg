@@ -50,10 +50,13 @@ pub(crate) const PREDEFINED_ROLES: &[&str] = &[
 /// Whether role `name` exists, as far as the catalog can tell. Roles are
 /// cluster objects the analyzer doesn't see, so a name is assumed to exist
 /// unless no role can bear it: `public` and `none` are reserved role names,
-/// and so is every `pg_` name but the predefined roles.
+/// and so is every `pg_` name but the predefined roles. Nor can a name with
+/// a newline or carriage return: CreateRole and RenameRole (PostgreSQL 19)
+/// refuse one.
 pub(crate) fn role_may_exist(name: &str) -> bool {
     match name {
         "public" | "none" => false,
+        _ if name.contains(['\n', '\r']) => false,
         _ if name.starts_with("pg_") => PREDEFINED_ROLES.contains(&name),
         _ => true,
     }

@@ -290,6 +290,17 @@ pub(crate) fn create_tablespace(
             stmt.tablespacename
         )));
     }
+    // An empty location is an in-place tablespace, which only
+    // allow_in_place_tablespaces permits: the analyzer doesn't track that
+    // developer setting, so it takes an empty one as allowed.
+    if !stmt.location.is_empty() && !stmt.location.starts_with('/') {
+        return Err(DdlError::Parse(
+            "tablespace location must be an absolute path".into(),
+        ));
+    }
+    if is_reserved_name(interp, &stmt.tablespacename) {
+        return Err(reserved_tablespace_name(&stmt.tablespacename));
+    }
     if tablespace_exists(interp, &stmt.tablespacename) {
         return Err(DdlError::DuplicateObject(format!(
             "tablespace \"{}\" already exists",
@@ -300,6 +311,66 @@ pub(crate) fn create_tablespace(
         .cluster_objects
         .tablespaces
         .push(stmt.tablespacename.clone());
+    Ok(())
+}
+
+/// `!allowSystemTableMods && IsReservedName(name)` (catalog.c): the `pg_`
+/// prefix is the system's.
+fn is_reserved_name(interp: &PgCatalog, name: &str) -> bool {
+    !interp.allow_system_table_mods.get() && name.starts_with("pg_")
+}
+
+fn reserved_tablespace_name(name: &str) -> DdlError {
+    DdlError::Parse(format!(
+        "unacceptable tablespace name \"{name}\" (The prefix \"pg_\" is reserved for system \
+         tablespaces.)"
+    ))
+}
+
+/// ALTER TABLESPACE ... RENAME TO (RenameTableSpace, PostgreSQL 19): the
+/// new name isn't reserved, has no newline or carriage return and is free.
+/// A tablespace the migrations didn't create is assumed to exist, as for
+/// placement (a DBA creates them); it goes by its new name afterwards.
+/// (`pg_default` and `pg_global` can be renamed too, but the catalog keeps
+/// their names.)
+pub(crate) fn rename_tablespace(
+    interp: &mut PgCatalog,
+    stmt: &typedpg_pg_query::ast::RenameStmt,
+) -> Result<(), DdlError> {
+    let (old, new) = (&stmt.subname, &stmt.newname);
+    if is_reserved_name(interp, new) {
+        return Err(reserved_tablespace_name(new));
+    }
+    if new.contains(['\n', '\r']) {
+        return Err(DdlError::Parse(format!(
+            "tablespace name \"{new}\" contains a newline or carriage return character"
+        )));
+    }
+    if tablespace_exists(interp, new) {
+        return Err(DdlError::DuplicateObject(format!(
+            "tablespace \"{new}\" already exists"
+        )));
+    }
+    let objects = &mut interp.cluster_objects.tablespaces;
+    match objects.iter_mut().find(|t| *t == old) {
+        Some(t) => new.clone_into(t),
+        None if !matches!(old.as_str(), "pg_default" | "pg_global") => objects.push(new.clone()),
+        None => {}
+    }
+    Ok(())
+}
+
+/// ALTER DATABASE ... RENAME TO (RenameDatabase, PostgreSQL 19): no
+/// newline or carriage return in the new name, checked before the database
+/// is looked up. Databases are cluster objects the analyzer doesn't see:
+/// the one named is assumed to exist and the new name to be free.
+pub(crate) fn rename_database(stmt: &typedpg_pg_query::ast::RenameStmt) -> Result<(), DdlError> {
+    if stmt.newname.contains(['\n', '\r']) {
+        return Err(DdlError::Parse(format!(
+            "database name \"{}\" contains a newline or carriage return character",
+            stmt.newname
+        )));
+    }
     Ok(())
 }
 
@@ -412,15 +483,34 @@ pub(crate) fn drop_subscription(
     interp: &mut PgCatalog,
     stmt: &DropSubscriptionStmt,
 ) -> Result<(), DdlError> {
-    let objects = &mut interp.cluster_objects.subscriptions;
-    let before = objects.len();
-    objects.retain(|s| s.name != stmt.subname);
-    if objects.len() == before && !stmt.missing_ok {
+    let Some(sub) = interp
+        .cluster_objects
+        .subscriptions
+        .iter()
+        .find(|s| s.name == stmt.subname)
+    else {
+        if stmt.missing_ok {
+            return Ok(());
+        }
         return Err(DdlError::TypeNotFound(format!(
             "subscription \"{}\" does not exist",
             stmt.subname
         )));
+    };
+    // DropSubscription (PostgreSQL 19): to drop its slot, a subscription
+    // through a server builds its connection string from the server's
+    // wrapper (construct_subserver_conninfo →
+    // ForeignServerConnectionString), which needs a CONNECTION function.
+    // (PreventInTransactionBlock, before, is txblock's.)
+    if sub.slot
+        && let Some(server) = &sub.server
+    {
+        super::fdw::check_subscription_server(interp, server)?;
     }
+    interp
+        .cluster_objects
+        .subscriptions
+        .retain(|s| s.name != stmt.subname);
     Ok(())
 }
 

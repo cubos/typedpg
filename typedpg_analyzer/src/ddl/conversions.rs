@@ -96,7 +96,7 @@ const ENCODING_NAMES: &[(&str, &str)] = &[
 
 /// pg_char_to_encoding: the canonical name of the encoding `name` spells
 /// (clean_encoding_name keeps the lowercased alphanumerics).
-fn encoding(name: &str) -> Option<&'static str> {
+pub(crate) fn encoding(name: &str) -> Option<&'static str> {
     let clean: String = name
         .chars()
         .filter(char::is_ascii_alphanumeric)
