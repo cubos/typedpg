@@ -2241,7 +2241,7 @@ fn recheck_dependents_of_retyped_column(
             Ok(r)
         })
         .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
-        if found.type_oid != oid::BOOL && found.type_oid != oid::UNKNOWN {
+        if !crate::coerce::coerces_to_boolean(found.type_oid, interp) {
             return Err(DdlError::UnsupportedDdl(format!(
                 "argument of {clause} must be type boolean, not type {}",
                 format_type_for_message(interp, found.type_oid)

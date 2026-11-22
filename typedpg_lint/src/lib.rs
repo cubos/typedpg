@@ -3207,4 +3207,126 @@ mod tests {
         );
         assert_eq!(fix_of(&[]), "INSERT INTO t (id, name) VALUES (1, 'a')");
     }
+
+    /// What each table reference named `name` of `view`'s tree resolved
+    /// to, in the order they are written.
+    fn relations_named(
+        view: &typedpg_analyzer::QueryView,
+        name: &str,
+    ) -> Vec<Option<typedpg_analyzer::RelationRef>> {
+        let mut refs: Vec<(i32, Option<typedpg_analyzer::RelationRef>)> = view
+            .tree
+            .nodes()
+            .filter_map(|(node, _)| match node {
+                typedpg_pg_query::NodeRef::RangeVar(rv) if rv.relname == name => {
+                    Some((rv.location, view.relation_of(rv)))
+                }
+                _ => None,
+            })
+            .collect();
+        refs.sort_by_key(|(location, _)| *location);
+        refs.dedup_by_key(|(location, _)| *location);
+        refs.into_iter().map(|(_, target)| target).collect()
+    }
+
+    fn relid(catalog: &PgCatalog, schema: &str, name: &str) -> typedpg_analyzer::RelationRef {
+        typedpg_analyzer::RelationRef::Relation(
+            catalog.resolve_table(Some(schema), name).unwrap().oid,
+        )
+    }
+
+    #[test]
+    fn a_table_reference_resolves_as_the_analyzer_resolved_it() {
+        use typedpg_analyzer::RelationRef;
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE TABLE t (id integer PRIMARY KEY, email text);
+                 CREATE INDEX ON t (email);",
+            )
+            .unwrap();
+        let t = relid(&catalog, "public", "t");
+        // A `WITH` query hides the table in the statement it belongs to,
+        // but not in its own body, a schema-qualified reference, or a
+        // data-modifying statement's target.
+        let view = catalog
+            .query_view(
+                "WITH t AS (SELECT id FROM t) \
+                 SELECT * FROM t JOIN public.t p USING (id) \
+                 WHERE id IN (SELECT id FROM t)",
+            )
+            .unwrap();
+        assert_eq!(
+            relations_named(&view, "t"),
+            vec![
+                Some(t),
+                Some(RelationRef::Cte),
+                Some(t),
+                Some(RelationRef::Cte)
+            ]
+        );
+        let view = catalog
+            .query_view("WITH t AS (SELECT 1) UPDATE t SET email = 'a' WHERE id = 1")
+            .unwrap();
+        assert_eq!(relations_named(&view, "t"), vec![Some(t)]);
+        // The rules read it: the UPDATE's target is the table, whose index
+        // on `email` `lower(email)` can't use.
+        let findings = lint(
+            &catalog,
+            "WITH t AS (SELECT 1) UPDATE t SET email = 'a' WHERE lower(email) = $1",
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule == Rule::NonSargablePredicate),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_table_reference_resolves_along_the_roles_search_path() {
+        let catalog = shadowing_role_catalog();
+        let sql = "SELECT * FROM t";
+        let plain = catalog.query_view(sql).unwrap();
+        assert_eq!(
+            relations_named(&plain, "t"),
+            vec![Some(relid(&catalog, "public", "t"))]
+        );
+        let scoped = catalog.with_role_search_path("app");
+        let as_app = scoped.query_view(sql).unwrap();
+        assert_eq!(
+            relations_named(&as_app, "t"),
+            vec![Some(relid(&catalog, "app_data", "t"))]
+        );
+    }
+
+    #[test]
+    fn a_view_bodys_table_reference_does_not_pass_for_the_querys() {
+        let ddl = "CREATE SCHEMA s;
+                   CREATE TABLE t (id integer PRIMARY KEY);
+                   CREATE TABLE s.t (id integer PRIMARY KEY);
+                   SET search_path = s;
+                   CREATE VIEW public.v AS SELECT * FROM t;
+                   RESET search_path;";
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog.apply_sql(ddl).unwrap();
+        // The view's stored query, analyzed again as the query reads it,
+        // has its `t`, a table, at an offset of the migration's text: the
+        // query's own `t`, padded to the same offset, keeps what it
+        // resolved to — a `WITH` query, or the table.
+        let offset = ddl.find("FROM t;").unwrap() + "FROM ".len();
+        let query = |prefix: &str| format!("{prefix}{}t, v", " ".repeat(offset - prefix.len()));
+        let sql = query("WITH t AS (SELECT 1 AS id) SELECT t.id FROM ");
+        let view = catalog.query_view(&sql).unwrap();
+        assert_eq!(
+            relations_named(&view, "t"),
+            vec![Some(typedpg_analyzer::RelationRef::Cte)]
+        );
+        let sql = query("SELECT t.id FROM ");
+        let view = catalog.query_view(&sql).unwrap();
+        assert_eq!(
+            relations_named(&view, "t"),
+            vec![Some(relid(&catalog, "public", "t"))]
+        );
+    }
 }

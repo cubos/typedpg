@@ -2443,6 +2443,12 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Whether some view's stored query is being looked into
+/// ([`expanding_view`]): its locations are in the view's text.
+pub(crate) fn expanding_any_view() -> bool {
+    EXPANDING_VIEWS.with(|v| !v.borrow().is_empty())
+}
+
 /// Run `f` looking into view `relid`'s stored query — `None` when that
 /// query is already being looked into: views made to read each other
 /// (`CREATE OR REPLACE VIEW` can close the loop) would recurse forever.

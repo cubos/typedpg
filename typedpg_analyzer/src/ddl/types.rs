@@ -497,7 +497,7 @@ fn check_domain_check_expression(
             Ok(r)
         })
         .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (in domain CHECK constraint)")))?;
-    if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
+    if !crate::coerce::coerces_to_boolean(result.type_oid, interp) {
         return Err(DdlError::UnsupportedDdl(format!(
             "argument of CHECK must be type boolean, not type {}",
             super::util::format_type_for_message(interp, result.type_oid)

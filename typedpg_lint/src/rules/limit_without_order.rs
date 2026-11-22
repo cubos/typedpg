@@ -411,8 +411,12 @@ pub(super) fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     {
         return false;
     }
-    let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-    let Some(class) = ctx.catalog.resolve_table(schema, &relation.relname) else {
+    // The relation as the analyzer resolved it (a `WITH` query of the
+    // same name is none).
+    let Some(typedpg_analyzer::RelationRef::Relation(oid)) = ctx.view.relation_of(relation) else {
+        return false;
+    };
+    let Some(class) = ctx.catalog.class_row(oid) else {
         return false;
     };
     if !no_volatile_functions(ctx, NodeRef::SelectStmt(select)) {

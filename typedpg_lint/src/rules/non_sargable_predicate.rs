@@ -24,9 +24,7 @@
 //! The help names the sargable rewrite when it is a range (`::date`,
 //! `date_trunc`). No fix is offered.
 
-use std::collections::HashSet;
-
-use typedpg_analyzer::{CastMethod, PgClassOid, PgTypeOid, RelKind};
+use typedpg_analyzer::{CastMethod, PgClassOid, PgTypeOid, RelKind, RelationRef};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{AConstValue, AExpr, AExprKind, ColumnRef, Node};
 
@@ -38,14 +36,6 @@ const TIMESTAMP: PgTypeOid = PgTypeOid::from_raw(1114);
 const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    let ctes: HashSet<&str> = ctx
-        .tree
-        .nodes()
-        .filter_map(|(node, _)| match node {
-            NodeRef::CommonTableExpr(cte) => Some(cte.ctename.as_str()),
-            _ => None,
-        })
-        .collect();
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         let mut level = Level::default();
@@ -53,25 +43,25 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         match node {
             NodeRef::SelectStmt(select) => {
                 for item in select.from_clause.iter().flatten() {
-                    level.add(ctx, &ctes, item, &mut quals);
+                    level.add(ctx, item, &mut quals);
                 }
                 quals.extend(select.where_clause.as_ref());
             }
             NodeRef::UpdateStmt(update) => {
                 if let Some(relation) = update.relation.as_deref() {
-                    level.add_relation(ctx, &ctes, relation);
+                    level.add_relation(ctx, relation);
                 }
                 for item in update.from_clause.iter().flatten() {
-                    level.add(ctx, &ctes, item, &mut quals);
+                    level.add(ctx, item, &mut quals);
                 }
                 quals.extend(update.where_clause.as_ref());
             }
             NodeRef::DeleteStmt(delete) => {
                 if let Some(relation) = delete.relation.as_deref() {
-                    level.add_relation(ctx, &ctes, relation);
+                    level.add_relation(ctx, relation);
                 }
                 for item in delete.using_clause.iter().flatten() {
-                    level.add(ctx, &ctes, item, &mut quals);
+                    level.add(ctx, item, &mut quals);
                 }
                 quals.extend(delete.where_clause.as_ref());
             }
@@ -99,21 +89,15 @@ struct Level {
 }
 
 impl Level {
-    fn add<'a>(
-        &mut self,
-        ctx: &Ctx<'_>,
-        ctes: &HashSet<&str>,
-        item: &'a Node,
-        quals: &mut Vec<&'a Node>,
-    ) {
+    fn add<'a>(&mut self, ctx: &Ctx<'_>, item: &'a Node, quals: &mut Vec<&'a Node>) {
         match item {
-            Node::RangeVar(relation) => self.add_relation(ctx, ctes, relation),
+            Node::RangeVar(relation) => self.add_relation(ctx, relation),
             Node::JoinExpr(join) => {
                 for side in [join.larg.as_ref(), join.rarg.as_ref()]
                     .into_iter()
                     .flatten()
                 {
-                    self.add(ctx, ctes, side, quals);
+                    self.add(ctx, side, quals);
                 }
                 quals.extend(join.quals.as_ref());
                 if let Some(alias) = &join.alias {
@@ -134,24 +118,20 @@ impl Level {
         }
     }
 
-    fn add_relation(
-        &mut self,
-        ctx: &Ctx<'_>,
-        ctes: &HashSet<&str>,
-        relation: &typedpg_pg_query::ast::RangeVar,
-    ) {
+    fn add_relation(&mut self, ctx: &Ctx<'_>, relation: &typedpg_pg_query::ast::RangeVar) {
         let name = relation
             .alias
             .as_ref()
             .map_or_else(|| relation.relname.clone(), |alias| alias.aliasname.clone());
-        let oid = if relation.schemaname.is_empty() && ctes.contains(relation.relname.as_str()) {
-            None
-        } else {
-            let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
-            ctx.catalog
-                .resolve_table(schema, &relation.relname)
+        // What the analyzer resolved the reference to: a `WITH` query of
+        // the same name is no table.
+        let oid = match ctx.view.relation_of(relation) {
+            Some(RelationRef::Relation(oid)) => ctx
+                .catalog
+                .class_row(oid)
                 .filter(|class| matches!(class.relkind, RelKind::Table | RelKind::Partitioned))
-                .map(|class| class.oid)
+                .map(|class| class.oid),
+            _ => None,
         };
         self.entries.push((name, oid));
     }

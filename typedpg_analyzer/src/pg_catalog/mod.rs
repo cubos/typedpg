@@ -1765,6 +1765,7 @@ impl PgCatalog {
             null_test_settled: lint_facts.null_test_settled,
             writes: lint_facts.writes,
             relation_uses: lint_facts.relation_uses,
+            relations_at: lint_facts.relations_at,
         })
     }
 
@@ -2981,6 +2982,30 @@ struct LintFacts {
     /// last.
     open_writes: Vec<usize>,
     relation_uses: Vec<(PgClassOid, char)>,
+    relations_at: HashMap<i32, RelationAt>,
+}
+
+/// What a table reference of a query — a `RangeVar` in FROM, a JOIN, a
+/// sublink or a CTE body, or a data-modifying statement's target —
+/// resolved to (see [`QueryView::relation_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationRef {
+    /// A relation of the catalog (a table, view, materialized view, ...),
+    /// found along the search path the query was analyzed with.
+    Relation(PgClassOid),
+    /// A `WITH` query of the statement, whose name hides a relation's.
+    Cte,
+}
+
+/// A recorded [`RelationRef`], with the name the reference was written
+/// with (`catalog`, `schema`, `relation`): a reference at the same
+/// location of another text (a view's stored query, a function body)
+/// can't pass for the query's own.
+#[derive(Debug, Clone)]
+struct RelationAt {
+    name: (String, String, String),
+    /// `None` when two recordings at the location disagree.
+    target: Option<RelationRef>,
 }
 
 /// While alive, the data-modifying statement [`note_write_statement`]
@@ -3067,6 +3092,48 @@ pub(crate) fn note_relation_use(relid: PgClassOid, cmd: char) {
             facts.relation_uses.push((relid, cmd));
         }
     });
+}
+
+/// Record that the table reference `rv` resolved to `target`. A
+/// recording that disagrees with one already made at the same location
+/// (another text's reference there, or the same written differently)
+/// leaves nothing known there. Nothing is recorded while the analysis
+/// works on another text than the query's (a view's stored query, a
+/// function body), whose locations are not the query's.
+pub(crate) fn note_relation_at(rv: &typedpg_pg_query::ast::RangeVar, target: RelationRef) {
+    if rv.location < 0 || crate::error::in_other_text() || crate::ddl::views::expanding_any_view() {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            let name = (
+                rv.catalogname.clone(),
+                rv.schemaname.clone(),
+                rv.relname.clone(),
+            );
+            match facts.relations_at.entry(rv.location) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let fact = entry.get_mut();
+                    if fact.name != name || fact.target != Some(target) {
+                        fact.target = None;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(RelationAt {
+                        name,
+                        target: Some(target),
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// [`note_relation_at`] for the target `rv` of an INSERT, UPDATE, DELETE
+/// or MERGE, which is always the relation `relid` (a `WITH` query's name
+/// never hides it).
+pub(crate) fn note_target_relation(rv: &typedpg_pg_query::ast::RangeVar, relid: PgClassOid) {
+    note_relation_at(rv, RelationRef::Relation(relid));
 }
 
 /// Record whether the argument of the `count(x)` call at `location` (the
@@ -3494,6 +3561,9 @@ pub struct QueryView {
     writes: Vec<crate::condition::WriteStatement>,
     /// The relations whose rows the query reads or writes, with the command.
     relation_uses: Vec<(PgClassOid, char)>,
+    /// What each table reference resolved to, by its location in
+    /// [`Self::sql`].
+    relations_at: HashMap<i32, RelationAt>,
 }
 
 impl QueryView {
@@ -3522,6 +3592,22 @@ impl QueryView {
     /// each command it has an action of), as the analyzer resolved them.
     pub fn relation_uses(&self) -> &[(PgClassOid, char)] {
         &self.relation_uses
+    }
+
+    /// What the table reference `rv` — a `RangeVar` of [`Self::tree`] in a
+    /// FROM clause, a JOIN, a sublink or a CTE body, or the target of an
+    /// INSERT, UPDATE, DELETE or MERGE — resolved to, as the analyzer
+    /// resolved it: a `WITH` query of the same name, or the relation the
+    /// search path the query was analyzed with (a role's, for
+    /// [`PgCatalog::query_view_as`]) finds. `None` when the analyzer
+    /// resolved no such reference there (a trigger's transition table, a
+    /// reference of a statement it doesn't analyze), or resolved it two
+    /// different ways.
+    pub fn relation_of(&self, rv: &typedpg_pg_query::ast::RangeVar) -> Option<RelationRef> {
+        let fact = self.relations_at.get(&rv.location)?;
+        (fact.name.0 == rv.catalogname && fact.name.1 == rv.schemaname && fact.name.2 == rv.relname)
+            .then_some(fact.target)
+            .flatten()
     }
 
     /// Whether a row may take the branch of the `CASE` `WHEN` at

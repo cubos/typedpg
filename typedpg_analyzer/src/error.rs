@@ -681,6 +681,12 @@ impl Drop for DiagContextGuard<'_> {
     }
 }
 
+/// Whether the analysis runs under a [`DiagContextGuard::barrier`]: it
+/// works on a tree parsed from another text than the installed context's.
+pub(crate) fn in_other_text() -> bool {
+    DIAG_TLS.with(|tls| tls.borrow().last().is_some_and(|slot| slot.ptrs.is_none()))
+}
+
 /// Run `f` with the topmost `DiagContext` from TLS, or `None` if none is
 /// installed. The borrow guarantees the pointers in TLS are still valid.
 fn with_diag_ctx<R>(f: impl FnOnce(Option<DiagContext>) -> R) -> R {

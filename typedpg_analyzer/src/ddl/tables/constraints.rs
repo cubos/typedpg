@@ -1157,7 +1157,7 @@ pub(crate) fn validate_constraint_expressions(
                                 QualifiedName::new(relname, &cd.colname),
                             ))
                         })?;
-                        if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
+                        if !crate::coerce::coerces_to_boolean(result.type_oid, interp) {
                             let typname = format_type_for_message(interp, result.type_oid);
                             return Err(DdlError::UnsupportedDdl(format!(
                                 "argument of CHECK must be type boolean, not type {typname} \
@@ -1222,7 +1222,7 @@ pub(crate) fn validate_constraint_expressions(
                     "{e} (in table-level CHECK constraint on \"{relname}\")"
                 ))
             })?;
-            if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
+            if !crate::coerce::coerces_to_boolean(result.type_oid, interp) {
                 let typname = format_type_for_message(interp, result.type_oid);
                 return Err(DdlError::UnsupportedDdl(format!(
                     "argument of CHECK must be type boolean, not type {typname} \
@@ -2123,7 +2123,7 @@ fn validate_check_expression_for_table(
     })
     // PG's message first, verbatim; the constraint after it.
     .map_err(|e| DdlError::UnsupportedDdl(format!("{e} (CHECK constraint on \"{relname}\")")))?;
-    if result.type_oid != oid::BOOL && result.type_oid != oid::UNKNOWN {
+    if !crate::coerce::coerces_to_boolean(result.type_oid, interp) {
         let typname = format_type_for_message(interp, result.type_oid);
         return Err(DdlError::UnsupportedDdl(format!(
             "argument of CHECK must be type boolean, not type {typname} \

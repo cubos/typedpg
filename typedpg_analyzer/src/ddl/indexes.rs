@@ -350,10 +350,7 @@ fn check_index_predicate(
             )
             .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
         }
-        Some(Ok(t))
-            if t.type_oid != crate::pg_catalog::oid::BOOL
-                && t.type_oid != crate::pg_catalog::oid::UNKNOWN =>
-        {
+        Some(Ok(t)) if !crate::coerce::coerces_to_boolean(t.type_oid, db) => {
             return Err(DdlError::UnsupportedDdl(format!(
                 "argument of WHERE must be type boolean, not type {}",
                 super::util::format_type_for_message(db, t.type_oid)

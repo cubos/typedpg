@@ -98,6 +98,7 @@ pub(crate) fn analyze_merge_with_outer_ctes(
             )
         })?;
     crate::scope::check_relation_opens(table)?;
+    crate::pg_catalog::note_target_relation(relation, table.oid);
     if !matches!(
         table.relkind,
         crate::pg_catalog::RelKind::Table

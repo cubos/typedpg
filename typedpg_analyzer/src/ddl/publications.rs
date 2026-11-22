@@ -532,9 +532,7 @@ fn check_row_filter(
     crate::clause::check_no_aggregates_or_windows(filter, interp, "WHERE").map_err(unsupported)?;
     crate::resolve::check_no_srf_in_clause(filter, interp, "WHERE").map_err(unsupported)?;
     // coerce_to_boolean.
-    if result.type_oid != crate::pg_catalog::oid::BOOL
-        && result.type_oid != crate::pg_catalog::oid::UNKNOWN
-    {
+    if !crate::coerce::coerces_to_boolean(result.type_oid, interp) {
         return Err(DdlError::UnsupportedDdl(format!(
             "argument of PUBLICATION WHERE must be type boolean, not type {}",
             super::util::format_type_for_message(interp, result.type_oid)

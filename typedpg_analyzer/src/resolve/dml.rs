@@ -127,6 +127,7 @@ fn analyze_insert_here(
         || write_base(snapshot, tgt.oid),
     );
     crate::pg_catalog::note_relation_use(tgt.oid, 'a');
+    crate::pg_catalog::note_target_relation(relation, tgt.oid);
 
     // Match $N params in VALUES to column types, or analyze INSERT...SELECT.
     // The rewriter later sees one target list entry per supplied column.
@@ -2993,6 +2994,7 @@ fn analyze_update_here(
         || write_base(snapshot, table_oid),
     );
     crate::pg_catalog::note_relation_use(table_oid, 'w');
+    crate::pg_catalog::note_target_relation(relation, table_oid);
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::UPDATE);
     crate::privileges::note_write(
         table_oid,
@@ -3275,6 +3277,7 @@ fn analyze_delete_here(
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
     crate::pg_catalog::note_relation_use(table_oid, 'd');
+    crate::pg_catalog::note_target_relation(relation, table_oid);
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
     crate::privileges::note_write(
         table_oid,
