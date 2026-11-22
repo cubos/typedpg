@@ -895,6 +895,21 @@ fn handle_any_all(
         // coercion of the left operand or of an element to the operator's
         // declared types.
         note_builtin_compare(expr.location, &op_name, &op, ctx);
+        // What the array's elements are, for what `x op ANY (arr)` TRUE
+        // says of `x` (an untyped literal's are read from its text).
+        if let Some(r) = right.as_ref().filter(|_| right_oid != oid::UNKNOWN) {
+            ctx.note_array_elements(
+                expr.location,
+                crate::nonnull::ArrayElements {
+                    elem_type: rtype,
+                    refine: if crate::refine::deterministic(r.collation, snapshot) {
+                        r.elem_refine.clone()
+                    } else {
+                        crate::refine::Refinement::NONE
+                    },
+                },
+            );
+        }
         // A `ScalarArrayOpExpr` folds when both arguments are constants
         // (`eval_const_expressions`), running the comparison function; it is
         // never inlined.
@@ -1421,6 +1436,55 @@ fn infer_generic_binary_op(
                 }
                 _ => None,
             };
+            // ... and what they are: each side's elements or value,
+            // converted to the result's element type (a NULL constant
+            // adds no element; an untyped array literal its content's).
+            let elem_refine = {
+                let result_elem = super::array_element_type(snapshot, op.result_type_oid);
+                let part = |t: &Option<ExprType>, node: &Option<ast::Node>, array: bool| {
+                    if matches!(node, Some(ast::Node::AConst(c)) if c.isnull) {
+                        return None;
+                    }
+                    let t = t.as_ref()?;
+                    Some(match (array, result_elem) {
+                        (_, None) => crate::refine::Refinement::NONE,
+                        (true, Some(elem)) if t.type_oid == oid::UNKNOWN => match node {
+                            Some(ast::Node::AConst(c)) => match &c.val {
+                                Some(ast::AConstValue::String(sv)) => {
+                                    super::array_literal_elem_refine(&sv.sval, elem, snapshot)
+                                }
+                                _ => crate::refine::Refinement::NONE,
+                            },
+                            _ => crate::refine::Refinement::NONE,
+                        },
+                        (true, _) => t.elem_refine_converted(op.result_type_oid, snapshot),
+                        (false, Some(elem)) => t
+                            .refine
+                            .converted(t.type_oid, elem, snapshot)
+                            .and(&snapshot.domain_refinement(elem)),
+                    })
+                };
+                let parts = match op
+                    .code
+                    .and_then(|c| snapshot.pg_proc.get(&c))
+                    .map(|p| p.proname.as_str())
+                {
+                    Some("array_cat") => vec![
+                        part(&left, &expr.lexpr, true),
+                        part(&right, &expr.rexpr, true),
+                    ],
+                    Some("array_append") => vec![
+                        part(&left, &expr.lexpr, true),
+                        part(&right, &expr.rexpr, false),
+                    ],
+                    Some("array_prepend") => vec![
+                        part(&left, &expr.lexpr, false),
+                        part(&right, &expr.rexpr, true),
+                    ],
+                    _ => vec![Some(crate::refine::Refinement::NONE)],
+                };
+                crate::refine::Refinement::either(parts.iter().flatten().collect::<Vec<_>>())
+            };
             // A built-in jsonb operator, for a CHECK's JSON reading.
             if let Some(b) = op
                 .code
@@ -1441,6 +1505,7 @@ fn infer_generic_binary_op(
             let mut out = ExprType::scalar(op.result_type_oid, nullable)
                 .with_collation(state)
                 .with_elem_nullable(elem_nullable)
+                .with_elem_refine(elem_refine)
                 .with_refine(refine);
             // inline_function: an operator whose function is `LANGUAGE sql`
             // may be replaced by the function's body when planned.

@@ -362,7 +362,8 @@ const rows = await sql("SELECT to_char(created_at, 'YYYY-MM') AS month FROM user
 
 The analysis knows which values a value can take when there are few — an enum's
 labels, a `CHECK (kind IN (…))` list (on the table or a domain), what the
-`WHERE` or a `CASE` branch leaves (`WHERE kind <> 'draft'`), literals — and
+`WHERE` or a `CASE` branch leaves (`WHERE kind <> 'draft'`, `WHERE kind =
+ANY ('{a,b}')`, `= ANY` of an array whose elements are known), literals — and
 the bounds of an integer: `CHECK (n BETWEEN 1 AND 100)` or `CHECK (VALUE >
 0)`, a `WHERE`, counts and positions (`count(*)`, `row_number()`, `length`),
 `min` / `max` and integer arithmetic. `NULLIF(x, v)` is NOT NULL when `x`

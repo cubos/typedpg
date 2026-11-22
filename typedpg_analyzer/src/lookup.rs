@@ -467,7 +467,9 @@ impl PgCatalog {
             // Under a nondeterministic collation, `VALUE IN ('a')` lets
             // `'A'` through.
             let collation = self.pg_type.get(&d).and_then(|t| t.typcollation);
-            if crate::refine::Exact::of(d, collation, self).is_none() {
+            if crate::refine::Exact::of(d, collation, self).is_none()
+                && crate::refine_bounds::OrdKind::of(d, self).is_none()
+            {
                 continue;
             }
             for a in self
@@ -481,7 +483,8 @@ impl PgCatalog {
             }
         }
         crate::refine::Refinement {
-            finite: self.domain_check_says(oid, |c| c.finite),
+            // (Bounds away from a date's infinities make it finite too.)
+            finite: allowed.finite || self.domain_check_says(oid, |c| c.finite),
             ..allowed
         }
     }

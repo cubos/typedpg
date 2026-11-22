@@ -131,9 +131,11 @@ export type Checks = [
     Equal<
       Row<typeof constructed>,
       {
-        r: { f1: number; f2: string; f3: string | null };
+        // Each field's value, as a column's.
+        r: { f1: 1; f2: "a"; f3: string | null };
         arr_of_row: Point2[];
-        strings: (string | null)[];
+        // The literal elements, each one's value.
+        strings: ("" | " a " | "\"" | "," | "NULL" | "\\" | "{}" | "é" | null)[];
         discrete: Range<number>;
         unbounded: Range<string>;
         nothing: Range<number>;

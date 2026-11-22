@@ -49,6 +49,15 @@ pub(crate) fn infer_a_const(a_const: &ast::AConst) -> Result<ExprType, AnalyzeEr
             values: Some([b.boolval.to_string()].into()),
             ..crate::refine::Refinement::FINITE
         },
+        // A `numeric` constant is the number it spells.
+        Some(ast::AConstValue::Float(f)) => crate::refine::Refinement::FINITE.with_bounds(
+            crate::refine_bounds::Num::parse(&f.fval).map(|n| {
+                crate::refine_bounds::OrdRange::exactly(
+                    crate::refine_bounds::OrdKind::Numeric,
+                    crate::refine_bounds::OrdPoint::Finite(n),
+                )
+            }),
+        ),
         _ => crate::refine::Refinement::FINITE,
     };
 
@@ -389,6 +398,7 @@ pub(crate) fn infer_type_cast(
                 typmod: None,
                 record_fields: None,
                 elem_nullable: None,
+                elem_refine: crate::refine::Refinement::NONE,
                 refine: Default::default(),
                 ..result
             }
@@ -457,6 +467,31 @@ pub(crate) fn infer_type_cast(
     } else {
         None
     };
+    // What the elements are: an array literal's, read as the target's
+    // elements; an array's, converted element by element (an `ARRAY[…]`
+    // built for the target already is). A typmod the cast applies
+    // truncates or rounds each element.
+    let elem_refine = match array_element_type(snapshot, target_base) {
+        None => crate::refine::Refinement::NONE,
+        Some(elem) => {
+            let mut refine = match inner {
+                Some(ast::Node::AConst(ac)) if inner_type.type_oid == oid::UNKNOWN => {
+                    match &ac.val {
+                        Some(ast::AConstValue::String(sv)) if !ac.isnull => {
+                            super::array_literal_elem_refine(&sv.sval, elem, snapshot)
+                        }
+                        _ => crate::refine::Refinement::NONE,
+                    }
+                }
+                _ => inner_type.elem_refine_converted(target_oid, snapshot),
+            };
+            if cast_typmod.is_some() {
+                refine.values = None;
+                refine.bounds = None;
+            }
+            refine
+        }
+    };
     // `ROW(a, b)::pair` is the row built for `pair` (and a cast to the
     // composite a value already is changes nothing): its fields keep
     // their nullability.
@@ -503,15 +538,20 @@ pub(crate) fn infer_type_cast(
         ..ExprType::scalar_with_typmod(target_oid, nullable, written_typmod)
             .with_collation(state)
             .with_elem_nullable(elem_nullable)
+            .with_elem_refine(elem_refine)
             .with_refine({
-                let mut refine = inner_type
-                    .refine
-                    .converted(inner_type.type_oid, target_oid, snapshot)
-                    .and(&snapshot.domain_refinement(target_oid));
-                // An explicit cast to `varchar(n)` truncates.
+                let mut refine =
+                    inner_type
+                        .refine
+                        .converted(inner_type.type_oid, target_oid, snapshot);
+                // An explicit cast to `varchar(n)` truncates, one to
+                // `numeric(p,s)` or `timestamp(p)` rounds.
                 if cast_typmod.is_some() {
                     refine.values = None;
+                    refine.bounds = None;
                 }
+                let mut refine = refine.and(&snapshot.domain_refinement(target_oid));
+
                 // A parameter cast to a type the generator binds finite
                 // (`$at::timestamptz`) is of that type.
                 if matches!(inner, Some(ast::Node::ParamRef(_)))

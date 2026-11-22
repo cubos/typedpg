@@ -14,6 +14,7 @@ mod from_row;
 mod migrations_hash;
 mod pg_type_map;
 mod query_macro;
+mod refinement_doc;
 
 /// Compile-time verified SQL query with named parameters.
 ///

@@ -189,7 +189,9 @@ impl TypeMapper<'_> {
             (Type::Enum { .. }, _) => |v| js_string(v),
             (Type::Basic { schema, name, .. }, output) if schema == "pg_catalog" => {
                 match (name.as_str(), output) {
-                    ("text" | "varchar", "string") => |v| js_string(v),
+                    // An `unknown` value (a record's field over a literal)
+                    // is the literal as written.
+                    ("text" | "varchar" | "unknown", "string") => |v| js_string(v),
                     ("int2" | "int4", "number") | ("bool", "boolean") => str::to_owned,
                     ("int8", "bigint") => |v| format!("{v}n"),
                     _ => return mapped,
@@ -209,6 +211,40 @@ impl TypeMapper<'_> {
                 .collect::<Vec<_>>()
                 .join(" | ")
         };
+        mapped
+    }
+
+    /// The mapping of an output column of type `ty` whose values are
+    /// `refinement` and, of an array, whose elements are `elements`: an
+    /// array of refined elements reads as an array of their literal union
+    /// (`("a" | "b")[]`), unless a type mapping names the array's domain.
+    pub fn map_column(&self, ty: &Type, refinement: &Refinement, elements: &Refinement) -> TsType {
+        let mut array = ty;
+        while let Type::Domain { base, .. } = array {
+            if self.overridden(array) {
+                return self.map_refined(ty, refinement);
+            }
+            array = base;
+        }
+        let Type::Array {
+            element,
+            element_nullable,
+        } = array
+        else {
+            return self.map_refined(ty, refinement);
+        };
+        let mut mapped = self.map(ty);
+        if elements.values.is_some() {
+            let elem = self.map_refined(element, elements).output;
+            // As [`Self::map`] prints it: an element is nullable unless the
+            // analysis proved it isn't.
+            let elem = if *element_nullable == Some(false) {
+                elem
+            } else {
+                format!("{elem} | null")
+            };
+            mapped.output = array_of(&elem);
+        }
         mapped
     }
 
@@ -337,9 +373,13 @@ impl TypeMapper<'_> {
         let mut codecs = Vec::with_capacity(fields.len());
         for field in fields {
             let mapped = self.map(&field.ty);
+            // A field reads as a column of its type would: refined to the
+            // literal union of its values. Only the output — the codec, and
+            // what a parameter takes, are its type's.
+            let refined = self.map_column(&field.ty, &field.refinement, &field.elem_refinement);
             let null = if field.nullable { " | null" } else { "" };
             let key = property_key(&field.name);
-            output.push(format!("{key}: {}{null}", mapped.output));
+            output.push(format!("{key}: {}{null}", refined.output));
             input.push(format!("{key}: {}{null}", mapped.input));
             codecs.push((field.name.clone(), mapped.codec));
         }
@@ -683,6 +723,88 @@ mod tests {
     }
 
     #[test]
+    fn arrays_of_refined_elements_read_as_arrays_of_literal_unions() {
+        let refined = |vs: &[&str]| Refinement {
+            values: Some(vs.iter().map(|v| (*v).to_owned()).collect()),
+            ..Refinement::NONE
+        };
+        let arr = |name: &str, n| Type::Array {
+            element: Box::new(basic_ty(name)),
+            element_nullable: n,
+        };
+        with(|m| {
+            let out =
+                |ty: &Type, vs: &[&str]| m.map_column(ty, &Refinement::NONE, &refined(vs)).output;
+            assert_eq!(
+                out(&arr("text", Some(false)), &["b", "a"]),
+                r#"("a" | "b")[]"#
+            );
+            assert_eq!(out(&arr("text", None), &["a"]), r#"("a" | null)[]"#);
+            assert_eq!(out(&arr("int8", Some(false)), &["2", "1"]), "(1n | 2n)[]");
+            assert_eq!(out(&arr("int4", Some(false)), &["7"]), "7[]");
+            assert_eq!(
+                out(&arr("bool", Some(false)), &["true", "false"]),
+                "boolean[]"
+            );
+            assert_eq!(out(&arr("text", Some(false)), &[]), "never[]");
+            assert_eq!(out(&arr("numeric", Some(false)), &["1"]), "string[]");
+            // Unrefined elements: as before.
+            assert_eq!(
+                m.map_column(&arr("text", None), &Refinement::NONE, &Refinement::NONE)
+                    .output,
+                "(string | null)[]"
+            );
+            // Not an array: the value's own refinement.
+            assert_eq!(
+                m.map_column(&basic_ty("text"), &refined(&["x"]), &Refinement::NONE)
+                    .output,
+                r#""x""#
+            );
+            // The input takes any array.
+            assert_eq!(
+                m.map_column(
+                    &arr("text", Some(false)),
+                    &Refinement::NONE,
+                    &refined(&["a"])
+                )
+                .input,
+                "readonly (string | null)[]"
+            );
+        });
+        // A type mapping names the element type, or the array's domain.
+        let overrides = HashMap::from([
+            (QualifiedName::new("pg_catalog", "text"), "Name".to_owned()),
+            (QualifiedName::new("public", "tags"), "Tags".to_owned()),
+        ]);
+        let m = TypeMapper {
+            overrides: &overrides,
+            used: RefCell::default(),
+        };
+        assert_eq!(
+            m.map_column(
+                &arr("text", Some(false)),
+                &Refinement::NONE,
+                &refined(&["a"])
+            )
+            .output,
+            "Name[]"
+        );
+        let tags = Type::Domain {
+            schema: "public".into(),
+            name: "tags".into(),
+            base: Box::new(arr("int4", Some(false))),
+            extension: None,
+            typmod: None,
+            collation: None,
+        };
+        assert_eq!(
+            m.map_column(&tags, &Refinement::NONE, &refined(&["1"]))
+                .output,
+            "Tags"
+        );
+    }
+
+    #[test]
     fn records_quote_odd_keys_and_nest() {
         with(|m| {
             let inner = Type::AnonymousRecord {
@@ -690,6 +812,8 @@ mod tests {
                     name: "f1".into(),
                     ty: basic_ty("int4"),
                     nullable: false,
+                    refinement: Refinement::NONE,
+                    elem_refinement: Refinement::NONE,
                 }],
             };
             let ty = Type::AnonymousRecord {
@@ -698,6 +822,8 @@ mod tests {
                         name: "?column?".into(),
                         ty: basic_ty("text"),
                         nullable: true,
+                        refinement: Refinement::NONE,
+                        elem_refinement: Refinement::NONE,
                     },
                     RecordField {
                         name: "rs".into(),
@@ -706,6 +832,8 @@ mod tests {
                             element_nullable: Some(false),
                         },
                         nullable: false,
+                        refinement: Refinement::NONE,
+                        elem_refinement: Refinement::NONE,
                     },
                 ],
             };
@@ -722,6 +850,91 @@ mod tests {
                 r#"({ "?column?": string | null; rs: { f1: number }[] } | null)[]"#
             );
         });
+    }
+
+    #[test]
+    fn refined_record_fields_read_as_literal_unions() {
+        let refined = |vs: &[&str]| Refinement {
+            values: Some(vs.iter().map(|v| (*v).to_owned()).collect()),
+            ..Refinement::NONE
+        };
+        let field =
+            |name: &str, ty: Type, nullable, values: &[&str], elements: &[&str]| RecordField {
+                name: name.into(),
+                ty,
+                nullable,
+                refinement: if values.is_empty() {
+                    Refinement::NONE
+                } else {
+                    refined(values)
+                },
+                elem_refinement: if elements.is_empty() {
+                    Refinement::NONE
+                } else {
+                    refined(elements)
+                },
+            };
+        let ty = Type::AnonymousRecord {
+            fields: vec![
+                field("status", basic_ty("text"), false, &["b", "a"], &[]),
+                field("lit", basic_ty("unknown"), false, &["x"], &[]),
+                field("n", basic_ty("int4"), true, &["2", "1"], &[]),
+                field("free", basic_ty("text"), false, &[], &[]),
+                field(
+                    "tags",
+                    Type::Array {
+                        element: Box::new(basic_ty("text")),
+                        element_nullable: Some(false),
+                    },
+                    false,
+                    &[],
+                    &["t"],
+                ),
+            ],
+        };
+        with(|m| {
+            let mapped = m.map(&ty);
+            assert_eq!(
+                mapped.output,
+                r#"{ status: "a" | "b"; lit: "x"; n: 1 | 2 | null; free: string; tags: "t"[] }"#
+            );
+            // A parameter takes any value of each field's type, and the
+            // decoding is the type's.
+            assert_eq!(
+                mapped.input,
+                "{ status: string; lit: string; n: number | null; free: string; \
+                 tags: readonly (string | null)[] }"
+            );
+            assert_eq!(mapped.codec, m.map(&without_refinements(&ty)).codec);
+            // Nested, and as an array's elements.
+            let outer = Type::Array {
+                element: Box::new(Type::AnonymousRecord {
+                    fields: vec![field("r", ty.clone(), false, &[], &[])],
+                }),
+                element_nullable: Some(false),
+            };
+            assert_eq!(
+                m.map(&outer).output,
+                r#"({ r: { status: "a" | "b"; lit: "x"; n: 1 | 2 | null; free: string; tags: "t"[] } })[]"#
+            );
+        });
+    }
+
+    /// `ty` with nothing known of its fields' values.
+    fn without_refinements(ty: &Type) -> Type {
+        match ty {
+            Type::AnonymousRecord { fields } => Type::AnonymousRecord {
+                fields: fields
+                    .iter()
+                    .map(|f| RecordField {
+                        refinement: Refinement::NONE,
+                        elem_refinement: Refinement::NONE,
+                        ..f.clone()
+                    })
+                    .collect(),
+            },
+            other => other.clone(),
+        }
     }
 
     #[test]

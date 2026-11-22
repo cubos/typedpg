@@ -213,7 +213,9 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
     );
     let value = match a.columns.as_slice() {
         [c] => Some(nullable(
-            &mapper.map_refined(&c.pg_type, &c.refinement).output,
+            &mapper
+                .map_column(&c.pg_type, &c.refinement, &c.elem_refinement)
+                .output,
             c.nullable,
         )),
         _ => None,
@@ -351,7 +353,7 @@ fn columns(cols: &[AnalyzedColumn], mapper: &TypeMapper) -> (Vec<String>, Vec<Va
     let mut row = Vec::new();
     let mut codecs = Vec::new();
     for c in cols {
-        let m = mapper.map_refined(&c.pg_type, &c.refinement);
+        let m = mapper.map_column(&c.pg_type, &c.refinement, &c.elem_refinement);
         row.push(member(&c.name, &m.output, c.nullable));
         codecs.push(json!([c.name, m.codec.to_json()]));
     }
@@ -658,6 +660,30 @@ mod tests {
     fn single_column_has_a_value() {
         let g = ok("SELECT count(*) AS n FROM users");
         assert!(g.types.contains("value: bigint;"), "{}", g.types);
+    }
+
+    #[test]
+    fn arrays_of_known_elements_are_arrays_of_their_values() {
+        let g = ok("SELECT ARRAY['a', 'b'] AS a, ARRAY[1, NULL] AS b, ARRAY[name] AS c FROM users");
+        assert!(g.types.contains(r#"a: ("a" | "b")[];"#), "{}", g.types);
+        assert!(g.types.contains("b: (1 | null)[];"), "{}", g.types);
+        assert!(g.types.contains("c: (string | null)[];"), "{}", g.types);
+        let g = ok("SELECT array_agg(big) FILTER (WHERE big IN (1, 2)) AS v FROM users");
+        assert!(
+            g.types.contains("value: (1n | 2n)[] | null;"),
+            "{}",
+            g.types
+        );
+    }
+
+    #[test]
+    fn equal_to_any_of_an_array_is_one_of_its_elements() {
+        let g = ok(
+            "SELECT name, big FROM users WHERE name = ANY(ARRAY['a', 'b']) \
+                    AND big = ANY('{1,2}')",
+        );
+        assert!(g.types.contains(r#"name: "a" | "b";"#), "{}", g.types);
+        assert!(g.types.contains("big: 1n | 2n;"), "{}", g.types);
     }
 
     #[test]

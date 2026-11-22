@@ -59,7 +59,8 @@ pub(crate) fn infer_sublink(
                 // subquery's column (make_subplan).
                 let mut t = ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
                     .with_collation(first.sublink_collation())
-                    .with_elem_nullable(first.elem_nullable);
+                    .with_elem_nullable(first.elem_nullable)
+                    .with_elem_refine(first.elem_refine.clone());
                 t.planned = first.planned;
                 return Ok(t);
             }
@@ -253,6 +254,7 @@ pub(crate) fn infer_sublink(
             let mut typmod = None;
             let mut collation = super::DerivedCollation::default();
             let mut elem_nullable = None;
+            let mut elem_refine = crate::refine::Refinement::NONE;
             let mut planned = super::Planned::AsParsed;
             if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 let (first, _) = single_sublink_column(sub, sel, ctx, params)?;
@@ -267,6 +269,11 @@ pub(crate) fn infer_sublink(
                 // The elements are the column's values (or, for an array
                 // column, the multidimensional result's sub-arrays').
                 elem_nullable = elem_array.is_some().then_some(first.nullable);
+                elem_refine = if elem_array.is_some() {
+                    first.refine.clone()
+                } else {
+                    first.elem_refine.clone()
+                };
                 array_oid = match elem_array {
                     Some(array) => array,
                     None if crate::coerce::element_type(elem, snapshot).is_some() => elem,
@@ -279,7 +286,8 @@ pub(crate) fn infer_sublink(
             }
             let mut t = ExprType::scalar_with_typmod(array_oid, false, typmod)
                 .with_collation(collation)
-                .with_elem_nullable(elem_nullable);
+                .with_elem_nullable(elem_nullable)
+                .with_elem_refine(elem_refine);
             t.planned = planned;
             Ok(t)
         }

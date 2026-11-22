@@ -235,6 +235,8 @@ pub(crate) fn analyze_set_operation(
             if expr::coercion_can_null_elements(c.type_oid, type_oid, snapshot) {
                 c.elem_nullable = Some(true);
             }
+            c.elem_refine =
+                expr::elem_refine_converted(&c.elem_refine, c.type_oid, type_oid, snapshot);
             c.refine = c.refine.converted(c.type_oid, type_oid, snapshot);
         }
         // transformSetOperationTree: every set operation but UNION ALL
@@ -291,6 +293,10 @@ pub(crate) fn analyze_set_operation(
                 _ => crate::expr::merge_elem_nullable([l.elem_nullable, r.elem_nullable]),
             },
             // A row of EXCEPT or INTERSECT is a left one.
+            elem_refine: match op_label {
+                "EXCEPT" | "INTERSECT" => l.elem_refine.clone(),
+                _ => crate::refine::Refinement::either([&l.elem_refine, &r.elem_refine]),
+            },
             refine: match op_label {
                 "EXCEPT" | "INTERSECT" => l.refine,
                 _ => crate::refine::Refinement::either([&l.refine, &r.refine]),
@@ -333,6 +339,7 @@ fn set_operation_sort_and_limit(
             table_alias: alias.clone(),
             record_fields: c.record_fields.clone(),
             elem_nullable: c.elem_nullable,
+            elem_refine: c.elem_refine.clone(),
             refine: c.refine.clone(),
             origin: None,
             output: None,

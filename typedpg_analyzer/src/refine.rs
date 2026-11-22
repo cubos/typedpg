@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::PgCatalog;
+use crate::refine_bounds::{OrdKind, OrdRange};
 
 /// What every non-NULL value of an expression is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -29,6 +30,12 @@ pub struct Refinement {
     pub values: Option<BTreeSet<String>>,
     /// Of an integer, the bounds it lies within.
     pub range: Option<IntRange>,
+    /// Of a `numeric`, `date`, `timestamp` or `timestamptz`, the bounds it
+    /// lies within, in the type's order — special values included: a
+    /// `numeric` `NaN` is above every bound short of it, and `±Infinity`
+    /// / `±infinity` sit at the ends (see [`OrdRange`]). Its `kind` is the
+    /// value's type (a domain's base type).
+    pub bounds: Option<OrdRange>,
 }
 
 /// The bounds an integer lies within, each inclusive (`None`: unbounded).
@@ -126,6 +133,7 @@ impl Refinement {
         finite: false,
         values: None,
         range: None,
+        bounds: None,
     };
 
     /// A finite value.
@@ -133,7 +141,22 @@ impl Refinement {
         finite: true,
         values: None,
         range: None,
+        bounds: None,
     };
+
+    /// The same, bounded by `bounds` too: a date or timestamp bounded away
+    /// from both infinities is finite.
+    pub(crate) fn with_bounds(mut self, bounds: Option<OrdRange>) -> Refinement {
+        let bounds = match (self.bounds, bounds) {
+            (Some(a), Some(b)) => Some(a.meet(&b)),
+            (a, b) => a.or(b),
+        };
+        self.bounds = bounds.filter(|b| !b.is_unbounded());
+        if self.bounds.is_some_and(|b| b.excludes_infinities()) {
+            self.finite = true;
+        }
+        self
+    }
 
     /// The bounds an integer value lies within: its range, narrowed by its
     /// values when they are integers.
@@ -184,10 +207,21 @@ impl Refinement {
             .map(|p| p.range)
             .collect::<Option<Vec<_>>>()
             .and_then(|rs| rs.into_iter().reduce(|a, b| a.hull(&b)));
+        let bounds = parts
+            .iter()
+            .map(|p| p.bounds)
+            .collect::<Option<Vec<_>>>()
+            .and_then(|bs| {
+                let mut bs = bs.into_iter();
+                let first = bs.next()?;
+                bs.try_fold(first, |a, b| a.hull(&b))
+            })
+            .filter(|b| !b.is_unbounded());
         Refinement {
             finite: parts.iter().all(|p| p.finite),
-            values,
+            values: capped(values),
             range,
+            bounds,
         }
     }
 
@@ -204,7 +238,10 @@ impl Refinement {
                 (Some(a), Some(b)) => Some(a.meet(&b)),
                 (a, b) => a.or(b),
             },
+            bounds: None,
         }
+        .with_bounds(self.bounds)
+        .with_bounds(other.bounds)
     }
 
     /// The refinement of a string literal (of type `unknown` until its
@@ -216,6 +253,7 @@ impl Refinement {
             finite: !text.to_ascii_lowercase().contains("inf"),
             values: Some(BTreeSet::from([text.to_owned()])),
             range: None,
+            bounds: None,
         }
     }
 
@@ -224,6 +262,15 @@ impl Refinement {
     /// no conversion), an untyped literal's input, or a conversion between
     /// `date`, `timestamp` and `timestamptz` (each maps an infinity to an
     /// infinity, and a finite value to a finite one or an error) keep it.
+    ///
+    /// Values survive the conversions that print them as they were (an
+    /// integer into another integer type, or into `text` / `varchar` in
+    /// decimal; `boolean` into `text` / `varchar` through `text(boolean)`,
+    /// `true` / `false`; an enum's label into `text` / `varchar`, and back
+    /// for the strings that are labels — `enum_in` rejects the others;
+    /// `text` and `varchar` into each other); an integer's range becomes
+    /// `numeric` bounds. A type modifier the conversion applies
+    /// (`varchar(2)`, `numeric(5,2)`) is the caller's to account for.
     pub(crate) fn converted(
         &self,
         from: PgTypeOid,
@@ -248,37 +295,85 @@ impl Refinement {
         let finite = self.finite
             && !extreme_interval
             && (from == to || pseudo || from == oid::UNKNOWN || (datetime(from) && datetime(to)));
-        let values = match &self.values {
-            Some(vs) if from == oid::UNKNOWN => Exact::of(to, None, snapshot)
-                .and_then(|kind| vs.iter().map(|v| kind.read(v)).collect()),
-            // An integer is the same number in any integer type.
-            Some(vs)
-                if from == to
-                    || pseudo
-                    || (Exact::of(from, None, snapshot) == Some(Exact::Int)
-                        && Exact::of(to, None, snapshot) == Some(Exact::Int)) =>
-            {
-                Some(vs.clone())
-            }
-            _ => None,
-        };
+        let exact_from = Exact::of(from, None, snapshot);
+        let exact_to = Exact::of(to, None, snapshot);
         // An integer is the same number in any integer type.
-        let ints = Exact::of(from, None, snapshot) == Some(Exact::Int)
-            && Exact::of(to, None, snapshot) == Some(Exact::Int);
+        let ints = exact_from == Some(Exact::Int) && exact_to == Some(Exact::Int);
+        let string = |t: PgTypeOid| t == oid::TEXT || t == oid::VARCHAR;
+        let is_enum = |t: PgTypeOid| {
+            snapshot
+                .pg_type
+                .get(&t)
+                .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Enum)
+        };
+        let values = if from == oid::UNKNOWN {
+            self.values
+                .as_ref()
+                .and_then(|vs| exact_to.and_then(|kind| vs.iter().map(|v| kind.read(v)).collect()))
+        } else if from == to || pseudo || ints {
+            self.values.clone()
+        } else if string(to) && (exact_from == Some(Exact::Int)) {
+            // `int4out`: the decimal — of a few integers in a range too.
+            self.enumerated()
+        } else if string(to) && (from == oid::BOOL || string(from) || is_enum(from)) {
+            self.values.clone()
+        } else if is_enum(to) && string(from) {
+            let labels: BTreeSet<&str> = snapshot
+                .pg_enum
+                .get(&to)
+                .into_iter()
+                .flatten()
+                .map(|l| l.enumlabel.as_str())
+                .collect();
+            self.values.as_ref().map(|vs| {
+                vs.iter()
+                    .filter(|v| labels.contains(v.as_str()))
+                    .cloned()
+                    .collect()
+            })
+        } else {
+            None
+        };
         let range = self.range.filter(|_| from == to || pseudo || ints);
+        let to_kind = OrdKind::of(to, snapshot);
+        let bounds = if from == to || pseudo {
+            self.bounds
+        } else if to_kind.is_some() && self.bounds.is_some_and(|b| Some(b.kind) == to_kind) {
+            // Already the converted value's (an implicit coercion, noted
+            // before the value is converted again).
+            self.bounds
+        } else if from == oid::UNKNOWN {
+            // An untyped literal, read by the type's input function.
+            to_kind.and_then(|kind| {
+                let points: Option<Vec<_>> =
+                    self.values.as_ref()?.iter().map(|v| kind.read(v)).collect();
+                let mut ranges = points?.into_iter().map(|p| OrdRange::exactly(kind, p));
+                let first = ranges.next()?;
+                ranges.try_fold(first, |a, b| a.hull(&b))
+            })
+        } else if exact_from == Some(Exact::Int) && to_kind == Some(OrdKind::Numeric) {
+            // An integer is the same number as a `numeric`.
+            self.int_bounds().map(|r| OrdRange::of_ints(&r))
+        } else {
+            None
+        };
         Refinement {
             finite,
-            values,
+            values: capped(values),
             range,
+            bounds: None,
         }
+        .with_bounds(bounds)
     }
 }
 
 /// A type whose equal values print the same, so a value set says what
 /// the client receives: the integer types, `boolean`, an enum, and `text`
 /// / `varchar` under a deterministic collation. Not `numeric` (`1` and
-/// `1.0` are equal), `char(n)` (padded) or a string type under a
-/// nondeterministic collation (`'a'` may be stored `'A'`).
+/// `1.0` are equal; its [`Refinement::bounds`] say what is known),
+/// `date` / `timestamp` (printed as the session's `DateStyle` says),
+/// `char(n)` (padded) or a string type under a nondeterministic collation
+/// (`'a'` may be stored `'A'`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Exact {
     Int,
@@ -309,10 +404,8 @@ impl Exact {
         {
             return Some(Exact::Text);
         }
-        // C (950), POSIX (951) and the database default (100) compare
-        // bytes.
-        let deterministic = collation.is_none_or(|c| matches!(c.get(), 100 | 950 | 951));
-        ((base == oid::TEXT || base == oid::VARCHAR) && deterministic).then_some(Exact::Text)
+        ((base == oid::TEXT || base == oid::VARCHAR) && deterministic(collation, snapshot))
+            .then_some(Exact::Text)
     }
 
     /// A literal's text as this kind of type reads it, in print: what
@@ -344,8 +437,35 @@ fn read_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// The most integers a range is listed as values for.
-const ENUMERATED: i128 = 16;
+/// Whether equal strings under `collation` are the same string: no
+/// collation (the database default, which PG never lets be
+/// nondeterministic), or one `pg_collation.collisdeterministic` says is
+/// (`C`, `POSIX`, a libc locale, an ICU one at the default strength). A
+/// collation the catalog doesn't know is not.
+pub(crate) fn deterministic(
+    collation: Option<crate::oid::PgCollationOid>,
+    snapshot: &PgCatalog,
+) -> bool {
+    collation.is_none_or(|c| {
+        snapshot
+            .pg_collation
+            .get(&c)
+            .is_some_and(|c| c.collisdeterministic)
+    })
+}
+
+/// The most integers a range is listed as values for (a range of fewer is
+/// listed, and split into cases by the CHECK reasoning).
+pub(crate) const ENUMERATED: i128 = 16;
+
+/// The most values a value set lists: a larger one says too little to
+/// keep (and is dropped).
+pub(crate) const MAX_VALUES: usize = 32;
+
+/// `values`, unless there are more than [`MAX_VALUES`].
+pub(crate) fn capped(values: Option<BTreeSet<String>>) -> Option<BTreeSet<String>> {
+    values.filter(|vs| vs.len() <= MAX_VALUES)
+}
 
 /// PG's `interval` type.
 const INTERVAL: PgTypeOid = PgTypeOid::from_raw(1186);
@@ -447,7 +567,29 @@ pub(crate) fn of_builtin_call(
         range: builtin
             .then(|| builtin_range(proc, args, snapshot))
             .flatten(),
+        bounds: builtin.then(|| builtin_bounds(proc, args)).flatten(),
     }
+}
+
+/// The bounds of the result of `pg_catalog` function `proc` over `args`
+/// that is one of its arguments' values: `min` / `max` of the input's,
+/// `lag(x, n, default)` of `x`'s or the default's, ….
+fn builtin_bounds(
+    proc: &crate::pg_catalog::PgProc,
+    args: &[&crate::expr::ExprType],
+) -> Option<OrdRange> {
+    if !matches!(
+        proc.proname.as_str(),
+        "min" | "max" | "first_value" | "last_value" | "nth_value" | "lag" | "lead"
+    ) {
+        return None;
+    }
+    let mut b = args.first()?.refine.bounds?;
+    // `lag(x, n, default)` may be the default.
+    if args.len() >= 3 {
+        b = b.hull(&args[2].refine.bounds?)?;
+    }
+    (!b.is_unbounded()).then_some(b)
 }
 
 /// The bounds of the integer result of `pg_catalog` function `proc` over

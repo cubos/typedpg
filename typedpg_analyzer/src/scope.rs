@@ -21,11 +21,20 @@ fn system_columns_for(alias: &str) -> Vec<ScopeColumn> {
             table_alias: alias.to_owned(),
             record_fields: None,
             elem_nullable: None,
+            elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,
             origin: None,
             output: None,
         })
         .collect()
+}
+
+/// What every non-NULL element of a column of type `t` is, when `t` is an
+/// array of a domain whose CHECKs say (each element was coerced to it).
+fn column_elem_refine(t: PgTypeOid, snapshot: &PgCatalog) -> crate::refine::Refinement {
+    crate::expr::array_element_type(snapshot, t)
+        .map(|e| snapshot.domain_refinement(e))
+        .unwrap_or_default()
 }
 
 /// A resolved column with its type and base nullability (from table definition).
@@ -64,6 +73,8 @@ pub(crate) struct ScopeColumn {
     pub elem_nullable: Option<bool>,
     /// What every non-NULL value of the column is (see [`crate::refine`]).
     pub refine: crate::refine::Refinement,
+    /// For an array column, what every non-NULL element is.
+    pub elem_refine: crate::refine::Refinement,
     /// The base-table column this column's value is read from, when it
     /// is one passed through unchanged (see [`Origin`]).
     pub origin: Option<Origin>,
@@ -976,8 +987,10 @@ impl Scope {
                     finite: finite.contains(&c.attname),
                     values: None,
                     range: None,
+                    bounds: None,
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
+                elem_refine: column_elem_refine(c.atttypid, snapshot),
                 origin: None,
                 output: None,
             })
@@ -1082,8 +1095,10 @@ impl Scope {
                     finite: finite.contains(&c.attname),
                     values: None,
                     range: None,
+                    bounds: None,
                 }
                 .and(&snapshot.domain_refinement(c.atttypid)),
+                elem_refine: column_elem_refine(c.atttypid, snapshot),
                 origin: None,
                 output: None,
             })

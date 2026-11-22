@@ -18,6 +18,11 @@
 -- one nullable column NULL and the rest filled, or the other way round,
 -- under both variants — so constraints tying columns together
 -- (`kind <> 'a' OR a_id IS NOT NULL`) get rows on each of their sides.
+-- Modes 4 and 5 add rows holding boundary values, one column at a time
+-- (see `typedpg_seed_values`): mode 4 the literals of CHECK constraints
+-- and their neighbours, enum labels and the query's literals `lits`,
+-- mode 5 each type's special values (NaN, infinities, integer extremes,
+-- the empty string).
 -- Foreign keys take the referenced table's first key, so tables are
 -- retried in passes until no pass makes progress (a parent seeded in pass
 -- 1 unblocks its children in pass 2). It returns the INSERTs that
@@ -246,8 +251,10 @@ $fn$;
 -- NULL and every other column filled with variant `variant`'s sample
 -- (foreign keys taking the referenced table's first key). A column of a
 -- unique index of integer or text type takes `salt` instead, so several
--- such rows fit.
-CREATE FUNCTION pg_temp.typedpg_pattern_sql(rel oid, variant int, nulls text[], salt int)
+-- such rows fit. Columns `over_atts`, when given, take the expressions
+-- `over_vals` (in the same order) instead of anything else.
+CREATE FUNCTION pg_temp.typedpg_pattern_sql(rel oid, variant int, nulls text[], salt int,
+                                            over_atts int[] DEFAULT '{}', over_vals text[] DEFAULT '{}')
 RETURNS text
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
@@ -265,7 +272,9 @@ BEGIN
              ORDER BY attnum
     LOOP
         CONTINUE WHEN a.attgenerated <> '' OR a.attidentity = 'a';
-        IF a.attname = ANY (nulls) AND NOT a.attnotnull
+        IF a.attnum = ANY (over_atts) THEN
+            v := over_vals[array_position(over_atts, a.attnum::int)];
+        ELSIF a.attname = ANY (nulls) AND NOT a.attnotnull
            AND NOT pg_temp.typedpg_type_not_null(a.atttypid) THEN
             v := 'NULL';
         ELSE
@@ -367,7 +376,280 @@ BEGIN
 END
 $fn$;
 
-CREATE FUNCTION pg_temp.typedpg_seed(mode int)
+-- The literals in the CHECK constraints on column `att` of `rel` and in
+-- those of the domains its type `typ` is (string constants unquoted,
+-- numbers as written).
+CREATE FUNCTION pg_temp.typedpg_check_literals(rel oid, att int, typ oid)
+RETURNS text[]
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $fn$
+    WITH RECURSIVE d(oid, base) AS (
+        SELECT oid, typbasetype FROM pg_type WHERE oid = typ
+        UNION ALL
+        SELECT t.oid, t.typbasetype FROM pg_type t JOIN d ON t.oid = d.base
+    ), defs AS (
+        SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c
+        WHERE c.contype = 'c'
+          AND ((c.conrelid = rel AND att = ANY (c.conkey))
+               OR c.contypid IN (SELECT oid FROM d WHERE base <> 0))
+    )
+    SELECT coalesce(array_agg(DISTINCT lit), '{}') FROM (
+        SELECT coalesce(replace(m[1], '''''', ''''), m[2]) AS lit
+        FROM defs,
+             regexp_matches(def, '''((?:[^'']|'''')*)''|(?<![[:alnum:]_.$])(-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)', 'g') AS m
+    ) s
+    WHERE lit IS NOT NULL
+$fn$;
+
+-- Expressions for the value `lit` and its neighbours in the base type
+-- `base`: b - 1, b, b + 1 of a number (and b ± 0.001 of a non-integer
+-- one); b ± one day and one microsecond of a date / time; b ± one
+-- microsecond of an interval. An expression `lit` can't be read as fails
+-- at evaluation and is dropped by the caller.
+CREATE FUNCTION pg_temp.typedpg_near(lit text, base oid)
+RETURNS text[]
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+    t pg_type;
+    tname text := format_type(base, NULL);
+    out text[] := ARRAY[quote_literal(lit)];
+BEGIN
+    SELECT * INTO t FROM pg_type WHERE oid = base;
+    IF t.typcategory = 'N' AND lit ~ '^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$' THEN
+        out := out || format('(%L::numeric - 1)', lit) || format('(%L::numeric + 1)', lit);
+        IF t.typname IN ('numeric', 'float4', 'float8') THEN
+            out := out || format('(%L::numeric - 0.001)', lit) || format('(%L::numeric + 0.001)', lit);
+        END IF;
+    ELSIF t.typcategory = 'D' THEN
+        out := out
+            || format('(%L::%s - interval ''1 day'')', lit, tname)
+            || format('(%L::%s + interval ''1 day'')', lit, tname)
+            || format('(%L::%s - interval ''1 microsecond'')', lit, tname)
+            || format('(%L::%s + interval ''1 microsecond'')', lit, tname);
+    ELSIF t.typcategory = 'T' THEN
+        out := out
+            || format('(%L::interval - interval ''1 microsecond'')', lit)
+            || format('(%L::interval + interval ''1 microsecond'')', lit);
+    END IF;
+    RETURN out;
+END
+$fn$;
+
+-- The special values of the base type `base`: an integer's extremes, a
+-- number's NaN and infinities, a date's or timestamp's infinities, the
+-- empty string.
+CREATE FUNCTION pg_temp.typedpg_extremes(base oid)
+RETURNS text[]
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $fn$
+    SELECT coalesce(array_agg(quote_literal(v)), '{}') FROM unnest(
+        CASE (SELECT typname FROM pg_type WHERE oid = base AND typnamespace = 'pg_catalog'::regnamespace)
+            WHEN 'int2' THEN '{-32768,32767,0,-1}'::text[]
+            WHEN 'int4' THEN '{-2147483648,2147483647,0,-1}'
+            WHEN 'int8' THEN '{-9223372036854775808,9223372036854775807,0,-1}'
+            WHEN 'numeric' THEN '{NaN,Infinity,-Infinity,0,-1,0.5}'
+            WHEN 'float4' THEN '{NaN,Infinity,-Infinity,-0,0}'
+            WHEN 'float8' THEN '{NaN,Infinity,-Infinity,-0,0}'
+            WHEN 'date' THEN '{infinity,-infinity,1970-01-01}'
+            WHEN 'timestamp' THEN '{infinity,-infinity,1970-01-01}'
+            WHEN 'timestamptz' THEN '{infinity,-infinity,1970-01-01}'
+            WHEN 'interval' THEN '{infinity,-infinity,0}'
+            WHEN 'text' THEN '{"", " "}'
+            WHEN 'varchar' THEN '{"", " "}'
+            WHEN 'bpchar' THEN '{"", " "}'
+            ELSE '{}'
+        END) AS v
+$fn$;
+
+-- Modes 4 and 5 of `typedpg_seed`: rows of every table that hold the
+-- values a refinement may depend on in one column, the other columns
+-- filled as in mode 2. Mode 4 (`bounds`) takes, per column, the literals
+-- of its CHECK constraints and its domains' and their neighbours, every
+-- label of an enum, and the query's own literals `lits` (with their
+-- neighbours); mode 5 (`extremes`) the type's special values. A value
+-- the column's type or domain rejects is dropped, a row a constraint
+-- rejects skipped. Columns take turns (each one's first value, then each
+-- one's second, …), up to `per_table` rows per table; the other columns
+-- keep the values of the first row that went in.
+CREATE FUNCTION pg_temp.typedpg_seed_values(mode int, lits text[])
+RETURNS TABLE (kind text, detail text)
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+    per_table int := CASE WHEN mode = 4 THEN 32 ELSE 16 END;
+    per_column int := 12;
+    r oid;
+    a record;
+    base oid;
+    tname text;
+    exprs text[];
+    own int;
+    e text;
+    j int;
+    canon text;
+    seen text[];
+    cand_att int[];
+    cand_rank int[];
+    cand_val text[];
+    i int;
+    stmt text;
+    salt int := 2000;
+    added int;
+    l text;
+    base_atts int[];
+    base_vals text[];
+    base_ok bool;
+    retry int[];
+    queue int[];
+    q int;
+    checks text[];
+    probe_att int[];
+    probe_val text[];
+    atts int[];
+    vals text[];
+    k int;
+BEGIN
+    FOR r IN SELECT cl.oid FROM pg_class cl JOIN pg_namespace n ON n.oid = cl.relnamespace
+             WHERE cl.relkind IN ('r', 'p') AND NOT cl.relispartition
+               AND cl.relpersistence <> 't'
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+               AND n.nspname NOT LIKE 'pg\_toast%'
+             ORDER BY cl.oid
+    LOOP
+        cand_att := '{}';
+        cand_rank := '{}';
+        cand_val := '{}';
+        probe_att := '{}';
+        probe_val := '{}';
+        FOR a IN SELECT attnum, atttypid FROM pg_attribute
+                 WHERE attrelid = r AND attnum > 0 AND NOT attisdropped
+                   AND attgenerated = '' AND attidentity <> 'a'
+                   AND NOT EXISTS (SELECT 1 FROM pg_constraint c
+                                   WHERE c.conrelid = r AND c.contype = 'f'
+                                     AND attnum = ANY (c.conkey))
+                 ORDER BY attnum
+        LOOP
+            base := NULL;
+            WITH RECURSIVE d(oid, b) AS (
+                SELECT oid, typbasetype FROM pg_type WHERE oid = a.atttypid
+                UNION ALL
+                SELECT t.oid, t.typbasetype FROM pg_type t JOIN d ON t.oid = d.b
+            )
+            SELECT oid INTO base FROM d WHERE b = 0;
+            CONTINUE WHEN base IS NULL;
+            tname := format_type(a.atttypid, NULL);
+            exprs := '{}';
+            checks := pg_temp.typedpg_check_literals(r, a.attnum, a.atttypid);
+            FOREACH l IN ARRAY checks LOOP
+                probe_att := probe_att || a.attnum::int;
+                probe_val := probe_val || format('%L::%s', l, tname);
+            END LOOP;
+            IF mode = 4 THEN
+                SELECT coalesce(array_agg(quote_literal(enumlabel) ORDER BY enumsortorder), '{}')
+                INTO exprs FROM pg_enum WHERE enumtypid = base;
+                FOREACH l IN ARRAY checks LOOP
+                    exprs := exprs || pg_temp.typedpg_near(l, base);
+                END LOOP;
+                -- The column's own values come before the query's.
+                own := cardinality(exprs);
+                FOREACH l IN ARRAY lits LOOP
+                    exprs := exprs || pg_temp.typedpg_near(l, base);
+                END LOOP;
+            ELSE
+                exprs := pg_temp.typedpg_extremes(base);
+                own := cardinality(exprs);
+            END IF;
+            seen := '{}';
+            FOR j IN 1 .. coalesce(cardinality(exprs), 0) LOOP
+                EXIT WHEN cardinality(seen) >= per_column;
+                e := exprs[j];
+                BEGIN
+                    EXECUTE format('SELECT ((%s)::%s)::text', e, tname) INTO canon;
+                EXCEPTION WHEN others THEN
+                    CONTINUE;
+                END;
+                CONTINUE WHEN canon IS NULL OR canon = ANY (seen);
+                seen := seen || canon;
+                cand_att := cand_att || a.attnum::int;
+                cand_rank := cand_rank || (cardinality(seen) + CASE WHEN j > own THEN 1000 ELSE 0 END);
+                cand_val := cand_val || format('%L::%s', canon, tname);
+            END LOOP;
+        END LOOP;
+        CONTINUE WHEN cardinality(cand_att) = 0;
+        added := 0;
+        base_atts := '{}';
+        base_vals := '{}';
+        base_ok := false;
+        retry := '{}';
+        SELECT array_agg(s ORDER BY cand_rank[s], cand_att[s]) INTO queue
+        FROM generate_subscripts(cand_att, 1) AS s;
+        -- The mode 2 values of the other columns may be what a CHECK
+        -- rejects (`d >= '2020-01-01'`): find a base the next rows vary one
+        -- column of — the mode 2 row itself, or it with one column taking
+        -- a literal of its CHECKs — by inserting it and rolling it back.
+        FOR j IN 0 .. cardinality(probe_att) LOOP
+            IF j = 0 THEN
+                atts := '{}';
+                vals := '{}';
+            ELSE
+                atts := ARRAY[probe_att[j]];
+                vals := ARRAY[probe_val[j]];
+            END IF;
+            stmt := pg_temp.typedpg_pattern_sql(r, 2, '{}', salt, atts, vals);
+            CONTINUE WHEN stmt IS NULL;
+            BEGIN
+                EXECUTE stmt;
+                RAISE EXCEPTION 'probe' USING ERRCODE = 'TPGOK';
+            EXCEPTION
+                WHEN SQLSTATE 'TPGOK' THEN
+                    base_ok := true;
+                    base_atts := atts;
+                    base_vals := vals;
+                WHEN others THEN
+                    NULL;
+            END;
+            EXIT WHEN base_ok;
+        END LOOP;
+        -- Otherwise the first row that goes in becomes the base, and the
+        -- candidates tried before it are tried again right away.
+        q := 0;
+        WHILE q < cardinality(queue) AND added < per_table LOOP
+            q := q + 1;
+            i := queue[q];
+            atts := base_atts;
+            vals := base_vals;
+            k := array_position(atts, cand_att[i]);
+            IF k IS NULL THEN
+                atts := atts || cand_att[i];
+                vals := vals || cand_val[i];
+            ELSIF vals[k] = cand_val[i] THEN
+                CONTINUE;
+            ELSE
+                vals[k] := cand_val[i];
+            END IF;
+            salt := salt + 1;
+            stmt := pg_temp.typedpg_pattern_sql(r, 2, '{}', salt, atts, vals);
+            CONTINUE WHEN stmt IS NULL;
+            BEGIN
+                EXECUTE stmt;
+                added := added + 1;
+                kind := 'insert';
+                detail := stmt;
+                RETURN NEXT;
+                IF NOT base_ok THEN
+                    base_ok := true;
+                    base_atts := atts;
+                    base_vals := vals;
+                    queue := queue[1:q] || retry || queue[q + 1:];
+                END IF;
+            EXCEPTION WHEN others THEN
+                IF NOT base_ok THEN
+                    retry := retry || i;
+                END IF;
+            END;
+        END LOOP;
+    END LOOP;
+END
+$fn$;
+
+CREATE FUNCTION pg_temp.typedpg_seed(mode int, lits text[] DEFAULT '{}')
 RETURNS TABLE (kind text, detail text)
 LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
@@ -383,6 +665,10 @@ DECLARE
 BEGIN
     IF mode = 3 THEN
         RETURN QUERY SELECT * FROM pg_temp.typedpg_seed_mixed();
+        RETURN;
+    END IF;
+    IF mode IN (4, 5) THEN
+        RETURN QUERY SELECT * FROM pg_temp.typedpg_seed_values(mode, lits);
         RETURN;
     END IF;
     SELECT coalesce(array_agg(c.oid ORDER BY c.oid), '{}') INTO pending

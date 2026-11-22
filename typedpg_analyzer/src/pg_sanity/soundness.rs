@@ -25,6 +25,19 @@
 //!    mixing NULL and filled nullable columns (one NULL, or one filled,
 //!    under either variant), so rows on each side of a constraint tying
 //!    columns together (`kind <> 'a' OR a_id IS NOT NULL`) exist.
+//! 5. `bounds` — plus rows holding, one column at a time (the others
+//!    filled), the values a refinement may hinge on: each literal of the
+//!    column's CHECK constraints and domains with its neighbours (b - 1,
+//!    b, b + 1 of an integer; b ± 0.001 of a numeric; b ± a day and a
+//!    microsecond of a date or timestamp), every label of an enum, and
+//!    the query's own literals with their neighbours.
+//! 6. `extremes` — plus rows holding each type's special values the same
+//!    way: integer extremes, numeric and float NaN and infinities, date
+//!    and timestamp infinities, the empty string.
+//!
+//! Scenarios 5 and 6 come last because their values make more queries
+//! fail at runtime (an overflow, an infinity a function rejects), which
+//! skips only that scenario.
 //!
 //! The rows come from `seed.sql`'s `typedpg_seed`, which introspects the
 //! scratch database and builds INSERTs that respect NOT NULL, defaults,
@@ -43,7 +56,8 @@
 //! A column's [`crate::Refinement`] is a promise too: one refined finite
 //! never comes back an infinite date, timestamp or interval, one refined
 //! to a set of values never comes back another, and an integer never
-//! comes back out of its range.
+//! comes back out of its range, nor a `numeric`, date or timestamp out of
+//! its bounds.
 //!
 //! Only SELECT / INSERT / UPDATE / DELETE / MERGE statements run; queries
 //! calling server-administration functions with effects that outlive a
@@ -113,7 +127,20 @@ const UNSAFE_CALLS: &[&str] = &[
 ];
 
 /// The cumulative scenarios, in order: name and seeding mode (0 = none).
-const SCENARIOS: [(&str, i32); 4] = [("as-is", 0), ("nulls", 1), ("full", 2), ("mixed", 3)];
+const SCENARIOS: [(&str, i32); 6] = [
+    ("as-is", 0),
+    ("nulls", 1),
+    ("full", 2),
+    ("mixed", 3),
+    ("bounds", 4),
+    ("extremes", 5),
+];
+
+/// The seeding mode that also takes the query's literals.
+const BOUNDS_MODE: i32 = 4;
+
+/// The query's literals `bounds` tries at most.
+const MAX_LITERALS: usize = 12;
 
 /// What `typedpg_seed(mode)` did: the INSERTs that succeeded, in order,
 /// and the tables it skipped (`table: reason`).
@@ -147,6 +174,10 @@ struct Stats {
     equivalence_checked: u64,
     /// Scenarios in which both ran and their results were compared.
     equivalence_compared: u64,
+    /// Rows each seeding scenario inserted, summed over the checks.
+    seeded_rows: BTreeMap<String, u64>,
+    /// Successful executions per scenario.
+    scenario_executions: BTreeMap<String, u64>,
 }
 
 /// Per-server oracle state.
@@ -156,7 +187,9 @@ pub(super) struct Soundness {
     /// Bumped on every DDL batch: seeding plans and parameter samples are
     /// valid for one schema generation only.
     schema_gen: u64,
-    plans: HashMap<(u64, i32), SeedPlan>,
+    /// Per (generation, mode, literals): only the `bounds` mode's plan
+    /// depends on the query's literals; the other modes' key has none.
+    plans: HashMap<(u64, i32, Vec<String>), SeedPlan>,
     param_texts: HashMap<(u64, u32, i32), Option<String>>,
     stats: Stats,
 }
@@ -203,7 +236,8 @@ impl Soundness {
         let has_promise = ours.columns.iter().zip(&checked).any(|(c, &on)| {
             on && (!c.nullable
                 || has_inner_promise(&c.pg_type)
-                || c.refinement != crate::refine::Refinement::NONE)
+                || c.refinement != crate::refine::Refinement::NONE
+                || c.elem_refinement != crate::refine::Refinement::NONE)
         });
         if !has_promise {
             self.stats.no_promise += 1;
@@ -228,12 +262,20 @@ impl Soundness {
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
 
+        let literals = query_literals(sql);
         let mut tx = client
             .transaction()
             .unwrap_or_else(|e| panic!("pg_sanity: BEGIN failed in the nullability check: {e}"));
         tx.batch_execute("SET LOCAL statement_timeout = '5s'; SET LOCAL lock_timeout = '1s'")
             .unwrap_or_else(|e| panic!("pg_sanity: SET LOCAL failed: {e}"));
-        self.check_scenarios(&mut tx, sql, ours, stmt, &checked, &values, &param_refs)
+        let run = ScenarioRun {
+            sql,
+            stmt,
+            checked: &checked,
+            values: &values,
+            literals: &literals,
+        };
+        self.check_scenarios(&mut tx, ours, &run, &param_refs)
     }
 
     /// Parameter values: NULL where the analyzer allows it, a sample of the
@@ -276,27 +318,35 @@ impl Soundness {
     }
 
     /// The scenarios of [`Self::check`].
-    #[allow(clippy::too_many_arguments)]
     fn check_scenarios(
         &mut self,
         tx: &mut Transaction<'_>,
-        sql: &str,
         ours: &AnalyzedQuery,
-        stmt: &Statement,
-        checked: &[bool],
-        values: &[Option<String>],
+        run: &ScenarioRun<'_>,
         param_refs: &[&(dyn ToSql + Sync)],
     ) -> Option<Divergence> {
+        let ScenarioRun {
+            sql,
+            stmt,
+            checked,
+            values,
+            literals,
+        } = *run;
         let mut seeded: Vec<(&str, SeedPlan)> = Vec::new();
         for (scenario, mode) in SCENARIOS {
             if mode > 0 {
-                let plan = self.seed(tx, mode);
+                let plan = self.seed(tx, mode, literals);
                 for skip in &plan.skips {
                     *self.stats.seed_skips.entry(skip.clone()).or_default() += 1;
                 }
-                // Nothing added (no table has mixed rows): the data is the
-                // previous scenario's, already checked.
-                let unchanged = mode == 3 && plan.inserts.is_empty();
+                *self
+                    .stats
+                    .seeded_rows
+                    .entry(scenario.to_owned())
+                    .or_default() += plan.inserts.len() as u64;
+                // Nothing added (no table has mixed or boundary rows): the
+                // data is the previous scenario's, already checked.
+                let unchanged = mode >= 3 && plan.inserts.is_empty();
                 seeded.push((scenario, plan));
                 if unchanged {
                     continue;
@@ -327,6 +377,11 @@ impl Soundness {
                 }
             };
             self.stats.executions += 1;
+            *self
+                .stats
+                .scenario_executions
+                .entry(scenario.to_owned())
+                .or_default() += 1;
             for (r, row) in rows.iter().enumerate() {
                 for (i, col) in ours.columns.iter().enumerate() {
                     if !checked.get(i).copied().unwrap_or(false) {
@@ -336,13 +391,28 @@ impl Soundness {
                         continue;
                     };
                     let problem = match raw {
-                        None if !col.nullable => Some("the value is NULL".to_string()),
+                        None if !col.nullable => {
+                            Some((Unsound::Nullability, "the value is NULL".to_string()))
+                        }
                         None => None,
                         Some(bytes) => inner_violation(&col.pg_type, bytes)
-                            .or_else(|| refinement_violation(col, bytes)),
+                            .map(|p| (Unsound::Nullability, p))
+                            .or_else(|| {
+                                refinement_violation(&col.pg_type, &col.refinement, bytes)
+                                    .or_else(|| {
+                                        elem_refinement_violation(
+                                            &col.pg_type,
+                                            &col.elem_refinement,
+                                            bytes,
+                                        )
+                                    })
+                                    .or_else(|| field_refinement_violation(&col.pg_type, bytes))
+                                    .map(|p| (Unsound::Refinement, p))
+                            }),
                     };
-                    if let Some(problem) = problem {
-                        let message = render(sql, ours, i, r, &problem, scenario, values, &seeded);
+                    if let Some((what, problem)) = problem {
+                        let message =
+                            render(sql, ours, i, r, what, &problem, scenario, values, &seeded);
                         return Some(Divergence {
                             kind: DivergenceKind::Nullability,
                             message,
@@ -384,6 +454,7 @@ impl Soundness {
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         let order_keys = order_keys(original.0, ours);
         let targets = written_tables(original.0);
+        let literals = query_literals(original.0);
 
         let mut tx = client
             .transaction()
@@ -393,8 +464,8 @@ impl Soundness {
         let mut seeded: Vec<(&str, SeedPlan)> = Vec::new();
         for (scenario, mode) in SCENARIOS {
             if mode > 0 {
-                let plan = self.seed(&mut tx, mode);
-                let unchanged = mode == 3 && plan.inserts.is_empty();
+                let plan = self.seed(&mut tx, mode, &literals);
+                let unchanged = mode >= 3 && plan.inserts.is_empty();
                 seeded.push((scenario, plan));
                 if unchanged {
                     continue;
@@ -491,13 +562,18 @@ impl Soundness {
         if !self.enabled {
             return false;
         }
-        !self.seed(tx, 2).inserts.is_empty()
+        !self.seed(tx, 2, &[]).inserts.is_empty()
     }
 
-    /// Seed one row per table for `mode`, replaying this generation's plan
-    /// when there is one.
-    fn seed(&mut self, tx: &mut Transaction<'_>, mode: i32) -> SeedPlan {
-        let key = (self.schema_gen, mode);
+    /// Seed the rows of `mode` (the `bounds` mode trying the query's
+    /// `literals` too), replaying this generation's plan when there is one.
+    fn seed(&mut self, tx: &mut Transaction<'_>, mode: i32, literals: &[String]) -> SeedPlan {
+        let literals: Vec<String> = if mode == BOUNDS_MODE {
+            literals.to_vec()
+        } else {
+            Vec::new()
+        };
+        let key = (self.schema_gen, mode, literals);
         if let Some(plan) = self.plans.get(&key) {
             if plan.inserts.is_empty() {
                 return plan.clone();
@@ -517,8 +593,8 @@ impl Soundness {
             .transaction()
             .unwrap_or_else(|e| panic!("pg_sanity: SAVEPOINT failed: {e}"));
         let plan = match sp.query(
-            "SELECT kind, detail FROM pg_temp.typedpg_seed($1)",
-            &[&mode],
+            "SELECT kind, detail FROM pg_temp.typedpg_seed($1, $2)",
+            &[&mode, &key.2],
         ) {
             Ok(rows) => {
                 let mut plan = SeedPlan::default();
@@ -604,6 +680,12 @@ impl Soundness {
             ("equivalence_compared", s.equivalence_compared),
         ] {
             out.push_str(&format!("count\t{name}\t{n}\n"));
+        }
+        for (scenario, n) in &s.scenario_executions {
+            out.push_str(&format!("scenario\t{scenario}\t{n}\n"));
+        }
+        for (scenario, n) in &s.seeded_rows {
+            out.push_str(&format!("seeded\t{scenario}\t{n}\n"));
         }
         for (code, n) in &s.exec_error_codes {
             out.push_str(&format!("error\t{code}\t{n}\n"));
@@ -789,9 +871,14 @@ fn has_inner_promise(ty: &Type) -> bool {
             element,
             element_nullable,
         } => *element_nullable == Some(false) || has_inner_promise(element),
-        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => fields
-            .iter()
-            .any(|f| !f.nullable || has_inner_promise(&f.ty)),
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => {
+            fields.iter().any(|f| {
+                !f.nullable
+                    || f.refinement != crate::refine::Refinement::NONE
+                    || f.elem_refinement != crate::refine::Refinement::NONE
+                    || has_inner_promise(&f.ty)
+            })
+        }
         Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => false,
     }
 }
@@ -861,14 +948,17 @@ fn is_executable(sql: &str) -> bool {
     )
 }
 
-/// What the binary value `bytes` of column `col` isn't of what its
-/// refinement says it is.
-fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<String> {
-    let mut ty = &col.pg_type;
+/// What the binary value `bytes` of type `ty` isn't of what `refinement`
+/// says it is.
+fn refinement_violation(
+    mut ty: &Type,
+    refinement: &crate::refine::Refinement,
+    bytes: &[u8],
+) -> Option<String> {
     while let Type::Domain { base, .. } = ty {
         ty = base;
     }
-    if let Some(values) = &col.refinement.values {
+    if let Some(values) = &refinement.values {
         // `int2send` / … big-endian, `boolsend` a byte, `textsend` /
         // `enum_send` the text.
         let printed = match ty {
@@ -878,7 +968,9 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
                 "int4" => Some(i32::from_be_bytes(bytes.try_into().ok()?).to_string()),
                 "int8" => Some(i64::from_be_bytes(bytes.try_into().ok()?).to_string()),
                 "bool" => Some((bytes.first()? != &0).to_string()),
-                "text" | "varchar" => std::str::from_utf8(bytes).ok().map(str::to_owned),
+                "text" | "varchar" | "unknown" => {
+                    std::str::from_utf8(bytes).ok().map(str::to_owned)
+                }
                 _ => None,
             },
             _ => None,
@@ -894,7 +986,7 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
     let Type::Basic { schema, name, .. } = ty else {
         return None;
     };
-    if let Some(range) = &col.refinement.range
+    if let Some(range) = &refinement.range
         && schema == "pg_catalog"
     {
         let int: Option<i128> = match name.as_str() {
@@ -911,7 +1003,16 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
             ));
         }
     }
-    if !col.refinement.finite || schema != "pg_catalog" {
+    if let Some(bounds) = &refinement.bounds
+        && schema == "pg_catalog"
+        && let Some(v) = ordered_point(name, bytes)
+        && !bounds.contains(v)
+    {
+        return Some(format!(
+            "the value is {v:?}, out of {bounds:?} (refinement: bounds)"
+        ));
+    }
+    if !refinement.finite || schema != "pg_catalog" {
         return None;
     }
     // `date_send` / `timestamp_send` / `interval_send`: the infinities are
@@ -935,6 +1036,68 @@ fn refinement_violation(col: &crate::AnalyzedColumn, bytes: &[u8]) -> Option<Str
         _ => false,
     };
     infinite.then(|| "the value is infinite (refinement: finite)".to_string())
+}
+
+/// What an element of the binary array `bytes` of type `ty` isn't of what
+/// `elements` says every non-NULL element is (at any depth: the elements
+/// of a multidimensional array are all listed).
+fn elem_refinement_violation(
+    mut ty: &Type,
+    elements: &crate::refine::Refinement,
+    bytes: &[u8],
+) -> Option<String> {
+    if *elements == crate::refine::Refinement::NONE {
+        return None;
+    }
+    while let Type::Domain { base, .. } = ty {
+        ty = base;
+    }
+    let Type::Array { element, .. } = ty else {
+        return None;
+    };
+    array_elements(bytes)?
+        .into_iter()
+        .enumerate()
+        .find_map(|(k, elem)| {
+            let found = refinement_violation(element, elements, elem?)?;
+            Some(format!("element [{}]: {found} (elem_refinement)", k + 1))
+        })
+}
+
+/// What a field of a record inside the binary value `bytes` of type `ty`
+/// (the value itself, an array's element, a field's record, at any depth)
+/// isn't of what the field's refinements say it is, as a path from the
+/// value (`element [2] field "a": …`).
+fn field_refinement_violation(ty: &Type, bytes: &[u8]) -> Option<String> {
+    match ty {
+        Type::Domain { base, .. } => field_refinement_violation(base, bytes),
+        Type::Array { element, .. } => {
+            if !has_inner_promise(element) {
+                return None;
+            }
+            array_elements(bytes)?
+                .into_iter()
+                .enumerate()
+                .find_map(|(k, elem)| {
+                    let found = field_refinement_violation(element, elem?)?;
+                    Some(format!("element [{}] {found}", k + 1))
+                })
+        }
+        Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => {
+            let values = record_fields(bytes)?;
+            if values.len() != fields.len() {
+                return None;
+            }
+            fields.iter().zip(values).find_map(|(field, value)| {
+                let b = value?;
+                let found = refinement_violation(&field.ty, &field.refinement, b)
+                    .or_else(|| elem_refinement_violation(&field.ty, &field.elem_refinement, b))
+                    .or_else(|| field_refinement_violation(&field.ty, b))?;
+                Some(format!("field \"{}\": {found}", field.name))
+            })
+        }
+        Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => None,
+    }
 }
 
 /// Find a NULL inside the binary value `bytes` of type `ty` where `ty`
@@ -978,6 +1141,59 @@ fn inner_violation(ty: &Type, bytes: &[u8]) -> Option<String> {
             None
         }
         Type::Basic { .. } | Type::Enum { .. } | Type::Range { .. } => None,
+    }
+}
+
+/// The binary value `bytes` of a `numeric`, `date`, `timestamp` or
+/// `timestamptz` (type `name`) as a point of its order
+/// ([`crate::refine_bounds::OrdPoint`]): `date_send` / `timestamp_send`
+/// send the count from 2000-01-01 (the extremes being the infinities),
+/// `numeric_send` its base-10000 digits.
+fn ordered_point(name: &str, bytes: &[u8]) -> Option<crate::refine_bounds::OrdPoint> {
+    use crate::refine_bounds::{Num, OrdPoint};
+    let point = |v: i128, min: i128, max: i128| {
+        if v == min {
+            OrdPoint::NegInfinity
+        } else if v == max {
+            OrdPoint::Infinity
+        } else {
+            OrdPoint::Finite(Num::int(v))
+        }
+    };
+    match name {
+        "date" => Some(point(
+            read_i32(bytes, 0)?.into(),
+            i32::MIN.into(),
+            i32::MAX.into(),
+        )),
+        "timestamp" | "timestamptz" => Some(point(
+            i64::from_be_bytes(bytes.get(..8)?.try_into().ok()?).into(),
+            i64::MIN.into(),
+            i64::MAX.into(),
+        )),
+        "numeric" => {
+            let u16_at = |at: usize| -> Option<u16> {
+                Some(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+            };
+            let (ndigits, weight, sign) = (u16_at(0)?, u16_at(2)? as i16, u16_at(4)?);
+            match sign {
+                0xC000 => return Some(OrdPoint::NaN),
+                0xD000 => return Some(OrdPoint::Infinity),
+                0xF000 => return Some(OrdPoint::NegInfinity),
+                _ => {}
+            }
+            if ndigits == 0 {
+                return Some(OrdPoint::Finite(Num::int(0)));
+            }
+            let mut digits = String::new();
+            for i in 0..usize::from(ndigits) {
+                digits.push_str(&format!("{:04}", u16_at(8 + 2 * i)?));
+            }
+            let exp = 4 * (i32::from(weight) - i32::from(ndigits) + 1);
+            let minus = if sign == 0x4000 { "-" } else { "" };
+            Num::parse(&format!("{minus}{digits}e{exp}")).map(OrdPoint::Finite)
+        }
+        _ => None,
     }
 }
 
@@ -1030,6 +1246,7 @@ fn render(
     ours: &AnalyzedQuery,
     col: usize,
     row: usize,
+    what: Unsound,
     problem: &str,
     scenario: &str,
     values: &[Option<String>],
@@ -1062,16 +1279,68 @@ fn render(
             seeding.push_str(&format!("    skipped {skip}\n"));
         }
     }
+    let (kind, inferred) = match what {
+        Unsound::Nullability => (
+            "nullability",
+            if c.nullable { "nullable" } else { "NOT NULL" }.to_owned(),
+        ),
+        Unsound::Refinement => ("refinement", format!("{:?}", c.refinement)),
+    };
     format!(
-        "pg_sanity: nullability unsound: column {col} '{}' ({}) inferred {}, but in a result row \
-         {problem}.\n\
+        "pg_sanity: {kind} unsound: column {col} '{}' ({}) inferred {inferred}, but in result \
+         row {} of scenario `{scenario}` {problem}.\n\
          SQL:\n---\n{sql}\n---\n\
-         scenario: {scenario} (row {})\nparams: {params}\nseeding:\n{seeding}",
+         params: {params}\nseeding (cumulative, up to `{scenario}`):\n{seeding}",
         c.name,
         super::qualified_type_name_for_compare(&c.pg_type),
-        if c.nullable { "nullable" } else { "NOT NULL" },
         row + 1,
     )
+}
+
+/// Which promise a result value broke.
+#[derive(Debug, Clone, Copy)]
+enum Unsound {
+    Nullability,
+    Refinement,
+}
+
+/// What [`Soundness::check_scenarios`] runs, besides the parameters.
+#[derive(Clone, Copy)]
+struct ScenarioRun<'a> {
+    sql: &'a str,
+    stmt: &'a Statement,
+    checked: &'a [bool],
+    values: &'a [Option<String>],
+    literals: &'a [String],
+}
+
+/// The constants written in `sql` (numbers as written, strings unquoted),
+/// sorted, distinct, at most [`MAX_LITERALS`]: the `bounds` scenario
+/// seeds them and their neighbours, since a refinement often hinges on a
+/// value the query compares with.
+fn query_literals(sql: &str) -> Vec<String> {
+    use typedpg_pg_query::NodeRef;
+    use typedpg_pg_query::ast::AConstValue;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = parsed
+        .tree
+        .nodes()
+        .filter_map(|(n, _)| match n {
+            NodeRef::AConst(c) => match c.val.as_ref()? {
+                AConstValue::Integer(i) => Some(i.ival.to_string()),
+                AConstValue::Float(f) => Some(f.fval.clone()),
+                AConstValue::String(s) => Some(s.sval.clone()),
+                AConstValue::Boolean(_) | AConstValue::BitString(_) => None,
+            },
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(MAX_LITERALS);
+    out
 }
 
 /// A result value as raw binary bytes (`None` for NULL), whatever its type.

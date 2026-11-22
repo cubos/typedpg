@@ -144,6 +144,11 @@ pub(crate) struct Space {
     domain: Option<Vec<Literal>>,
     /// An integer type (not numeric): its values are integers only.
     integral: bool,
+    /// Bounds every non-NULL value is known to lie within (a refinement's
+    /// range or bounds, see [`Space::with_refinement`]): `(value,
+    /// inclusive)`.
+    known_lo: Option<(Value, bool)>,
+    known_hi: Option<(Value, bool)>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -151,20 +156,82 @@ enum SpaceKind {
     /// Constants say nothing about each other.
     #[default]
     Opaque,
-    /// Integers and numeric, compared by integer constants (`int4in` /
-    /// `numeric_in` read them all as the same number; numeric's NaN is
-    /// above every number, so its order stays total).
+    /// The integer types, compared by integer constants (`int4in` reads
+    /// them all as the same number, and a `numeric` constant equal to an
+    /// integer is that integer).
     Int,
     Bool,
     /// Strings compared as written: the same text is the same value.
     Str,
+    /// `numeric`, `date`, `timestamp` or `timestamptz`, compared in the
+    /// type's total order (see [`crate::refine_bounds`]: numeric's NaN
+    /// above every number and its infinities, a date's infinities at the
+    /// ends) by the constants its input function reads exactly.
+    Ord(crate::refine_bounds::OrdKind),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A constant's value, in its space (a space's ordered values are all of
+/// one variant, so the derived order is theirs).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum Value {
     Int(i128),
     Bool(bool),
     Str(String),
+    Ord(crate::refine_bounds::OrdPoint),
+}
+
+/// `preds` with the ORs of conditions ([`ValPred::AnyOf`]) last: each of
+/// their arms is read within what the others leave.
+fn or_last(preds: &[ValPred]) -> impl Iterator<Item = &ValPred> {
+    let or = |p: &&ValPred| matches!(p, ValPred::AnyOf(_));
+    preds
+        .iter()
+        .filter(move |p| !or(p))
+        .chain(preds.iter().filter(or))
+}
+
+/// An interval of an ordered space: its lower and upper bounds, each
+/// `(value, inclusive)` (`None`: unbounded).
+#[derive(Debug, Clone)]
+struct Interval(Option<(Value, bool)>, Option<(Value, bool)>);
+
+impl Interval {
+    /// Bounded below by `b` too.
+    fn raise(&mut self, b: (Value, bool)) {
+        self.0 = Some(match self.0.take() {
+            Some(l) if l.0 > b.0 || (l.0 == b.0 && !l.1) => l,
+            _ => b,
+        });
+    }
+
+    /// Bounded above by `b` too.
+    fn lower(&mut self, b: (Value, bool)) {
+        self.1 = Some(match self.1.take() {
+            Some(h) if h.0 < b.0 || (h.0 == b.0 && !h.1) => h,
+            _ => b,
+        });
+    }
+
+    /// The smallest interval holding both.
+    fn hull(self, other: Interval) -> Interval {
+        let lo = match (self.0, other.0) {
+            (Some(a), Some(b)) => Some(if a.0 < b.0 || (a.0 == b.0 && a.1) {
+                a
+            } else {
+                b
+            }),
+            _ => None,
+        };
+        let hi = match (self.1, other.1) {
+            (Some(a), Some(b)) => Some(if a.0 > b.0 || (a.0 == b.0 && a.1) {
+                a
+            } else {
+                b
+            }),
+            _ => None,
+        };
+        Interval(lo, hi)
+    }
 }
 
 impl Space {
@@ -176,28 +243,32 @@ impl Space {
     ) -> Space {
         use crate::pg_catalog::oid;
         let base = snapshot.unwrap_domain(t);
-        let deterministic = collation.is_none_or(|c| matches!(c.get(), 100 | 950 | 951));
-        if [oid::INT2, oid::INT4, oid::INT8, oid::NUMERIC].contains(&base) {
+        let deterministic = crate::refine::deterministic(collation, snapshot);
+        if [oid::INT2, oid::INT4, oid::INT8].contains(&base) {
             return Space {
                 kind: SpaceKind::Int,
-                integral: base != oid::NUMERIC,
+                integral: true,
+                ..Space::default()
+            };
+        }
+        if let Some(kind) = crate::refine_bounds::OrdKind::of(base, snapshot) {
+            return Space {
+                kind: SpaceKind::Ord(kind),
                 ..Space::default()
             };
         }
         if base == oid::BOOL {
             return Space {
                 kind: SpaceKind::Bool,
-                distinct_strings: false,
                 domain: Some(vec![Literal::boolean(true), Literal::boolean(false)]),
-                integral: false,
+                ..Space::default()
             };
         }
         if [oid::TEXT, oid::VARCHAR, oid::BPCHAR, oid::NAME].contains(&base) {
             return Space {
                 kind: SpaceKind::Str,
                 distinct_strings: deterministic && (base == oid::TEXT || base == oid::VARCHAR),
-                domain: None,
-                integral: false,
+                ..Space::default()
             };
         }
         if snapshot
@@ -221,7 +292,7 @@ impl Space {
                 kind: SpaceKind::Str,
                 distinct_strings: true,
                 domain: Some(labels),
-                integral: false,
+                ..Space::default()
             };
         }
         Space::default()
@@ -238,7 +309,7 @@ impl Space {
             SpaceKind::Int => LitKind::Integer,
             SpaceKind::Bool => LitKind::Boolean,
             SpaceKind::Str => LitKind::String,
-            SpaceKind::Opaque => return self,
+            SpaceKind::Opaque | SpaceKind::Ord(_) => return self,
         };
         let refined: Vec<Literal> = values
             .iter()
@@ -257,12 +328,36 @@ impl Space {
         self
     }
 
+    /// The space with every value within what `r` (a value's refinement)
+    /// says: one of its values, or of the few integers of its range, and
+    /// within its range or bounds.
+    pub(crate) fn with_refinement(self, r: &crate::refine::Refinement) -> Space {
+        let mut s = self.with_values(r.enumerated().as_ref());
+        match s.kind {
+            SpaceKind::Int => {
+                if let Some(range) = r.int_bounds() {
+                    s.known_lo = range.lo.map(|v| (Value::Int(v), true));
+                    s.known_hi = range.hi.map(|v| (Value::Int(v), true));
+                }
+            }
+            SpaceKind::Ord(kind) => {
+                if let Some(b) = r.bounds.filter(|b| b.kind == kind) {
+                    s.known_lo = b.lo.map(|b| (Value::Ord(b.point), b.inclusive));
+                    s.known_hi = b.hi.map(|b| (Value::Ord(b.point), b.inclusive));
+                }
+            }
+            _ => {}
+        }
+        s
+    }
+
     /// `l` as printed in a [`crate::refine::Refinement::values`] set.
     pub(crate) fn print(&self, l: &Literal) -> Option<String> {
         Some(match self.value(l)? {
             Value::Int(i) => i.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Str(s) => s,
+            Value::Ord(_) => return None,
         })
     }
 
@@ -273,11 +368,20 @@ impl Space {
     }
 
     fn value(&self, l: &Literal) -> Option<Value> {
+        use crate::refine_bounds::{Num, OrdKind, OrdPoint};
         match (self.kind, l.kind) {
             (SpaceKind::Int, LitKind::Integer) => l.text.parse().ok().map(Value::Int),
             (SpaceKind::Int, LitKind::String) => {
                 crate::literal_input::parse_pg_integer(&l.text).map(Value::Int)
             }
+            // `i = 2.0` compares as numeric: `i` is 2. (`i < 2.5` says
+            // nothing here.)
+            (SpaceKind::Int, LitKind::Numeric) => Num::parse(&l.text)?.to_integer().map(Value::Int),
+            (SpaceKind::Ord(OrdKind::Numeric), LitKind::Integer | LitKind::Numeric) => {
+                Num::parse(&l.text).map(|n| Value::Ord(OrdPoint::Finite(n)))
+            }
+            (SpaceKind::Ord(kind), LitKind::String) => kind.read(&l.text).map(Value::Ord),
+            (SpaceKind::Ord(kind), LitKind::Point(_)) => l.as_point(kind).map(Value::Ord),
             (SpaceKind::Bool, LitKind::Boolean) => Some(Value::Bool(l.text == "true")),
             (SpaceKind::Str, LitKind::String) => Some(Value::Str(l.text.clone())),
             _ => None,
@@ -305,12 +409,34 @@ impl Space {
         }
     }
 
+    /// `l`'s value in the space's order (of an integer or ordered space).
+    fn ordered(&self, l: &Literal) -> Option<Value> {
+        match (self.kind, self.value(l)?) {
+            (SpaceKind::Int, v @ Value::Int(_)) | (SpaceKind::Ord(_), v @ Value::Ord(_)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Whether a non-NULL value `x` surely lies outside the known bounds.
+    fn outside_known(&self, x: &Literal) -> bool {
+        let Some(x) = self.ordered(x) else {
+            return false;
+        };
+        self.known_lo
+            .as_ref()
+            .is_some_and(|(lo, inc)| x < *lo || (x == *lo && !inc))
+            || self
+                .known_hi
+                .as_ref()
+                .is_some_and(|(hi, inc)| x > *hi || (x == *hi && !inc))
+    }
+
     /// Whether a non-NULL value `x` surely fails `p`.
     fn fails(&self, p: &ValPred, x: &Literal) -> bool {
         match p {
             ValPred::In(vs) => vs.iter().all(|v| self.distinct(x, v)),
             ValPred::NotIn(vs) => vs.iter().any(|v| self.same(x, v)),
-            ValPred::Cmp(op, v) => match (self.int(x), self.int(v)) {
+            ValPred::Cmp(op, v) => match (self.ordered(x), self.ordered(v)) {
                 (Some(x), Some(v)) => !match op {
                     CmpOp::Lt => x < v,
                     CmpOp::Le => x <= v,
@@ -319,6 +445,8 @@ impl Space {
                 },
                 _ => false,
             },
+            // Every arm has a predicate `x` fails.
+            ValPred::AnyOf(arms) => arms.iter().all(|arm| arm.iter().any(|q| self.fails(q, x))),
         }
     }
 
@@ -333,7 +461,7 @@ impl Space {
                 hi: Some(hi),
             }) = self.bounds(preds)
             && hi >= lo
-            && hi - lo < MAX_ENUMERATED
+            && hi - lo < crate::refine::ENUMERATED
         {
             cands = Some(
                 (lo..=hi)
@@ -345,19 +473,36 @@ impl Space {
             );
         }
         for p in preds {
-            if let ValPred::In(vs) = p {
-                cands = Some(match cands {
-                    None => vs.clone(),
-                    Some(cs) => cs
-                        .into_iter()
-                        .filter(|x| vs.iter().any(|v| !self.distinct(x, v)))
-                        .collect(),
-                });
-            }
+            // One of the arms' values, when each arm has few.
+            let any_of;
+            let vs = match p {
+                ValPred::In(vs) => vs,
+                ValPred::AnyOf(arms) => {
+                    let per_arm: Option<Vec<Vec<Literal>>> =
+                        arms.iter().map(|arm| self.candidates(arm)).collect();
+                    let Some(per_arm) = per_arm else { continue };
+                    let mut all: Vec<Literal> = Vec::new();
+                    for v in per_arm.into_iter().flatten() {
+                        if !all.contains(&v) {
+                            all.push(v);
+                        }
+                    }
+                    any_of = all;
+                    &any_of
+                }
+                _ => continue,
+            };
+            cands = Some(match cands {
+                None => vs.clone(),
+                Some(cs) => cs
+                    .into_iter()
+                    .filter(|x| vs.iter().any(|v| !self.distinct(x, v)))
+                    .collect(),
+            });
         }
         cands.map(|cs| {
             cs.into_iter()
-                .filter(|x| !preds.iter().any(|p| self.fails(p, x)))
+                .filter(|x| !self.outside_known(x) && !preds.iter().any(|p| self.fails(p, x)))
                 .collect()
         })
     }
@@ -369,7 +514,7 @@ impl Space {
             return None;
         }
         let mut r = crate::refine::IntRange::default();
-        for p in preds {
+        for p in or_last(preds) {
             let b = match p {
                 ValPred::Cmp(op, v) => {
                     let Some(v) = self.int(v) else { continue };
@@ -395,6 +540,90 @@ impl Space {
                     }
                 }
                 ValPred::NotIn(_) => continue,
+                // The hull of what each arm leaves of the bounds so far.
+                ValPred::AnyOf(arms) => {
+                    let empty = |r: &crate::refine::IntRange| matches!(r, crate::refine::IntRange { lo: Some(l), hi: Some(h) } if l > h);
+                    let mut live = arms
+                        .iter()
+                        .filter_map(|arm| self.bounds(arm))
+                        .map(|b| b.meet(&r))
+                        .filter(|r| !empty(r));
+                    let Some(first) = live.next() else {
+                        // No arm can hold: no row is there to bound.
+                        continue;
+                    };
+                    live.fold(first, |a, b| a.hull(&b))
+                }
+            };
+            r = r.meet(&b);
+        }
+        Some(r)
+    }
+
+    /// The bounds the ordering comparisons and value lists among `preds`
+    /// leave a non-NULL `numeric`, `date`, `timestamp` or `timestamptz`
+    /// column, in the type's order (`None` for a space of another kind).
+    pub(crate) fn ord_bounds(&self, preds: &[ValPred]) -> Option<crate::refine_bounds::OrdRange> {
+        use crate::refine_bounds::{OrdBound, OrdRange};
+        let SpaceKind::Ord(kind) = self.kind else {
+            return None;
+        };
+        let point = |l: &Literal| match self.ordered(l) {
+            Some(Value::Ord(p)) => Some(p),
+            _ => None,
+        };
+        let mut r = OrdRange::unbounded(kind);
+        for p in or_last(preds) {
+            let b = match p {
+                ValPred::Cmp(op, v) => {
+                    let Some(v) = point(v) else { continue };
+                    let bound = Some(OrdBound {
+                        point: v,
+                        inclusive: matches!(op, CmpOp::Ge | CmpOp::Le),
+                    });
+                    match op {
+                        CmpOp::Gt | CmpOp::Ge => OrdRange {
+                            kind,
+                            lo: bound,
+                            hi: None,
+                        },
+                        CmpOp::Lt | CmpOp::Le => OrdRange {
+                            kind,
+                            lo: None,
+                            hi: bound,
+                        },
+                    }
+                }
+                ValPred::In(vs) => {
+                    let points: Option<Vec<_>> = vs.iter().map(point).collect();
+                    let Some(mut ranges) =
+                        points.map(|ps| ps.into_iter().map(|p| OrdRange::exactly(kind, p)))
+                    else {
+                        continue;
+                    };
+                    let Some(first) = ranges.next() else { continue };
+                    let Some(hull) = ranges.try_fold(first, |a, b| a.hull(&b)) else {
+                        continue;
+                    };
+                    hull
+                }
+                ValPred::NotIn(_) => continue,
+                // The hull of what each arm leaves of the bounds so far.
+                ValPred::AnyOf(arms) => {
+                    let mut live = arms
+                        .iter()
+                        .filter_map(|arm| self.ord_bounds(arm))
+                        .map(|b| b.meet(&r))
+                        .filter(|r| !r.is_empty());
+                    let Some(first) = live.next() else {
+                        // No arm can hold: no row is there to bound.
+                        continue;
+                    };
+                    let Some(hull) = live.try_fold(first, |a, b| a.hull(&b)) else {
+                        continue;
+                    };
+                    hull
+                }
             };
             r = r.meet(&b);
         }
@@ -402,43 +631,77 @@ impl Space {
     }
 
     /// The interval the ordering comparisons among `preds` (and `extra`)
-    /// leave a non-NULL column: whether it is surely empty.
+    /// leave a non-NULL column, within its known bounds: whether it is
+    /// surely empty.
     fn interval_empty<'p>(&self, preds: impl IntoIterator<Item = &'p ValPred>) -> bool {
-        if self.kind != SpaceKind::Int {
+        if !matches!(self.kind, SpaceKind::Int | SpaceKind::Ord(_)) {
             return false;
         }
-        // (value, inclusive)
-        let mut lo: Option<(i128, bool)> = None;
-        let mut hi: Option<(i128, bool)> = None;
+        self.interval(preds).is_none()
+    }
+
+    /// The interval the ordering comparisons among `preds` leave a
+    /// non-NULL column of an ordered space, within its known bounds, as
+    /// its `(lower, upper)` bounds; `None` when it is surely empty. An OR
+    /// of conditions ([`ValPred::AnyOf`]) leaves the hull of what each of
+    /// its arms leaves of that interval.
+    fn interval<'p>(&self, preds: impl IntoIterator<Item = &'p ValPred>) -> Option<Interval> {
+        let mut acc = Interval(self.known_lo.clone(), self.known_hi.clone());
+        let mut ors: Vec<&Vec<Vec<ValPred>>> = Vec::new();
         for p in preds {
-            let ValPred::Cmp(op, v) = p else { continue };
-            let Some(v) = self.int(v) else { continue };
-            match op {
-                CmpOp::Gt | CmpOp::Ge => {
-                    let b = (v, *op == CmpOp::Ge);
-                    lo = Some(match lo {
-                        Some(l) if l.0 > b.0 || (l.0 == b.0 && !l.1) => l,
-                        _ => b,
-                    });
+            match p {
+                ValPred::Cmp(op, v) => {
+                    let Some(v) = self.ordered(v) else { continue };
+                    match op {
+                        CmpOp::Gt | CmpOp::Ge => acc.raise((v, *op == CmpOp::Ge)),
+                        CmpOp::Lt | CmpOp::Le => acc.lower((v, *op == CmpOp::Le)),
+                    }
                 }
-                CmpOp::Lt | CmpOp::Le => {
-                    let b = (v, *op == CmpOp::Le);
-                    hi = Some(match hi {
-                        Some(h) if h.0 < b.0 || (h.0 == b.0 && !h.1) => h,
-                        _ => b,
-                    });
-                }
+                ValPred::AnyOf(arms) => ors.push(arms),
+                ValPred::In(_) | ValPred::NotIn(_) => {}
             }
         }
-        // An integer column holds no value strictly between two
-        // consecutive integers.
-        if self.integral {
-            lo = lo.map(|(v, inc)| if inc { (v, true) } else { (v + 1, true) });
-            hi = hi.map(|(v, inc)| if inc { (v, true) } else { (v - 1, true) });
+        let mut acc = self.normalized(acc)?;
+        for arms in ors {
+            let mut hull: Option<Interval> = None;
+            for arm in arms {
+                let Some(mut i) = self.interval(arm) else {
+                    continue;
+                };
+                if let Some(l) = acc.0.clone() {
+                    i.raise(l);
+                }
+                if let Some(h) = acc.1.clone() {
+                    i.lower(h);
+                }
+                let Some(i) = self.normalized(i) else {
+                    continue;
+                };
+                hull = Some(match hull {
+                    None => i,
+                    Some(h) => h.hull(i),
+                });
+            }
+            // No arm can hold.
+            acc = hull?;
         }
-        match (lo, hi) {
-            (Some(l), Some(h)) => l.0 > h.0 || (l.0 == h.0 && !(l.1 && h.1)),
-            _ => false,
+        Some(acc)
+    }
+
+    /// `i` with an integer space's open bounds closed (no value lies
+    /// strictly between two consecutive integers); `None` when empty.
+    fn normalized(&self, Interval(mut lo, mut hi): Interval) -> Option<Interval> {
+        if self.integral {
+            let step = |b: Option<(Value, bool)>, d: i128| match b {
+                Some((Value::Int(v), false)) => v.checked_add(d).map(|v| (Value::Int(v), true)),
+                b => b,
+            };
+            lo = step(lo, 1);
+            hi = step(hi, -1);
+        }
+        match (&lo, &hi) {
+            (Some(l), Some(h)) if l.0 > h.0 || (l.0 == h.0 && !(l.1 && h.1)) => None,
+            _ => Some(Interval(lo, hi)),
         }
     }
 
@@ -454,9 +717,18 @@ impl Space {
         }
         match p {
             // Each value is excluded by what is known.
-            ValPred::In(vs) => vs.iter().all(|v| preds.iter().any(|q| self.fails(q, v))),
+            ValPred::In(vs) => vs
+                .iter()
+                .all(|v| self.outside_known(v) || preds.iter().any(|q| self.fails(q, v))),
+
             ValPred::NotIn(_) => false,
             ValPred::Cmp(..) => self.interval_empty(preds.iter().chain([p])),
+            // Every arm is refuted.
+            ValPred::AnyOf(arms) => arms.iter().all(|arm| {
+                let mut all = preds.to_vec();
+                all.extend(arm.iter().cloned());
+                self.contradictory(&all)
+            }),
         }
     }
 }
@@ -708,9 +980,6 @@ fn string_constant(n: Option<&ast::Node>) -> Option<String> {
 
 /// The arms past which an OR of DNF arms grows too large to keep.
 const MAX_ARMS: usize = 16;
-
-/// The most integers an interval is listed as candidates for.
-const MAX_ENUMERATED: i128 = 16;
 
 /// The most values a column is split into cases over.
 const MAX_CASES: usize = 8;
@@ -1572,9 +1841,10 @@ pub(crate) fn finite_column(n: Option<&ast::Node>, trust: &impl Trust) -> Option
 /// What a constraint expression allows its column `c`, of type `t` under
 /// `collation`, when non-NULL: the values its conjuncts that are `c = v`,
 /// `c IN (…)` or an OR of them leave of the type's, and the bounds its
-/// comparisons with constants set (built-in ones, see [`dnf`]). `None`
-/// when the type doesn't print values as they compare
-/// ([`crate::refine::Exact`]).
+/// comparisons with constants set (built-in ones, see [`dnf`]): an
+/// integer's range, or a `numeric`'s, date's or timestamp's bounds. Values
+/// only of a type that prints them as they compare
+/// ([`crate::refine::Exact`]); `None` for a type with neither.
 pub(crate) fn allowed_values(
     expr: Option<&ast::Node>,
     c: &str,
@@ -1583,7 +1853,10 @@ pub(crate) fn allowed_values(
     snapshot: &PgCatalog,
     trust: &TrustedNodes,
 ) -> Option<crate::refine::Refinement> {
-    crate::refine::Exact::of(t, collation, snapshot)?;
+    let exact = crate::refine::Exact::of(t, collation, snapshot).is_some();
+    if !exact && crate::refine_bounds::OrdKind::of(t, snapshot).is_none() {
+        return None;
+    }
     let is_composite = |_: &str| false;
     let column_type = |n: &str| (n == c).then_some(t);
     let subjects = std::cell::RefCell::new(HashMap::new());
@@ -1626,15 +1899,19 @@ pub(crate) fn allowed_values(
     }
     let values = space
         .candidates(&preds)
+        .filter(|_| exact)
         .and_then(|cands| cands.iter().map(|l| space.print(l)).collect());
     let range = space
         .bounds(&preds)
         .filter(|r| *r != crate::refine::IntRange::default());
-    Some(crate::refine::Refinement {
-        values,
-        range,
-        ..crate::refine::Refinement::NONE
-    })
+    Some(
+        crate::refine::Refinement {
+            values: crate::refine::capped(values),
+            range,
+            ..crate::refine::Refinement::NONE
+        }
+        .with_bounds(space.ord_bounds(&preds)),
+    )
 }
 
 /// The columns a constraint expression keeps finite (see [`finite_column`]).
