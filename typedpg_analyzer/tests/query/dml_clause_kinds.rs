@@ -161,6 +161,33 @@ fn allowed_placements() {
 }
 
 #[test]
+fn an_unqualified_column_in_on_conflict_do_update_is_ambiguous() {
+    // DO UPDATE's SET values and WHERE see both the target and EXCLUDED,
+    // which have the same columns: an unqualified column names both
+    // (colNameToVar, 42702), whatever the target is called.
+    let db = setup();
+    for sql in [
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = v",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = v + 1",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET w = 'x' WHERE v > 0",
+    ] {
+        let err = db.analyze(sql).expect_err(sql);
+        assert!(
+            err.to_string()
+                .starts_with(r#"column reference "v" is ambiguous"#),
+            "{sql}\n  got: {err}"
+        );
+    }
+    // Qualified, either side is fine.
+    for sql in [
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = t.v",
+        "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = excluded.v + t.v",
+    ] {
+        db.analyze(sql).expect(sql);
+    }
+}
+
+#[test]
 fn a_target_named_excluded_is_ambiguous_in_on_conflict() {
     // DO UPDATE's SET list and WHERE see the target and EXCLUDED: a target
     // that is itself named `excluded` makes the qualifier name both
