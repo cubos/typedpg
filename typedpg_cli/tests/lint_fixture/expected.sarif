@@ -354,6 +354,7 @@
               "shortDescription": {
                 "text": "ORDER BY keys that can't change the order of the rows"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_order_by.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -363,6 +364,7 @@
               "shortDescription": {
                 "text": "GROUP BY keys determined by the other keys or pinned to a constant"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_group_by.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -372,6 +374,7 @@
               "shortDescription": {
                 "text": "count(expr) over a value that is never NULL, which is count(*)"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/count_not_null.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -381,6 +384,7 @@
               "shortDescription": {
                 "text": "a comparison wrapping an indexed column so its index can't serve it"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/non_sargable_predicate.md",
               "defaultConfiguration": {
                 "level": "note"
               }
@@ -390,6 +394,7 @@
               "shortDescription": {
                 "text": "an equality comparison of floating-point values"
               },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/float_equality.md",
               "defaultConfiguration": {
                 "level": "warning"
               }
