@@ -1,7 +1,8 @@
 # `redundant_null_check`
 
 Reports an `IS [NOT] NULL` test or a `COALESCE` on a value typedpg proves is
-never `NULL`.
+never `NULL`, and an `IS [NOT] NULL` test the rest of its condition already
+settles.
 
 | | |
 |---|---|
@@ -32,6 +33,20 @@ return no row), `CASE` without `ELSE`, and so on.
   `WHERE nullable IS NOT NULL` does not prove itself redundant. A row or
   composite argument (`ROW(a, b) IS NULL`, `t IS NULL`), whose `IS NULL`
   semantics differ, is never reported.
+- **`x IS NOT NULL` / `x IS NULL` settled by the rest of the condition**: the
+  test is an `AND` argument of a `WHERE` (of a `SELECT`, `UPDATE` or
+  `DELETE`), `JOIN … ON` or `HAVING`, and the other `AND` arguments are never
+  true when `x` is `NULL` (the analyzer proves `x` non-`NULL` from them being
+  true: `x > 0`, `x = $1`, `lower(x) = 'a'`, …). Such a clause drops a row
+  whose condition is `NULL` just as one whose condition is `FALSE`, so a row
+  with a `NULL` `x` is dropped whatever the test says: `AND x IS NOT NULL`
+  changes nothing, and `AND x IS NULL` makes the condition never true. Other
+  `IS [NOT] NULL` tests are no proof (in `x IS NOT NULL AND x IS NOT NULL`
+  each would settle the other; the second is reported because the first,
+  not `FALSE`, proves `x` non-`NULL` there). Only the top-level `AND` of
+  those clauses is read: not an argument under `OR` or `NOT`, an expression
+  in a select list (where `NULL` and `FALSE` are different values), a
+  `CASE WHEN` or an aggregate's `FILTER`.
 - **`COALESCE(a, b, …)`** when some argument before the last is proven never
   `NULL`: the arguments after it are never evaluated. The message names that
   argument, or its position when its text is longer than 40 characters.
@@ -59,6 +74,10 @@ SELECT id FROM posts WHERE title IS NOT NULL;
 SELECT id, COALESCE(title, 'untitled') AS label FROM posts;
 SELECT id, COALESCE(title, 'untitled') FROM posts;
 SELECT COALESCE(name, email, 'unknown') AS label FROM users;
+-- name <> '' is never true for a NULL name: the row is dropped anyway.
+SELECT id FROM users WHERE name <> '' AND name IS NOT NULL;
+-- user_id = $user_id is never true for a NULL user_id: no row is kept.
+SELECT id FROM posts WHERE user_id = $user_id AND user_id IS NULL;
 ```
 
 ```
@@ -86,6 +105,20 @@ warning[redundant_null_check]: COALESCE never uses the arguments after `email`: 
  11 │ SELECT COALESCE(name, email, 'unknown') AS label FROM users;
     ·        ────────────────────────────────
     ╰────
+
+warning[redundant_null_check]: `name` IS NOT NULL changes nothing: the rest of the condition is never true when `name` is NULL
+    ╭─[queries.sql:14:43]
+ 14 │ SELECT id FROM users WHERE name <> '' AND name IS NOT NULL;
+    ·                                           ────────────────
+    ╰────
+   help: remove the check
+
+warning[redundant_null_check]: `user_id` IS NULL makes the condition never true: the rest of it is never true when `user_id` is NULL
+    ╭─[queries.sql:17:51]
+ 17 │ SELECT id FROM posts WHERE user_id = $user_id AND user_id IS NULL;
+    ·                                                   ───────────────
+    ╰────
+   help: the condition keeps no row: fix the test or the rest of the condition
 ```
 
 `--fix` rewrites the second query to `SELECT id, title AS label FROM posts`
@@ -108,12 +141,20 @@ SELECT COALESCE(max(views), 0) AS most FROM posts;
 
 -- Every argument but the last may be NULL.
 SELECT COALESCE(name, email) AS label FROM users;
+
+-- Under OR the test decides rows of its own.
+SELECT id FROM users WHERE name <> '' OR name IS NOT NULL;
+
+-- IS DISTINCT FROM is true for a NULL name: the test is what drops it.
+SELECT id FROM users WHERE name IS DISTINCT FROM '' AND name IS NOT NULL;
 ```
 
 ## Fix
 
 `IS [NOT] NULL` findings have no fix: removing a test from a `WHERE` changes
-which rows are kept, and what was meant is for the author to decide.
+which rows are kept, and what was meant is for the author to decide. (A test
+the rest of the condition settles could go without changing the rows, but
+the redundancy is as likely to point at a mistake in the other arguments.)
 
 For `COALESCE`, the fix deletes the arguments after the first never-`NULL`
 one. When that is the first argument, the call itself goes:
@@ -139,9 +180,12 @@ unchanged; a fix that doesn't is withheld and reported as an
 ## When it stays silent
 
 - Whenever the analyzer has no fact for the site, or the value may be `NULL`.
-- A condition does not narrow its own test: `WHERE nullable > 0 AND nullable
-  IS NOT NULL` is not reported, although the first conjunct already rejects
-  `NULL`.
+- A condition does not narrow its own test: `WHERE name IS NOT NULL` alone is
+  not reported.
+- A test under `OR` or `NOT`, in a select list, in a `CASE WHEN`, or in an
+  aggregate's `FILTER`; and one whose other `AND` arguments may be true for a
+  `NULL` value (`x IS DISTINCT FROM 0`, `coalesce(x, 0) = 0`, a comparison of
+  a parameter).
 - Row and composite `IS NULL` tests.
 - `IS DISTINCT FROM NULL` and other forms: only `IS [NOT] NULL` and
   `COALESCE` are read.

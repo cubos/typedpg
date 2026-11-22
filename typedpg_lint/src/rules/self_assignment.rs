@@ -1,10 +1,13 @@
-//! The `self_assignment` rule: reports an `UPDATE` assignment of a column
-//! to its own value — `SET a = a`, or `SET a = t.a` naming the target —
-//! which changes nothing, and usually stands where another value was
-//! meant. The analyzer says what the value names (see
+//! The `self_assignment` rule: reports an assignment of a column to its
+//! own value — `SET a = a`, or `SET a = t.a` naming the target — which
+//! changes nothing, and usually stands where another value was meant: in
+//! an `UPDATE`, an `INSERT … ON CONFLICT DO UPDATE` (where `t.a` is the
+//! existing row's value; `excluded.a`, the value proposed for insertion,
+//! is a change) and a `MERGE … WHEN MATCHED THEN UPDATE` (where `t.a` is
+//! the target row's own value). The analyzer says what the value names (see
 //! [`typedpg_analyzer::QueryView::column_ref_binding`]), so `SET a = s.a`
-//! of a FROM item `s` is not one. A multiple-column `SET (a, b) = (…)` is
-//! not read.
+//! of a FROM item or MERGE source `s`, or `SET a = excluded.a`, is not one.
+//! A multiple-column `SET (a, b) = (…)` is not read.
 //!
 //! The fix removes the assignment, only when:
 //! - another assignment remains (a SET list can't be empty);
@@ -15,7 +18,7 @@
 
 use typedpg_analyzer::RelKind;
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{Node as N, ResTarget, UpdateStmt};
+use typedpg_pg_query::ast::{CmdType, Node as N, RangeVar, ResTarget};
 
 use super::{location, scan_until, starts_clause};
 use crate::{Ctx, RawFinding, SqlEdit};
@@ -23,15 +26,38 @@ use crate::{Ctx, RawFinding, SqlEdit};
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
-        if let NodeRef::UpdateStmt(stmt) = node {
-            update(ctx, stmt, &mut out);
+        match node {
+            NodeRef::UpdateStmt(stmt) => {
+                assignments(ctx, stmt.relation.as_deref(), &stmt.target_list, &mut out);
+            }
+            NodeRef::InsertStmt(stmt) => {
+                if let Some(clause) = stmt.on_conflict_clause.as_deref() {
+                    assignments(ctx, stmt.relation.as_deref(), &clause.target_list, &mut out);
+                }
+            }
+            NodeRef::MergeStmt(stmt) => {
+                for when in &stmt.merge_when_clauses {
+                    if let Some(N::MergeWhenClause(when)) = when
+                        && when.command_type == CmdType::CmdUpdate
+                    {
+                        assignments(ctx, stmt.relation.as_deref(), &when.target_list, &mut out);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
 }
 
-fn update(ctx: &Ctx<'_>, stmt: &UpdateStmt, out: &mut Vec<RawFinding>) {
-    let Some(relation) = stmt.relation.as_deref() else {
+/// The self-assignments of one `SET` list writing `relation`.
+fn assignments(
+    ctx: &Ctx<'_>,
+    relation: Option<&RangeVar>,
+    target_list: &[Option<N>],
+    out: &mut Vec<RawFinding>,
+) {
+    let Some(relation) = relation else {
         return;
     };
     let target = relation
@@ -50,8 +76,7 @@ fn update(ctx: &Ctx<'_>, stmt: &UpdateStmt, out: &mut Vec<RawFinding>) {
         matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
             && !ctx.catalog.lint_relation_has_rules(class.oid)
     });
-    let items: Vec<&ResTarget> = stmt
-        .target_list
+    let items: Vec<&ResTarget> = target_list
         .iter()
         .filter_map(|item| match item {
             Some(N::ResTarget(target)) => Some(&**target),
@@ -193,6 +218,93 @@ mod tests {
         let findings = lint_rule(&db, sql, RULE);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(!findings[0].fix.is_empty());
+    }
+
+    #[test]
+    fn on_conflict_and_merge_self_assignments_are_reported() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE a (id int PRIMARY KEY, x int, y int);
+             CREATE TABLE b (id int PRIMARY KEY, x int);",
+        )
+        .unwrap();
+        for (sql, span, expected) in [
+            (
+                "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET x = a.x, y = excluded.y",
+                "x = a.x",
+                Some(
+                    "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET y = excluded.y",
+                ),
+            ),
+            (
+                "INSERT INTO a AS t VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE \
+                 SET y = excluded.y, x = t.x WHERE t.y > 0",
+                "x = t.x",
+                Some(
+                    "INSERT INTO a AS t VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE \
+                     SET y = excluded.y WHERE t.y > 0",
+                ),
+            ),
+            // The only assignment.
+            (
+                "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET x = a.x",
+                "x = a.x",
+                None,
+            ),
+            (
+                "MERGE INTO a t USING b s ON t.id = s.id \
+                 WHEN MATCHED THEN UPDATE SET y = t.y, x = s.x \
+                 WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.x, 0)",
+                "y = t.y",
+                Some(
+                    "MERGE INTO a t USING b s ON t.id = s.id \
+                     WHEN MATCHED THEN UPDATE SET x = s.x \
+                     WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.x, 0)",
+                ),
+            ),
+            (
+                "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET y = y",
+                "y = y",
+                None,
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], span, "{sql}");
+            match expected {
+                Some(expected) => assert_eq!(fixed(sql, &findings), expected, "{sql}"),
+                None => assert!(findings[0].fix.is_empty(), "{sql}: {findings:?}"),
+            }
+        }
+        for sql in [
+            "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET x = excluded.x",
+            "INSERT INTO a AS t VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET x = excluded.x",
+            "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET x = a.y",
+            "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT DO NOTHING",
+            "MERGE INTO a t USING b s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = s.x",
+            "MERGE INTO a t USING b s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = t.y",
+            "MERGE INTO a t USING b s ON t.id = s.id WHEN MATCHED THEN DELETE",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+
+        // An UPDATE OF trigger listing the column keeps the assignment.
+        db.apply_sql(
+            "CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RETURN NEW; END $$;
+             CREATE TRIGGER t BEFORE UPDATE OF x ON a \
+             FOR EACH ROW EXECUTE FUNCTION touch();",
+        )
+        .unwrap();
+        for sql in [
+            "INSERT INTO a VALUES (1, 2, 3) ON CONFLICT (id) DO UPDATE SET x = a.x, y = excluded.y",
+            "MERGE INTO a t USING b s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = t.x, y = 1",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(findings[0].fix.is_empty(), "{sql}: {findings:?}");
+        }
     }
 
     #[test]

@@ -78,6 +78,16 @@ pub(crate) struct TypeFacts {
     conversions: HashMap<NodeKey, Fact<Option<ValueConversion>>>,
     /// Per operator call (`A_Expr`) location.
     operators: HashMap<i32, Fact<OperatorTypes>>,
+    /// Per operator call location (a simple `CASE`'s `test = value` at its
+    /// `WHEN`'s): whether every operator resolved there is strict on the
+    /// operands as written — its function is, and so is each implicit
+    /// coercion to its declared argument types.
+    operator_strict: HashMap<i32, bool>,
+    /// Per operator call location: whether every operator resolved there
+    /// runs only functions that give one value per statement — its own and
+    /// its operands' implicit coercions' are neither VOLATILE nor
+    /// set-returning.
+    operator_nonvolatile: HashMap<i32, bool>,
 }
 
 impl TypeFacts {
@@ -93,6 +103,14 @@ impl TypeFacts {
             Fact::One(types) => Some(*types),
             Fact::Conflict => None,
         }
+    }
+
+    pub(crate) fn operator_strict(&self, location: i32) -> Option<bool> {
+        self.operator_strict.get(&location).copied()
+    }
+
+    pub(crate) fn operator_nonvolatile(&self, location: i32) -> Option<bool> {
+        self.operator_nonvolatile.get(&location).copied()
     }
 }
 
@@ -179,6 +197,43 @@ pub(crate) fn note_operator(location: i32, types: OperatorTypes, snapshot: &PgCa
     FACTS.with(|facts| {
         if let Some(facts) = facts.borrow_mut().as_mut() {
             merge(&mut facts.operators, location, types);
+        }
+    });
+}
+
+/// Record whether the operator resolved at `location` is strict (see
+/// [`TypeFacts::operator_strict`]). Several operators at one location (a
+/// BETWEEN's two, an IN list's) must all be strict.
+pub(crate) fn note_operator_strict(location: i32, strict: bool) {
+    if location < 0 || !collecting_now() {
+        return;
+    }
+    FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            facts
+                .operator_strict
+                .entry(location)
+                .and_modify(|s| *s &= strict)
+                .or_insert(strict);
+        }
+    });
+}
+
+/// Record whether the operator resolved at `location` runs only functions
+/// that give one value per statement (see
+/// [`TypeFacts::operator_nonvolatile`]), AND-merged as
+/// [`note_operator_strict`] is.
+pub(crate) fn note_operator_nonvolatile(location: i32, nonvolatile: bool) {
+    if location < 0 || !collecting_now() {
+        return;
+    }
+    FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            facts
+                .operator_nonvolatile
+                .entry(location)
+                .and_modify(|s| *s &= nonvolatile)
+                .or_insert(nonvolatile);
         }
     });
 }

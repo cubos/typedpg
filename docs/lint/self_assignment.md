@@ -1,6 +1,7 @@
 # `self_assignment`
 
-Reports an `UPDATE` assignment of a column to its own value.
+Reports an assignment of a column to its own value in an `UPDATE`, an
+`INSERT … ON CONFLICT DO UPDATE` or a `MERGE … UPDATE`.
 
 | | |
 |---|---|
@@ -17,12 +18,22 @@ reports its rows as updated, and the intended change never happens.
 
 ## What it reports
 
-A single-column assignment `SET col = col` or `SET col = t.col` in an
-`UPDATE` (including one inside a data-modifying CTE), where the analyzer
-resolved the value to the target table's own column — `t` being the target's
-name or alias. Because the analyzer says which table each reference names,
-`SET x = s.x` from a `FROM` item `s` is not reported, nor an unqualified `x`
-that resolves to an outer query.
+A single-column assignment `SET col = col` or `SET col = t.col` where the
+analyzer resolved the value to the target table's own column — `t` being the
+target's name or alias — in:
+
+- an `UPDATE` (including one inside a data-modifying CTE);
+- an `INSERT … ON CONFLICT DO UPDATE SET`, where `t.col` is the existing,
+  conflicting row's value. `SET col = excluded.col`, the value proposed for
+  insertion, is a change and is not reported. (An unqualified `col` there is
+  ambiguous between the target and `excluded`, and PostgreSQL rejects it.)
+- a `MERGE … WHEN MATCHED THEN UPDATE SET`, where `t.col` is the matched
+  target row's own value. `SET col = s.col` from the source `s` is not
+  reported.
+
+Because the analyzer says which table each reference names, `SET x = s.x`
+from a `FROM` item `s` is not reported, nor an unqualified `x` that resolves
+to an outer query.
 
 ## Examples
 
@@ -35,9 +46,20 @@ CREATE TABLE users (
     name text,
     deleted_at timestamptz
 );
+CREATE TABLE posts (
+    id bigint PRIMARY KEY,
+    user_id bigint REFERENCES users,
+    title text NOT NULL,
+    status text NOT NULL CHECK (status IN ('draft', 'published', 'archived')),
+    views integer NOT NULL DEFAULT 0 CHECK (views >= 0)
+);
 
 UPDATE users SET name = name, email = $email WHERE id = $id;
 UPDATE users u SET name = u.name WHERE id = $id;
+-- users.name is the existing row's name: excluded.name was meant.
+INSERT INTO users (id, email, name) VALUES ($id, $email, $name) ON CONFLICT (id) DO UPDATE SET name = users.name, email = excluded.email;
+-- p.title is the matched post's own title.
+MERGE INTO posts p USING users u ON p.user_id = u.id WHEN MATCHED THEN UPDATE SET title = p.title, views = 0;
 ```
 
 ```
@@ -54,12 +76,27 @@ warning[self_assignment]: assigning name its own value changes nothing
    ·                    ─────────────
    ╰────
   help: remove the assignment, or assign the value meant
+
+warning[self_assignment]: assigning name its own value changes nothing
+   ╭─[queries.sql:8:96]
+ 8 │ INSERT INTO users (id, email, name) VALUES ($id, $email, $name) ON CONFLICT (id) DO UPDATE SET name = users.name, email = excluded.email;
+   ·                                                                                                ─────────────────
+   ╰────
+  help: remove the assignment, or assign the value meant
+
+warning[self_assignment]: assigning title its own value changes nothing
+    ╭─[queries.sql:11:83]
+ 11 │ MERGE INTO posts p USING users u ON p.user_id = u.id WHEN MATCHED THEN UPDATE SET title = p.title, views = 0;
+    ·                                                                                   ───────────────
+    ╰────
+   help: remove the assignment, or assign the value meant
 ```
 
 `--fix` rewrites the first to
-`UPDATE users SET email = $email WHERE id = $id`. The second keeps its
-finding without a fix: it is the only assignment, and a `SET` list can't be
-empty.
+`UPDATE users SET email = $email WHERE id = $id`, the third to
+`… ON CONFLICT (id) DO UPDATE SET email = excluded.email` and the fourth to
+`… WHEN MATCHED THEN UPDATE SET views = 0`. The second keeps its finding
+without a fix: it is the only assignment, and a `SET` list can't be empty.
 
 ### Good
 
@@ -69,19 +106,23 @@ UPDATE posts SET title = a.title FROM archived_posts a WHERE a.id = posts.id;
 
 -- An expression of the column is a change.
 UPDATE posts SET views = views + 1 WHERE id = $id;
+
+-- excluded.name is the value proposed for insertion, not the existing one.
+INSERT INTO users (id, email, name) VALUES ($id, $email, $name) ON CONFLICT (id) DO UPDATE SET name = excluded.name;
 ```
 
 ## Fix
 
 The fix removes the assignment and the comma that separates it from its
-neighbor. It is withheld unless all of these hold:
+neighbor, in all three statements. It is withheld unless all of these hold:
 
 - another assignment remains;
 - the target is a plain or partitioned table without rewrite rules;
 - no `UPDATE OF` trigger of the table (or of a partition) lists the column.
   Such a trigger fires when the `SET` list names the column, even to assign
   the value it already has, so removing the assignment would stop the
-  trigger from firing. A trigger listing other columns doesn't matter.
+  trigger from firing (for an `ON CONFLICT DO UPDATE` and a `MERGE` update as
+  for an `UPDATE`). A trigger listing other columns doesn't matter.
 
 Every fix is also re-analyzed before it is offered and must keep the result
 columns' names, types, nullability and value refinements, and the parameters,
@@ -93,7 +134,8 @@ unchanged; a fix that doesn't is withheld and reported as an
 - A multiple-column assignment `SET (a, b) = (…)`, which is not read:
   `SET (name, email) = (name, $email)` is not reported.
 - An assignment to a subfield or array element (`SET a[1] = a`).
-- `INSERT … ON CONFLICT DO UPDATE SET` and `MERGE … UPDATE SET` are not read.
+- `SET col = excluded.col` in an `ON CONFLICT DO UPDATE`, and a `MERGE`
+  assignment from its source.
 - A value the analyzer didn't resolve to the target's own column.
 - Migrations are not read: this rule runs over queries only.
 

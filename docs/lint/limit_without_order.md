@@ -49,8 +49,12 @@ provably doesn't matter:
   batch;
 - it has a locking clause with `SKIP LOCKED` (the job-queue pattern wants any
   unlocked row);
-- every output row carries the same values: a select list of constants and
-  non-volatile, non-set-returning calls, or — over a single table, with no
+- every output row carries the same values: a select list that reads no
+  column, of constants and parameters, calls of functions none of whose
+  overloads is volatile or set-returning (`now()`), operators that resolved
+  to non-volatile functions (`1 + 1`, `'a' || 'b'`, `now() - interval '1
+  day'`, with their operands' implicit casts non-volatile too), and explicit
+  casts through no volatile cast function; or — over a single table, with no
   volatile call anywhere — bare columns a top-level `WHERE` conjunct fixes to a parameter or constant through the type's default
   equality (for types where equal values print the same: integers, `text`,
   `uuid`, dates and timestamps, `bool`, enums, …, under a deterministic
@@ -126,6 +130,7 @@ SELECT EXISTS (SELECT 1 FROM posts WHERE user_id = $user_id LIMIT 1) AS has_post
 -- Every row the LIMIT could pick projects the same values.
 SELECT status FROM posts WHERE status = $status LIMIT 1;
 SELECT 1 AS one FROM posts LIMIT 1;
+SELECT 1 + 1 AS two, now() - interval '1 day' AS since FROM posts LIMIT 1;
 ```
 
 ## When it stays silent
@@ -138,6 +143,9 @@ SELECT 1 AS one FROM posts LIMIT 1;
 - An `EXISTS` subquery's exemption passes through a `FROM` subquery only when
   the select in between adds no filter, join, grouping, aggregate, limit or
   set-returning call.
+- A select list with an operator the analyzer didn't resolve, or one that
+  resolved to a volatile function (a user-defined operator over `random()`),
+  is treated as varying per row and still reported.
 - An `ORDER BY` of any kind silences it, even one whose keys can tie: that is
   [`unstable_order`](unstable_order.md)'s finding.
 - Migrations are not read: this rule runs over queries only.

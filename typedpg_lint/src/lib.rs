@@ -33,7 +33,7 @@ pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
@@ -738,9 +738,6 @@ pub(crate) struct Ctx<'a> {
     pub tree: &'a typedpg_pg_query::ast::ParseResult,
     /// The non-comment tokens of `sql`, in order.
     pub tokens: &'a [Tok],
-    /// The names of operators with a non-strict implementation: comparing
-    /// with `NULL` through one may be meaningful.
-    pub non_strict_operators: &'a HashSet<String>,
     /// The analyzed view, for the facts the analyzer proved (the sublink
     /// nullability the `not_in_nullable` rule reads).
     pub view: &'a typedpg_analyzer::QueryView,
@@ -800,12 +797,10 @@ pub fn lint_query_called(
         })
         .unwrap_or_default();
     let (suppressed, mut findings) = suppressions(&view.sql);
-    let non_strict_operators = non_strict_operators(catalog);
     let ctx = Ctx {
         sql: &view.sql,
         tree: &view.tree,
         tokens: &tokens,
-        non_strict_operators: &non_strict_operators,
         view: &view,
         catalog,
     };
@@ -1016,24 +1011,6 @@ pub fn fails(findings: &[Finding], options: &LintOptions) -> bool {
     findings
         .iter()
         .any(|finding| finding.severity >= options.fail_on)
-}
-
-/// The operator names with an implementation that is not strict
-/// (`proisstrict = false`): a comparison through one may accept `NULL`.
-fn non_strict_operators(catalog: &PgCatalog) -> HashSet<String> {
-    let strict: HashMap<_, bool> = catalog
-        .iter_procs()
-        .map(|proc| (proc.oid, proc.proisstrict))
-        .collect();
-    catalog
-        .iter_operators()
-        .filter(|operator| {
-            operator
-                .oprcode
-                .is_some_and(|code| strict.get(&code).is_some_and(|strict| !strict))
-        })
-        .map(|operator| operator.oprname.clone())
-        .collect()
 }
 
 /// Find the allow comments of `sql`, returning the rules they suppress and
@@ -1580,6 +1557,60 @@ mod tests {
                 .all(|finding| finding.rule != Rule::NullComparison),
             "{findings:?}"
         );
+        // The user-defined `=` is for `weird` alone: a comparison that
+        // resolves to the built-in strict `=` is still never true, and one
+        // through the user's `<>`-less type (`NOT IN`) or a simple CASE over
+        // integers too.
+        for sql in [
+            "SELECT 1 = NULL",
+            "SELECT 1 WHERE 1 NOT IN (2, NULL)",
+            "SELECT CASE 1 WHEN NULL THEN 1 ELSE 0 END",
+        ] {
+            let findings = lint(&db, sql);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding.rule == Rule::NullComparison),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A simple CASE over `weird` compares with the non-strict `=`.
+        let findings = lint(&db, "SELECT CASE NULL::weird WHEN NULL THEN 1 ELSE 0 END");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule != Rule::NullComparison),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_strict_user_not_equal_is_not_flagged_in_not_in() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TYPE weird AS (v integer);
+             CREATE FUNCTION weird_ne(weird, weird) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT true';
+             CREATE OPERATOR <> (LEFTARG = weird, RIGHTARG = weird, FUNCTION = weird_ne);",
+        )
+        .unwrap();
+        let findings = lint(
+            &db,
+            "SELECT 1 WHERE ROW(1)::weird NOT IN (ROW(2)::weird, NULL)",
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.rule != Rule::NullComparison),
+            "{findings:?}"
+        );
+        let findings = lint(&db, "SELECT 1 WHERE 1 NOT IN (2, NULL)");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule == Rule::NullComparison),
+            "{findings:?}"
+        );
     }
 
     // ── unbounded_write ────────────────────────────────────────────────────
@@ -1952,6 +1983,82 @@ mod tests {
                 "{sql}: {:?}",
                 not_in_findings(&db, sql)
             );
+        }
+    }
+
+    #[test]
+    fn not_equal_all_has_the_not_in_trap() {
+        let db = catalog();
+        let cases = [
+            (
+                "SELECT id FROM users WHERE id <> ALL (SELECT author_id FROM posts)",
+                "<> ALL (SELECT …) returns no rows when the subquery returns a NULL",
+                "id <> ALL (SELECT author_id FROM posts)",
+            ),
+            (
+                "SELECT id FROM users WHERE lower(email) != ALL (SELECT title FROM posts)",
+                "<> ALL (SELECT …) returns no rows for a NULL left side when the subquery \
+                 returns any row, or when the subquery returns a NULL",
+                "lower(email) != ALL (SELECT title FROM posts)",
+            ),
+        ];
+        for (sql, message, span) in cases {
+            let findings = not_in_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(findings[0].message, message);
+            assert_eq!(&sql[findings[0].span.clone()], span);
+        }
+        for sql in [
+            // Both sides NOT NULL.
+            "SELECT id FROM users WHERE id <> ALL (SELECT id FROM posts)",
+            // `NOT (x <> ALL …)` is TRUE when some comparison is FALSE.
+            "SELECT id FROM users WHERE NOT (id <> ALL (SELECT author_id FROM posts))",
+            // Other operators and quantifiers.
+            "SELECT id FROM users WHERE id < ALL (SELECT author_id FROM posts)",
+            "SELECT id FROM users WHERE id <> ANY (SELECT author_id FROM posts)",
+            "SELECT id FROM users WHERE id = ALL (SELECT author_id FROM posts)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn not_in_nullable_ignores_non_strict_comparisons() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TYPE weird AS (v integer);
+             CREATE FUNCTION weird_eq(weird, weird) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT coalesce($1 = $2, false)';
+             CREATE FUNCTION weird_ne(weird, weird) RETURNS boolean
+                 LANGUAGE sql AS 'SELECT coalesce($1 <> $2, true)';
+             CREATE OPERATOR = (LEFTARG = weird, RIGHTARG = weird, FUNCTION = weird_eq);
+             CREATE OPERATOR <> (LEFTARG = weird, RIGHTARG = weird, FUNCTION = weird_ne);
+             CREATE TABLE things (w weird);
+             CREATE TYPE plain AS (v integer);
+             CREATE FUNCTION plain_eq(plain, plain) RETURNS boolean
+                 LANGUAGE sql STRICT AS 'SELECT $1.v = $2.v';
+             CREATE FUNCTION plain_ne(plain, plain) RETURNS boolean
+                 LANGUAGE sql STRICT AS 'SELECT $1.v <> $2.v';
+             CREATE OPERATOR = (LEFTARG = plain, RIGHTARG = plain, FUNCTION = plain_eq);
+             CREATE OPERATOR <> (LEFTARG = plain, RIGHTARG = plain, FUNCTION = plain_ne);
+             CREATE TABLE others (p plain);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT 1 FROM things WHERE w NOT IN (SELECT w FROM things)",
+            "SELECT 1 FROM things WHERE w <> ALL (SELECT w FROM things)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // The same over STRICT operators is the trap.
+        for sql in [
+            "SELECT 1 FROM others WHERE p NOT IN (SELECT p FROM others)",
+            "SELECT 1 FROM others WHERE p <> ALL (SELECT p FROM others)",
+        ] {
+            let findings = not_in_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
         }
     }
 

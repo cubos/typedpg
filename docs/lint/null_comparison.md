@@ -16,7 +16,7 @@ never `TRUE`, so a `WHERE deleted_at = NULL` returns no rows, and a
 `WHERE deleted_at <> NULL` returns no rows either. The query runs without an
 error and returns an empty result, so the bug is easy to miss.
 
-The same applies to two shapes that compare with `=` internally:
+The same applies to two shapes that compare internally:
 
 - `x NOT IN (1, 2, NULL)` is `x <> 1 AND x <> 2 AND x <> NULL`. The last term
   is never true, so the whole condition is never true and the query keeps no
@@ -45,10 +45,16 @@ through a function that is not `STRICT` (`CALLED ON NULL INPUT`, which may
 turn `NULL` into a value), when the target is a domain (its constraints run on
 the result), or when the cast can't be resolved.
 
-The rule reads the catalog for the operators' implementations: if any operator
-with that name (`=`, `<`, …) has a non-strict implementation function, a
-comparison through that operator name may legitimately accept `NULL`, and the
-rule doesn't report it.
+The rule checks the operator each comparison actually resolves to (for
+`NOT IN`, the `<>` it compares each item with; for a simple `CASE`, the `=`
+between the `CASE` operand and the value). It is reported only when that
+operator's function is `STRICT` and so are the implicit casts of its operands
+to the operator's argument types: then a `NULL` operand makes the result
+`NULL`. A user-defined operator declared `CALLED ON NULL INPUT` may
+legitimately accept `NULL`, so a comparison through one is not reported, but
+it doesn't silence comparisons that resolve to other operators of the same
+name (the built-in `=` on `integer` stays strict even if some other type has
+a non-strict `=`).
 
 ## Examples
 
@@ -118,9 +124,11 @@ SELECT id, coalesce(name, 'anonymous') AS label FROM users;
 - `NOT IN (SELECT …)` over a subquery that may return `NULL` is
   [`not_in_nullable`](not_in_nullable.md)'s, not this rule's.
 - A cast that may turn `NULL` into a value, or one into a domain (see above).
-- A comparison through an operator name that has a non-strict implementation
-  anywhere in the catalog: one user-defined non-strict `=` (on any type)
-  silences the rule for every `=` comparison.
+- A comparison that resolves to a non-strict operator (a user-defined one
+  declared `CALLED ON NULL INPUT`), or whose operand goes through a non-strict
+  implicit cast to reach it. Only that comparison is skipped; others of the
+  same operator name that resolve to a strict operator are still reported.
+- A comparison the analyzer didn't resolve (it doesn't guess).
 - Migrations are not read: this rule runs over queries only.
 
 ## Configuration

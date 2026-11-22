@@ -98,6 +98,11 @@ impl<'a> Ctx<'a> {
 
     /// Record the strictness of the node of `kind` at `location`.
     pub fn note_strict(&self, location: i32, kind: crate::nonnull::StrictNode, strict: bool) {
+        if kind == crate::nonnull::StrictNode::Op {
+            // Whether or not a qual's log is kept here: the lint rules read
+            // the operator's strictness wherever it is.
+            crate::type_facts::note_operator_strict(location, strict);
+        }
         if let Some(log) = self.strict_log {
             log.note(location, kind, strict);
         }
@@ -166,6 +171,33 @@ impl<'a> Ctx<'a> {
         if let Some(log) = self.cook_log {
             log.note_literal(literal, type_oid);
         }
+    }
+
+    /// Whether `proc` may give another value on each call within one
+    /// statement: it is VOLATILE or returns a set (or is unknown).
+    pub fn proc_may_vary(&self, proc: Option<crate::oid::PgProcOid>) -> bool {
+        proc.and_then(|p| self.snapshot.pg_proc.get(&p))
+            .is_none_or(|p| {
+                p.proretset || p.provolatile == crate::pg_catalog::ProVolatile::Volatile
+            })
+    }
+
+    /// Whether the implicit coercion from `from` to `to` runs a cast
+    /// function that [may vary](Self::proc_may_vary).
+    pub fn coercion_may_vary(&self, from: PgTypeOid, to: PgTypeOid) -> bool {
+        if from == to || from == oid::UNKNOWN {
+            return false;
+        }
+        let key = (
+            self.snapshot.unwrap_domain(from),
+            self.snapshot.unwrap_domain(to),
+        );
+        self.snapshot
+            .cast_by_pair
+            .get(&key)
+            .and_then(|oid| self.snapshot.pg_cast.get(oid))
+            .and_then(|c| c.castfunc)
+            .is_some_and(|f| self.proc_may_vary(Some(f)))
     }
 
     /// Whether `proc` is strict.

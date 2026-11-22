@@ -1421,6 +1421,9 @@ fn process_join_expr(
         })?;
         check_no_srf_in_clause(quals.as_ref(), snapshot, "JOIN conditions")?;
         on_facts = crate::nonnull::nonnullable(quals.as_ref(), true, &on_scope, &log, snapshot);
+        if let Some(qual) = quals.as_ref() {
+            crate::nonnull::note_settled_null_tests(qual, &on_scope, &log, snapshot);
+        }
         equalities = on_equalities(quals.as_ref(), &on_scope, &log, snapshot);
     }
 

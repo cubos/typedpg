@@ -3475,6 +3475,9 @@ fn where_facts(
     old_as_is: bool,
     target_keeps: impl Fn(&str) -> bool,
 ) -> (crate::nonnull::Facts, crate::nonnull::Facts) {
+    if let Some(qual) = where_clause {
+        crate::nonnull::note_settled_null_tests(qual, ctx.scope, log, ctx.snapshot);
+    }
     let mut all = crate::nonnull::nonnullable(where_clause, true, ctx.scope, log, ctx.snapshot)
         .restricted_to(&crate::nonnull::own_aliases(ctx.scope));
     // RETURNING may read the row as rewritten (SET, triggers): no

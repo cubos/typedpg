@@ -148,6 +148,9 @@ pub(crate) fn infer_sublink(
                 let mut result_nullable = false;
                 let mut lhs_nullable = false;
                 let mut subquery_nullable = false;
+                // Every comparison's function is STRICT, and so is each
+                // implicit coercion of its operands to the declared types.
+                let mut operators_strict = true;
                 let mut ops = Vec::with_capacity(lhs_nodes.len());
                 for (lhs_node, col) in lhs_nodes.iter().zip(cols.iter()) {
                     let lhs = infer_expr(*lhs_node, ctx, params, TypeGoal::NONE)?;
@@ -167,6 +170,13 @@ pub(crate) fn infer_sublink(
                         return Err(crate::pgmsg::row_comparison_operator_not_boolean(&name));
                     }
                     ops.push(found.clone());
+                    operators_strict &= found.as_ref().is_some_and(|op| {
+                        ctx.proc_is_strict(op.code)
+                            && op
+                                .left_type_oid
+                                .is_none_or(|d| ctx.coercion_is_strict(l_oid, d))
+                            && ctx.coercion_is_strict(r_oid, op.right_type_oid)
+                    });
                     match found {
                         Some(op) if l_oid != oid::UNKNOWN && r_oid != oid::UNKNOWN => {
                             strict &= ctx.proc_is_strict(op.code);
@@ -229,11 +239,17 @@ pub(crate) fn infer_sublink(
                 if lhs_row.is_some() {
                     check_row_comparison_interpretation(snapshot, &op_name, &ops, sub.location)?;
                 }
-                if sub_type == ast::SubLinkType::AnySublink && op_name == "=" {
+                // `x = ANY (SELECT …)` (`IN`) and `x <> ALL (SELECT …)`,
+                // the two forms whose negation / reading has NOT IN's NULL
+                // trap.
+                if (sub_type == ast::SubLinkType::AnySublink && op_name == "=")
+                    || (sub_type == ast::SubLinkType::AllSublink && op_name == "<>")
+                {
                     crate::pg_catalog::note_sublink_nullability(
                         sub.location,
                         lhs_nullable,
                         subquery_nullable,
+                        operators_strict,
                     );
                 }
                 ctx.note_strict(sub.location, crate::nonnull::StrictNode::Sublink, strict);

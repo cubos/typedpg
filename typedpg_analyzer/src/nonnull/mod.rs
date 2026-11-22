@@ -959,6 +959,57 @@ pub(crate) fn nonnullable(
     facts
 }
 
+/// For the lint's `redundant_null_check`: record, for each `IS [NOT] NULL`
+/// test that is a top-level `AND` argument of `qual` — a `WHERE`, `JOIN …
+/// ON` or `HAVING`, where a NULL condition drops the row as FALSE does —
+/// whether the other arguments being TRUE prove its argument non-NULL. Then
+/// a row whose argument is NULL is dropped by them whatever the test says:
+/// an `IS NOT NULL` test changes nothing, and an `IS NULL` one makes the
+/// condition never TRUE. The other `IS [NOT] NULL` tests are no proof
+/// (`x IS NOT NULL AND x IS NOT NULL`: each would settle the other, and
+/// removing both changes the rows).
+pub(crate) fn note_settled_null_tests(
+    qual: &ast::Node,
+    scope: &Scope,
+    log: &StrictLog,
+    snapshot: &PgCatalog,
+) {
+    fn conjuncts<'n>(n: &'n ast::Node, out: &mut Vec<&'n ast::Node>) {
+        match n {
+            ast::Node::BoolExpr(b) if b.boolop == ast::BoolExprType::AndExpr => {
+                for arg in b.args.iter().flatten() {
+                    conjuncts(arg, out);
+                }
+            }
+            n => out.push(n),
+        }
+    }
+    if !crate::pg_catalog::collecting_column_ref_bindings() {
+        return;
+    }
+    let mut all = Vec::new();
+    conjuncts(qual, &mut all);
+    for (i, c) in all.iter().enumerate() {
+        let ast::Node::NullTest(t) = c else {
+            continue;
+        };
+        let Some(arg) = t.arg.as_ref() else {
+            continue;
+        };
+        let proof = all
+            .iter()
+            .enumerate()
+            .filter(|(j, o)| *j != i && !matches!(o, ast::Node::NullTest(_)))
+            .fold(Facts::default(), |acc, (_, o)| {
+                acc.union(nonnullable(Some(o), true, scope, log, snapshot))
+            });
+        let settled = plain_column(arg, scope).is_some_and(|(col, _)| proof.columns.contains(&col))
+            || (exprs::reusable(Some(arg), scope, snapshot)
+                && proof.exprs.contains(&exprs::key(Some(arg))));
+        crate::pg_catalog::note_null_test_settled(t.location, settled);
+    }
+}
+
 fn is_and_or(n: Option<&ast::Node>) -> bool {
     matches!(n, Some(ast::Node::BoolExpr(b))
         if b.boolop != ast::BoolExprType::NotExpr)

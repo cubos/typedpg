@@ -1,6 +1,6 @@
 # `unreachable_case_branch`
 
-Reports the branches of a searched `CASE` that are never taken.
+Reports the branches of a `CASE` that are never taken.
 
 | | |
 |---|---|
@@ -19,11 +19,19 @@ author cared about silently never fires.
 
 ## What it reports
 
-In a searched `CASE WHEN cond THEN …` (not a simple `CASE x WHEN v …`):
+In a searched `CASE WHEN cond THEN …`:
 
 - a `WHEN` whose condition is never true (`FALSE` or `NULL`): that branch;
 - a `WHEN` whose condition is always true: every branch after it, `ELSE`
   included (nothing is reported when it is the last branch).
+
+In a simple `CASE x WHEN v THEN …`, which compares `x = v` with the operator
+PostgreSQL resolves for that comparison (after the same implicit casts as the
+written `x = v`):
+
+- a `WHEN` value `x` never equals, given the `WHEN`s before it: that branch;
+- a `WHEN` that every row reaching it takes (it and the ones before it cover
+  every value `x` can have): every branch after it, `ELSE` included.
 
 A condition is decided by the same two proofs as
 [`constant_condition`](constant_condition.md):
@@ -37,7 +45,10 @@ A condition is decided by the same two proofs as
   decided too.
 
 The message says why when one constraint, domain or earlier condition
-decides it.
+decides it. A simple `CASE`'s `WHEN` is judged from the analyzer's facts
+alone, as `CASE WHEN x = v` would be — `x` a column, `v` a constant of its
+type (not one cast to another type or under a `COLLATE`), the operator the
+built-in `=` — and its message doesn't name the reason.
 
 ## Examples
 
@@ -62,6 +73,8 @@ SELECT id, CASE WHEN status = 'deleted' THEN 'gone' ELSE 'here' END AS state FRO
 SELECT id, CASE WHEN status = 'draft' THEN 1 WHEN status = 'draft' THEN 2 ELSE 3 END AS rank FROM posts;
 SELECT id, CASE WHEN status IN ('draft', 'published') THEN 'live' WHEN status = 'archived' THEN 'old' ELSE 'unknown' END AS state FROM posts;
 SELECT id, CASE WHEN views >= 0 THEN 'counted' WHEN views > 100 THEN 'hot' END AS heat FROM posts;
+SELECT id, CASE status WHEN 'deleted' THEN 'gone' ELSE 'here' END AS state FROM posts;
+SELECT id, CASE status WHEN 'draft' THEN 1 WHEN 'published' THEN 2 WHEN 'archived' THEN 3 ELSE 4 END AS rank FROM posts;
 ```
 
 ```
@@ -92,6 +105,20 @@ warning[unreachable_case_branch]: CASE branches after an always-true WHEN are ne
     ·                                                ───────────────────────────
     ╰────
    help: remove them, or replace the CASE with the result of its always-true branch
+
+warning[unreachable_case_branch]: CASE branch is never taken: with the WHENs before it not taken, the CASE operand never equals its value
+    ╭─[queries.sql:14:24]
+ 14 │ SELECT id, CASE status WHEN 'deleted' THEN 'gone' ELSE 'here' END AS state FROM posts;
+    ·                        ──────────────────────────
+    ╰────
+   help: remove the branch, or fix its condition
+
+warning[unreachable_case_branch]: CASE branches after this WHEN are never taken: every row takes it or a branch before it
+    ╭─[queries.sql:17:91]
+ 17 │ SELECT id, CASE status WHEN 'draft' THEN 1 WHEN 'published' THEN 2 WHEN 'archived' THEN 3 ELSE 4 END AS rank FROM posts;
+    ·                                                                                           ──────
+    ╰────
+   help: remove them, or replace the CASE with the result of its always-true branch
 ```
 
 ### Good
@@ -103,8 +130,12 @@ SELECT id, CASE WHEN views > 100 THEN 'hot' ELSE 'cold' END AS heat FROM posts;
 -- An always-true last WHEN has nothing after it to make unreachable.
 SELECT id, CASE WHEN views > 100 THEN 'hot' WHEN true THEN 'cold' END AS heat FROM posts;
 
--- A simple CASE is not judged, even with a value the column can't have.
-SELECT id, CASE status WHEN 'deleted' THEN 'gone' ELSE 'here' END AS state FROM posts;
+-- A simple CASE whose value the column can hold.
+SELECT id, CASE status WHEN 'draft' THEN 'new' ELSE 'old' END AS state FROM posts;
+
+-- Compared under another collation, the CHECK's values say nothing of the
+-- comparison: the operand is no longer the plain column.
+SELECT id, CASE status::text COLLATE "C" WHEN 'deleted' THEN 'gone' ELSE 'here' END AS state FROM posts;
 ```
 
 ## Fix
@@ -116,7 +147,11 @@ decide.
 
 ## When it stays silent
 
-- A simple `CASE x WHEN v …`.
+- A simple `CASE x WHEN v …` whose operand is not a plain column (an
+  expression, a parameter, a column under a `COLLATE` or a cast), whose value
+  is not a constant of the column's type, or whose `=` is not the built-in
+  one (an exact-signature `=` on an enum or domain may mean anything). The
+  planner's folding of a constant `CASE 1 WHEN 2 …` is not asked either.
 - Conditions that may depend on a row, a parameter or the session.
 - A column of a table with a `NOT VALID` `CHECK` constraint, or under a
   nondeterministic collation (see

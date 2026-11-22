@@ -1731,6 +1731,7 @@ impl PgCatalog {
             case_when_reached: lint_facts.case_when_reached,
             case_when_passed: lint_facts.case_when_passed,
             count_arg_nullable: lint_facts.count_arg_nullable,
+            null_test_settled: lint_facts.null_test_settled,
         })
     }
 
@@ -2858,14 +2859,18 @@ pub trait MigrationObserver {
     }
 }
 
-/// What the analyzer proved about the two sides of one `= ANY` / `IN`
-/// sublink (the `location` is an offset in [`QueryView::sql`]).
+/// What the analyzer proved about the two sides of one `= ANY` / `IN` or
+/// `<> ALL` sublink (the `location` is an offset in [`QueryView::sql`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SublinkNullability {
     /// Some left-hand expression may be NULL.
     pub lhs_nullable: bool,
     /// Some output column of the subquery may be NULL.
     pub subquery_nullable: bool,
+    /// Every comparison operator it resolved to is strict on the operands
+    /// as written (its function and the implicit coercions of its
+    /// operands): a NULL on either side makes that comparison NULL.
+    pub operators_strict: bool,
 }
 
 /// What the analyzer proved about one `COALESCE` call (the `location` is an
@@ -2937,6 +2942,7 @@ struct LintFacts {
     case_when_reached: HashMap<i32, bool>,
     case_when_passed: HashMap<i32, bool>,
     count_arg_nullable: HashMap<i32, bool>,
+    null_test_settled: HashMap<i32, bool>,
 }
 
 /// Record whether the argument of the `count(x)` call at `location` (the
@@ -2952,8 +2958,23 @@ pub(crate) fn note_count_arg_nullable(location: i32, nullable: bool) {
     });
 }
 
-/// Record whether a row may take the branch of the searched `CASE` `WHEN`
-/// at `location`: the `WHEN`s before it not TRUE and it TRUE, with what
+/// Record whether the other `AND` arguments of the `WHERE`, `JOIN … ON` or
+/// `HAVING` the `IS [NOT] NULL` test at `location` is an argument of prove
+/// its argument non-NULL (see [`crate::nonnull::note_settled_null_tests`]).
+/// AND-merged with a fact already recorded there.
+pub(crate) fn note_null_test_settled(location: i32, settled: bool) {
+    if location < 0 {
+        return;
+    }
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut() {
+            *facts.null_test_settled.entry(location).or_insert(true) &= settled;
+        }
+    });
+}
+
+/// Record whether a row may take the branch of the `CASE` `WHEN` at
+/// `location`: the `WHEN`s before it not TRUE and it TRUE, with what
 /// holds there. OR-merged with a fact already recorded there.
 pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
     if location < 0 {
@@ -2966,8 +2987,7 @@ pub(crate) fn note_case_when_reached(location: i32, reached: bool) {
     });
 }
 
-/// Record whether a row may get past the searched `CASE` `WHEN` at
-/// `location`: it and every `WHEN` before it not TRUE, with what holds
+/// Record whether a row may get past the `CASE` `WHEN` at `location`: it and every `WHEN` before it not TRUE, with what holds
 /// there. OR-merged with a fact already recorded there.
 pub(crate) fn note_case_when_passed(location: i32, passed: bool) {
     if location < 0 {
@@ -3186,10 +3206,15 @@ fn collecting_null_check_facts<R>(
     (out, null_test, coalesce)
 }
 
-/// Record what an `= ANY` / `IN` sublink at `location` compared, merging
-/// with any fact already recorded for it (a sublink may be inferred more
-/// than once).
-pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subquery_nullable: bool) {
+/// Record what an `= ANY` / `IN` or `<> ALL` sublink at `location`
+/// compared, merging with any fact already recorded for it (a sublink may
+/// be inferred more than once).
+pub(crate) fn note_sublink_nullability(
+    location: i32,
+    lhs_nullable: bool,
+    subquery_nullable: bool,
+    operators_strict: bool,
+) {
     if location < 0 {
         return;
     }
@@ -3198,9 +3223,11 @@ pub(crate) fn note_sublink_nullability(location: i32, lhs_nullable: bool, subque
             let fact = facts.entry(location).or_insert(SublinkNullability {
                 lhs_nullable: false,
                 subquery_nullable: false,
+                operators_strict: true,
             });
             fact.lhs_nullable |= lhs_nullable;
             fact.subquery_nullable |= subquery_nullable;
+            fact.operators_strict &= operators_strict;
         }
     });
 }
@@ -3309,28 +3336,42 @@ pub struct QueryView {
     /// The outer joins each `WHERE` conjunct makes inner ones, by the
     /// conjunct's location in [`Self::sql`].
     nullified_joins: HashMap<i32, Vec<NullifiedJoin>>,
-    /// Whether a row may take each searched `CASE` branch, by its `WHEN`'s
+    /// Whether a row may take each `CASE` branch, by its `WHEN`'s
     /// location in [`Self::sql`].
     case_when_reached: HashMap<i32, bool>,
-    /// Whether a row may get past each searched `CASE` `WHEN`, by its
+    /// Whether a row may get past each `CASE` `WHEN`, by its
     /// location in [`Self::sql`].
     case_when_passed: HashMap<i32, bool>,
     /// Whether the argument of each `count(x)` call may be NULL, by the
     /// call's location in [`Self::sql`].
     count_arg_nullable: HashMap<i32, bool>,
+    /// Whether the other `AND` arguments of its condition settle each
+    /// `IS [NOT] NULL` test, by the test's location in [`Self::sql`].
+    null_test_settled: HashMap<i32, bool>,
 }
 
 impl QueryView {
-    /// Whether a row may take the branch of the searched `CASE` `WHEN` at
+    /// Whether the `IS [NOT] NULL` test at `location` (a byte offset in
+    /// [`Self::sql`]: the `NullTest`'s location), a top-level `AND`
+    /// argument of a `WHERE`, `JOIN … ON` or `HAVING`, tests a value the
+    /// other arguments (not `IS [NOT] NULL` tests themselves) being TRUE
+    /// prove non-NULL: a row where it is NULL is dropped by them. `None`
+    /// when the test is not such an argument.
+    pub fn null_test_settled(&self, location: i32) -> Option<bool> {
+        self.null_test_settled.get(&location).copied()
+    }
+
+    /// Whether a row may take the branch of the `CASE` `WHEN` at
     /// `location` (a byte offset in [`Self::sql`]: the `CaseWhen`'s
     /// location): with what holds there — the `WHEN`s before it not TRUE,
     /// the conditions around the `CASE`, the CHECK constraints — the
-    /// `WHEN` can be TRUE. `None` when no such `WHEN` was inferred there.
+    /// `WHEN` can be TRUE (for a simple `CASE x WHEN v`, `x = v`). `None`
+    /// when no such `WHEN` was inferred there.
     pub fn case_when_reached(&self, location: i32) -> Option<bool> {
         self.case_when_reached.get(&location).copied()
     }
 
-    /// Whether a row may get past the searched `CASE` `WHEN` at `location`
+    /// Whether a row may get past the `CASE` `WHEN` at `location`
     /// (see [`Self::case_when_reached`]): it and every `WHEN` before it can
     /// all be not TRUE. `false`: the branches after it are never taken.
     pub fn case_when_passed(&self, location: i32) -> Option<bool> {
@@ -3356,7 +3397,7 @@ impl QueryView {
         self.nullified_joins.get(&location).map(Vec::as_slice)
     }
 
-    /// What the analyzer proved about the `= ANY` / `IN` sublink at
+    /// What the analyzer proved about the `= ANY` / `IN` or `<> ALL` sublink at
     /// `location` (a byte offset in [`Self::sql`]): whether some left-hand
     /// expression and whether some subquery output column may be NULL.
     /// `None` when no such sublink was inferred there.
@@ -3426,6 +3467,27 @@ impl QueryView {
     /// site was inferred with different types.
     pub fn operator_types(&self, location: i32) -> Option<crate::OperatorTypes> {
         self.type_facts.operator(location)
+    }
+
+    /// Whether every operator the operator call at `location` (a byte
+    /// offset in [`Self::sql`]: an `A_Expr`'s own location, or a simple
+    /// `CASE`'s `WHEN` for its `test = value`) resolved to is strict on its
+    /// operands as written: its function is `STRICT` and so is each
+    /// implicit coercion of an operand to the operator's declared argument
+    /// type, so a NULL operand makes the result NULL. `None` when no
+    /// operator was resolved there.
+    pub fn operator_is_strict(&self, location: i32) -> Option<bool> {
+        self.type_facts.operator_strict(location)
+    }
+
+    /// Whether every operator the operator call at `location` (as for
+    /// [`Self::operator_is_strict`]) resolved to runs only functions that
+    /// give one value for given arguments within the statement: its
+    /// function and the implicit coercions of its operands are neither
+    /// VOLATILE nor set-returning. `None` when no operator was resolved
+    /// there.
+    pub fn operator_is_nonvolatile(&self, location: i32) -> Option<bool> {
+        self.type_facts.operator_nonvolatile(location)
     }
 
     /// Whether the `WHEN` condition of a searched `CASE`, at `location` (a
