@@ -30,7 +30,7 @@ pub enum MigrationLint {
     /// The statement rules are skipped, but the schema rules still run over
     /// the final catalog and place their findings on the statements that
     /// created the objects — as do the file's own allow comments, which are
-    /// still validated. Files unchanged from `--ignore-migrations-from` and
+    /// still validated. Files unchanged from `--previous-deployment` and
     /// files matched by `lint.ignore` use this: their history cannot be
     /// changed, but the schema they leave behind is still linted.
     SchemaOnly,

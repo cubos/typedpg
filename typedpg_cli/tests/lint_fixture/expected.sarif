@@ -433,6 +433,15 @@
               }
             },
             {
+              "id": "breaks_deployed_queries",
+              "shortDescription": {
+                "text": "a migration that breaks a query of the code deployed at --previous-deployment"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
               "id": "invalid_allow",
               "shortDescription": {
                 "text": "a malformed or unknown rule name in a typedpg-lint comment"

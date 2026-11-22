@@ -110,7 +110,7 @@ fn column_list(
 
 /// The number of values each row of `select` has, when the text says it:
 /// a `VALUES` row's length, or a select list without `*`.
-fn width(select: &SelectStmt) -> Option<usize> {
+pub(crate) fn width(select: &SelectStmt) -> Option<usize> {
     if select.op != SetOperation::SetopNone {
         return width(select.larg.as_deref()?);
     }

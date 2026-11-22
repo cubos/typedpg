@@ -421,3 +421,89 @@ fn an_escaping_bound_query_does_not_report_its_returning() {
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(!stdout.contains("unused_returning"), "{stdout}");
 }
+
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|error| panic!("git {}: {error}", args.join(" ")));
+    assert!(status.success(), "git {} failed", args.join(" "));
+}
+
+#[test]
+fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["queries/*.sql"], "emit": "none" }
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TABLE users (id int4 PRIMARY KEY, name text NOT NULL, email text NOT NULL);\n",
+    );
+    write(
+        &root.join("src/app.ts"),
+        "import { sql } from './db';\nexport const names = sql(`SELECT name FROM users`);\n",
+    );
+    write(
+        &root.join("queries/users.sql"),
+        "/* @name email */\nSELECT email FROM users WHERE id = $id;\n",
+    );
+    // The generated module is not committed: the deployed checkout gets an
+    // empty one, as `typedpg gen` would write first.
+    write(&root.join(".gitignore"), "src/db.ts\n");
+    generate(root);
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A", "."]);
+    git(root, &["commit", "-q", "-m", "deployed"]);
+
+    // The branch drops a column and stops reading it; the deployed code
+    // still does.
+    write(
+        &root.join("migrations/0002.sql"),
+        "ALTER TABLE users DROP COLUMN email;\n\
+         ALTER TABLE users ALTER COLUMN name DROP NOT NULL;\n",
+    );
+    write(
+        &root.join("queries/users.sql"),
+        "/* @name byId */\nSELECT id FROM users WHERE id = $id;\n",
+    );
+    generate(root);
+
+    for flag in ["--previous-deployment", "--ignore-migrations-from"] {
+        let output = run(root, &["lint", flag, "HEAD"]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert_eq!(
+            stdout.matches("warning[breaks_deployed_queries]").count(),
+            2,
+            "{stdout}"
+        );
+        for expected in [
+            "this migration breaks the deployed query at queries/users.sql:2 (HEAD): it no \
+             longer runs: column \"email\" does not exist",
+            "migrations/0002.sql:1:1",
+            "this migration breaks the deployed query at src/app.ts:2 (HEAD): result column \
+             \"name\" may now be NULL",
+            "migrations/0002.sql:2:1",
+        ] {
+            assert!(stdout.contains(expected), "{expected}\n{stdout}");
+        }
+        assert!(
+            stderr.contains("(1 unchanged from HEAD: statement rules skipped)"),
+            "{stderr}"
+        );
+    }
+
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+}

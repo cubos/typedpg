@@ -150,6 +150,7 @@ and lints the migrations themselves:
 | `fetch_may_return_many` | warning | `fetch_one` / `fetch_one_as` / `fetch_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
 | `fetch_all_single_row` | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
 | `unused_returning` | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
+| `breaks_deployed_queries` | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
 
 The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
 `unused_returning`) run in both CLIs: a query can be called directly on the
@@ -176,7 +177,7 @@ ignore = ["tests/**"]   # paths whose statement findings are not reported
 forward slashes. Findings in a matching query file are dropped. A matching
 migration file is still applied and its schema rules still report — on the
 statement that created the object — but its statement rules are skipped, like
-a migration unchanged from `--ignore-migrations-from`: its history cannot be
+a migration unchanged from `--previous-deployment`: its history cannot be
 changed. Failures are never dropped: a query in an ignored file that does not
 compile still fails lint, as it still fails the build.
 
@@ -196,17 +197,36 @@ Each fix is checked once more before it is offered: the edited query must
 analyze to the same columns and parameters. A fix that doesn't is a typedpg
 bug; it is withheld, and an `internal_error` warning asks you to report it.
 
-Migrations already applied in production cannot be changed, so `cargo typedpg
-lint --ignore-migrations-from <ref>` (for example `origin/main`) skips the
-statement rules of every migration file identical to its version at that git
-ref: it is applied for the schema, but its locks, scans and rewrites are not
+`cargo typedpg lint --previous-deployment <ref>` names the git ref of what is
+deployed now (for example `origin/main`): its code and its migrations.
+Migrations already applied in production cannot be changed, so it skips the
+statement rules of every migration file identical to its version at that ref:
+it is applied for the schema, but its locks, scans and rewrites are not
 reported. The schema rules (`fk_without_index`, `redundant_index`) still
 report problems of the current schema, placed on the statement that created
 the object, with a help line that puts the fix in a new migration; its allow
 comments are honored and validated. A file absent from the ref, or changed by
-the branch, is linted as usual. Queries are unaffected. The summary states how
-many files skipped the statement rules, e.g.
+the branch, is linted as usual. The summary states how many files skipped the
+statement rules, e.g.
 `300 unchanged from origin/main: statement rules skipped`.
+(`--ignore-migrations-from`, its former name, still works.)
+
+A deploy applies the new migrations while the code at the ref keeps running,
+and it keeps running until the rollout ends. `breaks_deployed_queries`
+analyzes that code's queries — read from the ref, so a query the branch
+changed or removed is still checked — against both schemas, and reports each
+one that analyzed against the old schema but breaks against the new: it no
+longer analyzes (PostgreSQL's error is quoted), a result column is gone,
+changes type or may now be NULL, the result's column list changes, a
+parameter changes type or no longer accepts NULL, an `INSERT … SELECT` leaves
+out a column that is now `NOT NULL` without a default, or a result value may
+now be one the code doesn't know (a new enum label, a `CHECK` that admits
+more values or a wider range). The finding is placed on the migration
+statement that makes the change and names the query's file and line at the
+ref. The fix is expand/contract: first deploy code that works with both
+schemas, then the migration. A `-- typedpg-lint:
+allow(breaks_deployed_queries)` comment on the statement, or in the deployed
+query, suppresses it.
 
 Findings go to stdout, the summary to stderr, and the run exits non-zero when
 a finding reaches `fail_on` or a query or migration fails analysis. Human is

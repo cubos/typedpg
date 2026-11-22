@@ -42,11 +42,13 @@ enum Commands {
         /// How to print the report: `human`, `json` or `sarif`.
         #[arg(long, default_value = "human")]
         format: Format,
-        /// A git ref (e.g. `origin/main`): migrations identical to it skip
-        /// the statement rules; the schema rules still report on the
-        /// statements that created their objects.
-        #[arg(long)]
-        ignore_migrations_from: Option<String>,
+        /// The git ref of the code and migrations deployed now (e.g.
+        /// `origin/main`): migrations identical to it skip the statement
+        /// rules (the schema rules still report on the statements that
+        /// created their objects), and `breaks_deployed_queries` checks the
+        /// queries of its code against the new migrations.
+        #[arg(long, alias = "ignore-migrations-from")]
+        previous_deployment: Option<String>,
         /// Apply the fixes of the findings that have one (the binding
         /// rules, and the SQL edits some query rules offer), then report
         /// what remains.
@@ -85,13 +87,13 @@ async fn run(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         Commands::Lint {
             manifest_path,
             format,
-            ignore_migrations_from,
+            previous_deployment,
             fix,
         } => {
             match typedpg_cli::lint::run(
                 &manifest_path,
                 format,
-                ignore_migrations_from.as_deref(),
+                previous_deployment.as_deref(),
                 fix,
             ) {
                 Ok(ok) => Ok(ok),

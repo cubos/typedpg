@@ -70,7 +70,7 @@ fn lint_ignores_migrations_unchanged_from_a_ref() {
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
         .args(["typedpg", "lint", "--manifest-path"])
         .arg(dir.path().join("Cargo.toml"))
-        .args(["--ignore-migrations-from", "HEAD"])
+        .args(["--previous-deployment", "HEAD"])
         .output()
         .expect("run `cargo-typedpg`");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
@@ -602,4 +602,191 @@ fn lint_fixture_reports_the_expected_documents() {
             );
         }
     }
+}
+
+/// Commit everything in `dir`.
+fn commit_all(dir: &Path, message: &str) {
+    let identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+    git(dir, &[&identity[..], &["add", "-A", "."]].concat());
+    git(
+        dir,
+        &[&identity[..], &["commit", "-q", "-m", message]].concat(),
+    );
+}
+
+/// A crate whose deployed code (the first commit) has `queries` in
+/// `src/lib.rs` and `0001_init.sql`, and whose branch adds `migration` as
+/// `0002_change.sql` and replaces the queries with `new_queries`.
+fn deployed_crate(queries: &[&str], migration: &str, new_queries: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "deployed_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    let source = |queries: &[&str]| {
+        let mut source = String::from(
+            "use typedpg::sql;\n\npub async fn run(pool: &typedpg::Pool) -> \
+             Result<(), typedpg::Error> {\n",
+        );
+        for query in queries {
+            source.push_str(&format!("    sql!(pool, {query:?}).execute().await?;\n"));
+        }
+        source.push_str("    Ok(())\n}\n");
+        source
+    };
+    std::fs::write(root.join("src/lib.rs"), source(queries)).unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TYPE status AS ENUM ('active', 'blocked');\n\
+         CREATE TABLE users (\n\
+             id integer PRIMARY KEY,\n\
+             email text NOT NULL,\n\
+             name text NOT NULL,\n\
+             status status NOT NULL,\n\
+             age integer\n\
+         );\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    commit_all(root, "deployed");
+    std::fs::write(root.join("migrations/0002_change.sql"), migration).unwrap();
+    std::fs::write(root.join("src/lib.rs"), source(new_queries)).unwrap();
+    dir
+}
+
+/// `cargo typedpg lint` over `dir` with `args`: its exit code, stdout and
+/// stderr.
+fn lint_crate(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-typedpg"))
+        .args(["typedpg", "lint", "--manifest-path"])
+        .arg(dir.join("Cargo.toml"))
+        .args(args)
+        .output()
+        .expect("run `cargo-typedpg`");
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
+    let dir = deployed_crate(
+        &[
+            "SELECT email FROM users WHERE id = $id",
+            "SELECT name, status FROM users",
+            "SELECT * FROM users",
+            "UPDATE users SET age = $age WHERE id = 1",
+        ],
+        "ALTER TABLE users DROP COLUMN email;\n\
+         ALTER TABLE users ALTER COLUMN name DROP NOT NULL;\n\
+         ALTER TYPE status ADD VALUE 'deleted';\n\
+         ALTER TABLE users ALTER COLUMN age TYPE bigint;\n",
+        // The branch removed every query: the deployed code still runs them.
+        &[],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    let findings = stdout.matches("warning[breaks_deployed_queries]").count();
+    // One per query and statement that breaks it.
+    assert_eq!(findings, 8, "{stdout}");
+    for expected in [
+        // No longer analyzes, with PostgreSQL's message; on the statement.
+        "migrations/0002_change.sql:1:1",
+        "this migration breaks the deployed query at src/lib.rs:4 (HEAD): it no longer runs: \
+         column \"email\" does not exist",
+        "result column \"name\" may now be NULL",
+        "result column \"status\" may now be 'deleted', a value the deployed code does not know",
+        "this migration breaks the deployed query at src/lib.rs:6 (HEAD): result column \"email\" \
+         is gone",
+        "migrations/0002_change.sql:4:1",
+        "parameter $age changes from integer to bigint",
+        "first deploy code that works with both schemas, then the migration (expand/contract)",
+    ] {
+        assert!(stdout.contains(expected), "{expected}\n{stdout}");
+    }
+
+    // Without the flag, the rule has nothing to compare with.
+    let (_, stdout, _) = lint_crate(dir.path(), &[]);
+    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+
+    // The flag's old name still works, and reports the same.
+    let (code, alias_stdout, stderr) =
+        lint_crate(dir.path(), &["--ignore-migrations-from", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        alias_stdout
+            .matches("warning[breaks_deployed_queries]")
+            .count(),
+        8,
+        "{alias_stdout}"
+    );
+    assert!(
+        stderr.contains("(1 unchanged from HEAD: statement rules skipped)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn breaks_deployed_queries_reports_an_insert_and_honors_its_level() {
+    let dir = deployed_crate(
+        &["INSERT INTO users (id, email, name, status) VALUES ($id, $email, $name, 'active')"],
+        "ALTER TABLE users ADD COLUMN tenant integer NOT NULL;\n",
+        &[],
+    );
+    let (_, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert!(
+        stdout.contains(
+            "null value in column \"tenant\" of relation \"users\" violates not-null constraint"
+        ),
+        "{stdout}\n{stderr}"
+    );
+
+    // `fail_on` and the level apply as to any rule.
+    let manifest = dir.path().join("Cargo.toml");
+    let mut config = std::fs::read_to_string(&manifest).unwrap();
+    config.push_str("\n[package.metadata.typedpg.lint]\nbreaks_deployed_queries = \"error\"\n");
+    std::fs::write(&manifest, config).unwrap();
+    let (code, stdout, _) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.contains("error[breaks_deployed_queries]"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn breaks_deployed_queries_accepts_a_compatible_migration() {
+    let dir = deployed_crate(
+        &[
+            "SELECT id, email, name, status, age FROM users WHERE id = $id",
+            "INSERT INTO users (id, email, name, status) VALUES ($id, $email, $name, 'active')",
+            "UPDATE users SET age = $age WHERE id = $id",
+        ],
+        // Expand: a nullable column, a defaulted NOT NULL one, a new table
+        // and an index change nothing for the deployed code.
+        "ALTER TABLE users ADD COLUMN bio text;\n\
+         ALTER TABLE users ADD COLUMN score integer NOT NULL DEFAULT 0;\n\
+         CREATE TABLE posts (id integer PRIMARY KEY);\n\
+         CREATE INDEX users_name_idx ON users (name);\n",
+        &["SELECT id, bio, score FROM users"],
+    );
+    let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
 }

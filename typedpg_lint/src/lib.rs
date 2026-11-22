@@ -21,11 +21,13 @@
 //! SARIF.
 
 mod call_site;
+mod deployed;
 mod ignore;
 mod migrations;
 pub mod report;
 mod rules;
 
+pub use deployed::{DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
 pub use ignore::IgnoreSet;
 pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
@@ -175,6 +177,9 @@ pub enum Rule {
     FetchAllSingleRow,
     /// `execute()` on a statement whose `RETURNING` rows are discarded.
     UnusedReturning,
+    /// A migration that breaks a query of the code deployed at
+    /// `--previous-deployment`, which keeps running while it is applied.
+    BreaksDeployedQueries,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
@@ -186,7 +191,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 47] = [
+    pub const ALL: [Rule; 48] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -234,6 +239,7 @@ impl Rule {
         Rule::FetchMayReturnMany,
         Rule::FetchAllSingleRow,
         Rule::UnusedReturning,
+        Rule::BreaksDeployedQueries,
     ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
@@ -287,6 +293,7 @@ impl Rule {
             Rule::FetchMayReturnMany => "fetch_may_return_many",
             Rule::FetchAllSingleRow => "fetch_all_single_row",
             Rule::UnusedReturning => "unused_returning",
+            Rule::BreaksDeployedQueries => "breaks_deployed_queries",
             Rule::InvalidAllow => "invalid_allow",
             Rule::InternalError => "internal_error",
         }
@@ -382,6 +389,9 @@ impl Rule {
             }
             Rule::FetchAllSingleRow => "fetch_all on a query that returns at most one row",
             Rule::UnusedReturning => "execute() on a statement whose RETURNING rows are discarded",
+            Rule::BreaksDeployedQueries => {
+                "a migration that breaks a query of the code deployed at --previous-deployment"
+            }
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
             Rule::InternalError => "a typedpg bug: a fix that would have changed the query",
         }
@@ -428,7 +438,8 @@ impl Rule {
             | Rule::CartesianJoin
             | Rule::InsertWithoutColumns
             | Rule::SelfAssignment
-            | Rule::UnusedCte => Some(Severity::Warning),
+            | Rule::UnusedCte
+            | Rule::BreaksDeployedQueries => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit

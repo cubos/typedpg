@@ -117,7 +117,7 @@ pub use pg_catalog::{
     CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement, PgCatalog,
     QueryView, SublinkNullability, UserObjectCounts,
 };
-pub use refine::{IntRange, Refinement};
+pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,

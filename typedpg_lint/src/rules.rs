@@ -29,6 +29,8 @@ mod simplifiable_case;
 mod unreachable_case_branch;
 mod unused_cte;
 
+pub(crate) use insert_without_columns::width as insert_width;
+
 /// The operators `null_comparison` reports: the ordinary comparisons, not
 /// `IS [NOT] DISTINCT FROM` or the pattern operators.
 const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
@@ -86,6 +88,9 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         | Rule::FetchMayReturnMany
         | Rule::FetchAllSingleRow
         | Rule::UnusedReturning
+        // It compares the deployed code's queries across two schemas, in
+        // `deployed`.
+        | Rule::BreaksDeployedQueries
         | Rule::InvalidAllow
         | Rule::InternalError => Vec::new(),
     }
@@ -693,7 +698,7 @@ pub(super) fn relation_end(ctx: &Ctx<'_>, relation: &RangeVar) -> Option<usize> 
 
 /// The table as the message names it, as SQL writes it: `users`,
 /// `public.users`, `"My Users"`.
-pub(super) fn table_name(relation: &RangeVar) -> String {
+pub(crate) fn table_name(relation: &RangeVar) -> String {
     if relation.schemaname.is_empty() {
         quote_identifier(&relation.relname)
     } else {

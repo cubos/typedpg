@@ -606,6 +606,7 @@ npx typedpg build          # compile the .sql files into the loaders' cache
 | `fetch_may_return_many` | warning | `fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` on a query not proven to return at most one row. |
 | `fetch_all_single_row` | info | `fetchAll` on a query that returns at most one row. |
 | `unused_returning` | info | `execute` on a statement whose `RETURNING` rows are discarded. |
+| `breaks_deployed_queries` | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
 
 A call-site finding is placed at the method identifier in the calling file,
 which may be a different file from the `.sql` query; `unused_returning`'s fix
@@ -635,13 +636,25 @@ Migration rules only apply to tables that existed before the file started;
 schema rules are placed at the statement that created the index or constraint.
 Findings go to stdout, the summary to stderr, and the run exits non-zero when
 a finding reaches `failOn` or a query or migration fails analysis.
-`--ignore-migrations-from <ref>` (for example `origin/main`) skips the
-statement rules of migration files identical to their version at that git ref:
-they build the schema, but their locks, scans and rewrites are not reported.
-The schema rules still report the current schema's problems, placed on the
-statement that created the object, with a help line that puts the fix in a new
-migration; their allow comments are honored and validated. A file absent from
-the ref, or changed by the branch, is linted as usual; queries are unaffected.
+`--previous-deployment <ref>` names the git ref of what is deployed now (for
+example `origin/main`; `--ignore-migrations-from` is its old name). It skips
+the statement rules of migration files identical to their version at that git
+ref: they build the schema, but their locks, scans and rewrites are not
+reported. The schema rules still report the current schema's problems, placed
+on the statement that created the object, with a help line that puts the fix
+in a new migration; their allow comments are honored and validated. A file
+absent from the ref, or changed by the branch, is linted as usual.
+It also runs `breaks_deployed_queries`: the code at the ref keeps running
+while the new migrations are applied and during the rollout, so its queries
+(read from the ref, even those the branch changed or removed) are analyzed
+against the new schema, and each one that breaks is reported on the statement
+that breaks it, with the query's file and line at the ref — it no longer
+analyzes, a result column is gone, changes type or may now be NULL, the column
+list changes, a parameter changes type or no longer accepts NULL, an `INSERT
+… SELECT` leaves out a new `NOT NULL` column without a default, or a result
+may now be a value the code doesn't know (a new enum label, a wider `CHECK`).
+Deploy code that works with both schemas first, then the migration
+(expand/contract).
 `--fix` writes the SQL fixes findings carry (the ones that have them; migration
 findings never do) into the sources and `.sql` files, then lints again and
 reports what remains. A finding's edits are applied all or none, one

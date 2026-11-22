@@ -26,8 +26,9 @@ use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
 use typedpg_lint::{
-    Call as LintCall, CallFinding, CallMethod, Finding, IgnoreSet, Language, LintOptions,
-    MigrationFile, MigrationLint, Rule, lint_migrations, lint_query_called,
+    Call as LintCall, CallFinding, CallMethod, DeployedQuery, Deployment, Finding, IgnoreSet,
+    Language, LintOptions, MigrationFile, MigrationLint, NewSchema, Rule, breaks_deployed_queries,
+    lint_migrations, lint_query_called,
 };
 
 /// The directories under the manifest's directory that hold Rust sources.
@@ -91,20 +92,22 @@ type CopyResult = Result<(), AnalysisError>;
 /// Lint `manifest`'s crate; whether no analysis failed and no finding
 /// reaches `fail_on`. The report goes to stdout, the summary to stderr.
 ///
-/// With `ignore_migrations_from`, migration files identical to that git ref
+/// With `previous_deployment`, migration files identical to that git ref
 /// have their statement rules skipped; the schema rules still report on the
-/// statements that created the schema's objects.
+/// statements that created the schema's objects. The queries of the code at
+/// that ref are checked against the new migrations
+/// (`breaks_deployed_queries`).
 ///
 /// With `fix`, the findings that have edits are applied to their files, and
 /// the report is built again from the fixed text so its positions match.
 pub fn run(
     manifest: &Path,
     format: Format,
-    ignore_migrations_from: Option<&str>,
+    previous_deployment: Option<&str>,
     fix: bool,
 ) -> Result<bool, String> {
     let start = Instant::now();
-    let (report, options, pending) = build(manifest, ignore_migrations_from, start);
+    let (report, options, pending) = build(manifest, previous_deployment, start);
     if !fix || pending.is_empty() {
         return Ok(finish(&report, &options, format));
     }
@@ -122,7 +125,7 @@ pub fn run(
     );
     // The findings' positions were in the text before the fixes; build the
     // report from the files as they are now.
-    let (mut report, options, _) = build(manifest, ignore_migrations_from, start);
+    let (mut report, options, _) = build(manifest, previous_deployment, start);
     report.failures.extend(outcome.failures);
     report.load_failure_sources(&manifest_dir(manifest));
     report.sort();
@@ -133,7 +136,7 @@ pub fn run(
 /// built with, and the fixes its findings could apply.
 fn build(
     manifest: &Path,
-    ignore_migrations_from: Option<&str>,
+    previous_deployment: Option<&str>,
     start: Instant,
 ) -> (Report, LintOptions, Vec<PendingFix>) {
     let base = manifest_dir(manifest);
@@ -176,7 +179,7 @@ fn build(
     let mut report = Report {
         queries: sites.len() + copies.len(),
         failures,
-        migrations_unchanged_from: ignore_migrations_from.map(str::to_owned),
+        previous_deployment: previous_deployment.map(str::to_owned),
         ..Report::default()
     };
     // The default database, then every configured one: a named database's
@@ -185,6 +188,7 @@ fn build(
     databases.extend(config.database_names().into_iter().map(Some));
 
     let mut catalogs: HashMap<Option<String>, Result<PgCatalog, String>> = HashMap::new();
+    let mut new_migrations: HashMap<Option<String>, NewMigrations> = HashMap::new();
     let mut migration_paths = HashSet::new();
     for db in &databases {
         let catalog = match config.resolve(db.as_deref()) {
@@ -195,11 +199,15 @@ fn build(
                 &MigrationSettings {
                     options: &options,
                     ignore: &ignore,
-                    ignore_migrations_from,
+                    previous_deployment,
                 },
                 &mut migration_paths,
                 &mut report,
-            ),
+            )
+            .map(|(catalog, migrations)| {
+                new_migrations.insert(db.clone(), migrations);
+                catalog
+            }),
             Err(error) => {
                 let message = error.to_string();
                 report.failures.push(Failure {
@@ -217,6 +225,58 @@ fn build(
             ));
         }
         catalogs.insert(db.clone(), catalog);
+    }
+
+    if let Some(reference) = previous_deployment
+        && options.level(Rule::BreaksDeployedQueries).is_some()
+    {
+        match deployed(reference, manifest, &options) {
+            Ok(deployed) => {
+                for db in &databases {
+                    let (Some(Ok(catalog)), Some(new), Some(old_catalog), Some(queries)) = (
+                        catalogs.get(db),
+                        new_migrations.get(db),
+                        deployed.catalogs.get(db),
+                        deployed.queries.get(db),
+                    ) else {
+                        continue;
+                    };
+                    let Some(first_new) = new.first_new else {
+                        continue;
+                    };
+                    let finite = &new.finite;
+                    let findings = breaks_deployed_queries(
+                        &Deployment {
+                            reference,
+                            catalog: old_catalog,
+                            queries,
+                        },
+                        &NewSchema {
+                            files: &new.files,
+                            first_new,
+                            use_transaction: new.use_transaction,
+                            catalog,
+                            prepare: &|catalog| catalog.assume_finite_parameters(finite),
+                        },
+                        &options,
+                    );
+                    for migration in findings {
+                        let file = &new.files[migration.file];
+                        report.entries.push(Entry {
+                            path: file.path.clone(),
+                            start: position(&file.sql, migration.finding.span.start),
+                            end: position(&file.sql, migration.finding.span.end),
+                            finding: migration.finding,
+                        });
+                    }
+                }
+            }
+            Err(message) => report.failures.push(Failure {
+                path: relative(manifest, &base),
+                start: None,
+                message,
+            }),
+        }
     }
 
     let mut pending = Vec::new();
@@ -649,16 +709,91 @@ fn collect_rust_files(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+/// The code deployed at `--previous-deployment`: per database, its
+/// queries and the schema its migrations build.
+#[derive(Default)]
+struct Deployed {
+    catalogs: HashMap<Option<String>, PgCatalog>,
+    queries: HashMap<Option<String>, Vec<DeployedQuery>>,
+}
+
+/// The queries and schemas of the crate as git ref `reference` has it,
+/// read from a checkout of the ref exactly as the crate itself is read.
+///
+/// A ref where the crate has no typedpg configuration, or a database whose
+/// migrations don't build there, has nothing deployed to check.
+fn deployed(reference: &str, manifest: &Path, options: &LintOptions) -> Result<Deployed, String> {
+    let snapshot = crate::Snapshot::new(reference, manifest)?;
+    let old_manifest = snapshot.path(manifest)?;
+    let mut deployed = Deployed::default();
+    if !old_manifest.is_file() {
+        return Ok(deployed);
+    }
+    let Ok(config) = Config::from_cargo_toml(&old_manifest) else {
+        return Ok(deployed);
+    };
+    let base = manifest_dir(&old_manifest);
+    let ignore = IgnoreSet::new(&[])?;
+    let mut databases: Vec<Option<String>> = vec![None];
+    databases.extend(config.database_names().into_iter().map(Some));
+    for db in databases {
+        // Its own findings and failures are not this run's.
+        let mut scratch = Report::default();
+        let built = catalog_for(
+            &config,
+            db.as_deref(),
+            &base,
+            &MigrationSettings {
+                options,
+                ignore: &ignore,
+                previous_deployment: None,
+            },
+            &mut HashSet::new(),
+            &mut scratch,
+        );
+        if let Ok((catalog, _)) = built {
+            deployed.catalogs.insert(db, catalog);
+        }
+    }
+    for site in scan_sources(&base).sites {
+        let location = format!(
+            "{}:{}",
+            relative(&site.path, &base),
+            position(&site.file, site.literal.source_offset(0)).line
+        );
+        let queries = deployed.queries.entry(site.db).or_default();
+        match queries.iter_mut().find(|query| query.sql == site.sql) {
+            Some(query) => query.locations.push(location),
+            None => queries.push(DeployedQuery {
+                sql: site.sql,
+                locations: vec![location],
+            }),
+        }
+    }
+    Ok(deployed)
+}
+
+/// A database's migrations as `breaks_deployed_queries` replays them.
+struct NewMigrations {
+    /// Every file, as linted.
+    files: Vec<MigrationFile>,
+    /// The first reported file `--previous-deployment` doesn't have as is.
+    first_new: Option<usize>,
+    use_transaction: bool,
+    /// The parameter types the catalog assumes finite.
+    finite: Vec<QualifiedName>,
+}
+
 /// How a run lints the migrations: its rule options, its `lint.ignore`
-/// patterns and the `--ignore-migrations-from` reference.
+/// patterns and the `--previous-deployment` reference.
 struct MigrationSettings<'a> {
     options: &'a LintOptions,
     ignore: &'a IgnoreSet,
-    ignore_migrations_from: Option<&'a str>,
+    previous_deployment: Option<&'a str>,
 }
 
 /// Build the catalog of database `db` from its migrations, reporting the
-/// failures that keep it from being built.
+/// failures that keep it from being built; with the migrations as linted.
 fn catalog_for(
     config: &Config,
     db: Option<&str>,
@@ -666,11 +801,11 @@ fn catalog_for(
     settings: &MigrationSettings<'_>,
     migration_paths: &mut HashSet<String>,
     report: &mut Report,
-) -> Result<PgCatalog, String> {
+) -> Result<(PgCatalog, NewMigrations), String> {
     let MigrationSettings {
         options,
         ignore,
-        ignore_migrations_from,
+        previous_deployment,
     } = *settings;
     let resolved = config.resolve(db).map_err(|error| error.to_string())?;
     let migrations_dir = resolved.migrations_dir(base);
@@ -695,7 +830,8 @@ fn catalog_for(
         migration_paths.insert(file.path.clone());
     }
     let mut lint_files: Vec<MigrationFile> = files.iter().map(|(_, file)| file.clone()).collect();
-    if let Some(reference) = ignore_migrations_from {
+    let mut first_new = None;
+    if let Some(reference) = previous_deployment {
         let candidates: Vec<PathBuf> = files
             .iter()
             .filter(|(_, file)| file.lint == MigrationLint::All)
@@ -713,10 +849,15 @@ fn catalog_for(
                     return Err(error);
                 }
             };
-            for (path, file) in files.iter().zip(&mut lint_files) {
-                if file.lint == MigrationLint::All && unchanged.contains(&path.0) {
+            for (index, (path, file)) in files.iter().zip(&mut lint_files).enumerate() {
+                if file.lint != MigrationLint::All {
+                    continue;
+                }
+                if unchanged.contains(&path.0) {
                     file.lint = MigrationLint::SchemaOnly;
                     report.migrations_unchanged += 1;
+                } else if first_new.is_none() {
+                    first_new = Some(index);
                 }
             }
         }
@@ -764,7 +905,13 @@ fn catalog_for(
         });
         return Err(error);
     }
-    Ok(catalog)
+    let migrations = NewMigrations {
+        files: lint_files,
+        first_new,
+        use_transaction: resolved.migrations_use_transaction(),
+        finite,
+    };
+    Ok((catalog, migrations))
 }
 
 /// The database's migration files, with their paths on disk, in the order the

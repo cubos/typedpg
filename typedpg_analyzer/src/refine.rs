@@ -38,6 +38,28 @@ pub struct Refinement {
     pub bounds: Option<OrdRange>,
 }
 
+/// The facts of a [`Refinement`] another one no longer guarantees (see
+/// [`Refinement::widenings`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Widenings {
+    /// It was finite and may now be an infinity.
+    pub finite: bool,
+    /// It was one of a few values and may now be another.
+    pub values: bool,
+    /// It was an integer within bounds and may now lie outside them.
+    pub range: bool,
+    /// It was a `numeric`, `date` or timestamp within bounds and may now
+    /// lie outside them.
+    pub bounds: bool,
+}
+
+impl Widenings {
+    /// Whether any fact is no longer guaranteed.
+    pub fn any(&self) -> bool {
+        self.finite || self.values || self.range || self.bounds
+    }
+}
+
 /// The bounds an integer lies within, each inclusive (`None`: unbounded).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct IntRange {
@@ -172,6 +194,33 @@ impl Refinement {
         match (self.range, from_values) {
             (Some(r), Some(v)) => Some(r.meet(&v)),
             (r, v) => r.or(v),
+        }
+    }
+
+    /// Which facts of `self` a value `other` admits may break: what changes
+    /// for code written against `self` when the same value becomes `other`
+    /// (a schema change that drops a CHECK, or widens it).
+    pub fn widenings(&self, other: &Refinement) -> Widenings {
+        let values = self.values.as_ref().is_some_and(|ours| {
+            !other
+                .enumerated()
+                .is_some_and(|theirs| theirs.is_subset(ours))
+        });
+        let range = self.range.is_some_and(|ours| {
+            !other
+                .int_bounds()
+                .is_some_and(|theirs| ours.hull(&theirs) == ours)
+        });
+        let bounds = self.bounds.is_some_and(|ours| {
+            !other
+                .bounds
+                .is_some_and(|theirs| ours.hull(&theirs) == Some(ours))
+        });
+        Widenings {
+            finite: self.finite && !other.finite,
+            values,
+            range,
+            bounds,
         }
     }
 

@@ -53,7 +53,10 @@
 //! `missing_primary_key`, `rls_policy_not_enforced`, `rls_no_policy`,
 //! `security_definer_search_path`, `prefer_timestamptz`, `prefer_identity`,
 //! `prefer_text`, `prefer_bigint_pk` and `prefer_jsonb`, evaluated over the
-//! migrations' final schema.
+//! migrations' final schema. `breaks_deployed_queries` runs with
+//! `--previous-deployment <ref>` only: it analyzes the queries of the code
+//! at that ref against the new schema, and reports on a new migration what
+//! breaks for that code, which keeps running while the migration applies.
 //! `like_unescaped_param` and the `prefer_*` rules are off by default; set
 //! them to a level to enable them. [`LINT_RULES`] is the one list of their
 //! keys. The call-site rules (`fetch_may_return_many`,
@@ -231,6 +234,7 @@ pub const LINT_RULES: &[&str] = &[
     "fetch_may_return_many",
     "fetch_all_single_row",
     "unused_returning",
+    "breaks_deployed_queries",
 ];
 
 /// The lint rules over the Rust source of `sql!` invocations: the binding
@@ -1746,7 +1750,7 @@ event_data = "crate::EventData"
              `prefer_timestamptz`, `prefer_identity`, `prefer_text`, `prefer_bigint_pk`, \
              `prefer_jsonb`, \
              `fetch_may_return_many`, `fetch_all_single_row`, `unused_returning`, \
-             `redundant_binding`, `renaming_binding`"
+             `breaks_deployed_queries`, `redundant_binding`, `renaming_binding`"
         );
     }
 
