@@ -116,6 +116,19 @@ pub enum Rule {
     RedundantCast,
     /// An output column alias naming the column what it already is.
     RedundantAlias,
+    /// An unqualified column reference in a subquery that resolves to an
+    /// outer query's relation.
+    OuterReferenceInSubquery,
+    /// FROM items joined with no condition connecting them.
+    CartesianJoin,
+    /// An `INSERT` without a column list.
+    InsertWithoutColumns,
+    /// An `UPDATE` assigning a column its own value.
+    SelfAssignment,
+    /// A `WITH` query nothing references.
+    UnusedCte,
+    /// A `CASE` that is a `COALESCE` or its own condition.
+    SimplifiableCase,
     /// A `LIKE` pattern built from a parameter whose `%` and `_` are not
     /// escaped.
     LikeUnescapedParam,
@@ -149,7 +162,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 30] = [
+    pub const ALL: [Rule; 36] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -170,6 +183,12 @@ impl Rule {
         Rule::CaseWithoutElse,
         Rule::RedundantCast,
         Rule::RedundantAlias,
+        Rule::OuterReferenceInSubquery,
+        Rule::CartesianJoin,
+        Rule::InsertWithoutColumns,
+        Rule::SelfAssignment,
+        Rule::UnusedCte,
+        Rule::SimplifiableCase,
         Rule::LikeUnescapedParam,
         Rule::FkTypeMismatch,
         Rule::MissingLockTimeout,
@@ -206,6 +225,12 @@ impl Rule {
             Rule::CaseWithoutElse => "case_without_else",
             Rule::RedundantCast => "redundant_cast",
             Rule::RedundantAlias => "redundant_alias",
+            Rule::OuterReferenceInSubquery => "outer_reference_in_subquery",
+            Rule::CartesianJoin => "cartesian_join",
+            Rule::InsertWithoutColumns => "insert_without_columns",
+            Rule::SelfAssignment => "self_assignment",
+            Rule::UnusedCte => "unused_cte",
+            Rule::SimplifiableCase => "simplifiable_case",
             Rule::LikeUnescapedParam => "like_unescaped_param",
             Rule::FkTypeMismatch => "fk_type_mismatch",
             Rule::MissingLockTimeout => "missing_lock_timeout",
@@ -260,6 +285,14 @@ impl Rule {
             Rule::RedundantAlias => {
                 "an output column alias that names the column what it already is"
             }
+            Rule::OuterReferenceInSubquery => {
+                "an unqualified column reference in a subquery that resolves to an outer query"
+            }
+            Rule::CartesianJoin => "FROM items joined with no condition connecting them",
+            Rule::InsertWithoutColumns => "an INSERT without a column list",
+            Rule::SelfAssignment => "an UPDATE that assigns a column its own value",
+            Rule::UnusedCte => "a WITH query nothing references",
+            Rule::SimplifiableCase => "a CASE that is a COALESCE or its own condition",
             Rule::LikeUnescapedParam => {
                 "a LIKE pattern built from a parameter whose % and _ are not escaped"
             }
@@ -311,13 +344,19 @@ impl Rule {
             | Rule::FetchMayReturnMany
             | Rule::ConstantCondition
             | Rule::UnreachableCaseBranch
-            | Rule::CaseWithoutElse => Some(Severity::Warning),
+            | Rule::CaseWithoutElse
+            | Rule::OuterReferenceInSubquery
+            | Rule::CartesianJoin
+            | Rule::InsertWithoutColumns
+            | Rule::SelfAssignment
+            | Rule::UnusedCte => Some(Severity::Warning),
             Rule::RedundantIndex
             | Rule::RenamingBinding
             | Rule::RedundantLimit
             | Rule::RedundantDistinct
             | Rule::RedundantCast
             | Rule::RedundantAlias
+            | Rule::SimplifiableCase
             | Rule::FetchAllSingleRow
             | Rule::UnusedReturning => Some(Severity::Info),
             // Off by default: enabled with a level, they report at info.

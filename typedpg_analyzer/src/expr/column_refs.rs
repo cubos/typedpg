@@ -104,6 +104,11 @@ pub(crate) fn infer_column_ref(
         Ok(col) => {
             super::read_deferred([col], col_ref.location)?;
             record_column_bindings(scope, snapshot, col_ref.location, &parts, col);
+            if crate::pg_catalog::collecting_column_ref_bindings()
+                && let Some(source) = scope.column_source(col)
+            {
+                note_binding(scope, col_ref.location, source);
+            }
             let nullable = null_ctx.is_nullable(&col.table_alias, &col.name, col.base_not_null);
             Ok(ExprType {
                 type_oid: col.type_oid,
@@ -144,6 +149,7 @@ pub(crate) fn infer_column_ref(
             {
                 scope.check_refname_unique(column, None)?;
                 super::read_deferred(&src.columns, col_ref.location)?;
+                note_binding(scope, col_ref.location, src);
                 if let Some(relid) = src.relid {
                     crate::ddl::policies::note_relation_ref(col_ref.location, relid);
                 }
@@ -318,6 +324,7 @@ fn infer_star_ref(
         AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
     })?;
     super::read_deferred(&source.columns, col_ref.location)?;
+    note_binding(scope, col_ref.location, source);
     if let Some(relid) = source.relid
         && let Some(qn) = source.source_qn.as_ref()
         && qn.name == alias
@@ -331,6 +338,14 @@ fn infer_star_ref(
         );
     }
     whole_row_ref(source, null_ctx, snapshot)
+}
+
+/// Record, for the lint rules, that the column reference at `location`
+/// bound to `source` — one of this level's FROM entries, or an enclosing
+/// level's.
+fn note_binding(scope: &Scope, location: i32, source: &crate::scope::TableSource) {
+    let own = scope.sources.iter().any(|s| std::ptr::eq(s, source));
+    crate::pg_catalog::note_column_ref_binding(location, !own, &source.alias);
 }
 
 /// Record what the `ColumnRef` at `location` resolved to while a policy

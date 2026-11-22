@@ -2377,7 +2377,7 @@ pub(crate) fn coerce_unknown_operand(
 }
 
 /// Whether `expr` is or holds a `$N`.
-fn has_param_ref(expr: Option<&ast::Node>) -> bool {
+pub(super) fn has_param_ref(expr: Option<&ast::Node>) -> bool {
     expr.is_some_and(|inner| {
         matches!(inner, ast::Node::ParamRef(_))
             || inner

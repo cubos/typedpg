@@ -190,6 +190,60 @@
               }
             },
             {
+              "id": "outer_reference_in_subquery",
+              "shortDescription": {
+                "text": "an unqualified column reference in a subquery that resolves to an outer query"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "cartesian_join",
+              "shortDescription": {
+                "text": "FROM items joined with no condition connecting them"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "insert_without_columns",
+              "shortDescription": {
+                "text": "an INSERT without a column list"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "self_assignment",
+              "shortDescription": {
+                "text": "an UPDATE that assigns a column its own value"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "unused_cte",
+              "shortDescription": {
+                "text": "a WITH query nothing references"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "simplifiable_case",
+              "shortDescription": {
+                "text": "a CASE that is a COALESCE or its own condition"
+              },
+              "defaultConfiguration": {
+                "level": "note"
+              }
+            },
+            {
               "id": "like_unescaped_param",
               "shortDescription": {
                 "text": "a LIKE pattern built from a parameter whose % and _ are not escaped"

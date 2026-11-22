@@ -87,6 +87,23 @@ impl PgCatalog {
         )
     }
 
+    /// Whether an `UPDATE OF` trigger of `relid`, or of a table inheriting
+    /// from it (a partition), lists column `column`, whatever its state: it
+    /// fires when an `UPDATE`'s SET list names the column, even assigning
+    /// the value it already has.
+    pub fn lint_update_of_trigger_lists(&self, relid: PgClassOid, column: &str) -> bool {
+        std::iter::once(relid)
+            .chain(crate::resolve::inheritance_descendants(self, relid))
+            .any(|rel| {
+                self.triggers.get(&rel).is_some_and(|triggers| {
+                    triggers.iter().any(|trigger| {
+                        trigger.events & crate::ddl::triggers::TRIGGER_TYPE_UPDATE != 0
+                            && trigger.columns.iter().any(|c| c == column)
+                    })
+                })
+            })
+    }
+
     /// The typmod a column's declared type carries, through domains and
     /// arrays, exactly as the analyzer resolves it.
     pub fn lint_effective_typmod(&self, oid: PgTypeOid, typmod: Option<i32>) -> Option<i32> {

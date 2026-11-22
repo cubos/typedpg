@@ -11,16 +11,22 @@ use typedpg_pg_query::ast::{
 
 use crate::{Ctx, RawFinding, Rule};
 
+mod cartesian_join;
 mod case_without_else;
 mod constant_condition;
+mod insert_without_columns;
 mod like_unescaped_param;
 mod limit_without_order;
+mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
 mod redundant_distinct;
 mod redundant_limit;
 mod redundant_null_check;
+mod self_assignment;
+mod simplifiable_case;
 mod unreachable_case_branch;
+mod unused_cte;
 
 /// The operators `null_comparison` reports: the ordinary comparisons, not
 /// `IS [NOT] DISTINCT FROM` or the pattern operators.
@@ -40,6 +46,12 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::CaseWithoutElse => case_without_else::findings(ctx),
         Rule::RedundantCast => redundant_cast::findings(ctx),
         Rule::RedundantAlias => redundant_alias::findings(ctx),
+        Rule::OuterReferenceInSubquery => outer_reference_in_subquery::findings(ctx),
+        Rule::CartesianJoin => cartesian_join::findings(ctx),
+        Rule::InsertWithoutColumns => insert_without_columns::findings(ctx),
+        Rule::SelfAssignment => self_assignment::findings(ctx),
+        Rule::UnusedCte => unused_cte::findings(ctx),
+        Rule::SimplifiableCase => simplifiable_case::findings(ctx),
         Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
@@ -647,7 +659,7 @@ fn write_finding(
     });
 }
 
-fn relation_end(ctx: &Ctx<'_>, relation: &RangeVar) -> Option<usize> {
+pub(super) fn relation_end(ctx: &Ctx<'_>, relation: &RangeVar) -> Option<usize> {
     let start = location(relation.location)?;
     let mut tokens = ctx.tokens.iter().filter(|token| token.start >= start);
     let first = tokens.next()?;
