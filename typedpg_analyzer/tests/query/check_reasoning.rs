@@ -398,3 +398,26 @@ fn a_match_full_foreign_key_has_all_or_none_of_its_columns() {
         &[("v", true)],
     );
 }
+
+#[test]
+fn a_foreign_tables_checks_are_trusted_on_reads_only() {
+    // PG enforces no CHECK on a foreign table, but its planner assumes
+    // they hold (CREATE FOREIGN TABLE: "the system assumes them to hold
+    // for purposes of query optimization"), and so does the analyzer when
+    // the table is read. A write is not checked: a NULL is accepted.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE EXTENSION postgres_fdw;
+         CREATE SERVER nowhere FOREIGN DATA WRAPPER postgres_fdw;
+         CREATE FOREIGN TABLE f (a int CHECK (a IS NOT NULL), b int,
+             kind text, x int, CHECK (kind <> 'x' OR x IS NOT NULL)) SERVER nowhere;",
+    )
+    .unwrap();
+    // Its rows are on a server the oracle can't reach.
+    db.skip_pg_sanity();
+    assert_nullable(&db, "SELECT a, b FROM f", &[("a", false), ("b", true)]);
+    assert_nullable(&db, "SELECT x FROM f WHERE kind = 'x'", &[("x", false)]);
+    // An alias list renames the columns the CHECKs name.
+    nullable(&db, "SELECT a FROM f AS g(a2, a)");
+    db.analyze("INSERT INTO f (a) VALUES (NULL)").unwrap();
+}

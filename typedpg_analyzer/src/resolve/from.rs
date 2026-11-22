@@ -517,12 +517,17 @@ pub(crate) fn process_from_item(
 
                 // Every row of a table satisfies its CHECK constraints
                 // (named by the table's own column names: not with an
-                // alias list renaming them).
+                // alias list renaming them). A foreign table's are not
+                // enforced, but the planner trusts them (constraint
+                // exclusion, relation_excluded_by_constraints), and so do
+                // we.
                 let renamed = rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty());
                 if !renamed
                     && matches!(
                         class.relkind,
-                        crate::pg_catalog::RelKind::Table | crate::pg_catalog::RelKind::Partitioned
+                        crate::pg_catalog::RelKind::Table
+                            | crate::pg_catalog::RelKind::Partitioned
+                            | crate::pg_catalog::RelKind::ForeignTable
                     )
                     && let Some(checks) =
                         crate::nonnull::checks::RelationChecks::of(snapshot, class.oid)
