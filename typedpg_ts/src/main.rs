@@ -361,22 +361,41 @@ fn build_lint(
                 let deployed_root = deployed.config.root.clone();
                 let mut queries: Vec<Vec<typedpg_lint::DeployedQuery>> =
                     vec![Vec::new(); deployed.database_count()];
-                for query in deployed.lint_queries() {
-                    let location = format!(
-                        "{}:{}",
-                        relative(query.file, &deployed_root),
-                        query.pos.line
-                    );
-                    let queries = &mut queries[query.db];
-                    match queries.iter_mut().find(|q| q.sql == query.text) {
+                // The queries, then the `copyIn()` targets: the deployed
+                // code sends each target's rows with `COPY … FROM STDIN`.
+                let statements = deployed
+                    .lint_queries()
+                    .into_iter()
+                    .map(|query| {
+                        (
+                            query.db,
+                            query.file,
+                            query.pos,
+                            query.text,
+                            typedpg_lint::DeployedKind::Query,
+                        )
+                    })
+                    .chain(deployed.lint_copy_ins().into_iter().map(|copy| {
+                        (
+                            copy.db,
+                            copy.file,
+                            copy.pos,
+                            copy.target,
+                            typedpg_lint::DeployedKind::CopyIn,
+                        )
+                    }));
+                for (db, file, pos, sql, kind) in statements {
+                    let location = format!("{}:{}", relative(file, &deployed_root), pos.line);
+                    let queries = &mut queries[db];
+                    match queries.iter_mut().find(|q| q.sql == sql && q.kind == kind) {
                         Some(q) => q.locations.push(location),
                         None => queries.push(typedpg_lint::DeployedQuery {
-                            sql: query.text,
+                            sql,
                             locations: vec![location],
-                            // Every query of the database runs as each of
-                            // its configured roles.
-                            roles: deployed.config.databases[query.db].roles.clone(),
-                            kind: typedpg_lint::DeployedKind::Query,
+                            // Every statement of the database runs as each
+                            // of its configured roles.
+                            roles: deployed.config.databases[db].roles.clone(),
+                            kind,
                         }),
                     }
                 }

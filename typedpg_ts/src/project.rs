@@ -184,6 +184,17 @@ pub struct LintQuery<'a> {
     pub escapes: bool,
 }
 
+/// A `copyIn()` target in the sources.
+#[derive(Debug, Clone)]
+pub struct LintCopyIn<'a> {
+    /// The index of the database whose catalog analyzes it.
+    pub db: usize,
+    pub file: &'a Path,
+    /// The target as written: `table (columns)`.
+    pub target: String,
+    pub pos: Position,
+}
+
 /// A call on a [`LintQuery`], in the file that calls it.
 #[derive(Debug, Clone)]
 pub struct LintCall<'a> {
@@ -595,9 +606,8 @@ impl Project {
             self.files.remove(path);
             return;
         };
-        let dir = path.parent().unwrap_or(Path::new("."));
         let result = scan(path, &source, &mut |spec, name| {
-            self.resolve_export(dir, spec, name, 0)
+            self.resolve_export(path, spec, name, 0)
         });
         match result {
             Some(scan) => {
@@ -610,9 +620,13 @@ impl Project {
         }
     }
 
-    /// What the module `spec` (imported from `dir`) exports as `name`.
-    fn resolve_export(&self, dir: &Path, spec: &str, name: &str, depth: usize) -> Option<Export> {
-        let resolved = self.resolver.resolve(dir, spec).ok()?;
+    /// What the module `spec` (imported by the file `from`) exports as
+    /// `name`.
+    fn resolve_export(&self, from: &Path, spec: &str, name: &str, depth: usize) -> Option<Export> {
+        // Resolved for the importing file, not its directory: only then does
+        // the resolver find the tsconfig.json that owns the file and apply its
+        // `paths` and `baseUrl` (`resolve(dir, …)` ignores tsconfig discovery).
+        let resolved = self.resolver.resolve_file(from, spec).ok()?;
         self.export_of(resolved.path(), name, depth)
     }
 
@@ -658,7 +672,6 @@ impl Project {
                 name: name.to_owned(),
             }));
         }
-        let dir = path.parent().unwrap_or(Path::new("."));
         for entry in &exports.entries {
             if let crate::scan::ExportEntry::Named {
                 exported,
@@ -667,7 +680,7 @@ impl Project {
             } = entry
                 && exported == name
             {
-                return self.resolve_export(dir, spec, imported, depth + 1);
+                return self.resolve_export(path, spec, imported, depth + 1);
             }
         }
         if name == "default" {
@@ -675,7 +688,7 @@ impl Project {
         }
         exports.entries.iter().find_map(|entry| match entry {
             crate::scan::ExportEntry::All { spec } => {
-                self.resolve_export(dir, spec, name, depth + 1)
+                self.resolve_export(path, spec, name, depth + 1)
             }
             crate::scan::ExportEntry::Named { .. } => None,
         })
@@ -1209,18 +1222,31 @@ impl Project {
         out
     }
 
-    /// How many `copy_in!` targets the project has: statements `typedpg
+    /// How many `copyIn()` targets the project has: statements `typedpg
     /// lint` counts beside the queries, though it lints no rules over them.
     pub fn lint_copy_in_count(&self) -> usize {
-        self.files
-            .values()
-            .map(|scan| {
-                scan.queries
-                    .iter()
-                    .filter(|query| query.kind == Kind::CopyIn)
-                    .count()
-            })
-            .sum()
+        self.lint_copy_ins().len()
+    }
+
+    /// Every `copyIn()` target in the sources, sorted by file and position:
+    /// the targets `breaks_deployed_queries` checks in the previous
+    /// deployment.
+    pub fn lint_copy_ins(&self) -> Vec<LintCopyIn<'_>> {
+        let mut out = Vec::new();
+        for (path, scan) in &self.files {
+            for query in &scan.queries {
+                if query.kind == Kind::CopyIn {
+                    out.push(LintCopyIn {
+                        db: query.db,
+                        file: path,
+                        target: query.text.clone(),
+                        pos: query.pos,
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| (&a.file, a.pos).cmp(&(&b.file, b.pos)));
+        out
     }
 
     /// Database `db`'s catalog, or why it could not be built.

@@ -30,7 +30,7 @@ cargo typedpg lint --previous-deployment origin/main
 npx typedpg lint --previous-deployment origin/main
 ```
 
-typedpg checks out the ref into a temporary snapshot and reads the project there exactly as it reads it now: its configuration, its migrations (which build the deployed schema, per database) and its queries (`sql!` and `copy_in!` invocations, or the TypeScript sources and `.sql` files). Queries come from the ref, so a query your branch changed or deleted is still checked — the deployed code still runs it. A migration file identical to its version at the ref is an applied migration; the first file that is absent from the ref or differs from it is the first new one. With no new migration, nothing is reported.
+typedpg checks out the ref into a temporary snapshot and reads the project there exactly as it reads it now: its configuration, its migrations (which build the deployed schema, per database) and its queries (`sql!` and `copy_in!` invocations, or the `sql()` and `copyIn()` calls of the TypeScript sources and the `.sql` files). Queries come from the ref, so a query your branch changed or deleted is still checked — the deployed code still runs it. A migration file identical to its version at the ref is an applied migration; the first file that is absent from the ref or differs from it is the first new one. With no new migration, nothing is reported.
 
 Each deployed query that analyzes against the deployed schema is analyzed again against the new one. It is reported when, against the new schema:
 
@@ -240,7 +240,7 @@ warning[breaks_deployed_queries]: this migration breaks the deployed query at sr
 - An allow comment on the migration statement, or in the deployed query's SQL (see below).
 - A ref where the project has no typedpg configuration, or a database whose migrations don't build at the ref: there is nothing deployed to compare with.
 
-The rule sees the queries typedpg analyzes. SQL built at run time, queries in other services and ad-hoc scripts are outside its view. The TypeScript CLI checks the deployed queries, not yet its `copyIn` targets.
+The rule sees the queries typedpg analyzes. SQL built at run time, queries in other services and ad-hoc scripts are outside its view.
 
 ## Configuration
 
