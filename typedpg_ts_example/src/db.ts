@@ -70,7 +70,7 @@ export interface Queries {
   "\n  SELECT ROW(1, 'a', NULL::text) AS r,\n         ARRAY[ROW(1, 2.5)::point2] AS arr_of_row,\n         ARRAY['', NULL, 'NULL', '\"', '\\', ',', '{}', ' a ', 'é'] AS strings,\n         int4range(1, 10, '[]') AS discrete,\n         '(,5]'::numrange AS unbounded,\n         'empty'::int4range AS nothing,\n         '{[1,3), [5,7)}'::int4multirange AS multi,\n         interval '1 year 2 mons 3 days 04:05:06.789' AS iv,\n         '\"a\"=>\"1\", \"b c\"=>NULL'::hstore AS h,\n         'infinity'::date AS forever,\n         '-infinity'::timestamp AS dawn,\n         '23:59:59.999999'::time AS last\n": {
     params: {};
     row: {
-      r: { f1: number; f2: string; f3: string | null };
+      r: { f1: 1; f2: "a"; f3: string | null };
       arr_of_row: Point2[];
       strings: ("" | " a " | "\"" | "," | "NULL" | "\\" | "{}" | "é" | null)[];
       discrete: typedpg.Range<number>;

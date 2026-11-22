@@ -58,13 +58,19 @@ fn typmod_suffix(name: &str, typmod: i32) -> Option<String> {
     }
 }
 
-/// One field of an [`Type::AnonymousRecord`]. Carries the field's name, its
-/// resolved [`Type`], and whether the value at that position can be NULL.
+/// One field of a [`Type::AnonymousRecord`] or [`Type::Composite`]. Carries
+/// the field's name, its resolved [`Type`], whether the value at that
+/// position can be NULL, and what the analysis knows of its non-NULL
+/// values (as [`crate::AnalyzedColumn`] does of a column's).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordField {
     pub name: String,
     pub ty: Type,
     pub nullable: bool,
+    /// What every non-NULL value of the field is.
+    pub refinement: crate::refine::Refinement,
+    /// Of an array field, what every non-NULL element is (at any depth).
+    pub elem_refinement: crate::refine::Refinement,
 }
 
 /// A resolved PostgreSQL type.
@@ -170,6 +176,35 @@ pub enum Type {
 }
 
 impl Type {
+    /// The same type, with nothing known of its (nested) record fields'
+    /// values: what a value of it is shaped like, without what the
+    /// analysis knows of it.
+    pub fn without_refinements(&self) -> Type {
+        let fields = |fields: &[RecordField]| {
+            fields
+                .iter()
+                .map(|f| RecordField {
+                    name: f.name.clone(),
+                    ty: f.ty.without_refinements(),
+                    nullable: f.nullable,
+                    refinement: crate::refine::Refinement::NONE,
+                    elem_refinement: crate::refine::Refinement::NONE,
+                })
+                .collect()
+        };
+        let mut out = self.clone();
+        match &mut out {
+            Type::Domain { base, .. } => **base = base.without_refinements(),
+            Type::Array { element, .. } => **element = element.without_refinements(),
+            Type::Range { subtype, .. } => **subtype = subtype.without_refinements(),
+            Type::Composite { fields: f, .. } | Type::AnonymousRecord { fields: f } => {
+                *f = fields(f);
+            }
+            Type::Basic { .. } | Type::Enum { .. } => {}
+        }
+        out
+    }
+
     /// How a diagnostic names the type: PostgreSQL's SQL spelling of the
     /// built-ins (`integer`, `character varying`, `timestamp with time
     /// zone`), the qualified name of a user type, `[]` after an array's

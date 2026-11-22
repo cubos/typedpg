@@ -36,19 +36,23 @@ pub(crate) fn check_column_ref_length(col_ref: &ast::ColumnRef) -> Result<(), An
 /// leave it (`WHERE kind IN ('a', 'b')` makes `kind` one of those), or
 /// the bounds they leave a `numeric`, date or timestamp (`WHERE d >=
 /// '2024-01-01'`).
-fn column_refinement(col: &crate::scope::ScopeColumn, ctx: Ctx<'_>) -> crate::refine::Refinement {
+fn column_refinement(
+    col: &crate::scope::ScopeColumn,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+) -> crate::refine::Refinement {
     let mut refine = col.refine.clone();
-    if crate::refine_bounds::OrdKind::of(col.type_oid, ctx.snapshot).is_some() {
-        let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, ctx.snapshot);
+    if crate::refine_bounds::OrdKind::of(col.type_oid, snapshot).is_some() {
+        let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot);
         let key = (col.table_alias.clone(), col.name.clone());
-        let preds = ctx.null_ctx.column_preds(&key);
+        let preds = null_ctx.column_preds(&key);
         refine.values = None;
         refine = refine.with_bounds(space.ord_bounds(&preds));
-    } else if crate::refine::Exact::of(col.type_oid, col.collation, ctx.snapshot).is_some() {
-        let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, ctx.snapshot)
+    } else if crate::refine::Exact::of(col.type_oid, col.collation, snapshot).is_some() {
+        let space = crate::nonnull::checks::Space::of(col.type_oid, col.collation, snapshot)
             .with_values(col.refine.enumerated().as_ref());
         let key = (col.table_alias.clone(), col.name.clone());
-        let preds = ctx.null_ctx.column_preds(&key);
+        let preds = null_ctx.column_preds(&key);
         if let Some(cands) = space.candidates_of(&preds) {
             refine.values = crate::refine::capped(cands.iter().map(|l| space.print(l)).collect());
         }
@@ -142,7 +146,7 @@ pub(crate) fn infer_column_ref(
                 // (No relation has an `unknown` column: a function in FROM
                 // returning it is rejected.)
                 unknown_value: false,
-                refine: column_refinement(col, ctx),
+                refine: column_refinement(col, null_ctx, snapshot),
             })
         }
         Err(e) => {
@@ -438,7 +442,7 @@ fn whole_row_ref(
         // a value of the row type in general doesn't (`ROW(NULL)::t`, a
         // column of type `t`): carry the columns as the value's shape, the
         // only place field nullability is taken from for a composite.
-        let mut shape = shape_of_columns(&source.columns);
+        let mut shape = shape_of_columns(&source.columns, null_ctx, snapshot);
         // A RETURNING OLD / NEW row may be missing (`null_row`), which its
         // columns fold into their own nullability; a row that is there
         // has the target's NOT NULL columns.
@@ -493,7 +497,7 @@ fn whole_row_ref(
         explicit_collation: false,
         no_collation: None,
         planned: super::Planned::AsParsed,
-        record_fields: Some(shape_of_columns(&source.columns).into()),
+        record_fields: Some(shape_of_columns(&source.columns, null_ctx, snapshot).into()),
         elem_nullable: None,
         elem_refine: crate::refine::Refinement::NONE,
         refine: crate::refine::Refinement::NONE,
@@ -502,8 +506,14 @@ fn whole_row_ref(
 }
 
 /// The row shape of a FROM entry's columns, each field NULL only where the
-/// column itself may be (outer-join nullability is the whole row's).
-fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
+/// column itself may be (outer-join nullability is the whole row's), and
+/// what a reference to the column would be known to be (its CHECKs, the
+/// query's conditions on it): the row is the one the column is read from.
+fn shape_of_columns(
+    columns: &[crate::scope::ScopeColumn],
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+) -> Vec<RecordField> {
     columns
         .iter()
         .map(|c| RecordField {
@@ -519,7 +529,7 @@ fn shape_of_columns(columns: &[crate::scope::ScopeColumn]) -> Vec<RecordField> {
                 record_fields: c.record_fields.clone(),
                 elem_nullable: c.elem_nullable,
                 elem_refine: c.elem_refine.clone(),
-                refine: c.refine.clone(),
+                refine: column_refinement(c, null_ctx, snapshot),
                 unknown_value: false,
             },
         })

@@ -38,16 +38,17 @@ pub(crate) fn build_column(
         name,
         pg_type,
         nullable,
-        // A range of a few integers lists them.
-        refinement: crate::refine::Refinement {
-            values: rc.refine.enumerated(),
-            ..rc.refine
-        },
-        elem_refinement: crate::refine::Refinement {
-            values: rc.elem_refine.enumerated(),
-            ..rc.elem_refine
-        },
+        refinement: enumerated(rc.refine),
+        elem_refinement: enumerated(rc.elem_refine),
     })
+}
+
+/// `refine`, a range of a few integers listing them.
+fn enumerated(refine: crate::refine::Refinement) -> crate::refine::Refinement {
+    crate::refine::Refinement {
+        values: refine.enumerated(),
+        ..refine
+    }
 }
 
 /// Like [`resolve_type`] but lets the caller override the structural shape
@@ -76,19 +77,24 @@ fn resolve_type_with_shape(
                     snapshot,
                 )?,
                 nullable: f.ty.nullable,
+                refinement: enumerated(f.ty.refine.clone()),
+                elem_refinement: enumerated(f.ty.elem_refine.clone()),
             });
         }
         return Ok(Type::AnonymousRecord { fields: out });
     }
     let mut ty = resolve_type(type_oid, typmod, collation, snapshot)?;
     // A composite carrying a shape is a row read from a relation: its
-    // fields are NULL only where the relation's columns may be.
+    // fields are NULL only where the relation's columns may be, and are
+    // what they are known to be there.
     if let (Type::Composite { fields, .. }, Some(shape)) = (&mut ty, shape) {
         for field in fields {
-            field.nullable = shape
-                .iter()
-                .find(|f| f.name == field.name)
-                .is_none_or(|f| f.ty.nullable);
+            let known = shape.iter().find(|f| f.name == field.name);
+            field.nullable = known.is_none_or(|f| f.ty.nullable);
+            if let Some(f) = known {
+                field.refinement = enumerated(field.refinement.and(&f.ty.refine));
+                field.elem_refinement = enumerated(field.elem_refinement.and(&f.ty.elem_refine));
+            }
         }
     }
     Ok(ty)
@@ -263,6 +269,15 @@ fn resolve_type(
                         // (`ROW(NULL)::t`); `resolve_type_with_shape`
                         // narrows a row read from the relation.
                         nullable: true,
+                        // What the field's type says of every value: a
+                        // domain's CHECKs (each field was coerced to it),
+                        // or those of an array's domain elements.
+                        refinement: enumerated(snapshot.domain_refinement(f.atttypid)),
+                        elem_refinement: enumerated(
+                            crate::expr::array_element_type(snapshot, f.atttypid)
+                                .map(|e| snapshot.domain_refinement(e))
+                                .unwrap_or_default(),
+                        ),
                     });
                 }
                 return Ok(Type::Composite {

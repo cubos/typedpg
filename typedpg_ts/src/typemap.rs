@@ -189,7 +189,9 @@ impl TypeMapper<'_> {
             (Type::Enum { .. }, _) => |v| js_string(v),
             (Type::Basic { schema, name, .. }, output) if schema == "pg_catalog" => {
                 match (name.as_str(), output) {
-                    ("text" | "varchar", "string") => |v| js_string(v),
+                    // An `unknown` value (a record's field over a literal)
+                    // is the literal as written.
+                    ("text" | "varchar" | "unknown", "string") => |v| js_string(v),
                     ("int2" | "int4", "number") | ("bool", "boolean") => str::to_owned,
                     ("int8", "bigint") => |v| format!("{v}n"),
                     _ => return mapped,
@@ -371,9 +373,13 @@ impl TypeMapper<'_> {
         let mut codecs = Vec::with_capacity(fields.len());
         for field in fields {
             let mapped = self.map(&field.ty);
+            // A field reads as a column of its type would: refined to the
+            // literal union of its values. Only the output — the codec, and
+            // what a parameter takes, are its type's.
+            let refined = self.map_column(&field.ty, &field.refinement, &field.elem_refinement);
             let null = if field.nullable { " | null" } else { "" };
             let key = property_key(&field.name);
-            output.push(format!("{key}: {}{null}", mapped.output));
+            output.push(format!("{key}: {}{null}", refined.output));
             input.push(format!("{key}: {}{null}", mapped.input));
             codecs.push((field.name.clone(), mapped.codec));
         }
@@ -806,6 +812,8 @@ mod tests {
                     name: "f1".into(),
                     ty: basic_ty("int4"),
                     nullable: false,
+                    refinement: Refinement::NONE,
+                    elem_refinement: Refinement::NONE,
                 }],
             };
             let ty = Type::AnonymousRecord {
@@ -814,6 +822,8 @@ mod tests {
                         name: "?column?".into(),
                         ty: basic_ty("text"),
                         nullable: true,
+                        refinement: Refinement::NONE,
+                        elem_refinement: Refinement::NONE,
                     },
                     RecordField {
                         name: "rs".into(),
@@ -822,6 +832,8 @@ mod tests {
                             element_nullable: Some(false),
                         },
                         nullable: false,
+                        refinement: Refinement::NONE,
+                        elem_refinement: Refinement::NONE,
                     },
                 ],
             };
@@ -838,6 +850,91 @@ mod tests {
                 r#"({ "?column?": string | null; rs: { f1: number }[] } | null)[]"#
             );
         });
+    }
+
+    #[test]
+    fn refined_record_fields_read_as_literal_unions() {
+        let refined = |vs: &[&str]| Refinement {
+            values: Some(vs.iter().map(|v| (*v).to_owned()).collect()),
+            ..Refinement::NONE
+        };
+        let field =
+            |name: &str, ty: Type, nullable, values: &[&str], elements: &[&str]| RecordField {
+                name: name.into(),
+                ty,
+                nullable,
+                refinement: if values.is_empty() {
+                    Refinement::NONE
+                } else {
+                    refined(values)
+                },
+                elem_refinement: if elements.is_empty() {
+                    Refinement::NONE
+                } else {
+                    refined(elements)
+                },
+            };
+        let ty = Type::AnonymousRecord {
+            fields: vec![
+                field("status", basic_ty("text"), false, &["b", "a"], &[]),
+                field("lit", basic_ty("unknown"), false, &["x"], &[]),
+                field("n", basic_ty("int4"), true, &["2", "1"], &[]),
+                field("free", basic_ty("text"), false, &[], &[]),
+                field(
+                    "tags",
+                    Type::Array {
+                        element: Box::new(basic_ty("text")),
+                        element_nullable: Some(false),
+                    },
+                    false,
+                    &[],
+                    &["t"],
+                ),
+            ],
+        };
+        with(|m| {
+            let mapped = m.map(&ty);
+            assert_eq!(
+                mapped.output,
+                r#"{ status: "a" | "b"; lit: "x"; n: 1 | 2 | null; free: string; tags: "t"[] }"#
+            );
+            // A parameter takes any value of each field's type, and the
+            // decoding is the type's.
+            assert_eq!(
+                mapped.input,
+                "{ status: string; lit: string; n: number | null; free: string; \
+                 tags: readonly (string | null)[] }"
+            );
+            assert_eq!(mapped.codec, m.map(&without_refinements(&ty)).codec);
+            // Nested, and as an array's elements.
+            let outer = Type::Array {
+                element: Box::new(Type::AnonymousRecord {
+                    fields: vec![field("r", ty.clone(), false, &[], &[])],
+                }),
+                element_nullable: Some(false),
+            };
+            assert_eq!(
+                m.map(&outer).output,
+                r#"({ r: { status: "a" | "b"; lit: "x"; n: 1 | 2 | null; free: string; tags: "t"[] } })[]"#
+            );
+        });
+    }
+
+    /// `ty` with nothing known of its fields' values.
+    fn without_refinements(ty: &Type) -> Type {
+        match ty {
+            Type::AnonymousRecord { fields } => Type::AnonymousRecord {
+                fields: fields
+                    .iter()
+                    .map(|f| RecordField {
+                        refinement: Refinement::NONE,
+                        elem_refinement: Refinement::NONE,
+                        ..f.clone()
+                    })
+                    .collect(),
+            },
+            other => other.clone(),
+        }
     }
 
     #[test]

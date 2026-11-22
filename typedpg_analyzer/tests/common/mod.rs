@@ -7,7 +7,8 @@ pub use typedpg_analyzer::{
     PgAggregate, PgAttribute, PgCast, PgCastOid, PgCatalog, PgCatalogSeed, PgClass, PgClassOid,
     PgDepend, PgEnum, PgEnumOid, PgExtension, PgExtensionOid, PgGenericOid, PgIndex, PgNamespace,
     PgNamespaceOid, PgOperator, PgOperatorOid, PgProc, PgProcOid, PgRange, PgType, PgTypeOid,
-    ProKind, QualifiedName, RecordField, RelKind, TypAlign, TypCategory, TypStorage, TypType, Type,
+    ProKind, QualifiedName, RecordField, Refinement, RelKind, TypAlign, TypCategory, TypStorage,
+    TypType, Type,
 };
 
 /// Terse helper for building a [`QualifiedName`] in tests.
@@ -214,6 +215,8 @@ pub fn rf(name: &str, ty: Type) -> RecordField {
         name: name.into(),
         ty,
         nullable: false,
+        refinement: Refinement::NONE,
+        elem_refinement: Refinement::NONE,
     }
 }
 
@@ -223,6 +226,8 @@ pub fn rfn(name: &str, ty: Type) -> RecordField {
         name: name.into(),
         ty,
         nullable: true,
+        refinement: Refinement::NONE,
+        elem_refinement: Refinement::NONE,
     }
 }
 
@@ -353,7 +358,9 @@ pub fn assert_cols(analyzed: &AnalyzedQuery, expected: Vec<ColSpec>) {
             name: c.name.clone(),
             // What is known of an array's element nullability is checked by
             // query/array_element_nullability.rs; these tests check types.
-            ty: match c.pg_type.clone() {
+            // What is known of a record's field values is checked by
+            // query/refinements.rs.
+            ty: match without_field_refinements(c.pg_type.clone()) {
                 Type::Array { element, .. } => Type::Array {
                     element,
                     element_nullable: None,
@@ -364,6 +371,11 @@ pub fn assert_cols(analyzed: &AnalyzedQuery, expected: Vec<ColSpec>) {
         })
         .collect();
     assert_eq!(actual, expected, "columns mismatch");
+}
+
+/// `ty` with nothing known of its (nested) record fields' values.
+pub fn without_field_refinements(ty: Type) -> Type {
+    ty.without_refinements()
 }
 
 /// What a test expects a param to look like.
