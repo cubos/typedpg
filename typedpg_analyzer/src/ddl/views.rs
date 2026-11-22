@@ -779,6 +779,10 @@ pub fn refresh_materialized_view(
                 check_refill(interp, oid)?;
                 interp.unpopulated_matviews.remove(&oid);
             }
+            // The rows it held are gone (an unpopulated one is refilled by
+            // a later REFRESH, from the query as it stands then): what its
+            // query returns now is what it holds.
+            rederive_view_nullability(interp, vec![oid], false, Some(oid));
             // Without CONCURRENTLY the data goes in a new heap
             // (finish_heap_swap), its indexes rebuilt with it.
             if !stmt.concurrent {
@@ -2006,6 +2010,13 @@ pub fn drop_views(snapshot: &mut PgCatalog, view_oids: &[PgClassOid]) {
 /// (`relaxing`), every column of the view is conservatively marked
 /// nullable.
 ///
+/// A materialized view is no re-expansion but the rows its query returned
+/// when it was last populated (CREATE, REFRESH): a change adding NULLs
+/// reaches it (the next REFRESH, which the application may run at any
+/// time, stores them), but one ruling NULLs out says nothing of the rows
+/// it already holds until a REFRESH re-derives it
+/// ([`refresh_materialized_view`]).
+///
 /// Relation-level dependencies are used (not column-level ones) because a
 /// `SELECT *` body records no column references.
 pub(crate) fn refresh_dependent_view_nullability(
@@ -2013,13 +2024,31 @@ pub(crate) fn refresh_dependent_view_nullability(
     relid: PgClassOid,
     relaxing: bool,
 ) {
-    let mut queue: std::collections::VecDeque<PgClassOid> =
-        find_dependent_views(interp, relid).into();
+    let views = find_dependent_views(interp, relid);
+    rederive_view_nullability(interp, views, relaxing, None);
+}
+
+/// Re-derive the nullability of `views` and of the views reading those (see
+/// [`refresh_dependent_view_nullability`]). A materialized view keeps the
+/// NOT NULL-ness of the rows it holds, only ever losing it — unless it is
+/// `refreshed`, whose rows were just replaced by its query's.
+fn rederive_view_nullability(
+    interp: &mut PgCatalog,
+    views: Vec<PgClassOid>,
+    relaxing: bool,
+    refreshed: Option<PgClassOid>,
+) {
+    let mut queue: std::collections::VecDeque<PgClassOid> = views.into();
     let mut seen = std::collections::HashSet::new();
     while let Some(view) = queue.pop_front() {
         if !seen.insert(view) {
             continue;
         }
+        let keeps_rows = refreshed != Some(view)
+            && interp
+                .pg_class
+                .get(&view)
+                .is_some_and(|c| c.relkind == RelKind::MaterializedView);
         let reanalyzed = reanalyze_view(interp, view);
         let attrs = interp.attributes_of(view).to_vec();
         let new_not_null: Option<Vec<bool>> = reanalyzed.and_then(|cols| {
@@ -2028,7 +2057,13 @@ pub(crate) fn refresh_dependent_view_nullability(
                     .iter()
                     .zip(&cols)
                     .all(|(a, c)| a.atttypid == c.type_oid))
-            .then(|| attrs.iter().zip(&cols).map(|(_, c)| !c.nullable).collect())
+            .then(|| {
+                attrs
+                    .iter()
+                    .zip(&cols)
+                    .map(|(a, c)| !c.nullable && (a.attnotnull || !keeps_rows))
+                    .collect()
+            })
         });
         let changed = match (new_not_null, relaxing) {
             (Some(flags), _) => {

@@ -420,3 +420,61 @@ fn noop_cast_groups_by_the_column() {
         );
     }
 }
+
+/// PostgreSQL 19 matches a grouping expression inside a sublink too: the
+/// sublink reads the grouped value, which the grouping sets omitting it
+/// NULL. With a row (1), `ROLLUP (a + 1)` yields 2 and the grand total's
+/// NULL — through `(SELECT t.a + 1)` and `ARRAY(SELECT t.a + 1)` as well.
+#[test]
+fn grouping_set_nulled_expression_read_in_a_sublink_is_nullable() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE gt (a int NOT NULL);").unwrap();
+    let s = db
+        .analyze("SELECT (SELECT gt.a + 1) AS x FROM gt GROUP BY ROLLUP (a + 1)")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", int4())]);
+    let s = db
+        .analyze("SELECT (SELECT gt.a + 1) AS x FROM gt GROUP BY GROUPING SETS ((a + 1), ())")
+        .unwrap();
+    assert_cols(&s, vec![cn("x", int4())]);
+    let s = db
+        .analyze("SELECT ARRAY(SELECT gt.a + 1) AS x FROM gt GROUP BY ROLLUP (a + 1)")
+        .unwrap();
+    // (`assert_cols` leaves element nullability out.)
+    assert!(!s.columns[0].nullable);
+    assert_eq!(s.columns[0].pg_type, array_with_elems(int4(), true));
+}
+
+/// Only an expression over the grouped level's own columns is the grouped
+/// one: an inner column of the same name is not (with rows (1) in gt and
+/// (5) in s, PG 19.0 returns {6} for both rows of the first query), while
+/// a sublink nested deeper still reads the grouped value ({NULL} in the
+/// grand total).
+#[test]
+fn a_sublinks_own_column_is_not_the_grouped_expression() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql("CREATE TABLE gt (a int NOT NULL); CREATE TABLE s (a int NOT NULL);")
+        .unwrap();
+    for sql in [
+        "SELECT ARRAY(SELECT a + 1 FROM s) AS x FROM gt GROUP BY ROLLUP (a + 1)",
+        "SELECT ARRAY(SELECT s.a + 1 FROM s) AS x FROM gt GROUP BY ROLLUP (a + 1)",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_eq!(
+            s.columns[0].pg_type,
+            array_with_elems(int4(), false),
+            "{sql}"
+        );
+    }
+    let s = db
+        .analyze(
+            "SELECT ARRAY(SELECT (SELECT gt.a + 1) FROM s) AS x FROM gt GROUP BY ROLLUP (a + 1)",
+        )
+        .unwrap();
+    assert_eq!(s.columns[0].pg_type, array_with_elems(int4(), true));
+    // Without a grouping set omitting it, the grouped value is never NULL.
+    let s = db
+        .analyze("SELECT ARRAY(SELECT gt.a + 1) AS x FROM gt GROUP BY a + 1")
+        .unwrap();
+    assert_eq!(s.columns[0].pg_type, array_with_elems(int4(), false));
+}

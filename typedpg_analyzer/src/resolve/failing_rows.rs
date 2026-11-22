@@ -2,7 +2,10 @@
 //! domain, `CAST(NULL AS d)` of one with `CHECK (VALUE IS NOT NULL)`) that
 //! every execution of a statement evaluates: the coercion fails when
 //! evaluated (`ExecEvalConstraintNotNull` / `ExecEvalConstraintCheck`),
-//! naming the domain cast to, so the statement is rejected.
+//! naming the domain cast to, so the statement is rejected. So is a call to
+//! a built-in window function with a null treatment it doesn't take
+//! (`row_number() IGNORE NULLS OVER ()`), which fails for each row the
+//! WindowAgg computes it for.
 //!
 //! A query is followed only where it surely evaluates a row: a select list
 //! over no FROM item (one row, one group if grouped) or over a single
@@ -91,6 +94,7 @@ fn check_rows(
             .or(r.projection)
             .or(r.fail_after.map(|(_, f)| f))
     }) {
+        Some(f) if f.unsupported => Err(AnalyzeError::FeatureNotSupported(f.message)),
         Some(f) => Err(AnalyzeError::Invalid(f.message)),
         None => Ok(()),
     }
@@ -131,6 +135,9 @@ struct Failure {
     /// parallel worker: an Append over it is no Parallel Append, and runs
     /// its children in order.
     domain: bool,
+    /// A feature_not_supported error (SQLSTATE 0A000), not one of the
+    /// codes [`AnalyzeError::Invalid`] stands for.
+    unsupported: bool,
 }
 
 /// The errors reading some of a query's rows surely raises.
@@ -1610,6 +1617,11 @@ impl Level<'_> {
                     return Some(f);
                 }
             }
+            ast::Node::FuncCall(fc) => {
+                if let Some(f) = self.null_treatment_error(fc) {
+                    return Some(f);
+                }
+            }
             _ => {}
         }
         if !self.standalone {
@@ -1631,6 +1643,7 @@ impl Level<'_> {
         infer().err().map(|e| Failure {
             message: e.to_string(),
             domain: false,
+            unsupported: false,
         })
     }
 
@@ -1860,6 +1873,50 @@ impl Level<'_> {
         Some(Failure {
             message,
             domain: true,
+            unsupported: false,
+        })
+    }
+
+    /// A built-in window function that takes no null treatment called with
+    /// one (`row_number() IGNORE NULLS OVER ()`): the WindowAgg calls it for
+    /// each row, and WinCheckAndInitializeNullTreatment rejects every call
+    /// to `window_row_number` … `window_ntile` (PG 19.0 `pg_proc` OIDs
+    /// 3100–3105) made so. No row, no call: over an empty input the query
+    /// succeeds.
+    fn null_treatment_error(&self, fc: &ast::FuncCall) -> Option<Failure> {
+        if fc.over.is_none() || fc.ignore_nulls == 0 {
+            return None;
+        }
+        let parts = expr::extract_string_fields(&fc.funcname);
+        let (schema, name) = match parts.as_slice() {
+            [n] => (None, n.as_str()),
+            [s, n] => (Some(s.as_str()), n.as_str()),
+            _ => return None,
+        };
+        let arg_types: Vec<PgTypeOid> = fc
+            .args
+            .iter()
+            .map(|a| self.type_of(a.as_ref()))
+            .collect::<Option<_>>()?;
+        let notation = crate::functions::CallNotation::of(fc).ok()?;
+        let f = crate::functions::resolve_function(
+            self.snapshot,
+            schema,
+            name,
+            &arg_types,
+            &notation,
+            false,
+            None,
+        )
+        .ok()?;
+        if !(3100..=3105).contains(&f.oid.get()) {
+            return None;
+        }
+        let p = self.snapshot.pg_proc.get(&f.oid)?;
+        Some(Failure {
+            message: format!("function {} does not allow RESPECT/IGNORE NULLS", p.proname),
+            domain: false,
+            unsupported: true,
         })
     }
 

@@ -417,18 +417,20 @@ pub struct PgCatalog {
     /// Tables with `FORCE ROW LEVEL SECURITY` (`relforcerowsecurity`): row
     /// security applies to the table's owner too (`check_enable_rls`).
     pub(crate) force_row_security: Shared<std::collections::HashSet<PgClassOid>>,
-    /// Tables whose triggers were all disabled (`DISABLE TRIGGER ALL`),
-    /// the internal ones enforcing foreign keys included: a foreign key
-    /// from or to one no longer promises anything.
-    pub(crate) ri_triggers_disabled: Shared<std::collections::HashSet<PgClassOid>>,
-    /// Tables whose triggers were all disabled at some point of the
-    /// migrations, even if enabled again since: rows written meanwhile
-    /// were never checked against their foreign keys.
+    /// Tables whose triggers were all disabled (`DISABLE TRIGGER ALL`), the
+    /// internal ones enforcing foreign keys included, at some point of the
+    /// migrations, even if enabled again since: rows written meanwhile were
+    /// never checked against their foreign keys, so a foreign key from or
+    /// to one no longer promises anything.
     pub(crate) ri_triggers_ever_disabled: Shared<std::collections::HashSet<PgClassOid>>,
     /// The migrations set `session_replication_role`, which turns off the
     /// triggers enforcing foreign keys (in `replica` mode) for whatever
     /// they wrote meanwhile.
     pub(crate) fk_checks_bypassed: bool,
+    /// A migration statement explicitly set `session_replication_role` to
+    /// `replica` (or to a value it doesn't state): rows it wrote meanwhile
+    /// skipped every foreign key's check (`ddl::fk_bypass`).
+    pub(crate) fk_replica_role_set: bool,
     /// Foreign keys (and clones) PG marked validated without checking the
     /// rows: `ALTER CONSTRAINT ... ENFORCED` together with a change of
     /// deferrability rewrites an enforced NOT VALID key's row as validated
@@ -965,9 +967,9 @@ impl PgCatalog {
             typed_tables: Shared::default(),
             row_security: Shared::default(),
             force_row_security: Shared::default(),
-            ri_triggers_disabled: Shared::default(),
             ri_triggers_ever_disabled: Shared::default(),
             fk_checks_bypassed: false,
+            fk_replica_role_set: false,
             fk_validity_unproven: Shared::default(),
             clustered_indexes: Shared::default(),
             statistics: Shared::default(),
@@ -2379,7 +2381,6 @@ impl PgCatalog {
         self.typed_tables.remove(&oid);
         self.row_security.remove(&oid);
         self.force_row_security.remove(&oid);
-        self.ri_triggers_disabled.remove(&oid);
         self.ri_triggers_ever_disabled.remove(&oid);
         self.clustered_indexes.remove(&oid);
         self.clustered_indexes.retain(|_, index| *index != oid);

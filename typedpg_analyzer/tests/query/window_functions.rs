@@ -555,3 +555,76 @@ fn over_on_aggregate_still_allowed() {
         .unwrap();
     assert!(!col(&s, "w").nullable || col(&s, "w").nullable); // shape-only smoke
 }
+
+#[test]
+fn null_treatment_on_a_window_function_that_does_not_allow_it_rejected() {
+    // PostgreSQL 19 WinCheckAndInitializeNullTreatment: row_number, rank,
+    // dense_rank, percent_rank, cume_dist and ntile take no RESPECT /
+    // IGNORE NULLS; evaluating one with it fails. Without a FROM the
+    // window sees one row, so every execution fails.
+    let db = setup();
+    for (sql, func) in [
+        (
+            "SELECT row_number() IGNORE NULLS OVER () AS x",
+            "row_number",
+        ),
+        ("SELECT rank() RESPECT NULLS OVER () AS x", "rank"),
+        (
+            "SELECT dense_rank() IGNORE NULLS OVER () AS x",
+            "dense_rank",
+        ),
+        (
+            "SELECT percent_rank() IGNORE NULLS OVER () AS x",
+            "percent_rank",
+        ),
+        ("SELECT cume_dist() RESPECT NULLS OVER () AS x", "cume_dist"),
+        ("SELECT ntile(2) IGNORE NULLS OVER () AS x", "ntile"),
+    ] {
+        let expected = format!("function {func} does not allow RESPECT/IGNORE NULLS");
+        match db.analyze(sql) {
+            Err(err) => assert!(
+                err.to_string().starts_with(&expected),
+                "{sql}\n  got: {err}"
+            ),
+            Ok(_) => panic!("{sql}\n  expected: {expected}\n  got: Ok"),
+        }
+    }
+}
+
+#[test]
+fn null_treatment_on_a_window_function_that_does_not_allow_it_fails_only_when_called() {
+    // WinCheckAndInitializeNullTreatment runs when the WindowAgg calls the
+    // function, for a row: over no row (an empty table), or where the
+    // column is never computed (dropped as unused), PG 19.0 succeeds; so
+    // do EXPLAIN and a view's definition, which run nothing. The functions
+    // taking a null treatment accept one.
+    let mut db = setup();
+    db.apply_sql("CREATE VIEW vrn AS SELECT row_number() IGNORE NULLS OVER () AS x;")
+        .unwrap();
+    for sql in [
+        "SELECT row_number() IGNORE NULLS OVER () AS x FROM posts",
+        "SELECT 1 AS y FROM (SELECT row_number() IGNORE NULLS OVER () AS x) s",
+        "EXPLAIN SELECT row_number() IGNORE NULLS OVER () AS x",
+        "SELECT lag(1) IGNORE NULLS OVER () AS x",
+        "SELECT first_value(1) RESPECT NULLS OVER () AS x",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Read from a subquery or view yielding a row, it is computed.
+    for (sql, func) in [
+        (
+            "SELECT x FROM (SELECT rank() IGNORE NULLS OVER () AS x) s",
+            "rank",
+        ),
+        ("SELECT x FROM vrn", "row_number"),
+    ] {
+        let expected = format!("function {func} does not allow RESPECT/IGNORE NULLS");
+        match db.analyze(sql) {
+            Err(err) => assert!(
+                err.to_string().starts_with(&expected),
+                "{sql}\n  got: {err}"
+            ),
+            Ok(_) => panic!("{sql}\n  expected: {expected}\n  got: Ok"),
+        }
+    }
+}

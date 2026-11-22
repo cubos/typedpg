@@ -1718,7 +1718,6 @@ fn apply_alter_subtype(
             };
             for rel in targets {
                 if subtype == AlterTableType::AtDisableTrigAll {
-                    interp.ri_triggers_disabled.insert(rel);
                     interp.ri_triggers_ever_disabled.insert(rel);
                     crate::ddl::triggers::set_all_triggers_state(
                         interp,
@@ -1726,7 +1725,6 @@ fn apply_alter_subtype(
                         crate::ddl::triggers::TriggerState::Disabled,
                     );
                 } else {
-                    interp.ri_triggers_disabled.remove(&rel);
                     crate::ddl::triggers::set_all_triggers_state(
                         interp,
                         rel,

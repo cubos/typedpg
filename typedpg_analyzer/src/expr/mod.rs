@@ -1338,7 +1338,117 @@ fn infer_expr_here(
     {
         t.nullable = true;
     }
+    // So is one an enclosing level groups by, read inside a sublink:
+    // PostgreSQL 19 matches the grouping expressions at each sublevel.
+    if !t.nullable && outer_grouping_omits(node, ctx) {
+        t.nullable = true;
+    }
     Ok(t)
+}
+
+/// The grouped expressions some grouping set of an enclosing query level
+/// leaves out ([`crate::grouping::expr_key`]s), with the aliases of that
+/// level's own FROM items — one entry per enclosing level whose grouping
+/// sets omit an expression, outermost first.
+struct OuterGrouping {
+    aliases: Vec<String>,
+    keys: std::collections::HashSet<String>,
+}
+
+thread_local! {
+    static OUTER_GROUPING: std::cell::RefCell<Vec<OuterGrouping>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` (a sublink's analysis) with the grouped expressions the grouping
+/// sets of the enclosing level — of `scope`, with `null_ctx` — omit in
+/// reach: inside the sublink, such an expression over that level's columns
+/// is the grouped value, NULL in the rows of the sets omitting it
+/// (check_ungrouped_columns_walker compares the grouping clauses at each
+/// sublevel, and the expression read is the grouped one).
+pub(crate) fn with_outer_grouping<R>(
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+    f: impl FnOnce() -> R,
+) -> R {
+    /// Pops the entry pushed below when dropped, also on unwinding.
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            OUTER_GROUPING.with(|g| g.borrow_mut().pop());
+        }
+    }
+    if !null_ctx.grouping_omits_exprs() {
+        return f();
+    }
+    let keys = null_ctx
+        .grouping_omitted
+        .iter()
+        .filter(|(a, _)| a == crate::grouping::EXPR_KEY)
+        .map(|(_, k)| k.clone())
+        .collect();
+    let aliases = scope.sources.iter().map(|s| s.alias.clone()).collect();
+    OUTER_GROUPING.with(|g| g.borrow_mut().push(OuterGrouping { aliases, keys }));
+    let _pop = Pop;
+    f()
+}
+
+/// Whether `node` is an expression an enclosing level groups by and some of
+/// its grouping sets omit (see [`with_outer_grouping`]): its key is one of
+/// that level's, and each column it reads resolves — past this level's own
+/// FROM items — to one of that level's.
+fn outer_grouping_omits(node: Option<&ast::Node>, ctx: Ctx<'_>) -> bool {
+    if OUTER_GROUPING.with(|g| g.borrow().is_empty()) {
+        return false;
+    }
+    let Some(n) = node else {
+        return false;
+    };
+    if matches!(
+        n,
+        ast::Node::ColumnRef(_) | ast::Node::AConst(_) | ast::Node::ParamRef(_)
+    ) {
+        return false;
+    }
+    // The enclosing level each column reference resolves to, by the alias
+    // of the FROM item it names there.
+    let mut read = Vec::new();
+    for (x, _) in n.nodes() {
+        let typedpg_pg_query::NodeRef::ColumnRef(cr) = x else {
+            continue;
+        };
+        let parts = extract_string_fields(&cr.fields);
+        let (table, column) = match parts.as_slice() {
+            [c] if parts.len() == cr.fields.len() => (None, c.as_str()),
+            [t, c] if parts.len() == cr.fields.len() => (Some(t.as_str()), c.as_str()),
+            _ => return false,
+        };
+        if !ctx.scope.level_column_sources(table, column).is_empty() {
+            return false;
+        }
+        let holds = |s: &crate::scope::TableSource| match table {
+            Some(t) => s.answers_to(t) && s.columns.iter().any(|c| c.name == column),
+            None => s.visible_columns().any(|c| c.name == column),
+        };
+        let Some(source) = ctx
+            .scope
+            .outer_tiers
+            .iter()
+            .find_map(|tier| tier.iter().find(|s| holds(s)))
+        else {
+            return false;
+        };
+        read.push(source.alias.clone());
+    }
+    if read.is_empty() {
+        return false;
+    }
+    let key = crate::grouping::expr_key(node, ctx.scope, ctx.snapshot);
+    OUTER_GROUPING.with(|g| {
+        g.borrow().iter().any(|level| {
+            level.keys.contains(&key) && read.iter().all(|a| level.aliases.contains(a))
+        })
+    })
 }
 
 fn infer_expr_unlocated(

@@ -583,13 +583,19 @@ pub(crate) fn validate_not_null(
 }
 
 /// `relid` and all its descendants (find_all_inheritors).
-/// Whether the triggers enforcing foreign keys may be off for some row a
-/// scan of `relid` returns, or for a row it holds: `DISABLE TRIGGER ALL`
-/// on the relation, on one of its descendants (a partition holds its own
-/// triggers) or on an ancestor (`ONLY` on a partitioned table, or
-/// partitions attached since).
+/// Whether the triggers enforcing foreign keys may have been off for some
+/// row a scan of `relid` returns, or for a row it holds: `DISABLE TRIGGER
+/// ALL` on the relation, on one of its descendants (a partition holds its
+/// own triggers) or on an ancestor (`ONLY` on a partitioned table, or
+/// partitions attached since), at any point of the migrations — `ENABLE
+/// TRIGGER ALL` checks none of the rows written meanwhile — or a statement
+/// that set `session_replication_role` to `replica`, turning them off for
+/// every table ([`PgCatalog::fk_replica_role_set`]).
 pub(crate) fn fk_triggers_disabled(interp: &PgCatalog, relid: PgClassOid) -> bool {
-    if interp.ri_triggers_disabled.is_empty() {
+    if interp.fk_replica_role_set {
+        return true;
+    }
+    if interp.ri_triggers_ever_disabled.is_empty() {
         return false;
     }
     let mut ancestors = vec![relid];
@@ -606,7 +612,7 @@ pub(crate) fn fk_triggers_disabled(interp: &PgCatalog, relid: PgClassOid) -> boo
     ancestors
         .into_iter()
         .chain(all_inheritors(interp, relid))
-        .any(|r| interp.ri_triggers_disabled.contains(&r))
+        .any(|r| interp.ri_triggers_ever_disabled.contains(&r))
 }
 
 pub(crate) fn all_inheritors(interp: &PgCatalog, relid: PgClassOid) -> Vec<PgClassOid> {
