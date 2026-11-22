@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 description = "Static SQL type and nullability analyzer for typedpg"
 keywords = ["postgres", "postgresql", "sql", "static-analysis", "types"]

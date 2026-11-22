@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 description = "Shared types between typedpg runtime and proc macro"
 keywords = ["postgres", "postgresql", "sql", "typedpg"]

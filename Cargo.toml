@@ -38,5 +38,4 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/cubos/typedpg"
-homepage = "https://github.com/cubos/typedpg"
 authors = ["Cubos"]

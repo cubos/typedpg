@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version = "1.98"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 description = "TypeScript code generator for typedpg: types SQL queries in .ts sources"
 publish = false

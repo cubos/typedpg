@@ -8,7 +8,6 @@ rust-version.workspace = true
 # BSD-3-Clause.
 license = "MIT AND PostgreSQL AND BSD-3-Clause"
 repository.workspace = true
-homepage.workspace = true
 authors.workspace = true
 description = "PostgreSQL parser bindings for typedpg, built on PostgreSQL's own sources"
 keywords = ["postgres", "postgresql", "sql", "parser"]
