@@ -1683,6 +1683,22 @@ impl PgCatalog {
         }
     }
 
+    /// This catalog as a session of `role` sees it: unqualified names
+    /// resolve along the search path the role's sessions start with (see
+    /// [`Self::analyze_as`]). Borrowed when that path is this catalog's own.
+    /// Privileges are not checked; for a tool that reads the catalog the
+    /// way [`Self::query_view_as`] resolved a query, after that succeeded.
+    pub fn with_role_search_path(&self, role: &str) -> std::borrow::Cow<'_, PgCatalog> {
+        let path = self.role_search_path(role);
+        if path == self.search_path {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            let mut catalog = self.clone();
+            catalog.search_path = path;
+            std::borrow::Cow::Owned(catalog)
+        }
+    }
+
     /// Analyze `sql` for a tool that reads its parse tree, without applying
     /// the query simplifications.
     ///

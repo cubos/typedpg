@@ -751,7 +751,9 @@ pub(crate) struct Ctx<'a> {
     /// The analyzed view, for the facts the analyzer proved (the sublink
     /// nullability the `not_in_nullable` rule reads).
     pub view: &'a typedpg_analyzer::QueryView,
-    /// The catalog the query was analyzed against.
+    /// The catalog the query was analyzed against, with the search path it
+    /// was analyzed along (the role's, for a query run as one): a rule's
+    /// own lookup of an unqualified name finds what the query's did.
     pub catalog: &'a PgCatalog,
 }
 
@@ -809,7 +811,9 @@ pub fn lint_query_called(
 /// role must succeed — a role may lack a privilege, or not exist — and
 /// resolve the query to the same types, and the rules read the analysis as
 /// the first role, whose search path decides what its unqualified names
-/// are. No roles: the plain analysis (the schema owner's).
+/// are — and what the rules' own catalog lookups find. Each fix is checked
+/// to keep the query's shape as every role. No roles: the plain analysis
+/// (the schema owner's).
 pub fn lint_query_called_as(
     catalog: &PgCatalog,
     sql: &str,
@@ -817,8 +821,14 @@ pub fn lint_query_called_as(
     roles: &[String],
     options: &LintOptions,
 ) -> Result<Vec<CallFinding>, LocatedError> {
-    let view = match roles {
-        [] => catalog.query_view(sql)?,
+    // The catalog as the analysis the rules read saw it: the first role's
+    // search path decides what the rules' own lookups of unqualified names
+    // find, as it decided the query's.
+    let (view, scoped) = match roles {
+        [] => (
+            catalog.query_view(sql)?,
+            std::borrow::Cow::Borrowed(catalog),
+        ),
         [first, rest @ ..] => {
             let analysis = catalog.analyze_as_located(sql, first)?;
             for role in rest {
@@ -832,7 +842,10 @@ pub fn lint_query_called_as(
                     });
                 }
             }
-            catalog.query_view_as(sql, first)?
+            // `query_view_as`, without checking the privileges again (the
+            // analysis as `first` above did) or cloning the catalog twice.
+            let scoped = catalog.with_role_search_path(first);
+            (scoped.query_view(sql)?, scoped)
         }
     };
     let tokens: Vec<Tok> = typedpg_pg_query::scan(&view.sql)
@@ -857,7 +870,7 @@ pub fn lint_query_called_as(
         tree: &view.tree,
         tokens: &tokens,
         view: &view,
-        catalog,
+        catalog: &scoped,
     };
     let mut placed: Vec<CallFinding> = findings
         .drain(..)
@@ -928,7 +941,9 @@ pub fn lint_query_called_as(
         } else {
             ExpectedColumns::Same
         };
-        if let Err(change) = fix_keeps_shape(catalog, sql, &view.analyzed, &finding.fix, columns) {
+        if let Err(change) =
+            fix_keeps_shape(catalog, roles, sql, &view.analyzed, &finding.fix, columns)
+        {
             finding.fix.clear();
             let message = format!(
                 "typedpg bug: the {} fix would have changed {change}, so it was not offered",
@@ -987,17 +1002,41 @@ pub fn lint_query_called_as(
 /// meaning: no rule should ever propose a fix that fails it, so a failure is
 /// a typedpg bug. It can't see a change in the rows themselves; that stays
 /// each rule's proof to make.
+///
+/// With `roles`, the edited query is analyzed as each of them, as the
+/// original was: every role must still be allowed to run it, and its names
+/// resolve along their search paths.
 fn fix_keeps_shape(
     catalog: &PgCatalog,
+    roles: &[String],
     sql: &str,
     original: &typedpg_analyzer::AnalyzedQuery,
     fix: &[SqlEdit],
     columns: ExpectedColumns,
 ) -> Result<(), &'static str> {
     let edited = apply_edits(sql, fix).ok_or("the query text (overlapping edits)")?;
-    let analyzed = catalog
-        .analyze(&edited)
-        .map_err(|_| "the query into one that doesn't analyze")?;
+    let analyses = if roles.is_empty() {
+        vec![catalog.analyze(&edited)]
+    } else {
+        roles
+            .iter()
+            .map(|role| catalog.analyze_as(&edited, role))
+            .collect()
+    };
+    for analyzed in analyses {
+        let analyzed = analyzed.map_err(|_| "the query into one that doesn't analyze")?;
+        same_shape(original, &analyzed, columns)?;
+    }
+    Ok(())
+}
+
+/// Whether `analyzed`, a fixed query's analysis, has the shape of
+/// `original` (see [`fix_keeps_shape`]).
+fn same_shape(
+    original: &typedpg_analyzer::AnalyzedQuery,
+    analyzed: &typedpg_analyzer::AnalyzedQuery,
+    columns: ExpectedColumns,
+) -> Result<(), &'static str> {
     let same_columns = match columns {
         ExpectedColumns::None => analyzed.columns.is_empty(),
         ExpectedColumns::Same => {
@@ -1258,7 +1297,7 @@ mod tests {
                 }
             })
             .collect();
-        fix_keeps_shape(catalog, sql, &original, &fix, ExpectedColumns::Same).is_ok()
+        fix_keeps_shape(catalog, &[], sql, &original, &fix, ExpectedColumns::Same).is_ok()
     }
 
     #[test]
@@ -1320,6 +1359,7 @@ mod tests {
         assert!(
             fix_keeps_shape(
                 &db,
+                &[],
                 "SELECT id FROM users",
                 &original,
                 &overlapping,
@@ -1340,17 +1380,33 @@ mod tests {
             text: String::new(),
         }];
         assert!(
-            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::None).is_ok()
+            fix_keeps_shape(
+                &db,
+                &[],
+                sql,
+                &original,
+                &drop_returning,
+                ExpectedColumns::None
+            )
+            .is_ok()
         );
         assert!(
-            fix_keeps_shape(&db, sql, &original, &drop_returning, ExpectedColumns::Same).is_err()
+            fix_keeps_shape(
+                &db,
+                &[],
+                sql,
+                &original,
+                &drop_returning,
+                ExpectedColumns::Same
+            )
+            .is_err()
         );
         // Keeping a column is not what such a fix may do.
         let keep = [SqlEdit {
             range: start..start,
             text: String::new(),
         }];
-        assert!(fix_keeps_shape(&db, sql, &original, &keep, ExpectedColumns::None).is_err());
+        assert!(fix_keeps_shape(&db, &[], sql, &original, &keep, ExpectedColumns::None).is_err());
     }
 
     fn options(level: Option<Severity>, fail_on: Option<Severity>) -> LintOptions {
@@ -3072,5 +3128,83 @@ mod tests {
             error.starts_with("query resolves differently for roles"),
             "{error}"
         );
+    }
+
+    /// A catalog where role `app`'s search path finds `app_data.t` before
+    /// `public.t`, a table of the same name with other columns.
+    fn shadowing_role_catalog() -> PgCatalog {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE ROLE app;
+                 CREATE SCHEMA app_data;
+                 CREATE TABLE t (id integer PRIMARY KEY, name text NOT NULL);
+                 CREATE TABLE app_data.t (x bigint PRIMARY KEY, y text);
+                 GRANT USAGE ON SCHEMA app_data TO app;
+                 GRANT SELECT, INSERT ON t, app_data.t TO app;
+                 ALTER ROLE app SET search_path = app_data, public;",
+            )
+            .unwrap();
+        catalog
+    }
+
+    #[test]
+    fn a_fix_is_verified_as_the_role() {
+        let catalog = shadowing_role_catalog();
+        let options = LintOptions::default();
+        let sql = "SELECT x::bigint FROM t";
+        // As `app`, `t` is `app_data.t`, whose `x` is already bigint: the
+        // cast is redundant, and dropping it keeps the column's type — as
+        // `app` analyzes the fixed query. The plain analysis of
+        // `SELECT x FROM t` (`public.t`, without `x`) fails, so a check
+        // made without the role withholds the fix (and panics in a test).
+        let findings =
+            lint_query_called_as(&catalog, sql, &[], &["app".to_owned()], &options).unwrap();
+        let rules: Vec<Rule> = findings.iter().map(|f| f.finding.rule).collect();
+        assert_eq!(rules, vec![Rule::RedundantCast]);
+        let fixed = apply_edits(sql, &findings[0].finding.fix).unwrap();
+        assert_eq!(fixed, "SELECT x FROM t");
+        // `public.t` has no `x`: the plain analysis rejects the query.
+        assert!(lint_query_called_as(&catalog, sql, &[], &[], &options).is_err());
+        // The check runs as the role: a fix only the schema owner's search
+        // path keeps the shape of is refused.
+        let original = catalog.analyze_as(sql, "app").unwrap();
+        let fix = findings[0].finding.fix.clone();
+        assert!(
+            fix_keeps_shape(
+                &catalog,
+                &["app".to_owned()],
+                sql,
+                &original,
+                &fix,
+                ExpectedColumns::Same
+            )
+            .is_ok()
+        );
+        assert!(
+            fix_keeps_shape(&catalog, &[], sql, &original, &fix, ExpectedColumns::Same).is_err()
+        );
+    }
+
+    #[test]
+    fn a_rules_catalog_lookups_see_the_roles_table() {
+        let catalog = shadowing_role_catalog();
+        let options = LintOptions::default();
+        // `insert_without_columns` looks up the table's columns itself to
+        // build its fix: as `app`, they are `app_data.t`'s.
+        let sql = "INSERT INTO t VALUES (1, 'a')";
+        let fix_of = |roles: &[String]| -> String {
+            let findings = lint_query_called_as(&catalog, sql, &[], roles, &options).unwrap();
+            let finding = findings
+                .iter()
+                .find(|f| f.finding.rule == Rule::InsertWithoutColumns)
+                .expect("an insert_without_columns finding");
+            apply_edits(sql, &finding.finding.fix).unwrap()
+        };
+        assert_eq!(
+            fix_of(&["app".to_owned()]),
+            "INSERT INTO t (x, y) VALUES (1, 'a')"
+        );
+        assert_eq!(fix_of(&[]), "INSERT INTO t (id, name) VALUES (1, 'a')");
     }
 }
