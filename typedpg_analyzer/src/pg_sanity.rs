@@ -842,13 +842,49 @@ impl PgSanityServer {
                     Err(exec_err) => {
                         let our_err = our_result.as_ref().unwrap_err();
                         let our_msg = format!("{our_err}");
-                        check_error_prefix(
+                        let divergence = check_error_prefix(
                             &our_msg,
                             our_err.sqlstate(),
                             &exec_err,
                             analysis_sql,
                             "analyze (execute fallback)",
-                        )
+                        );
+                        // A NULL parameter can fail first on its own (a
+                        // NOT NULL column PG checks before the one the
+                        // analyzer's literal fills): the analyzer's error
+                        // must then be the one the execution raises with
+                        // non-NULL parameters.
+                        if divergence.is_none() || n_params == 0 {
+                            return divergence;
+                        }
+                        let Some(samples) =
+                            self.soundness.sample_params(&mut self.query_client, stmt)
+                        else {
+                            return divergence;
+                        };
+                        let sample_refs: Vec<&(dyn ToSql + Sync)> =
+                            samples.iter().map(|p| p as _).collect();
+                        let retry = match self.query_client.transaction() {
+                            Ok(mut tx) => tx.execute(stmt, &sample_refs),
+                            Err(e) => panic!(
+                                "pg_sanity: BEGIN failed in execute-fallback for {analysis_sql}: {e}"
+                            ),
+                        };
+                        match retry {
+                            Err(retry_err)
+                                if check_error_prefix(
+                                    &our_msg,
+                                    our_err.sqlstate(),
+                                    &retry_err,
+                                    analysis_sql,
+                                    "analyze (execute fallback)",
+                                )
+                                .is_none() =>
+                            {
+                                None
+                            }
+                            _ => divergence,
+                        }
                     }
                 }
             }

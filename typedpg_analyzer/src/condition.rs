@@ -604,13 +604,7 @@ fn base_column(
     if parts.len() != c.fields.len() {
         return None;
     }
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return None,
-    };
-    let col = ctx.scope.resolve_column(table, column, None).ok()?;
+    let col = ctx.scope.resolve_column_names(&parts, None)?.ok()?;
     let (relid, name) = match ctx.scope.column_source(col).and_then(|s| s.relid) {
         Some(relid) => (relid, col.name.clone()),
         None => {

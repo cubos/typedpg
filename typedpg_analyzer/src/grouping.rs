@@ -519,13 +519,8 @@ fn resolve_group_column(
     if parts.len() != cr.fields.len() {
         return None;
     }
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return None,
-    };
     scope
-        .resolve_column(table, column, None)
+        .resolve_column_names(&parts, None)?
         .ok()
         .map(|c| (c.table_alias.clone(), c.name.clone()))
 }
@@ -586,14 +581,9 @@ fn is_noop_cast(
             if parts.len() != cr.fields.len() {
                 return false;
             }
-            let (table, column) = match parts.as_slice() {
-                [col] => (None, col.as_str()),
-                [tbl, col] | [_, tbl, col] => (Some(tbl.as_str()), col.as_str()),
+            match scope.resolve_column_names(&parts, None) {
+                Some(Ok(col)) => (col.type_oid, col.typmod),
                 _ => return false,
-            };
-            match scope.resolve_column(table, column, None) {
-                Ok(col) => (col.type_oid, col.typmod),
-                Err(_) => return false,
             }
         }
         Some(n) => {
@@ -678,6 +668,10 @@ struct NsSource {
     visible: HashSet<String>,
     /// The columns a qualified reference reaches.
     all: HashSet<String>,
+    /// The relation an entry scans under its own name: what a
+    /// schema-qualified reference reaches (see
+    /// [`crate::scope::Scope::schema_qualified_source`]).
+    relation: Option<crate::qualified_name::QualifiedName>,
 }
 
 impl Namespace {
@@ -699,6 +693,12 @@ impl Namespace {
                         .chain(&s.system_columns)
                         .map(|c| c.name.clone())
                         .collect(),
+                    relation: (matches!(s.kind, crate::scope::SourceKind::Relation)
+                        && !s.aliased
+                        && !s.table_only
+                        && s.hidden.is_none())
+                    .then(|| s.source_qn.clone())
+                    .flatten(),
                 })
                 .collect(),
         }
@@ -706,6 +706,18 @@ impl Namespace {
 
     fn has_alias(&self, alias: &str) -> bool {
         self.sources.iter().any(|s| s.alias == alias)
+    }
+
+    /// The entry scanning relation `schema.table` under its own name.
+    fn relation_alias(&self, schema: &str, table: &str) -> Option<&str> {
+        self.sources
+            .iter()
+            .find(|s| {
+                s.relation
+                    .as_ref()
+                    .is_some_and(|qn| qn.schema == schema && qn.name == table)
+            })
+            .map(|s| s.alias.as_str())
     }
 
     /// Whether entry `alias` has a column `col` a qualified reference
@@ -1082,6 +1094,33 @@ impl Chain {
                         }
                         _ => None,
                     })
+            }
+            // `schema.table.column`: the entry scanning that relation under
+            // its own name (refnameNamespaceItem with a schema).
+            [Some(schema), Some(table), last] => {
+                for (level, ns) in self.levels.iter().enumerate() {
+                    match ns {
+                        None if self.pending_owns(level, |ns| {
+                            ns.relation_alias(schema, table).is_some()
+                        }) =>
+                        {
+                            return Some(RefTarget {
+                                level,
+                                target: None,
+                            });
+                        }
+                        Some(ns) => {
+                            if let Some(alias) = ns.relation_alias(schema, table) {
+                                return Some(RefTarget {
+                                    level,
+                                    target: Some((alias.to_owned(), last.map(str::to_owned))),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                None
             }
             [.., Some(table), last] => {
                 for (level, ns) in self.levels.iter().enumerate() {
@@ -2040,6 +2079,36 @@ pub(crate) fn aggregate_levels_up(fc: &ast::FuncCall, scope: &Scope) -> usize {
 /// `aggregated`, written at the current level, belongs.
 pub(crate) fn levels_up_of(aggregated: &[Option<&ast::Node>], scope: &Scope) -> usize {
     call_level(aggregated, &mut current_chain(scope))
+}
+
+/// PG's check_agglevels_and_constraints as transformAggregateCall runs it,
+/// once the call `fc` is resolved to an aggregate (its arguments and FILTER
+/// transformed, before the expression around it is): an error when the
+/// clause the level it belongs to is analyzing forbids aggregates. So in
+/// `WHERE upper(min(id))` the misplaced `min` is reported, not `upper`.
+pub(crate) fn check_aggregate_placement(
+    fc: &ast::FuncCall,
+    scope: &Scope,
+) -> Result<(), AnalyzeError> {
+    let levels_up = aggregate_levels_up(fc, scope);
+    let clause = FRAMES.with(|f| {
+        let f = f.borrow();
+        let n = f.len();
+        (levels_up < n)
+            .then(|| f[n - 1 - levels_up].clause)
+            .flatten()
+    });
+    // In its own level's FROM clause, outside a JOIN condition, the call is
+    // an argument of a function, TABLESAMPLE or table function there
+    // (EXPR_KIND_FROM_FUNCTION).
+    let clause = match clause {
+        Some("FROM clause of their own query level") if levels_up == 0 => Some("functions in FROM"),
+        c => c,
+    };
+    match clause {
+        Some(c) => Err(crate::clause::aggregate_not_allowed(c, Some(fc.location))),
+        None => Ok(()),
+    }
 }
 
 /// Hand a call found at the current level that belongs `levels_up` levels

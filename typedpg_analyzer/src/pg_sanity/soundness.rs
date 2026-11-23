@@ -658,6 +658,25 @@ impl Soundness {
             .unwrap_or(oid)
     }
 
+    /// A non-NULL sample of each parameter's type, `None` when one has no
+    /// sample (or its type is unknown).
+    pub(super) fn sample_params(
+        &mut self,
+        client: &mut Client,
+        stmt: &Statement,
+    ) -> Option<Vec<Param>> {
+        self.install(client);
+        stmt.params()
+            .iter()
+            .map(|ty| {
+                (ty.oid() != 0)
+                    .then(|| self.param_text(client, ty.oid(), 1))
+                    .flatten()
+                    .map(|text| Param(Some(text)))
+            })
+            .collect()
+    }
+
     fn param_text(&mut self, client: &mut Client, oid: u32, variant: i32) -> Option<String> {
         let key = (self.schema_gen, oid, variant);
         if let Some(v) = self.param_texts.get(&key) {

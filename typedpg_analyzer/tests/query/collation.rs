@@ -95,6 +95,51 @@ fn collate_on_int_column_is_rejected() {
     );
 }
 
+/// transformCollateClause transforms the argument and checks its type is
+/// collatable before it looks the collation up.
+#[test]
+fn collate_checks_its_argument_before_the_collation_name() {
+    let db = setup();
+    assert_err_prefix!(
+        db.analyze("SELECT id COLLATE \"nope\" FROM users"),
+        AnalyzeError::Invalid(_),
+        "collations are not supported by type bigint"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT nosuch COLLATE \"nope\" FROM users"),
+        AnalyzeError::UndefinedColumn(_),
+        "column \"nosuch\" does not exist"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT id COLLATE nosuch.\"C\" FROM users"),
+        AnalyzeError::Invalid(_),
+        "collations are not supported by type bigint"
+    );
+    assert_err_prefix!(
+        db.analyze("SELECT name COLLATE \"nope\" FROM users"),
+        AnalyzeError::UndefinedObject(_),
+        "collation \"nope\" for encoding \"UTF8\" does not exist"
+    );
+    // In a clause wanting another type, the argument is checked before the
+    // clause coerces the result.
+    for sql in [
+        "SELECT 1 FROM users WHERE (id COLLATE \"C\")",
+        "SELECT CASE WHEN (id COLLATE \"POSIX\") THEN 1 END FROM users",
+        "SELECT 1 FROM users LIMIT (id COLLATE \"C\")",
+    ] {
+        assert_err_prefix!(
+            db.analyze(sql),
+            AnalyzeError::Invalid(_),
+            "collations are not supported by type bigint"
+        );
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT 1 FROM users WHERE (name COLLATE \"C\")"),
+        AnalyzeError::DatatypeMismatch(_),
+        "argument of WHERE must be type boolean, not type text"
+    );
+}
+
 #[test]
 fn collate_on_jsonb_column_is_rejected() {
     let mut db = PgCatalog::new().unwrap();

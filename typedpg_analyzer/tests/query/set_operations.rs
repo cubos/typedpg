@@ -23,6 +23,35 @@ fn union_with_incompatible_concrete_types_rejected() {
     );
 }
 
+/// select_common_type smashes domains to their base types before comparing:
+/// the mismatch names the base types, as for CASE or COALESCE.
+#[test]
+fn union_mismatch_names_a_domains_base_type() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN email AS TEXT;
+         CREATE DOMAIN posint AS INT;
+         CREATE TABLE t (id BIGINT PRIMARY KEY, addr email, n posint, ts TIMESTAMPTZ);",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT addr FROM t UNION SELECT ts FROM t",
+            "UNION types text and timestamp with time zone cannot be matched",
+        ),
+        (
+            "SELECT ts FROM t INTERSECT SELECT addr FROM t",
+            "INTERSECT types timestamp with time zone and text cannot be matched",
+        ),
+        (
+            "SELECT n FROM t EXCEPT SELECT ts FROM t",
+            "EXCEPT types integer and timestamp with time zone cannot be matched",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::DatatypeMismatch(_), msg);
+    }
+}
+
 #[test]
 fn union_with_incompatible_unknown_literal_rejected() {
     // `'text'` is an untyped string literal: PG keeps it `unknown` in a

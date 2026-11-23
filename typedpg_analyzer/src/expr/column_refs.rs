@@ -109,11 +109,12 @@ pub(crate) fn infer_column_ref(
         }
     };
 
-    match scope.resolve_column(
-        table,
-        column,
-        crate::error::SourceSpan::from_node_qname(col_ref.location),
-    ) {
+    let span = crate::error::SourceSpan::from_node_qname(col_ref.location);
+    let resolved = match parts.as_slice() {
+        [schema, tbl, col] => scope.resolve_schema_qualified_column(schema, tbl, col, span),
+        _ => scope.resolve_column(table, column, span),
+    };
+    match resolved {
         Ok(col) => {
             super::read_deferred([col], col_ref.location)?;
             record_column_bindings(scope, snapshot, col_ref.location, &parts, col);
@@ -333,10 +334,22 @@ fn infer_star_ref(
             AnalyzeError::Unsupported("unqualified * has no relation — use alias.* instead".into())
         })?;
 
-    scope.check_refname_unique(alias, None)?;
-    let source = scope.find_source(alias).ok_or_else(|| {
-        AnalyzeError::UndefinedTable(format!("missing FROM-clause entry for table \"{alias}\""))
-    })?;
+    let source = match extract_string_fields(&col_ref.fields).as_slice() {
+        // `schema.t.*` (and `db.schema.t.*`, its database checked above).
+        [.., schema, _] if col_ref.fields.len() >= 3 => scope.schema_qualified_source(
+            schema,
+            alias,
+            crate::error::SourceSpan::from_node_qname(col_ref.location),
+        )?,
+        _ => {
+            scope.check_refname_unique(alias, None)?;
+            scope.find_source(alias).ok_or_else(|| {
+                AnalyzeError::UndefinedTable(format!(
+                    "missing FROM-clause entry for table \"{alias}\""
+                ))
+            })?
+        }
+    };
     super::read_deferred(&source.columns, col_ref.location)?;
     note_binding(scope, col_ref.location, source);
     if let Some(relid) = source.relid

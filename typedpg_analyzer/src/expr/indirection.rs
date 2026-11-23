@@ -240,13 +240,9 @@ pub(crate) fn column_ref_is_column(cr: &ast::ColumnRef, scope: &Scope) -> bool {
     if parts.len() != cr.fields.len() {
         return false; // `t.*`
     }
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return false,
-    };
-    scope.resolve_column(table, column, None).is_ok()
+    scope
+        .resolve_column_names(&parts, None)
+        .is_some_and(|r| r.is_ok())
 }
 
 /// PG's `expandRecordVariable`: the row shape of a `record` column (of a

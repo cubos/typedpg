@@ -987,6 +987,30 @@ fn values_rows_need_a_common_column_type() {
     assert_cols(&s, vec![c("column1", numeric()), cn("column2", text())]);
 }
 
+/// transformValuesClause resolves and coerces one column after the other:
+/// an earlier column's failing cell is reported before a later column's
+/// type mismatch or failing cell, whatever the row.
+#[test]
+fn values_columns_fail_in_column_order() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT * FROM (VALUES ('x', -1), (0.0, now())) AS v(a0, a1)",
+            "invalid input syntax for type numeric: \"x\"",
+        ),
+        (
+            "SELECT * FROM (VALUES (1, 'a'), ('b', 2.5)) AS v(a0, a1)",
+            "invalid input syntax for type integer: \"b\"",
+        ),
+        (
+            "VALUES (1, 'a', true), (2, 2.5, 'c')",
+            "invalid input syntax for type numeric: \"a\"",
+        ),
+    ] {
+        assert_err_prefix(&db, sql, msg);
+    }
+}
+
 /// A bare name matching several output columns with different expressions
 /// is ambiguous (42702) — in GROUP BY only when no input column has it.
 #[test]

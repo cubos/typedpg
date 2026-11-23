@@ -1936,7 +1936,6 @@ fn infer_expr_unlocated(
             let arg = &c.arg;
             arg.as_ref()
                 .ok_or_else(|| AnalyzeError::Internal("CollateClause without arg".into()))?;
-            // PG rejects unknown collation names up front; mirror that.
             // `collname` is a list of identifier nodes (`["pg_catalog", "C"]`
             // when fully qualified, just `["C"]` otherwise).
             let parts: Vec<&str> = c
@@ -1954,6 +1953,27 @@ fn infer_expr_unlocated(
                     return Err(AnalyzeError::Invalid("malformed COLLATE clause".into()));
                 }
             };
+            let result = match infer_expr(arg.as_ref(), ctx, params, goal) {
+                Ok(t) => t,
+                // The argument isn't of the type the context wants: PG
+                // transforms it (with no goal) and checks it is collatable
+                // before the context coerces the result, so a
+                // non-collatable argument is reported first.
+                Err(e @ AnalyzeError::TypeMismatch { .. }) => {
+                    let mut scratch = params.clone();
+                    match infer_expr(arg.as_ref(), ctx, &mut scratch, TypeGoal::NONE) {
+                        Ok(t) => {
+                            check_collatable(&t, arg.as_ref(), snapshot)?;
+                            return Err(e);
+                        }
+                        Err(_) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            check_collatable(&result, arg.as_ref(), snapshot)?;
+            // transformCollateClause looks the collation up only once the
+            // argument is transformed and found collatable.
             let resolved_collation = if parts.is_empty() {
                 None
             } else {
@@ -1973,50 +1993,6 @@ fn infer_expr_unlocated(
                 crate::ddl::policies::note_collation_ref(c.location, r.oid);
                 Some(r.oid)
             };
-            let result = infer_expr(arg.as_ref(), ctx, params, goal)?;
-            // PG rejects `COLLATE` on non-collatable types with
-            // `collations are not supported by type X`. Collatable means
-            // string-category — or an *array* of a collatable element
-            // (`tags COLLATE "C"` is valid; the collation applies to the
-            // elements). Accept UNKNOWN (untyped literal/param) — the
-            // parser already coerces it through the surrounding goal.
-            if result.type_oid != oid::UNKNOWN {
-                let base = snapshot.unwrap_domain(result.type_oid);
-                let category_of = |t: PgTypeOid| {
-                    snapshot
-                        .get_type(t)
-                        .map(|ty| ty.typcategory)
-                        .unwrap_or(TypCategory::UserDefined)
-                };
-                let mut effective = base;
-                if category_of(effective) == TypCategory::Array
-                    && let Some(elem) = snapshot.get_type(effective).and_then(|t| t.typelem)
-                {
-                    effective = snapshot.unwrap_domain(elem);
-                }
-                let category = category_of(effective);
-                if category != TypCategory::String {
-                    // PG renders the bare type name here (search-path
-                    // aware) — keep the SQL-standard aliases for built-ins
-                    // (`int4` → `integer`) but drop the schema prefix for
-                    // user types so a `public.address` column reads the
-                    // same way PG would: `... by type address`.
-                    let formatted = crate::ddl::util::format_type_for_message(snapshot, base);
-                    let type_name = match formatted.rsplit_once('.') {
-                        Some((_, bare)) => bare.to_owned(),
-                        None => formatted,
-                    };
-                    let span = crate::error::node_location(arg.as_ref())
-                        .and_then(crate::error::SourceSpan::from_node_qname);
-                    return Err(crate::error::RawError::invalid(
-                        format!("collations are not supported by type {type_name}"),
-                        span,
-                        None,
-                    )
-                    .with_primary_label(format!("this is {type_name}, not a collatable type"))
-                    .finalize_implicit());
-                }
-            }
             // Explicit COLLATE overrides whatever collation was inherited
             // from the inner expression (PG's "explicit" derivation tier).
             return Ok(ExprType {
@@ -3230,6 +3206,59 @@ pub(crate) fn extract_string_fields(nodes: &[Option<ast::Node>]) -> Vec<String> 
             _ => None,
         })
         .collect()
+}
+
+/// transformCollateClause: `COLLATE` on a value of a non-collatable type
+/// is `collations are not supported by type X`.
+fn check_collatable(
+    result: &ExprType,
+    arg: Option<&ast::Node>,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    // PG rejects `COLLATE` on non-collatable types with
+    // `collations are not supported by type X`. Collatable means
+    // string-category — or an *array* of a collatable element
+    // (`tags COLLATE "C"` is valid; the collation applies to the
+    // elements). Accept UNKNOWN (untyped literal/param) — the
+    // parser already coerces it through the surrounding goal.
+    if result.type_oid != oid::UNKNOWN {
+        let base = snapshot.unwrap_domain(result.type_oid);
+        let category_of = |t: PgTypeOid| {
+            snapshot
+                .get_type(t)
+                .map(|ty| ty.typcategory)
+                .unwrap_or(TypCategory::UserDefined)
+        };
+        let mut effective = base;
+        if category_of(effective) == TypCategory::Array
+            && let Some(elem) = snapshot.get_type(effective).and_then(|t| t.typelem)
+        {
+            effective = snapshot.unwrap_domain(elem);
+        }
+        let category = category_of(effective);
+        if category != TypCategory::String {
+            // PG renders the bare type name here (search-path
+            // aware) — keep the SQL-standard aliases for built-ins
+            // (`int4` → `integer`) but drop the schema prefix for
+            // user types so a `public.address` column reads the
+            // same way PG would: `... by type address`.
+            let formatted = crate::ddl::util::format_type_for_message(snapshot, base);
+            let type_name = match formatted.rsplit_once('.') {
+                Some((_, bare)) => bare.to_owned(),
+                None => formatted,
+            };
+            let span = crate::error::node_location(arg)
+                .and_then(crate::error::SourceSpan::from_node_qname);
+            return Err(crate::error::RawError::invalid(
+                format!("collations are not supported by type {type_name}"),
+                span,
+                None,
+            )
+            .with_primary_label(format!("this is {type_name}, not a collatable type"))
+            .finalize_implicit());
+        }
+    }
+    Ok(())
 }
 
 /// PG's `DeconstructQualifiedName` over an already-split name (a function

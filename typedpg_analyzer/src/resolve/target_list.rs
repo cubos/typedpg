@@ -157,7 +157,18 @@ pub(crate) fn resolve_target_list_explicit(
                 _ => None,
             });
 
-            let star_cols: Vec<&ScopeColumn> = if let Some(tbl) = table_filter {
+            let names = expr::extract_string_fields(&cr.fields);
+            let star_cols: Vec<&ScopeColumn> = if let [.., schema, tbl] = names.as_slice() {
+                // `schema.t.*`: only an entry scanning that very relation
+                // under its own name (refnameNamespaceItem).
+                let src = scope.schema_qualified_source(
+                    schema,
+                    tbl,
+                    crate::error::SourceSpan::from_node_qname(cr.location),
+                )?;
+                src.note_star_columns();
+                src.columns.iter().collect()
+            } else if let Some(tbl) = table_filter {
                 // Any entry the reference can see — this level's, a LATERAL
                 // one, or an outer query's (PG's `ExpandColumnRefStar`
                 // resolves the name like any qualifier).
@@ -396,111 +407,115 @@ pub(crate) fn analyze_values_lists(
         }
     }
 
-    // transformValuesClause: select_common_type("VALUES") per column — rows
-    // whose types have none are `VALUES types X and Y cannot be matched`.
+    // transformValuesClause, one column after the other: select_common_type
+    // ("VALUES") — rows whose types have none are `VALUES types X and Y
+    // cannot be matched` —, each cell coerced to it, then the column's
+    // collation; so a later column's error is only reached once the earlier
+    // columns are fine.
     let mut common: Vec<PgTypeOid> = Vec::with_capacity(arity);
-    for (column, types) in column_types.iter().enumerate() {
-        if let Some(t) = crate::coerce::find_common_type(types, snapshot) {
-            common.push(t);
-            continue;
-        }
-        let concrete: Vec<PgTypeOid> = types
-            .iter()
-            .copied()
-            .filter(|&t| t != oid::UNKNOWN)
-            .collect();
-        if concrete.is_empty() {
-            common.push(oid::UNKNOWN);
-            continue;
-        }
-        let name = |t| crate::ddl::util::format_type_for_message(snapshot, t);
-        // The column's cells, parallel to `types`, to point at the failing one.
-        let cells: Vec<Option<&ast::Node>> = rows
-            .iter()
-            .filter_map(|r| r.get(column))
-            .map(Option::as_ref)
-            .collect();
-        let span = |failing| crate::expr::failing_input_span(types, &cells, failing, snapshot);
-        match crate::coerce::select_common_type(&concrete, snapshot) {
-            Ok(t) => common.push(t),
-            Err(crate::coerce::CommonTypeError::Mismatch(a, b)) => {
-                return Err(crate::pgmsg::types_cannot_be_matched(
-                    "VALUES",
-                    &name(a),
-                    &name(b),
-                    "",
-                    None,
-                    span(b),
-                )
-                .finalize_implicit());
-            }
-            Err(crate::coerce::CommonTypeError::CannotConvert { from, to }) => {
-                return Err(crate::pgmsg::could_not_convert_type(
-                    "VALUES",
-                    &name(from),
-                    &name(to),
-                    span(from),
-                )
-                .finalize_implicit());
-            }
-        }
-    }
-
-    // A column of `unknown` values only is text (select_common_type), and
-    // coerce_to_common_type converts a literal to it but no other `unknown`
-    // value. (A typed column's coercion is the back-fill below.)
-    for &(i, item) in &unknown_values {
-        if common[i] == oid::UNKNOWN {
-            expr::unknown_value_coercion(
-                oid::TEXT,
-                crate::coerce::CoercionContext::Implicit,
-                snapshot,
-                item,
-            )?;
-        }
-    }
-
-    // Each cell is coerced to its column's common type, which may map a
-    // value to NULL.
-    for (i, types) in column_types.iter().enumerate() {
-        column_nullable[i] |= types
-            .iter()
-            .any(|&t| expr::coercion_can_return_null(t, common[i], snapshot));
-    }
-
-    // Back-fill: re-walk cells whose type stayed UNKNOWN with the column's
-    // resolved common type as the goal, so `(VALUES (42), ($1))` pins the
-    // param to int4 (matching PG's Describe) and string-literal contents
-    // get validated. Speculative-walk rules apply: only literal-content
-    // rejections propagate.
-    for (row_idx, row) in rows.iter().enumerate() {
-        for (i, item) in row.iter().enumerate() {
-            if common[i] == oid::UNKNOWN {
-                continue;
-            }
-            if column_types[i].get(row_idx) == Some(&oid::UNKNOWN) {
-                expr::coerce_unknown_to(item.as_ref(), ctx(), params, common[i])?;
-            }
-        }
-    }
-
-    // transformValuesClause: select_common_collation over each column's
-    // cells, coerced to its type (a coercion is a node over the cell, which
-    // takes the type's default when the cell has no collation). Different
-    // explicit collations are an error; a conflict leaves the column
-    // without one.
     let mut collations = Vec::with_capacity(arity);
-    for (i, cells) in column_exprs.iter().enumerate() {
-        let mut coerced = Vec::with_capacity(cells.len());
-        for t in cells {
-            coerced.push(if t.type_oid == common[i] {
-                t.clone()
+    for (column, types) in column_types.iter().enumerate() {
+        let t = match crate::coerce::find_common_type(types, snapshot) {
+            Some(t) => t,
+            None => {
+                let concrete: Vec<PgTypeOid> = types
+                    .iter()
+                    .copied()
+                    .filter(|&t| t != oid::UNKNOWN)
+                    .collect();
+                if concrete.is_empty() {
+                    oid::UNKNOWN
+                } else {
+                    let name = |t| crate::ddl::util::format_type_for_message(snapshot, t);
+                    // The column's cells, parallel to `types`, to point at the
+                    // failing one.
+                    let cells: Vec<Option<&ast::Node>> = rows
+                        .iter()
+                        .filter_map(|r| r.get(column))
+                        .map(Option::as_ref)
+                        .collect();
+                    let span =
+                        |failing| crate::expr::failing_input_span(types, &cells, failing, snapshot);
+                    match crate::coerce::select_common_type(&concrete, snapshot) {
+                        Ok(t) => t,
+                        Err(crate::coerce::CommonTypeError::Mismatch(a, b)) => {
+                            return Err(crate::pgmsg::types_cannot_be_matched(
+                                "VALUES",
+                                &name(a),
+                                &name(b),
+                                "",
+                                None,
+                                span(b),
+                            )
+                            .finalize_implicit());
+                        }
+                        Err(crate::coerce::CommonTypeError::CannotConvert { from, to }) => {
+                            return Err(crate::pgmsg::could_not_convert_type(
+                                "VALUES",
+                                &name(from),
+                                &name(to),
+                                span(from),
+                            )
+                            .finalize_implicit());
+                        }
+                    }
+                }
+            }
+        };
+        common.push(t);
+
+        // A column of `unknown` values only is text (select_common_type),
+        // and coerce_to_common_type converts a literal to it but no other
+        // `unknown` value. (A typed column's coercion is the back-fill
+        // below.)
+        if t == oid::UNKNOWN {
+            for &(_, item) in unknown_values.iter().filter(|(i, _)| *i == column) {
+                expr::unknown_value_coercion(
+                    oid::TEXT,
+                    crate::coerce::CoercionContext::Implicit,
+                    snapshot,
+                    item,
+                )?;
+            }
+        }
+
+        // Each cell is coerced to its column's common type, which may map a
+        // value to NULL.
+        column_nullable[column] |= types
+            .iter()
+            .any(|&ty| expr::coercion_can_return_null(ty, t, snapshot));
+
+        // Back-fill: re-walk cells whose type stayed UNKNOWN with the
+        // column's resolved common type as the goal, so `(VALUES (42),
+        // ($1))` pins the param to int4 (matching PG's Describe) and
+        // string-literal contents get validated. Speculative-walk rules
+        // apply: only literal-content rejections propagate.
+        if t != oid::UNKNOWN {
+            for (row_idx, row) in rows.iter().enumerate() {
+                if types.get(row_idx) == Some(&oid::UNKNOWN) {
+                    expr::coerce_unknown_to(row[column].as_ref(), ctx(), params, t)?;
+                }
+            }
+        }
+
+        // select_common_collation over the column's cells, coerced to its
+        // type (a coercion is a node over the cell, which takes the type's
+        // default when the cell has no collation). Different explicit
+        // collations are an error; a conflict leaves the column without
+        // one.
+        let mut coerced = Vec::with_capacity(column_exprs[column].len());
+        for cell in &column_exprs[column] {
+            coerced.push(if cell.type_oid == t {
+                cell.clone()
             } else {
-                expr::ExprType::scalar(common[i], t.nullable)
-                    .with_collation(expr::derive_collation([t], common[i], snapshot)?)
+                expr::ExprType::scalar(t, cell.nullable).with_collation(expr::derive_collation(
+                    [cell],
+                    t,
+                    snapshot,
+                )?)
             });
         }
-        collations.push(expr::derive_collation(&coerced, common[i], snapshot)?);
+        collations.push(expr::derive_collation(&coerced, t, snapshot)?);
     }
 
     let columns = (0..arity)

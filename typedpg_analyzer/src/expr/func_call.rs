@@ -456,6 +456,9 @@ pub(crate) fn infer_func_call(
     if let Some(outer) = ctx.strict_log {
         outer.absorb(&filter_log);
     }
+    if resolved.is_aggregate && func.over.is_none() {
+        crate::grouping::check_aggregate_placement(func, ctx.scope)?;
+    }
     let mut args = args;
     // A parameter the call typed: finite when its type is one the
     // generator binds finite (see `PgCatalog::assume_finite_parameters`).

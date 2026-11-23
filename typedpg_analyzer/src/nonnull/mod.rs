@@ -1822,19 +1822,13 @@ fn column_ref_facts(c: &ast::ColumnRef, scope: &Scope) -> Facts {
             None => Facts::default(),
         };
     }
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return Facts::default(),
-    };
-    match scope.resolve_column(table, column, None) {
-        Ok(col) => Facts::column(&col.table_alias, &col.name),
-        Err(crate::error::AnalyzeError::UndefinedColumn(_)) if table.is_none() => scope
-            .find_source(column)
+    match scope.resolve_column_names(&parts, None) {
+        Some(Ok(col)) => Facts::column(&col.table_alias, &col.name),
+        Some(Err(crate::error::AnalyzeError::UndefinedColumn(_))) if parts.len() == 1 => scope
+            .find_source(&parts[0])
             .map(|s| Facts::rel(&s.alias))
             .unwrap_or_default(),
-        Err(_) => Facts::default(),
+        _ => Facts::default(),
     }
 }
 
@@ -1862,13 +1856,7 @@ pub(crate) fn plain_column(n: &ast::Node, scope: &Scope) -> Option<(Col, crate::
         return None;
     }
     let parts = crate::expr::extract_string_fields(&c.fields);
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return None,
-    };
-    let col = scope.resolve_column(table, column, None).ok()?;
+    let col = scope.resolve_column_names(&parts, None)?.ok()?;
     Some(((col.table_alias.clone(), col.name.clone()), col.type_oid))
 }
 
