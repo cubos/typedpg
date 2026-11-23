@@ -288,6 +288,12 @@ mod tests {
         for sql in [
             "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
             "SELECT id FROM users ORDER BY created_at DESC FETCH FIRST 1 ROW ONLY",
+            // No count: PG's implicit 1 has no location in the parse tree.
+            "SELECT id FROM users ORDER BY created_at DESC FETCH FIRST ROW ONLY",
+            "SELECT id FROM users ORDER BY created_at DESC FETCH NEXT ROW ONLY",
+            "SELECT id FROM users ORDER BY created_at DESC FETCH FIRST ROWS ONLY",
+            "SELECT (SELECT id FROM users ORDER BY created_at DESC FETCH FIRST ROW ONLY)",
+            "(SELECT id FROM users ORDER BY created_at DESC) FETCH FIRST ROW ONLY",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -297,6 +303,22 @@ mod tests {
                     .ends_with("which of the tied rows comes back is arbitrary"),
                 "{sql}: {findings:?}"
             );
+            let picks = if sql.contains("LIMIT") {
+                "LIMIT"
+            } else {
+                "FETCH"
+            };
+            assert!(
+                findings[0].message.contains(&format!("under {picks},")),
+                "{sql}: {findings:?}"
+            );
+        }
+        // One row, or a unique key: nothing reported, as with LIMIT 1.
+        for sql in [
+            "SELECT id FROM users WHERE id = $1 ORDER BY created_at FETCH FIRST ROW ONLY",
+            "SELECT id FROM users ORDER BY created_at, id FETCH FIRST ROW ONLY",
+        ] {
+            assert!(lint_rule(&db, sql, RULE).is_empty(), "{sql}");
         }
         // A page past the first still pages.
         let findings = lint_rule(

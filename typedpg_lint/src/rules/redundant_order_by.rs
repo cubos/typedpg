@@ -400,6 +400,7 @@ mod tests {
             "SELECT DISTINCT ON (id, created_at) id FROM users ORDER BY id, created_at",
             // Every key pinned under LIMIT: unstable_order's finding.
             "SELECT id FROM users WHERE status = 'a' ORDER BY status LIMIT 10",
+            "SELECT id FROM users WHERE status = 'a' ORDER BY status FETCH FIRST ROW ONLY",
             // The order a FROM subquery, CTE, ARRAY or LIMIT observes.
             "SELECT * FROM (SELECT id FROM users ORDER BY created_at) s",
             "WITH s AS (SELECT id FROM users ORDER BY created_at) SELECT * FROM s",

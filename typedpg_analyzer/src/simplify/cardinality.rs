@@ -111,7 +111,12 @@ pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) ->
         catalog,
         analyzed: &view.analyzed,
     };
-    let ties = dedup::order_ties(&ctx, &dedup::cte_names(&view.tree), select, None);
+    order_ties_in(&ctx, select)
+}
+
+/// [`order_ties`] of `select`, a node of `ctx`'s tree.
+fn order_ties_in(ctx: &Ctx<'_>, select: &SelectStmt) -> dedup::OrderTies {
+    let ties = dedup::order_ties(ctx, &dedup::cte_names(ctx.tree), select, None);
     if !matches!(ties, dedup::OrderTies::Ties(_)) {
         return ties;
     }
@@ -119,10 +124,10 @@ pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) ->
     // statement's root knows.
     let mut found = None;
     let env = CteEnv::default();
-    for raw in &view.tree.stmts {
+    for raw in &ctx.tree.stmts {
         if let Some(root) = raw.stmt.as_ref() {
             find_select(
-                &ctx,
+                ctx,
                 root.to_ref(),
                 None,
                 &env,
@@ -299,12 +304,144 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
         catalog,
         analyzed: &view.analyzed,
     };
+    select_at_most_one_row_of(&ctx, select)
+}
+
+/// Whether two runs of `sql` (analyzed as `analyzed`) over the same rows
+/// may pick different ones: a select whose `LIMIT`, `OFFSET` or `DISTINCT
+/// ON` picks among rows its `ORDER BY` doesn't tell apart (its keys can tie,
+/// or the proof can't tell, see [`order_ties`]), unless it has at most one
+/// row to pick from. `FETCH … WITH TIES` without an `OFFSET` returns every
+/// tie, which is no choice. For the pg_sanity oracles, which compare the
+/// rows of two queries: picked rows can only be compared by their count.
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn picks_rows_arbitrarily(
+    catalog: &PgCatalog,
+    sql: &str,
+    analyzed: &crate::resolve::AnalyzedQuery,
+) -> bool {
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return true;
+    };
+    let ctx = Ctx {
+        sql,
+        tree: &parsed.tree,
+        catalog,
+        analyzed,
+    };
+    let is_null = |node: &Node| matches!(node, Node::AConst(c) if c.isnull);
+    let is_zero = |node: &Node| {
+        matches!(node, Node::AConst(c)
+            if !c.isnull && matches!(&c.val, Some(AConstValue::Integer(i)) if i.ival == 0))
+    };
+    parsed.tree.nodes().any(|(node, _)| {
+        let NodeRef::SelectStmt(select) = node else {
+            return false;
+        };
+        let distinct_on = matches!(select.distinct_clause.first(), Some(Some(_)));
+        let limits = select
+            .limit_count
+            .as_ref()
+            .is_some_and(|count| !is_null(count) && !is_zero(count));
+        let offsets = select
+            .limit_offset
+            .as_ref()
+            .is_some_and(|offset| !is_null(offset) && !is_zero(offset));
+        if !(distinct_on || limits || offsets) {
+            return false;
+        }
+        if !analyzed.spreads.is_empty() {
+            return true;
+        }
+        if select.limit_option == LimitOption::WithTies && !offsets && !distinct_on {
+            return false;
+        }
+        if !distinct_on && select_at_most_one_row_of(&ctx, select) {
+            return false;
+        }
+        select.sort_clause.is_empty()
+            || !(order_covers_output(select)
+                || matches!(order_ties_in(&ctx, select), dedup::OrderTies::Unique))
+    })
+}
+
+/// Whether `select`'s `ORDER BY` keys are its output columns (by position,
+/// or by a name only one output column has) and cover every one: rows
+/// that tie then show the same values (equal under the sort, if not always
+/// byte for byte: `1.0` and `1.00`), whichever of them is picked.
+#[cfg(feature = "pg_sanity")]
+fn order_covers_output(select: &SelectStmt) -> bool {
+    let mut first = select;
+    while first.op != SetOperation::SetopNone {
+        match first.larg.as_deref() {
+            Some(larg) => first = larg,
+            None => return false,
+        }
+    }
+    let mut names: Vec<Option<&str>> = Vec::with_capacity(first.target_list.len());
+    for target in &first.target_list {
+        let Some(Node::ResTarget(target)) = target else {
+            return false;
+        };
+        let column = match target.val.as_ref() {
+            Some(Node::ColumnRef(c)) => match c.fields.last() {
+                Some(Some(Node::String(name))) => Some(name.sval.as_str()),
+                // `*` or `t.*`: the columns are unknown.
+                _ => return false,
+            },
+            _ => None,
+        };
+        // Set operations take the first arm's names; PG resolves a bare
+        // name in a plain select's ORDER BY to an output column first.
+        names.push(if target.name.is_empty() {
+            column
+        } else {
+            Some(target.name.as_str())
+        });
+    }
+    let mut covered = vec![false; names.len()];
+    for sort in &select.sort_clause {
+        let Some(Node::SortBy(by)) = sort else {
+            return false;
+        };
+        let at = match by.node.as_ref() {
+            Some(Node::AConst(c)) => match &c.val {
+                Some(AConstValue::Integer(i)) => {
+                    usize::try_from(i.ival).ok().and_then(|i| i.checked_sub(1))
+                }
+                _ => None,
+            },
+            Some(Node::ColumnRef(c)) => match c.fields.as_slice() {
+                [Some(Node::String(name))] => {
+                    let mut at = names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| **n == Some(name.sval.as_str()));
+                    match (at.next(), at.next()) {
+                        (Some((i, _)), None) => Some(i),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match at.and_then(|i| covered.get_mut(i)) {
+            Some(slot) => *slot = true,
+            None => return false,
+        }
+    }
+    covered.iter().all(|&c| c)
+}
+
+/// [`select_at_most_one_row`] of `select`, judged against `ctx`'s tree.
+fn select_at_most_one_row_of(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     let mut found = None;
     let env = CteEnv::default();
-    for raw in &view.tree.stmts {
+    for raw in &ctx.tree.stmts {
         if let Some(root) = raw.stmt.as_ref() {
             find_select(
-                &ctx,
+                ctx,
                 root.to_ref(),
                 None,
                 &env,
@@ -321,8 +458,8 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
     // CTE name in this tree a reference the proof gives up on (the node may
     // be inside one, shadowing a table of the same name).
     found.unwrap_or_else(|| {
-        let env = CteEnv::blocked(&dedup::cte_names(&view.tree));
-        select_at_most_one_row_in(&ctx, select, &FromScope::opaque(None), &env)
+        let env = CteEnv::blocked(&dedup::cte_names(ctx.tree));
+        select_at_most_one_row_in(ctx, select, &FromScope::opaque(None), &env)
     })
 }
 

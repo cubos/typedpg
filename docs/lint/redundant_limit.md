@@ -1,6 +1,7 @@
 # `redundant_limit`
 
-A `LIMIT` or `FETCH FIRST` on a query that returns at most one row anyway.
+A `LIMIT` or `FETCH FIRST` (with a count or without: `FETCH FIRST ROW ONLY`) on
+a query that returns at most one row anyway.
 
 | Level | Applies to | Fix |
 |---|---|---|

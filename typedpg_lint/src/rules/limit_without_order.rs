@@ -801,7 +801,9 @@ pub(super) fn limit_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops:
     if is_null_literal(count) {
         return None;
     }
-    let at = node_start(count)?;
+    let Some(at) = node_start(count) else {
+        return implicit_fetch(ctx, select).map(|fetch| fetch.start..fetch.end);
+    };
     let index = ctx.tokens.iter().position(|token| token.start == at)?;
     let previous = ctx.tokens.get(index.checked_sub(1)?)?;
     if is_keyword(ctx, previous, "LIMIT") {
@@ -818,6 +820,93 @@ pub(super) fn limit_span(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<std::ops:
         return Some(previous.start..fetch_end(ctx, index, at));
     }
     None
+}
+
+/// A `FETCH FIRST ROW ONLY` clause written without a row count.
+pub(super) struct ImplicitFetch {
+    /// The `FETCH` keyword's first byte.
+    pub start: usize,
+    /// The clause's last byte (its `ONLY`, or `TIES` of `WITH TIES`).
+    pub end: usize,
+}
+
+/// The `FETCH FIRST | NEXT ROW | ROWS ONLY` (or `WITH TIES`) clause of
+/// `select` when it has no row count. PostgreSQL stores the implicit 1
+/// without a location (`makeIntConst(1, -1)` in gram.y), so the clause is
+/// read from the tokens: the first `FETCH` after everything else `select`
+/// covers, outside any parenthesis opened after that point (a subquery of
+/// an `OFFSET`). It may lie after the parenthesis closing `select`: the
+/// limit of `(SELECT …) FETCH FIRST ROW ONLY` is the inner select's.
+pub(super) fn implicit_fetch(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<ImplicitFetch> {
+    if !matches!(select.limit_count.as_ref(), Some(count) if node_start(count).is_none()) {
+        return None;
+    }
+    let last = covered_end(ctx, select)?;
+    let mut depth = 0isize;
+    let mut fetch = None;
+    for (index, token) in ctx.tokens.iter().enumerate() {
+        if token.start <= last {
+            continue;
+        }
+        match &ctx.sql[token.start..token.end] {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            _ if depth <= 0 && is_keyword(ctx, token, "FETCH") => {
+                fetch = Some(index);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let fetch = fetch?;
+    let words = ctx.tokens.get(fetch + 1..fetch + 4)?;
+    let reads = |i: usize, options: &[&str]| options.iter().any(|w| is_keyword(ctx, &words[i], w));
+    if !reads(0, &["FIRST", "NEXT"]) || !reads(1, &["ROW", "ROWS"]) {
+        return None;
+    }
+    let end = if reads(2, &["ONLY"]) {
+        words[2].end
+    } else if reads(2, &["WITH"]) {
+        let ties = ctx.tokens.get(fetch + 4)?;
+        if !is_keyword(ctx, ties, "TIES") {
+            return None;
+        }
+        ties.end
+    } else {
+        return None;
+    };
+    Some(ImplicitFetch {
+        start: ctx.tokens[fetch].start,
+        end,
+    })
+}
+
+/// The last byte position `select` covers apart from its limit and offset:
+/// the greatest location of its other nodes, or the end of a nested
+/// select's own count-less `FETCH` (which has no location either).
+fn covered_end(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<usize> {
+    let mut body = select.clone();
+    body.limit_count = None;
+    body.limit_offset = None;
+    let mut last: Option<usize> = None;
+    let mut stack = vec![NodeRef::SelectStmt(&body)];
+    let mut root = true;
+    while let Some(node) = stack.pop() {
+        let mut here = node
+            .location()
+            .and_then(|location| usize::try_from(location).ok());
+        if let NodeRef::SelectStmt(nested) = node
+            && !std::mem::take(&mut root)
+            && let Some(fetch) = implicit_fetch(ctx, nested)
+        {
+            here = Some(here.map_or(fetch.end, |here| here.max(fetch.end)));
+        }
+        if let Some(here) = here {
+            last = Some(last.map_or(here, |last| last.max(here)));
+        }
+        stack.extend(node.children());
+    }
+    last
 }
 
 /// The end of a `FETCH` clause: its `ONLY`, or the count when it has none.
@@ -973,6 +1062,83 @@ mod tests {
         );
         assert_eq!(&sql[findings[0].span.clone()], "LIMIT 10");
         assert!(findings[0].fix.is_empty());
+    }
+
+    #[test]
+    fn a_fetch_without_a_count_is_a_limit_of_one() {
+        let db = catalog();
+        // PG stores the implicit 1 with no location: the clause is read
+        // from the tokens, wherever it is written.
+        for (sql, clause) in [
+            (
+                "SELECT id FROM users FETCH FIRST ROW ONLY",
+                "FETCH FIRST ROW ONLY",
+            ),
+            (
+                "SELECT id FROM users fetch next row only",
+                "fetch next row only",
+            ),
+            (
+                "SELECT id FROM users FETCH FIRST ROWS ONLY",
+                "FETCH FIRST ROWS ONLY",
+            ),
+            (
+                "SELECT id FROM users FETCH NEXT ROWS ONLY OFFSET 2",
+                "FETCH NEXT ROWS ONLY",
+            ),
+            (
+                "SELECT id FROM users OFFSET (SELECT 1 FROM posts FETCH FIRST 1 ROW ONLY) \
+                 ROWS FETCH FIRST ROW ONLY",
+                "FETCH FIRST ROW ONLY",
+            ),
+            (
+                "(SELECT id FROM users) FETCH FIRST ROW ONLY",
+                "FETCH FIRST ROW ONLY",
+            ),
+            (
+                "SELECT id FROM users UNION SELECT user_id FROM posts FETCH FIRST ROW ONLY",
+                "FETCH FIRST ROW ONLY",
+            ),
+            (
+                "SELECT (SELECT id FROM users FETCH FIRST ROW ONLY) AS id",
+                "FETCH FIRST ROW ONLY",
+            ),
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|f| f.rule == Rule::LimitWithoutOrder)
+                .filter(|f| f.message.starts_with("LIMIT"))
+                .collect();
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], clause, "{sql}");
+        }
+        // Each select's own clause: the nested one's inside its parentheses.
+        let sql = "SELECT * FROM (SELECT id FROM users FETCH FIRST ROW ONLY) AS u, \
+                   (SELECT id FROM posts) AS p FETCH NEXT ROW ONLY";
+        let spans: Vec<&str> = lint(&db, sql)
+            .into_iter()
+            .filter(|f| f.rule == Rule::LimitWithoutOrder)
+            .map(|f| &sql[f.span])
+            .collect();
+        assert_eq!(spans, ["FETCH FIRST ROW ONLY", "FETCH NEXT ROW ONLY"]);
+        let sql = "SELECT id FROM users UNION (SELECT user_id FROM posts FETCH FIRST ROW ONLY) \
+                   FETCH NEXT ROW ONLY";
+        let mut spans: Vec<&str> = lint(&db, sql)
+            .into_iter()
+            .filter(|f| f.rule == Rule::LimitWithoutOrder)
+            .map(|f| &sql[f.span])
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(spans, ["FETCH FIRST ROW ONLY", "FETCH NEXT ROW ONLY"]);
+        // One row: nothing to pick from, as with LIMIT 1.
+        assert!(
+            lint(
+                &db,
+                "SELECT id FROM users WHERE id = $1 FETCH FIRST ROW ONLY"
+            )
+            .iter()
+            .all(|f| f.rule != Rule::LimitWithoutOrder)
+        );
     }
 
     #[test]

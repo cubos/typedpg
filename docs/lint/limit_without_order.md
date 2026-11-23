@@ -47,7 +47,8 @@ production returns different rows.
 A `SELECT` at any level (subqueries, CTEs, the `LIMIT` of a `UNION`) has no
 `ORDER BY` and has, each reported separately:
 
-- `LIMIT n` or `FETCH FIRST n ROWS`, also with a parameter: `LIMIT $n`;
+- `LIMIT n` or `FETCH FIRST n ROWS ONLY` (`FETCH FIRST ROW ONLY` without a count
+  is `LIMIT 1`), also with a parameter: `LIMIT $n`;
 - `OFFSET n`;
 - `DISTINCT ON (…)`.
 

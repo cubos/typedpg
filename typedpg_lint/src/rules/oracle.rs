@@ -387,10 +387,9 @@ fn claims(ctx: &Ctx<'_>, record: &Record) -> Vec<LintProbe> {
             let sql = replace(ctx.sql, removal, "");
             let top = matches!(
                 ctx.tree.stmts.first().and_then(|s| s.stmt.as_ref()),
-                Some(N::SelectStmt(select)) if select.limit_count.as_ref()
-                    .and_then(|c| c.to_ref().location())
-                    .and_then(|l| usize::try_from(l).ok())
-                    .is_some_and(|l| span.contains(&l))
+                Some(N::SelectStmt(select))
+                    if super::limit_without_order::limit_span(ctx, select)
+                        .is_some_and(|clause| span.contains(&clause.start))
             );
             vec![if top {
                 LintProbe::AtMostOneRow { sql }

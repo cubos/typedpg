@@ -45,7 +45,7 @@ argument), in a row comparison `(a, b) = (SELECT …)` or in
 - equates every column of a primary or unique key to constants, parameters
   or outer columns (`WHERE u.id = p.user_id`);
 - aggregates without `GROUP BY`, or groups by columns its `WHERE` pins;
-- has `LIMIT 0` or `LIMIT 1` (or `FETCH FIRST 1 ROW ONLY`);
+- has `LIMIT 0` or `LIMIT 1` (or `FETCH FIRST 1 ROW ONLY`, `FETCH FIRST ROW ONLY`);
 - has no `FROM`, or a `WHERE` that is never true.
 
 A `VALUES` list of two or more rows without `LIMIT` is always reported:

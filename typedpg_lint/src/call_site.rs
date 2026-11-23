@@ -498,14 +498,30 @@ mod tests {
     #[test]
     fn a_limit_of_one_is_proof_enough() {
         let db = catalog();
-        let sql = "SELECT id, name FROM users LIMIT 1";
-        assert!(
-            only(
-                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
-            )
-            .is_empty()
-        );
+        for sql in [
+            "SELECT id, name FROM users LIMIT 1",
+            "SELECT id, name FROM users FETCH FIRST ROW ONLY",
+            "SELECT id, name FROM users FETCH NEXT ROWS ONLY",
+        ] {
+            assert!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                    Rule::FetchMayReturnMany
+                )
+                .is_empty(),
+                "{sql}"
+            );
+            // And `fetch_all` on it returns at most one row.
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchAll, "fetch_all")]),
+                    Rule::FetchAllSingleRow
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

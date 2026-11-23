@@ -153,6 +153,8 @@ awk -F'\t' '
             n["no_promise"], n["not_executable"], n["unsafe_calls"], n["no_param_sample"]
         printf "  simplified queries executed next to the written one: %d (%d scenario results compared)\n",
             n["equivalence_checked"], n["equivalence_compared"]
+        printf "    rows compared by count only (picked arbitrarily): %d; %d scenarios not compared (results differed under a volatile call); not executed: %d lacking a parameter sample\n",
+            n["equivalence_counts_only"], n["equivalence_volatile"], n["equivalence_no_param_sample"]
         k = 0
         for (s in skips) k++
         printf "  tables the seeder could not fill: %d distinct\n", k

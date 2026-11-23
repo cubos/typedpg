@@ -76,7 +76,7 @@ A query proven to return at most one row:
   value: `SELECT … FROM current_builds WHERE project_id = $p AND arch = $a`;
 - an aggregate without `GROUP BY`, or `GROUP BY` keys pinned to one value:
   `SELECT count(*) AS n FROM posts WHERE user_id = $userId`;
-- `LIMIT 1` / `LIMIT 0` / `FETCH FIRST 1 ROW ONLY`:
+- `LIMIT 1` / `LIMIT 0` / `FETCH FIRST 1 ROW ONLY` / `FETCH FIRST ROW ONLY`:
   `… ORDER BY created_at DESC, id DESC LIMIT 1`;
 - a one-row `INSERT … VALUES`, `INSERT … DEFAULT VALUES`, or
   `INSERT … SELECT` of one row, whatever its `ON CONFLICT`;

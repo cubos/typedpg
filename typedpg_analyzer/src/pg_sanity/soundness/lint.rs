@@ -18,7 +18,10 @@
 use postgres::types::ToSql;
 use postgres::{Client, Statement, Transaction};
 
-use super::{Outcome, Param, Row, SCENARIOS, SeedPlan, Soundness, order_keys, run};
+use super::{
+    Difference, Outcome, Param, Rows, SCENARIOS, SeedPlan, Soundness, nondeterministic, repro,
+    restore_sequences, result_difference, row_comparison, run, sequence_state,
+};
 use crate::resolve::AnalyzedQuery;
 
 /// The text every assertion's error starts with.
@@ -157,6 +160,7 @@ impl Soundness {
     pub(crate) fn lint_probes(
         &mut self,
         client: &mut Client,
+        catalog: &crate::PgCatalog,
         original_sql: &str,
         ours: &AnalyzedQuery,
         probes: &[LintProbe],
@@ -278,14 +282,7 @@ impl Soundness {
         if !samplings.contains(&sampled) {
             samplings.push(sampled);
         }
-        // Rows a `LIMIT` / `OFFSET` / `DISTINCT ON` picks arbitrarily, or a
-        // system column's physical value, differ between runs: only the
-        // row counts are compared then.
-        let rows = if picks_arbitrary_rows(original_sql) {
-            Rows::Count
-        } else {
-            Rows::All(order_keys(original_sql, ours))
-        };
+        let rows = row_comparison(catalog, original_sql, ours);
         let mut targets = super::written_tables(original_sql);
         for p in &prepared {
             if let Some(sql) = p.probe.sql() {
@@ -373,14 +370,7 @@ impl Soundness {
                     LintProbe::NeverWrites => never_writes(&written),
                     _ => {
                         let stmt = p.stmt.as_ref().expect("a probe with SQL is prepared");
-                        if let Some(restore) = &restore {
-                            tx.batch_execute(restore).unwrap_or_else(|e| {
-                                panic!(
-                                    "pg_sanity: restoring the sequences failed: {}",
-                                    super::super::render_pg_error(&e)
-                                )
-                            });
-                        }
+                        restore_sequences(tx, restore.as_deref());
                         let (sent, sent_tables) = run(tx, stmt, param_refs, targets);
                         compare(
                             p.probe,
@@ -396,22 +386,7 @@ impl Soundness {
                         p.skipped.get_or_insert(why);
                     }
                     Verdict::Broken(problem) => {
-                        let mut seeding = String::new();
-                        for (name, plan) in &seeded {
-                            seeding.push_str(&format!("  [{name}]\n"));
-                            for insert in &plan.inserts {
-                                seeding.push_str(&format!("    {insert};\n"));
-                            }
-                        }
-                        let params = values
-                            .iter()
-                            .enumerate()
-                            .map(|(i, v)| match v {
-                                Some(v) => format!("${} = '{v}'", i + 1),
-                                None => format!("${} = NULL", i + 1),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let (params, seeding) = repro(values, &seeded);
                         let probe = p
                             .probe
                             .sql()
@@ -426,76 +401,6 @@ impl Soundness {
             }
         }
     }
-}
-
-/// The statements setting every sequence back to its current state, or
-/// `None` without sequences.
-fn sequence_state(tx: &mut Transaction<'_>) -> Option<String> {
-    tx.query_one(
-        "SELECT pg_catalog.string_agg(pg_catalog.format('SELECT pg_catalog.setval(%L, %s, %s)', \
-             pg_catalog.format('%I.%I', schemaname, sequencename), \
-             coalesce(last_value, start_value), (last_value IS NOT NULL)::text), '; ') \
-         FROM pg_catalog.pg_sequences",
-        &[],
-    )
-    .ok()
-    .and_then(|row| row.get::<_, Option<String>>(0))
-}
-
-/// How two results' rows are compared.
-enum Rows {
-    /// As multisets, and in the order of these output columns.
-    All(Option<Vec<usize>>),
-    /// By count.
-    Count,
-}
-
-/// Whether `sql` calls a function whose value differs between two runs of
-/// it in one transaction.
-fn nondeterministic(sql: &str) -> bool {
-    let lower = sql.to_ascii_lowercase();
-    [
-        "random(",
-        "random_normal",
-        "clock_timestamp",
-        "statement_timestamp",
-        "timeofday",
-        "gen_random",
-        "uuidv",
-        "nextval",
-        "setval",
-        "txid_current",
-        "pg_current_xact",
-        "pg_backend_pid",
-    ]
-    .iter()
-    .any(|f| lower.contains(f))
-}
-
-/// Whether some of `sql`'s rows are picked arbitrarily (a `LIMIT` or
-/// `OFFSET`, `DISTINCT ON`, `TABLESAMPLE`) or carry a physical location
-/// (`ctid`, `xmin`, …), which differ between two runs.
-fn picks_arbitrary_rows(sql: &str) -> bool {
-    use typedpg_pg_query::NodeRef;
-    let lower = sql.to_ascii_lowercase();
-    if ["ctid", "xmin", "xmax", "cmin", "cmax"]
-        .iter()
-        .any(|c| lower.contains(c))
-    {
-        return true;
-    }
-    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
-        return true;
-    };
-    parsed.tree.nodes().any(|(n, _)| match n {
-        NodeRef::SelectStmt(s) => {
-            s.limit_count.is_some()
-                || s.limit_offset.is_some()
-                || s.distinct_clause.iter().any(Option::is_some)
-        }
-        NodeRef::RangeTableSample(_) => true,
-        _ => false,
-    })
 }
 
 enum Verdict {
@@ -583,62 +488,26 @@ fn compare(
         }
         _ => {}
     }
-    if written_tables != sent_tables {
-        return Verdict::Broken(format!(
-            "it leaves other table contents:\n  original: {written_tables:?}\n  probe:    \
-             {sent_tables:?}"
-        ));
+    if let (LintProbe::FixDropsReturning { .. }, Outcome::Rows(a), Outcome::Count(_)) =
+        (probe, written, sent)
+    {
+        // The rows it no longer returns are the rows it affects.
+        if let Difference::Differs(problem) = result_difference(
+            (&Outcome::Count(a.len() as u64), written_tables),
+            (sent, sent_tables),
+            rows,
+            NAMES,
+        ) {
+            return Verdict::Broken(problem);
+        }
+        return Verdict::Held;
     }
-    match (written, sent) {
-        (Outcome::Count(a), Outcome::Count(b)) if a != b => {
-            Verdict::Broken(format!("it affects {b} rows, the original {a}"))
-        }
-        (Outcome::Count(_), Outcome::Count(_)) => Verdict::Held,
-        (Outcome::Rows(a), Outcome::Count(b))
-            if matches!(probe, LintProbe::FixDropsReturning { .. }) =>
-        {
-            if a.len() as u64 == *b {
-                Verdict::Held
-            } else {
-                Verdict::Broken(format!(
-                    "it affects {b} rows, the original returns {}",
-                    a.len()
-                ))
-            }
-        }
-        (Outcome::Rows(a), Outcome::Rows(b)) => match rows {
-            Rows::All(order) => compare_rows(a, b, order.as_deref()),
-            Rows::Count if a.len() == b.len() => Verdict::Held,
-            Rows::Count => Verdict::Broken(format!(
-                "it returns {} rows, the original {}:\n  original: {a:?}\n  probe:    {b:?}",
-                b.len(),
-                a.len()
-            )),
-        },
-        _ => Verdict::Broken("one returns rows, the other a row count".to_owned()),
+    match result_difference((written, written_tables), (sent, sent_tables), rows, NAMES) {
+        Difference::Same => Verdict::Held,
+        Difference::Differs(problem) => Verdict::Broken(problem),
+        Difference::Uncompared => Verdict::Skip("too many rows".to_owned()),
     }
 }
 
-fn compare_rows(a: &[Row], b: &[Row], order: Option<&[usize]>) -> Verdict {
-    let (mut sa, mut sb) = (a.to_vec(), b.to_vec());
-    sa.sort();
-    sb.sort();
-    if sa != sb {
-        return Verdict::Broken(format!(
-            "it returns other rows:\n  original: {a:?}\n  probe:    {b:?}"
-        ));
-    }
-    if let Some(keys) = order {
-        let project = |rows: &[Row]| -> Vec<Row> {
-            rows.iter()
-                .map(|r| keys.iter().map(|&k| r[k].clone()).collect())
-                .collect()
-        };
-        if project(a) != project(b) {
-            return Verdict::Broken(format!(
-                "it returns the rows in another order:\n  original: {a:?}\n  probe:    {b:?}"
-            ));
-        }
-    }
-    Verdict::Held
-}
+/// How the lint oracle names the two statements in a difference.
+const NAMES: (&str, &str) = ("original", "probe");

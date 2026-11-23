@@ -2281,7 +2281,7 @@ impl PgCatalog {
     ) {
         let finite_params = self.finite_param_oids();
         self.with_pg_sanity::<()>(|server| {
-            server.assert_analyze_matches(analysis_sql, result, &finite_params)
+            server.assert_analyze_matches(self, analysis_sql, result, &finite_params)
         });
     }
 
@@ -2303,7 +2303,7 @@ impl PgCatalog {
         }];
         ours.sql = rewritten.to_owned();
         let finite = self.finite_param_oids();
-        self.with_pg_sanity(|server| server.check_rewrite(&analysis_sql, &ours, &finite))
+        self.with_pg_sanity(|server| server.check_rewrite(self, &analysis_sql, &ours, &finite))
             .flatten()
     }
 
@@ -2324,8 +2324,10 @@ impl PgCatalog {
             return none("the catalog has no live mirror");
         }
         let finite = self.finite_param_oids();
-        self.with_pg_sanity(|server| server.lint_probes(analysis_sql, analyzed, probes, &finite))
-            .unwrap_or_else(|| none("the catalog has no live mirror"))
+        self.with_pg_sanity(|server| {
+            server.lint_probes(self, analysis_sql, analyzed, probes, &finite)
+        })
+        .unwrap_or_else(|| none("the catalog has no live mirror"))
     }
 
     /// Run the role oracle on `analysis` as if the analyzer had produced it
@@ -2369,7 +2371,12 @@ impl PgCatalog {
         }
         let divergence = self
             .with_pg_sanity(|server| {
-                server.compare_analyze_matches(&analysis_sql, &result, &self.finite_param_oids())
+                server.compare_analyze_matches(
+                    self,
+                    &analysis_sql,
+                    &result,
+                    &self.finite_param_oids(),
+                )
             })
             .flatten();
         (result, divergence)

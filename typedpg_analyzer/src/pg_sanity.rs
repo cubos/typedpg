@@ -468,6 +468,7 @@ impl PgSanityServer {
     /// name disagrees.
     pub(crate) fn assert_analyze_matches(
         &mut self,
+        catalog: &crate::PgCatalog,
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
         finite_params: &std::collections::HashSet<u32>,
@@ -475,7 +476,9 @@ impl PgSanityServer {
         if self.mirror_only {
             return;
         }
-        if let Some(div) = self.compare_analyze_matches(analysis_sql, our_result, finite_params) {
+        if let Some(div) =
+            self.compare_analyze_matches(catalog, analysis_sql, our_result, finite_params)
+        {
             panic!("{}", div.message);
         }
     }
@@ -488,6 +491,7 @@ impl PgSanityServer {
     /// oracle's own tests: a deliberately wrong rewrite must be caught.
     pub(crate) fn check_rewrite(
         &mut self,
+        catalog: &crate::PgCatalog,
         written: &str,
         ours: &AnalyzedQuery,
         finite_params: &std::collections::HashSet<u32>,
@@ -496,13 +500,14 @@ impl PgSanityServer {
             .query_client
             .prepare(written)
             .unwrap_or_else(|e| panic!("pg_sanity: the written query must prepare: {e}"));
-        self.check_simplification(written, ours, &original, finite_params)
+        self.check_simplification(catalog, written, ours, &original, finite_params)
     }
 
     /// Run the lint oracle's `probes` next to `analysis_sql` (see
     /// [`soundness::lint`]).
     pub(crate) fn lint_probes(
         &mut self,
+        catalog: &crate::PgCatalog,
         analysis_sql: &str,
         ours: &AnalyzedQuery,
         probes: &[LintProbe],
@@ -510,6 +515,7 @@ impl PgSanityServer {
     ) -> Vec<LintProbeResult> {
         self.soundness.lint_probes(
             &mut self.query_client,
+            catalog,
             analysis_sql,
             ours,
             probes,
@@ -519,6 +525,7 @@ impl PgSanityServer {
 
     fn check_simplification(
         &mut self,
+        catalog: &crate::PgCatalog,
         original_sql: &str,
         ours: &AnalyzedQuery,
         original: &postgres::Statement,
@@ -561,6 +568,7 @@ impl PgSanityServer {
         }
         self.soundness.equivalence(
             &mut self.query_client,
+            catalog,
             (original_sql, original),
             (&ours.sql, &simplified),
             ours,
@@ -578,6 +586,7 @@ impl PgSanityServer {
     /// indicate the mirror itself is broken, not an analyzer bug.
     pub(crate) fn compare_analyze_matches(
         &mut self,
+        catalog: &crate::PgCatalog,
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
         finite_params: &std::collections::HashSet<u32>,
@@ -734,7 +743,7 @@ impl PgSanityServer {
                 if ours.simplifications.is_empty() {
                     return None;
                 }
-                self.check_simplification(analysis_sql, ours, stmt, finite_params)
+                self.check_simplification(catalog, analysis_sql, ours, stmt, finite_params)
             }
             (Err(e), Err(_)) => {
                 let our_msg = format!("{e}");
