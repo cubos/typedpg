@@ -1276,6 +1276,11 @@ impl PgCatalog {
         };
         #[cfg(feature = "pg_sanity")]
         {
+            // Code the analyzer couldn't follow may have changed anything:
+            // there is nothing left to compare.
+            if self.roles.uncertain.catalog {
+                self.pg_sanity_tainted = true;
+            }
             if !self.pg_sanity_tainted && !self.pg_sanity_skip {
                 if sql_touches_extension(stripped) {
                     self.run_pg_sanity_extension_apply_check(stripped, &result);
@@ -1665,11 +1670,34 @@ impl PgCatalog {
         let (_analysis_sql, result) = self.analyze_as_with_sql(sql, role);
 
         #[cfg(feature = "pg_sanity")]
-        if !self.pg_sanity_tainted && !self.pg_sanity_skip {
+        if !self.pg_sanity_tainted
+            && !self.pg_sanity_skip
+            && !self.role_outcome_uncertain(sql, role, &result)
+        {
             self.run_pg_sanity_role_check(&_analysis_sql, role, &result);
         }
 
         result
+    }
+
+    /// Whether the role may run `sql` only because of privileges code the
+    /// analyzer couldn't follow may have granted (see
+    /// [`crate::ddl::uncertain`]): denied at the catalog's lower bound,
+    /// either outcome agrees with it.
+    #[cfg(feature = "pg_sanity")]
+    fn role_outcome_uncertain(
+        &self,
+        sql: &str,
+        role: &str,
+        result: &Result<AnalyzedQuery, AnalyzeError>,
+    ) -> bool {
+        use crate::ddl::uncertain::{Bound, with_bound};
+        result.is_ok()
+            && self.roles.uncertain.privileges()
+            && matches!(
+                with_bound(Bound::Lower, || self.analyze_as_with_sql(sql, role).1),
+                Err(AnalyzeError::InsufficientPrivilege(_))
+            )
     }
 
     /// [`Self::analyze_as`], with an error's location (see
@@ -2666,6 +2694,25 @@ impl PgCatalog {
             for t in self.inline_body_trust.values_mut() {
                 *t = std::sync::OnceLock::new();
             }
+        }
+    }
+
+    /// The migrations' routines may have been redefined by code the
+    /// analyzer couldn't follow (see [`crate::ddl::uncertain`]): nothing is
+    /// inferred from their bodies any more — not inlined, not followed by
+    /// a `CALL`, not checked for the privileges they need — as for a
+    /// routine in a language the analyzer doesn't read.
+    pub(crate) fn forget_user_routine_bodies(&mut self) {
+        let end = self.seed_oid_end;
+        let user = |oid: &PgProcOid| oid.get() >= end;
+        if self.inline_sql_bodies.keys().any(user) {
+            self.inline_sql_bodies.retain(|oid, _| !user(oid));
+        }
+        if self.inline_body_trust.keys().any(user) {
+            self.inline_body_trust.retain(|oid, _| !user(oid));
+        }
+        if self.routine_bodies.keys().any(user) {
+            self.routine_bodies.retain(|oid, _| !user(oid));
         }
     }
 

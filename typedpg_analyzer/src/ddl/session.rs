@@ -174,6 +174,18 @@ impl SearchPathGuc {
         self.database.as_deref().unwrap_or(&self.default)
     }
 
+    /// `current_setting('search_path')`: the setting in effect, as text.
+    pub(crate) fn effective_setting(&self) -> String {
+        if self.local.is_none() && self.session.is_none() {
+            return self.default_setting.clone();
+        }
+        self.effective()
+            .iter()
+            .map(|n| typedpg_core::quote_identifier(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub(crate) fn effective(&self) -> &[String] {
         self.local
             .as_deref()

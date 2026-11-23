@@ -54,6 +54,8 @@ mod schemas;
 mod temporal;
 #[path = "ddl/types.rs"]
 mod types;
+#[path = "ddl/uncertain.rs"]
+mod uncertain;
 #[path = "ddl/views.rs"]
 mod views;
 

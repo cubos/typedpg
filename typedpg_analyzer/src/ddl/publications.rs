@@ -1012,6 +1012,15 @@ pub(crate) fn publication_exists(interp: &PgCatalog, name: &str) -> bool {
     interp.publications.iter().any(|p| p.name == name)
 }
 
+/// `pg_publication.puballtables` of publication `name`, if it exists.
+pub(crate) fn publication_all_tables(interp: &PgCatalog, name: &str) -> Option<bool> {
+    interp
+        .publications
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.all_tables)
+}
+
 impl Publication {
     /// A dropped relation leaves the publication.
     pub(crate) fn forget_relation(&mut self, relid: PgClassOid) {

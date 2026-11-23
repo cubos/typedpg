@@ -892,8 +892,11 @@ impl PgSanityServer {
             .unwrap_or_else(|e| panic!("pg_sanity: privilege comparison BEGIN failed: {e}"));
         let mut divergence = None;
         // Every created role, plus the predefined roles that carry implicit
-        // privileges: they exercise the model's special cases.
+        // privileges: they exercise the model's special cases. A role code
+        // the analyzer couldn't follow may have dropped may not exist (see
+        // `ddl::uncertain`).
         let mut subjects = created;
+        subjects.retain(|role| !db.roles.uncertain.roles.contains(role));
         for role in [
             "pg_read_all_data",
             "pg_write_all_data",
@@ -933,10 +936,23 @@ impl PgSanityServer {
         }
         let ignored = std::env::var("PG_SANITY_CATALOG_IGNORE").unwrap_or_default();
         let ignored: Vec<&str> = ignored.split('|').filter(|s| !s.is_empty()).collect();
+        // Routines code the analyzer couldn't follow may have redefined
+        // (see `ddl::uncertain`) are compared only for existing; triggers
+        // it may have enabled or disabled, but for their state.
+        let routines_uncertain = db.roles.uncertain.routines;
+        let triggers_uncertain = db.roles.uncertain.triggers;
         let differences: Vec<String> = self
             .catalog_differences(db)
             .into_iter()
             .filter(|line| !ignored.iter().any(|s| line.contains(s)))
+            .filter(|line| {
+                !(routines_uncertain
+                    && line.starts_with("pg_proc ")
+                    && line.contains(" in the analyzer, "))
+                    && !(triggers_uncertain
+                        && line.starts_with("pg_trigger ")
+                        && line.contains(": tgenabled is "))
+            })
             .collect();
         if differences.is_empty() {
             return;
@@ -1177,8 +1193,10 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_table_privilege(role, relid, privilege);
                 let theirs = pg_privs[at(i)];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_table_privilege(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1188,8 +1206,10 @@ impl PgSanityServer {
                         theirs,
                     ));
                 }
-                let ours = db.has_table_privilege_with_grant_option(role, relid, privilege);
                 let theirs = pg_privs[at(i) + 1];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_table_privilege_with_grant_option(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1209,8 +1229,10 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_any_column_privilege(role, relid, privilege);
                 let theirs = pg_privs[at(RELATION_PRIVS.len() + i)];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_any_column_privilege(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1220,8 +1242,10 @@ impl PgSanityServer {
                         theirs,
                     ));
                 }
-                let ours = db.has_any_column_privilege_with_grant_option(role, relid, privilege);
                 let theirs = pg_privs[at(RELATION_PRIVS.len() + i) + 1];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_any_column_privilege_with_grant_option(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1307,8 +1331,10 @@ impl PgSanityServer {
                 .into_iter()
                 .enumerate()
                 {
-                    let ours = db.has_column_privilege(role, class.oid, attr.attnum, privilege);
                     let theirs = pg_privs[i * 2];
+                    let ours = within_bounds(db, theirs, || {
+                        db.has_column_privilege(role, class.oid, attr.attnum, privilege)
+                    });
                     if ours != theirs {
                         return Some(privilege_mismatch(
                             role,
@@ -1322,13 +1348,15 @@ impl PgSanityServer {
                             theirs,
                         ));
                     }
-                    let ours = db.has_column_privilege_with_grant_option(
-                        role,
-                        class.oid,
-                        attr.attnum,
-                        privilege,
-                    );
                     let theirs = pg_privs[i * 2 + 1];
+                    let ours = within_bounds(db, theirs, || {
+                        db.has_column_privilege_with_grant_option(
+                            role,
+                            class.oid,
+                            attr.attnum,
+                            privilege,
+                        )
+                    });
                     if ours != theirs {
                         return Some(privilege_mismatch(
                             role,
@@ -1408,8 +1436,10 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_sequence_privilege(role, relid, privilege);
                 let theirs = pg_privs[i * 2];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_sequence_privilege(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1419,8 +1449,10 @@ impl PgSanityServer {
                         theirs,
                     ));
                 }
-                let ours = db.has_sequence_privilege_with_grant_option(role, relid, privilege);
                 let theirs = pg_privs[i * 2 + 1];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_sequence_privilege_with_grant_option(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1504,11 +1536,13 @@ impl PgSanityServer {
                 "{}({signature})",
                 crate::QualifiedName::new(schema.clone(), proname.clone())
             );
-            let ours = db.has_function_privilege(role, proc_oid);
+            let ours = within_bounds(db, pg_priv, || db.has_function_privilege(role, proc_oid));
             if ours != pg_priv {
                 return Some(privilege_mismatch(role, &object, "EXECUTE", ours, pg_priv));
             }
-            let ours = db.has_function_privilege_with_grant_option(role, proc_oid);
+            let ours = within_bounds(db, pg_option, || {
+                db.has_function_privilege_with_grant_option(role, proc_oid)
+            });
             if ours != pg_option {
                 return Some(privilege_mismatch(
                     role,
@@ -1569,7 +1603,9 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_schema_privilege(role, ns_oid, privilege);
+                let ours = within_bounds(db, pg_privs[i * 2], || {
+                    db.has_schema_privilege(role, ns_oid, privilege)
+                });
                 if ours != pg_privs[i * 2] {
                     return Some(privilege_mismatch(
                         role,
@@ -1579,7 +1615,9 @@ impl PgSanityServer {
                         pg_privs[i * 2],
                     ));
                 }
-                let ours = db.has_schema_privilege_with_grant_option(role, ns_oid, privilege);
+                let ours = within_bounds(db, pg_privs[i * 2 + 1], || {
+                    db.has_schema_privilege_with_grant_option(role, ns_oid, privilege)
+                });
                 if ours != pg_privs[i * 2 + 1] {
                     return Some(privilege_mismatch(
                         role,
@@ -1638,11 +1676,13 @@ impl PgSanityServer {
                 ));
             };
             let object = crate::QualifiedName::new(schema.clone(), typname.clone()).to_string();
-            let ours = db.has_type_privilege(role, typ_oid);
+            let ours = within_bounds(db, pg_priv, || db.has_type_privilege(role, typ_oid));
             if ours != pg_priv {
                 return Some(privilege_mismatch(role, &object, "USAGE", ours, pg_priv));
             }
-            let ours = db.has_type_privilege_with_grant_option(role, typ_oid);
+            let ours = within_bounds(db, pg_option, || {
+                db.has_type_privilege_with_grant_option(role, typ_oid)
+            });
             if ours != pg_option {
                 return Some(privilege_mismatch(
                     role,
@@ -1678,7 +1718,9 @@ impl PgSanityServer {
                     language.lanname
                 ));
             };
-            let ours = db.has_language_privilege(role, language.oid);
+            let ours = within_bounds(db, pg_priv, || {
+                db.has_language_privilege(role, language.oid)
+            });
             if ours != pg_priv {
                 return Some(privilege_mismatch(
                     role,
@@ -1688,7 +1730,9 @@ impl PgSanityServer {
                     pg_priv,
                 ));
             }
-            let ours = db.has_language_privilege_with_grant_option(role, language.oid);
+            let ours = within_bounds(db, pg_option, || {
+                db.has_language_privilege_with_grant_option(role, language.oid)
+            });
             if ours != pg_option {
                 return Some(privilege_mismatch(
                     role,
@@ -1715,15 +1759,16 @@ impl PgSanityServer {
             ("pg_subscription", "SELECT"),
             ("pg_shadow", "SELECT"),
         ] {
-            let (ours, pg) = (
-                db.resolve_table(Some("pg_catalog"), name)
-                    .map(|c| db.has_table_privilege(role, c.oid, crate::Privilege::Select)),
-                self.query_one_bool(
-                    "SELECT has_table_privilege($2::name, $1::text::regclass, 'SELECT')",
-                    &format!("pg_catalog.{name}"),
-                    role,
-                ),
+            let pg = self.query_one_bool(
+                "SELECT has_table_privilege($2::name, $1::text::regclass, 'SELECT')",
+                &format!("pg_catalog.{name}"),
+                role,
             );
+            let ours = db.resolve_table(Some("pg_catalog"), name).map(|c| {
+                within_bounds(db, pg, || {
+                    db.has_table_privilege(role, c.oid, crate::Privilege::Select)
+                })
+            });
             if let Some(ours) = ours
                 && ours != pg
             {
@@ -1742,16 +1787,16 @@ impl PgSanityServer {
             ("lo_import", 1, "pg_catalog.lo_import(text)"),
             ("now", 0, "pg_catalog.now()"),
         ] {
-            let ours = db
-                .find_functions(Some("pg_catalog"), name)
-                .into_iter()
-                .find(|p| p.proargtypes.len() == args)
-                .map(|p| db.has_function_privilege(role, p.oid));
             let pg = self.query_one_bool(
                 "SELECT has_function_privilege($2::name, $1::text::regprocedure, 'EXECUTE')",
                 sql_name,
                 role,
             );
+            let ours = db
+                .find_functions(Some("pg_catalog"), name)
+                .into_iter()
+                .find(|p| p.proargtypes.len() == args)
+                .map(|p| within_bounds(db, pg, || db.has_function_privilege(role, p.oid)));
             if let Some(ours) = ours
                 && ours != pg
             {
@@ -1818,6 +1863,11 @@ impl PgSanityServer {
             })
             .filter(|(role, member, grantor, ..)| interesting(role, member, grantor))
             .collect();
+        // A membership code the analyzer couldn't follow may have granted
+        // or revoked is not compared (see `ddl::uncertain`).
+        let uncertain = &db.roles.uncertain;
+        pg_rows.retain(|(role, member, ..)| !uncertain.memberships_may_differ(role, member));
+        model_rows.retain(|(role, member, ..)| !uncertain.memberships_may_differ(role, member));
         pg_rows.sort();
         model_rows.sort();
         if pg_rows != model_rows {
@@ -1837,6 +1887,15 @@ impl PgSanityServer {
         db: &crate::pg_catalog::PgCatalog,
         created: &[String],
     ) -> Option<String> {
+        // A role code the analyzer couldn't follow may have created,
+        // altered or dropped is not compared (see `ddl::uncertain`).
+        let uncertain = &db.roles.uncertain;
+        let created: Vec<String> = created
+            .iter()
+            .filter(|name| !uncertain.roles.contains(name) && !uncertain.catalog)
+            .cloned()
+            .collect();
+        let created = created.as_slice();
         if created.is_empty() {
             return None;
         }
@@ -1905,6 +1964,11 @@ impl PgSanityServer {
         created: &[String],
         session_user: &str,
     ) -> Option<String> {
+        // Default privileges code the analyzer couldn't follow may have
+        // changed are not compared (see `ddl::uncertain`).
+        if db.roles.uncertain.default_acls || db.roles.uncertain.catalog {
+            return None;
+        }
         let mut names = created.to_vec();
         if !names.iter().any(|name| name == session_user) {
             names.push(session_user.to_owned());
@@ -2014,6 +2078,9 @@ impl PgSanityServer {
                             pg: &HashMap<(String, String), String>|
          -> Option<String> {
             let mut seen: Vec<(String, String)> = Vec::new();
+            // Owners code the analyzer couldn't follow may have changed are
+            // not compared (see `ddl::uncertain`).
+            let uncertain = &db.roles.uncertain.owners;
             for (key, owner) in ours {
                 let Some(pg_owner) = pg.get(&key) else {
                     return Some(format!(
@@ -2022,7 +2089,8 @@ impl PgSanityServer {
                     ));
                 };
                 let ours = pg_role_name(db, owner, session_user);
-                if ours != *pg_owner {
+                if ours != *pg_owner && !uncertain.contains(&ours) && !uncertain.contains(pg_owner)
+                {
                     return Some(format!(
                         "pg_sanity: owner mismatch of {what} {}: model says \"{ours}\", PG says \
                          \"{pg_owner}\"",
@@ -2900,6 +2968,22 @@ fn render_pg_error(e: &postgres::Error) -> String {
         format!("{} (SQLSTATE {})", db.message(), db.code().code())
     } else {
         e.to_string()
+    }
+}
+
+/// The analyzer's answer to a privilege question PostgreSQL answered
+/// `theirs`: what `ours` says — at both bounds of an uncertain catalog (see
+/// `ddl::uncertain`), where PG agreeing with either bound agrees.
+fn within_bounds(db: &crate::pg_catalog::PgCatalog, theirs: bool, ours: impl Fn() -> bool) -> bool {
+    use crate::ddl::uncertain::{Bound, with_bound};
+    let upper = with_bound(Bound::Upper, &ours);
+    if upper == theirs || !db.roles.uncertain.privileges() {
+        return upper;
+    }
+    if with_bound(Bound::Lower, &ours) == theirs {
+        theirs
+    } else {
+        upper
     }
 }
 

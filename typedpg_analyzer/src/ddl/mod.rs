@@ -47,11 +47,13 @@ pub mod sequences;
 pub(crate) mod session;
 pub(crate) mod statistics;
 pub(crate) mod stored_exprs;
+pub(crate) mod symbolic;
 pub mod tables;
 pub(crate) mod text_search;
 pub(crate) mod triggers;
 mod txblock;
 pub mod types;
+pub(crate) mod uncertain;
 pub mod util;
 pub mod views;
 pub(crate) mod volatile;
@@ -220,12 +222,29 @@ fn apply_migration_here(
                 span: start + span_offset..end + span_offset,
             };
             observer.before(db, &statement);
+            // Once code the analyzer couldn't follow may have changed
+            // anything (see `uncertain`), a statement's failure is no longer
+            // certain: its effect becomes uncertain too.
+            let uncertain_start = (db.roles.uncertain.may_fail_on(stmt)
+                && !matches!(stmt, ast::Node::TransactionStmt(_)))
+            .then(|| db.snapshot());
             let result = {
                 db.in_transaction_block = tx.in_block();
                 with_statement_sql(db, sql, raw_stmt, |db| match stmt {
                     ast::Node::TransactionStmt(t) => tx.control(db, t),
                     _ => apply_statement(db, stmt),
                 })
+            };
+            let result = match (result, uncertain_start) {
+                (Err(_), Some(start)) => {
+                    // What it would have done, had it run, is uncertain.
+                    db.roll_back_to(&start);
+                    let mut found = uncertain::Uncertain::default();
+                    symbolic::classify_statement(stmt, &mut found);
+                    do_block::record(db, &found);
+                    Ok(())
+                }
+                (result, _) => result,
             };
             if let Err(e) = result {
                 located = Some(locate_in_statement(sql, raw_stmt, &e));

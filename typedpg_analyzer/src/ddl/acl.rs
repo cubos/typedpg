@@ -524,11 +524,17 @@ fn grant_options_held(
     if bits == 0 {
         return 0;
     }
-    if db.roles.has_privs_of_role(role, owner) || db.roles.is_superuser(role) {
+    if db.roles.has_privs_of_role(role, owner)
+        || db.roles.is_superuser(role)
+        || may_have_gained_privileges(db, role)
+    {
         return bits;
     }
     let mut result = 0;
     for item in acl {
+        if may_have_lost(db, item) {
+            continue;
+        }
         let matches = match item.grantee {
             Grantee::Public => true,
             Grantee::Role(grantee) => grantee == role || db.roles.has_privs_of_role(role, grantee),
@@ -605,6 +611,45 @@ fn select_best_grantor(
     (grantor, grant_options)
 }
 
+/// Whether `role` may hold privileges the catalog doesn't record, when
+/// checks read the upper bound of an uncertain catalog (see
+/// [`super::uncertain`]): it, or a role whose privileges it has, may have
+/// been granted some by code the analyzer couldn't follow.
+fn may_have_gained_privileges(db: &PgCatalog, role: RoleId) -> bool {
+    let uncertain = &db.roles.uncertain;
+    if super::uncertain::bound() != super::uncertain::Bound::Upper {
+        return false;
+    }
+    if uncertain.catalog {
+        return true;
+    }
+    if uncertain.gained_privileges.is_empty() && uncertain.roles.is_empty() {
+        return false;
+    }
+    db.roles.roles_with_privs_of(role).into_iter().any(|other| {
+        let name = db.roles.name(other);
+        // A role whose attributes may differ may be a superuser.
+        uncertain.gained_privileges.contains(name) || uncertain.roles.contains(name)
+    })
+}
+
+/// Whether ACL entry `item` may be gone, when checks read the lower bound
+/// of an uncertain catalog (see [`super::uncertain`]).
+fn may_have_lost(db: &PgCatalog, item: &AclItem) -> bool {
+    let uncertain = &db.roles.uncertain;
+    if super::uncertain::bound() != super::uncertain::Bound::Lower
+        || (uncertain.lost_privileges.is_empty() && !uncertain.catalog)
+    {
+        return false;
+    }
+    match item.grantee {
+        Grantee::Public => uncertain.lost_privileges.all || uncertain.catalog,
+        Grantee::Role(grantee) => {
+            uncertain.catalog || uncertain.lost_privileges.contains(db.roles.name(grantee))
+        }
+    }
+}
+
 /// `aclmask` of plain privileges (`pg_class_aclmask` & co.'s core): the ACL
 /// entries for `role`, for PUBLIC, and for every role it has the privileges
 /// of.
@@ -618,15 +663,19 @@ fn aclmask_privileges(
     if mask == 0 {
         return 0;
     }
+    if may_have_gained_privileges(db, role) {
+        return mask;
+    }
+    let acl: Vec<&AclItem> = acl.iter().filter(|item| !may_have_lost(db, item)).collect();
     let mut result = 0;
-    for item in acl {
+    for item in acl.iter().copied() {
         if matches!(item.grantee, Grantee::Public) || item.grantee == Grantee::Role(role) {
             result |= item.privileges & mask;
         }
     }
     let remaining = mask & !result;
     if remaining != 0 {
-        for item in acl {
+        for item in acl.iter().copied() {
             let Grantee::Role(grantee) = item.grantee else {
                 continue;
             };

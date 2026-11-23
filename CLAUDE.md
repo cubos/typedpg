@@ -224,6 +224,18 @@ mapped to names; what is compared and what is deliberately normalized is
 listed there. `tests/catalog_oracle` feeds it migration corpora
 (`CATALOG_CORPUS`) and random DDL, and minimizes a divergence.
 
+**Uncertain state.** A `DO` block or procedure whose effect depends on what
+the analyzer can't know (a loop over a table's rows, an `EXECUTE` of a
+computed string) records what it *may* have changed instead of running it
+(`typedpg_analyzer/src/ddl/uncertain.rs`, `ddl/symbolic.rs`): privileges and
+memberships possibly granted or revoked, roles, owners, routine definitions,
+trigger states, or — for a statement of unknown kind — the whole catalog.
+Nothing reported afterwards may depend on it: privilege checks read the
+catalog's upper bound, and a failing statement that may fail only because of
+it becomes uncertain itself. The oracles compare everything still known and
+accept PG's state wherever it lies between the bounds; a fully uncertain
+catalog ends the mirror's comparisons.
+
 **Nullability soundness.** Describe says nothing about nullability, so the
 mirror also *executes* every accepted query, in a rolled-back transaction,
 over adversarial rows it seeds into every table (NULL in each nullable
