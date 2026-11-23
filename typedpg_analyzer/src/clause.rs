@@ -191,6 +191,17 @@ pub(crate) fn coerce_clause_expr(
         Err(e) => e,
     };
     if !matches!(e, AnalyzeError::TypeMismatch { .. }) {
+        // PG raises a misplaced call's error as it transforms the call
+        // (`check_agglevels_and_constraints`, `transformWindowFuncCall`):
+        // before an enclosing operator or function that then fails to
+        // resolve. Only an error in what it transforms first (the call's
+        // own arguments, the operands before it) comes earlier.
+        if let Err(pe) = placement()
+            && let Some(loc) = placement_location(node, ctx, kind)
+            && call_reached_first(node, loc, ctx, params)
+        {
+            return Err(pe);
+        }
         return Err(e);
     }
     // The expression resolved but isn't the expected type — placement still
@@ -220,6 +231,97 @@ pub(crate) fn coerce_clause_expr(
         raw
     };
     Err(raw.finalize_implicit())
+}
+
+/// The location of the call [`check_level_calls`] rejects first in a
+/// clause of `kind`.
+fn placement_location(node: Option<&ast::Node>, ctx: Ctx<'_>, kind: ClauseKind) -> Option<i32> {
+    let calls = crate::grouping::level_calls(node, ctx.scope, ctx.snapshot);
+    if kind.aggregate_context().is_some() {
+        calls.aggregate.or(calls.grouping).or(calls.window)
+    } else if kind.window_only_context().is_some() {
+        calls.window
+    } else {
+        None
+    }
+}
+
+/// Whether PG, transforming `node` operands first and left to right,
+/// transforms the call at `loc` before anything fails: the call itself and
+/// every operand transformed before it (the left siblings on the path down
+/// to it) resolve. `false` when the path goes through a node this doesn't
+/// know the transform order of.
+fn call_reached_first(
+    node: Option<&ast::Node>,
+    loc: i32,
+    ctx: Ctx<'_>,
+    params: &ParamCollector,
+) -> bool {
+    fn list(v: &[Option<ast::Node>]) -> Vec<&ast::Node> {
+        v.iter().flatten().collect()
+    }
+    fn operands(n: &ast::Node) -> Option<Vec<&ast::Node>> {
+        Some(match n {
+            ast::Node::AExpr(e) => {
+                let mut out: Vec<&ast::Node> = e.lexpr.iter().collect();
+                match e.rexpr.as_ref() {
+                    Some(ast::Node::List(l)) => out.extend(list(&l.items)),
+                    r => out.extend(r),
+                }
+                out
+            }
+            ast::Node::FuncCall(f) => list(&f.args),
+            ast::Node::BoolExpr(b) => list(&b.args),
+            ast::Node::TypeCast(t) => t.arg.iter().collect(),
+            ast::Node::NullTest(t) => t.arg.iter().collect(),
+            ast::Node::BooleanTest(t) => t.arg.iter().collect(),
+            ast::Node::CollateClause(c) => c.arg.iter().collect(),
+            ast::Node::NamedArgExpr(a) => a.arg.iter().collect(),
+            ast::Node::AIndirection(i) => i.arg.iter().collect(),
+            ast::Node::CoalesceExpr(c) => list(&c.args),
+            ast::Node::MinMaxExpr(m) => list(&m.args),
+            ast::Node::RowExpr(r) => list(&r.args),
+            ast::Node::AArrayExpr(a) => list(&a.elements),
+            _ => return None,
+        })
+    }
+    fn holds(n: &ast::Node, loc: i32) -> bool {
+        n.nodes().any(|(r, _)| match r {
+            typedpg_pg_query::NodeRef::FuncCall(f) => f.location == loc,
+            typedpg_pg_query::NodeRef::GroupingFunc(g) => g.location == loc,
+            _ => false,
+        })
+    }
+    let resolves = |n: &ast::Node| {
+        let mut scratch = params.clone();
+        crate::error::speculative(|| {
+            expr::infer_expr(Some(n), ctx, &mut scratch, TypeGoal::NONE).ok()
+        })
+        .is_some()
+    };
+    let Some(mut n) = node else {
+        return false;
+    };
+    loop {
+        let is_call = match n {
+            ast::Node::FuncCall(f) => f.location == loc,
+            ast::Node::GroupingFunc(g) => g.location == loc,
+            _ => false,
+        };
+        if is_call {
+            return resolves(n);
+        }
+        let Some(ops) = operands(n) else {
+            return false;
+        };
+        let Some(i) = ops.iter().position(|o| holds(o, loc)) else {
+            return false;
+        };
+        if !ops[..i].iter().all(|o| resolves(o)) {
+            return false;
+        }
+        n = ops[i];
+    }
 }
 
 /// PG's placement rules (check_agglevels_and_constraints,

@@ -301,6 +301,134 @@ fn locking_clause_through_views_and_subqueries() {
     }
 }
 
+/// `make_outerjoininfo` refuses a locked relation on the nullable side of
+/// an outer join `reduce_outer_joins` leaves outer — and that reduction
+/// reads only the strictness of the quals handed down to the join
+/// (`find_nonnullable_rels`), not what else proves the side non-NULL.
+#[test]
+fn only_strict_quals_reduce_a_locked_outer_join() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE w (id int PRIMARY KEY, t_id int NOT NULL REFERENCES t, x text NOT NULL);
+         CREATE VIEW vl AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id < t.id;
+         CREATE VIEW vn AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id < t.id
+             WHERE u IS NOT NULL;
+         CREATE VIEW vc AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id < t.id
+             WHERE coalesce(u.x, '') = 'a';
+         CREATE VIEW vu AS SELECT t.id FROM t LEFT JOIN u USING (id) WHERE id = 1;
+         CREATE VIEW vx AS SELECT t.id FROM t LEFT JOIN (u CROSS JOIN t t3) ON t3.id = t.id
+             WHERE t3.a = 1;",
+    )
+    .unwrap();
+    let nullable = "FOR UPDATE cannot be applied to the nullable side of an outer join";
+    for sql in [
+        // Not strict: a whole-row test, a COALESCE (even a NULL for it
+        // that makes the qual FALSE), an ordering row comparison, IS
+        // DISTINCT FROM.
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE u IS NOT NULL FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE coalesce(u.x, 'z') = 'a' \
+         FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE t.a = coalesce(u.id, 0) \
+         FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE (u.id, u.t_id) < (1, 2) \
+         FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE u.x IS DISTINCT FROM 'a' \
+         FOR UPDATE OF u",
+        // A foreign key: every child has its parent, but no qual says so.
+        "SELECT 1 FROM w LEFT JOIN t ON w.t_id = t.id FOR UPDATE OF t",
+        // A strict set-returning function's argument, a LATERAL subquery's
+        // WHERE: no qual above the join.
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id \
+         CROSS JOIN LATERAL generate_series(1, u.id) g FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id \
+         CROSS JOIN LATERAL (SELECT 1 FROM w WHERE w.id = u.id) s FOR UPDATE OF u",
+        // Through views and subqueries: their own quals, the level's.
+        "SELECT * FROM vn FOR UPDATE",
+        "SELECT * FROM vc FOR UPDATE",
+        "SELECT * FROM vu FOR UPDATE",
+        "SELECT * FROM vl WHERE vl.x IS NULL FOR UPDATE",
+        "SELECT * FROM vl WHERE coalesce(vl.x, '') = 'a' FOR UPDATE",
+        "SELECT * FROM (SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id < t.id) s \
+         WHERE s.id = 1 FOR UPDATE",
+        // A pulled-up COALESCE on the nullable side is a PlaceHolderVar
+        // over two relations: strict in neither.
+        "SELECT * FROM t t2 LEFT JOIN (SELECT t.id, coalesce(u.x, '') AS c \
+         FROM t LEFT JOIN u ON u.t_id < t.id) s ON true WHERE s.c = 'a' FOR UPDATE OF s",
+        // The relations an aliased join hides are in the range table.
+        "SELECT 1 FROM (t LEFT JOIN u ON u.t_id < t.id) j FOR UPDATE",
+        "SELECT 1 FROM (t LEFT JOIN u ON u.t_id < t.id) j FOR UPDATE OF u",
+    ] {
+        let err = assert_err_prefix(&db, sql, nullable);
+        assert!(
+            matches!(err, AnalyzeError::FeatureNotSupported(_)),
+            "{sql}: {err:?}"
+        );
+    }
+    for sql in [
+        // Strict: BETWEEN's bounds (an AND of comparisons), a NOT over IS
+        // NULL (IS NOT NULL), a row's fields' tests, an EXISTS pulled up into
+        // a semi-join, a join below forced by a strict qual on another of
+        // its relations.
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE t.id BETWEEN 1 AND u.id \
+         FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE NOT (u.x IS NULL) FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id WHERE ROW(u.x, u.id) IS NOT NULL \
+         FOR UPDATE OF u",
+        "SELECT 1 FROM t LEFT JOIN u ON u.t_id < t.id \
+         WHERE EXISTS (SELECT 1 FROM w WHERE w.id = u.id) FOR UPDATE OF u",
+        "SELECT * FROM vx FOR UPDATE",
+        // A pulled-up view's whole row is a row constructor of its columns.
+        "SELECT * FROM vl WHERE vl IS NOT NULL FOR UPDATE",
+        "SELECT * FROM (SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id < t.id) s(i, y) \
+         WHERE s.y = 'a' FOR UPDATE",
+        "SELECT 1 FROM (t LEFT JOIN u ON u.t_id < t.id) j WHERE j.x = 'a' FOR UPDATE OF u",
+        "SELECT 1 FROM (t LEFT JOIN u ON u.t_id < t.id) j FOR UPDATE OF t",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// Two locking errors at once: PG raises the parser's (`transformLockingClause`
+/// over every clause: a missing entry, a subquery's blocker) before the
+/// planner's, and among those `make_outerjoininfo` over the level's joins
+/// before the views it plans on their own (`CheckSelectLocking` in
+/// `preprocess_rowmarks`).
+#[test]
+fn locking_errors_come_parser_first_then_planner() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW va AS SELECT count(*) AS c FROM t;
+         CREATE VIEW vl AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id < t.id;",
+    )
+    .unwrap();
+    for (sql, msg) in [
+        (
+            "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF u FOR SHARE OF missing",
+            "relation \"missing\" in FOR SHARE clause not found in FROM clause",
+        ),
+        (
+            "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id, (SELECT DISTINCT a FROM t) s \
+             FOR UPDATE OF u FOR SHARE OF s",
+            "FOR SHARE is not allowed with DISTINCT clause",
+        ),
+        (
+            "SELECT * FROM va, t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF va FOR SHARE OF u",
+            "FOR SHARE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT * FROM (SELECT * FROM va) q, t LEFT JOIN u ON u.t_id = t.id \
+             FOR UPDATE OF q FOR SHARE OF u",
+            "FOR SHARE cannot be applied to the nullable side of an outer join",
+        ),
+        (
+            "SELECT * FROM vl, va FOR UPDATE OF va FOR SHARE OF vl",
+            "FOR SHARE cannot be applied to the nullable side of an outer join",
+        ),
+    ] {
+        assert_err_prefix(&db, sql, msg);
+    }
+}
+
 /// The rewriter marks only a view's relations and subqueries for locking
 /// (`markQueryForLocking`), and the planner checks the view's query
 /// (`CheckSelectLocking` in `preprocess_rowmarks`) only when it has a row

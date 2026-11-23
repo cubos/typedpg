@@ -359,8 +359,11 @@ pub(crate) struct HiddenEntry {
 /// Why a locking clause can't be pushed into a view or subquery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockBlock {
-    /// `CheckSelectLocking`: `FOR UPDATE is not allowed with <construct>`.
-    NotAllowedWith(&'static str),
+    /// `CheckSelectLocking`: `FOR UPDATE is not allowed with <construct>` —
+    /// the parser's (a subquery's, pushed down by `transformLockingClause`)
+    /// or, through a view whose query only the rewriter brings in, the
+    /// planner's (`true`).
+    NotAllowedWith(&'static str, bool),
     /// `make_outerjoininfo`: a marked relation on an outer join's nullable
     /// side.
     NullableSide,

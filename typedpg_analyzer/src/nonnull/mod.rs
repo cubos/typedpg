@@ -21,6 +21,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub(crate) mod checks;
 pub(crate) mod exprs;
+pub(crate) mod plan_strict;
 pub(crate) mod subst;
 
 use typedpg_pg_query::NodeBox;
@@ -362,6 +363,18 @@ impl StrictLog {
 
     pub fn is_strict(&self, location: i32, kind: StrictNode) -> bool {
         location >= 0 && self.0.borrow().get(&(location, kind)) == Some(&true)
+    }
+
+    /// What [`StrictLog::note`] recorded for the node of `kind` at
+    /// `location`, if anything.
+    pub fn strictness(&self, location: i32, kind: StrictNode) -> Option<bool> {
+        self.0.borrow().get(&(location, kind)).copied()
+    }
+
+    /// The function the plain call at `location` resolved to (see
+    /// [`StrictLog::note_call`]).
+    pub fn called_proc(&self, location: i32) -> Option<crate::oid::PgProcOid> {
+        self.3.borrow().get(&location).copied()
     }
 
     /// Record what the `EXISTS` sublink at `location` being TRUE proves of

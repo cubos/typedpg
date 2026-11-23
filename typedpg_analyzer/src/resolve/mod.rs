@@ -1901,7 +1901,7 @@ mod call;
 pub(crate) use call::call_target;
 mod copy_in;
 mod cte;
-mod deferred;
+pub(crate) mod deferred;
 mod dml;
 pub(crate) use dml::assignment_violation;
 mod failing_rows;

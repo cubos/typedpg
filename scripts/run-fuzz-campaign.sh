@@ -6,7 +6,7 @@
 # cross-seed summary at the end.
 #
 # The campaign never fails on findings (FUZZ_STRICT stays unset) — triage
-# happens on the collected .sql files, where single-*.sql are the
+# happens on the collected .sql files, where high-*.sql are the
 # high-signal single-fault findings and multi-*.sql may be error-ordering
 # noise (see CLAUDE.md).
 #
@@ -47,7 +47,7 @@ total_single=0
 total_multi=0
 for seed in "${SEEDS[@]}"; do
     out="$root/seed-$seed"
-    single=$(find "$out" -name 'single-*.sql' 2>/dev/null | wc -l)
+    single=$(find "$out" -name 'high-*.sql' 2>/dev/null | wc -l)
     multi=$(find "$out" -name 'multi-*.sql' 2>/dev/null | wc -l)
     total_single=$((total_single + single))
     total_multi=$((total_multi + multi))

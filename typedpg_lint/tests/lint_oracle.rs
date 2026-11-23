@@ -78,6 +78,10 @@ struct Totals {
     /// The analyzer disagreeing with PostgreSQL on a generated query (or
     /// rejecting a generated schema's statement).
     divergences: BTreeMap<String, String>,
+    /// Divergences on a query with two simultaneous errors, each side
+    /// reporting one (see `multi_error`): tagged and written out, not
+    /// failures (CLAUDE.md, "multiple simultaneous errors").
+    multi_errors: BTreeMap<String, String>,
     /// Generated queries both the analyzer and PostgreSQL reject: the
     /// generator's own mistakes, written out to tune it.
     invalid: Vec<String>,
@@ -241,6 +245,13 @@ fn lint_oracle_corpus() {
         )
         .unwrap();
     }
+    for (i, (key, message)) in totals.multi_errors.iter().enumerate() {
+        std::fs::write(
+            format!("{out_dir}/multi-error-{i:03}.txt"),
+            format!("{key}\n\n{message}\n"),
+        )
+        .unwrap();
+    }
     std::fs::write(
         format!("{out_dir}/invalid-generated.txt"),
         totals.invalid.join("\n"),
@@ -248,12 +259,14 @@ fn lint_oracle_corpus() {
     .unwrap();
     eprintln!(
         "lint oracle: {} queries linted ({} the analyzer rejects), {} distinct broken claims, \
-         {} distinct panics, {} analyzer divergences on generated queries; written to {out_dir}",
+         {} distinct panics, {} analyzer divergences on generated queries ({} more on \
+         queries with two simultaneous errors, tagged multi-error); written to {out_dir}",
         totals.queries,
         totals.rejected,
         totals.broken.len(),
         totals.panics.len(),
-        totals.divergences.len()
+        totals.divergences.len(),
+        totals.multi_errors.len()
     );
     let mut by_rule: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for ((rule, what), n) in &totals.stats {
@@ -267,6 +280,9 @@ fn lint_oracle_corpus() {
     }
     for key in totals.divergences.keys() {
         eprintln!("  DIVERGENCE {key}");
+    }
+    for key in totals.multi_errors.keys() {
+        eprintln!("  MULTI-ERROR {key}");
     }
     assert!(
         totals.broken.is_empty() && totals.divergences.is_empty(),
@@ -334,6 +350,14 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
             let mut t = totals.lock().unwrap();
             match checked {
                 Ok((_, Some(divergence))) if deliberate_divergence(&divergence) => {}
+                Ok((_, Some(divergence))) if multi_error(&divergence) => {
+                    let key = format!("{}: {}", case.origin, first_line(&divergence.message));
+                    t.multi_errors.entry(key).or_insert(format!(
+                        "{}\nschema:\n{};",
+                        divergence.message,
+                        case.ddl.join(";\n")
+                    ));
+                }
                 Ok((_, Some(divergence))) => {
                     let key = format!("{}: {}", case.origin, first_line(&divergence.message));
                     t.divergences.entry(key).or_insert(format!(
@@ -436,6 +460,40 @@ fn deliberate_divergence(div: &typedpg_analyzer::Divergence) -> bool {
         }
         _ => false,
     }
+}
+
+/// A divergence on a statement with two errors at once, where each side
+/// reports one of them:
+///
+/// - an INSERT … ON CONFLICT whose arbiter is a deferrable constraint fails
+///   as its first row is stored (`ExecCheckIndexConstraints`), and a value
+///   one of its rows can't hold (a domain's CHECK, a NOT NULL or CHECK
+///   constraint) fails as that row is built or stored: the executor reports
+///   whichever row comes first, the analyzer the value's error. Which one
+///   depends on the row the value is in — the executor's row-by-row order,
+///   which the analyzer doesn't model.
+fn multi_error(div: &typedpg_analyzer::Divergence) -> bool {
+    use typedpg_analyzer::DivergenceKind;
+    let line = |prefix: &str| {
+        div.message
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix(prefix).map(str::to_owned))
+    };
+    div.kind == DivergenceKind::ErrorPrefix
+        && div.message.contains("(execute fallback)")
+        && line("PG (expected prefix):").is_some_and(|e| {
+            e.trim_start().starts_with(
+                "ON CONFLICT does not support deferrable unique constraints/exclusion \
+                 constraints as arbiters",
+            )
+        })
+        && line("analyzer:").is_some_and(|e| {
+            let e = e.trim_start();
+            (e.starts_with("value for domain ") && e.contains("violates check constraint"))
+                || e.starts_with("null value in column ")
+                || (e.starts_with("new row for relation ")
+                    && e.contains("violates check constraint"))
+        })
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {

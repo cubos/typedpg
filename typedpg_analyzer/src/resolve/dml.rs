@@ -3212,11 +3212,27 @@ fn analyze_update_here(
             },
         );
         null_ctx.add_where_facts(facts);
+        let plan_rels = crate::nonnull::plan_strict::qual_rels(
+            where_clause.as_ref(),
+            &crate::nonnull::plan_strict::ScopeVars {
+                scope: &scope,
+                from: upd.from_clause.iter().flatten().collect(),
+                null_ctx: &null_ctx,
+                log: &log,
+                snapshot,
+            },
+            &crate::nonnull::plan_strict::Strictness {
+                log: Some(&log),
+                snapshot,
+            },
+        );
+        null_ctx.add_plan_quals(plan_rels);
         old_facts = Some(all);
     }
     // The planner's: a FULL JOIN in FROM / USING no merge or hash join
-    // implements.
-    super::select::check_full_joins(&null_ctx, None, snapshot)?;
+    // implements — raised once the statement is parsed and rewritten (and
+    // its constants folded), so after those errors.
+    let full_joins = super::select::check_full_joins(&null_ctx, None, snapshot);
 
     let ret_scope = with_written_target(
         &scope,
@@ -3234,14 +3250,34 @@ fn analyze_update_here(
     )?;
 
     // SET col = expr / (a, b) = (…) / col[i] = expr — assignment context.
-    let set_list = analyze_set_clause(
+    let set_list = match analyze_set_clause(
         &upd.target_list,
         &table_attrs,
         &table_relname,
         expr::Ctx::new(&scope, &set_null_ctx, snapshot),
         params,
         true,
-    )?;
+    ) {
+        Ok(set_list) => set_list,
+        Err(e) => {
+            // A NULL literal written into a NOT NULL column is the error
+            // its execution raises: the planner's come first.
+            let mut scratch = params.clone();
+            if analyze_set_clause(
+                &upd.target_list,
+                &table_attrs,
+                &table_relname,
+                expr::Ctx::new(&scope, &set_null_ctx, snapshot),
+                &mut scratch,
+                false,
+            )
+            .is_ok()
+            {
+                full_joins?;
+            }
+            return Err(e);
+        }
+    };
 
     // The old row is a stored row past WHERE; the new one, with no BEFORE
     // ROW trigger or row movement, that row with the SET values (computed
@@ -3298,6 +3334,7 @@ fn analyze_update_here(
     );
     rw.returning = has_returning(upd.returning_clause.as_deref());
     check_rewrite(snapshot, table_oid, &rw)?;
+    full_joins?;
     Ok((columns, None))
 }
 
@@ -3469,11 +3506,27 @@ fn analyze_delete_here(
             |_| keeps,
         );
         null_ctx.add_where_facts(facts);
+        let plan_rels = crate::nonnull::plan_strict::qual_rels(
+            where_clause.as_ref(),
+            &crate::nonnull::plan_strict::ScopeVars {
+                scope: &scope,
+                from: del.using_clause.iter().flatten().collect(),
+                null_ctx: &null_ctx,
+                log: &log,
+                snapshot,
+            },
+            &crate::nonnull::plan_strict::Strictness {
+                log: Some(&log),
+                snapshot,
+            },
+        );
+        null_ctx.add_plan_quals(plan_rels);
         old_facts = Some(all);
     }
     // The planner's: a FULL JOIN in FROM / USING no merge or hash join
-    // implements.
-    super::select::check_full_joins(&null_ctx, None, snapshot)?;
+    // implements — raised once the statement is parsed and rewritten (and
+    // its constants folded), so after those errors.
+    let full_joins = super::select::check_full_joins(&null_ctx, None, snapshot);
     // A deleted row is a stored row past WHERE: its CHECK constraints and
     // generated columns hold too.
     if has_returning(del.returning_clause.as_deref())
@@ -3503,6 +3556,7 @@ fn analyze_delete_here(
     let mut rw = Rewrite::single(DmlEvent::Delete, Vec::new(), Overriding::NotSet);
     rw.returning = has_returning(del.returning_clause.as_deref());
     check_rewrite(snapshot, table_oid, &rw)?;
+    full_joins?;
     Ok((columns, None))
 }
 
