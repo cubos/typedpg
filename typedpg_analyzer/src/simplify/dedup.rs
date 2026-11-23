@@ -3574,7 +3574,18 @@ fn index_expression_call(
     let mut args = Vec::with_capacity(call.args.len());
     let mut types = Vec::with_capacity(call.args.len());
     let mut collations_deterministic = true;
+    // An argument the index's rebuild cast to its parameter's type
+    // (`lower((c)::text)`): the query's call coerces it the same way.
+    let mut casts: Vec<Option<PgTypeOid>> = Vec::with_capacity(call.args.len());
     for arg in &call.args {
+        let (arg, cast) = match arg {
+            Some(Node::TypeCast(tc)) => (
+                tc.arg.as_ref(),
+                Some(crate::nonnull::cast_target(tc, ctx.catalog)?),
+            ),
+            other => (other.as_ref(), None),
+        };
+        casts.push(cast);
         let Some(Node::ColumnRef(column)) = arg else {
             return None;
         };
@@ -3616,6 +3627,10 @@ fn index_expression_call(
     if proc.provolatile != ProVolatile::Immutable
         || proc.prokind != ProKind::Function
         || proc.proargtypes.len() != args.len()
+        || casts
+            .iter()
+            .zip(&proc.proargtypes)
+            .any(|(cast, param)| cast.is_some_and(|t| t != *param))
     {
         return None;
     }

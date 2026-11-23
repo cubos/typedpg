@@ -721,3 +721,119 @@ fn on_conflict_infers_an_index_bound_to_another_schema() {
     )
     .unwrap();
 }
+
+#[test]
+fn a_rebuilt_expression_keeps_the_coercions_ruleutils_prints() {
+    // ALTER COLUMN TYPE rebuilds a CHECK or an index from the text
+    // pg_get_constraintdef / pg_get_indexdef print for it: a function's or
+    // operator's argument shows its implicit coercion as a cast
+    // (`pos((b)::integer)`, `length((c)::text)`, `((d)::text = 'x'::text)`),
+    // which the new type then goes through explicitly — while a constant
+    // is printed typed (`a > 5` for `a > '5'`).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION pos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+         CREATE FUNCTION inc(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+         CREATE TABLE t (b smallint CHECK (pos(b)), a int CHECK (pos(a)), x smallint);
+         CREATE INDEX ON t (inc(x));
+         CREATE TABLE v (c varchar(10) CHECK (length(c) > 0), d varchar CHECK (d = 'x'),
+             e varchar);
+         CREATE UNIQUE INDEX ON v (lower(e));
+         CREATE TABLE k (a int CHECK (a > '5'));",
+    )]);
+    db.apply_sql(
+        "ALTER TABLE t ALTER b TYPE text;
+         ALTER TABLE t ALTER a TYPE smallint;
+         ALTER TABLE t ALTER a TYPE text;
+         ALTER TABLE t ALTER x TYPE text;
+         ALTER TABLE v ALTER c TYPE int USING length(c);
+         ALTER TABLE v ALTER d TYPE int USING length(d);
+         ALTER TABLE v ALTER e TYPE int USING length(e);",
+    )
+    .unwrap();
+    expect_failure(
+        &mut db,
+        "ALTER TABLE k ALTER a TYPE text;",
+        "operator does not exist: text > integer",
+    );
+    db.apply_sql("ALTER TABLE k ALTER a TYPE bigint;").unwrap();
+}
+
+#[test]
+fn inference_compares_an_index_rebuilt_with_coercions_as_transformed() {
+    // ON CONFLICT's inference compares the transformed trees: a rebuilt
+    // `lower((e)::text)` is the query's `lower(e)`, and a rebuilt
+    // `((c)::text = 'x'::text)` predicate is implied by `c = 'x'`.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE u (a int, c varchar(10), e varchar);
+         CREATE UNIQUE INDEX ON u (lower(e));
+         CREATE UNIQUE INDEX ON u (a) WHERE c = 'x';",
+    )]);
+    db.apply_sql(
+        "ALTER TABLE u ALTER e TYPE varchar(20);
+         ALTER TABLE u ALTER c TYPE varchar(30);
+         INSERT INTO u VALUES (1, 'x', 'e') ON CONFLICT (lower(e)) DO NOTHING;
+         INSERT INTO u VALUES (1, 'x', 'e') ON CONFLICT (lower(e::text)) DO NOTHING;
+         INSERT INTO u VALUES (1, 'x', 'e') ON CONFLICT (a) WHERE c = 'x' DO NOTHING;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn reg_constants_keep_the_objects_they_named() {
+    // PG stores a reg* constant as an OID: another search path, a renamed
+    // routine, type, text search configuration or schema leave it naming
+    // the same object, and a rebuild prints it as its output function
+    // does.
+    let mut db = build_db(&[
+        ("0001.sql", BOUND_SETUP),
+        (
+            "0002.sql",
+            "CREATE TEXT SEARCH CONFIGURATION s.myconf (COPY = simple);
+             SET search_path = s, public;
+             CREATE TABLE public.r (p regproc DEFAULT 'spos',
+                 q regprocedure DEFAULT 'spos(integer)',
+                 o regoperator DEFAULT '===(integer,integer)', oo regoper DEFAULT '===',
+                 y regtype DEFAULT 'e', co regcollation DEFAULT 'co',
+                 n regnamespace DEFAULT 's', cf regconfig DEFAULT 'myconf',
+                 y2 regtype CHECK (y2 <> 'e'::regtype),
+                 q2 regprocedure CHECK (q2 <> 'spos(integer)'::regprocedure));",
+        ),
+    ]);
+    db.apply_sql(
+        "RESET search_path;
+         INSERT INTO r (y2, q2) VALUES ('int4', 'tf()');
+         ALTER TABLE r ALTER y2 TYPE regtype;
+         ALTER TABLE r ALTER q2 TYPE regprocedure;
+         ALTER FUNCTION s.spos(int) RENAME TO spos2;
+         ALTER TYPE s.e RENAME TO e2;
+         ALTER TEXT SEARCH CONFIGURATION s.myconf RENAME TO myconf2;
+         ALTER SCHEMA s RENAME TO s3;
+         INSERT INTO r (y2, q2) VALUES ('int4', 'tf()');
+         ALTER TABLE r ALTER y2 TYPE regtype;
+         ALTER TABLE r ALTER q2 TYPE regprocedure;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn role_and_database_constants_cannot_be_stored() {
+    // find_expr_references_walker records no dependency on a role or a
+    // database, so a stored expression may not hold a `regrole` or
+    // `regdatabase` constant.
+    let mut db = build_db(&[("0001.sql", "CREATE ROLE stored_regrole_owner;")]);
+    for sql in [
+        "CREATE TABLE r (g regrole DEFAULT 'stored_regrole_owner');",
+        "CREATE TABLE r (g regrole CHECK (g <> 'stored_regrole_owner'::regrole));",
+        "CREATE TABLE r (g oid CHECK (g <> 'stored_regrole_owner'::regrole::oid));",
+    ] {
+        expect_failure(
+            &mut db,
+            sql,
+            "constant of the type regrole cannot be used here",
+        );
+    }
+    db.apply_sql("CREATE TABLE r (g regrole, n int CHECK (n > 0));")
+        .unwrap();
+}

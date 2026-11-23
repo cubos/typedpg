@@ -548,3 +548,137 @@ mod tests {
         }
     }
 }
+
+/// The object a reg* constant names: what its input function looks up,
+/// and its output function prints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegObject {
+    Class(crate::oid::PgClassOid),
+    Proc(crate::oid::PgProcOid),
+    Operator(crate::oid::PgOperatorOid),
+    Type(PgTypeOid),
+    Collation(crate::oid::PgCollationOid),
+    Namespace(crate::oid::PgNamespaceOid),
+    Role(String),
+    /// A text search configuration (`c`) or dictionary (`d`), by OID.
+    TsObject(crate::oid::PgGenericOid),
+}
+
+/// The reg* types whose constants name an object (`regdatabase` aside:
+/// databases are not modelled).
+pub(crate) const REG_TYPES: &[&str] = &[
+    "regclass",
+    "regproc",
+    "regprocedure",
+    "regoper",
+    "regoperator",
+    "regtype",
+    "regcollation",
+    "regnamespace",
+    "regrole",
+    "regconfig",
+    "regdictionary",
+];
+
+/// The object the `typname` constant `content` names under the current
+/// search path, as its input function finds it; `None` where it finds
+/// none (or a `pg_catalog`-less built-in the snapshot doesn't carry).
+pub(crate) fn resolve(typname: &str, content: &str, snapshot: &PgCatalog) -> Option<RegObject> {
+    // The lookup is the binding's, not the statement's: what it notes is
+    // dropped.
+    let (found, _) = crate::ddl::depend::collect(|| resolve_noting(typname, content, snapshot));
+    found
+}
+
+fn resolve_noting(typname: &str, content: &str, snapshot: &PgCatalog) -> Option<RegObject> {
+    match typname {
+        "regprocedure" => {
+            let (names, args) = name_and_arg_types(content, false, snapshot).ok()?;
+            let (schema, name) = deconstruct(&names).ok()?;
+            snapshot
+                .find_functions(schema, name)
+                .into_iter()
+                .find(|p| {
+                    p.proargtypes
+                        .iter()
+                        .map(|&t| Some(t))
+                        .eq(args.iter().copied())
+                })
+                .map(|p| RegObject::Proc(p.oid))
+        }
+        "regoperator" => {
+            let (names, args) = name_and_arg_types(content, true, snapshot).ok()?;
+            let [left, Some(right)] = args.as_slice() else {
+                return None;
+            };
+            let (schema, name) = deconstruct(&names).ok()?;
+            crate::ddl::drop::find_operator(snapshot, schema, name, &|o| {
+                o.oprleft == *left && o.oprright == *right
+            })
+            .map(RegObject::Operator)
+        }
+        "regtype" => parse_type_string(content, snapshot)
+            .ok()
+            .map(RegObject::Type),
+        _ => {
+            let names = qualified_name_list(content).ok()?;
+            match typname {
+                "regclass" => {
+                    let (schema, name) = deconstruct(&names).ok()?;
+                    snapshot
+                        .resolve_table(schema, name)
+                        .map(|c| RegObject::Class(c.oid))
+                }
+                "regproc" => {
+                    let (schema, name) = deconstruct(&names).ok()?;
+                    match snapshot.find_functions(schema, name).as_slice() {
+                        [p] => Some(RegObject::Proc(p.oid)),
+                        _ => None,
+                    }
+                }
+                "regoper" => {
+                    let (schema, name) = deconstruct(&names).ok()?;
+                    let path = snapshot.schemas_for_function_lookup(schema);
+                    let found: Vec<_> = snapshot
+                        .pg_operator
+                        .values()
+                        .filter(|o| o.oprname == name && path.contains(&o.oprnamespace))
+                        .collect();
+                    match found.as_slice() {
+                        [o] => Some(RegObject::Operator(o.oid)),
+                        _ => None,
+                    }
+                }
+                "regcollation" => {
+                    let (schema, name) = deconstruct(&names).ok()?;
+                    snapshot
+                        .resolve_collation(schema, name)
+                        .map(|c| RegObject::Collation(c.oid))
+                }
+                "regnamespace" => match names.as_slice() {
+                    [n] => snapshot.namespace_oid(n).map(RegObject::Namespace),
+                    _ => None,
+                },
+                "regrole" => match names.as_slice() {
+                    [n] => Some(RegObject::Role(n.clone())),
+                    _ => None,
+                },
+                "regconfig" | "regdictionary" => {
+                    let (schema, name) = deconstruct(&names).ok()?;
+                    let kind = if typname == "regconfig" { "c" } else { "d" };
+                    snapshot
+                        .schemas_for_lookup(schema)
+                        .into_iter()
+                        .find_map(|ns| {
+                            snapshot
+                                .pg_ts_objects
+                                .iter()
+                                .find(|o| o.kind == kind && o.name == name && o.namespace == ns)
+                        })
+                        .map(|o| RegObject::TsObject(o.oid))
+                }
+                _ => None,
+            }
+        }
+    }
+}

@@ -172,8 +172,7 @@ pub(crate) fn over_own_row(
             fields.drain(..idx);
         }
     });
-    // And its objects named as the current search path prints them.
-    render(interp, tree.stmts.pop().and_then(|s| s.stmt).as_ref())
+    tree.stmts.pop().and_then(|s| s.stmt)
 }
 
 /// ALTER TABLE ... RENAME COLUMN `old` TO `new` of relation `relid`: the
@@ -406,6 +405,11 @@ pub(crate) enum Renamed<'a> {
         oid: crate::oid::PgNamespaceOid,
         name: &'a str,
     },
+    /// A role renamed from `old` to `new` (a `regrole` constant names it).
+    Role { old: &'a str, new: &'a str },
+    /// Another object, only reg* constants name (a relation, a text
+    /// search configuration or dictionary).
+    Other,
 }
 
 /// Where a stored expression lives.
@@ -533,18 +537,14 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
 
 /// The name slots of `expr`, analyzed over `over`, and what they resolved
 /// to.
-fn bindings_of(
-    interp: &PgCatalog,
-    over: Over,
-    expr: Option<&ast::Node>,
-) -> crate::ddl::policies::PolicyRefs {
+fn bindings_of(interp: &PgCatalog, over: Over, expr: Option<&ast::Node>) -> Bindings {
     use crate::qualified_name::QualifiedName;
     let mut scope = crate::scope::Scope::default();
     let mut analyzed = expr.cloned();
     match over {
         Over::Row(relid) | Over::TriggerRow(relid) => {
             let Some(class) = interp.pg_class.get(&relid) else {
-                return Default::default();
+                return Bindings::default();
             };
             let nspname = interp
                 .namespace_name(class.relnamespace)
@@ -599,15 +599,28 @@ fn bindings_of(
     // Only the bindings are wanted: what the analysis reports is the
     // expression's own business, and no diagnostic may be left behind.
     let _barrier = crate::error::DiagContextGuard::barrier();
+    let log = crate::nonnull::StrictLog::default();
     let (_, refs) = crate::ddl::policies::collect_refs(|| {
         crate::expr::infer_expr(
             analyzed.as_ref(),
-            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log),
             &mut params,
             crate::expr::TypeGoal::NONE,
         )
     });
-    refs
+    Bindings {
+        refs,
+        literals: log.trusted().literal_types,
+    }
+}
+
+/// What a stored expression's names resolved to ([`bindings_of`]): its
+/// name slots, and the types its string literals were coerced to (a reg*
+/// constant's names an object).
+#[derive(Default)]
+struct Bindings {
+    refs: crate::ddl::policies::PolicyRefs,
+    literals: std::collections::HashMap<i32, PgTypeOid>,
 }
 
 /// Whether `expr` has a name `String` among `names` (a cheap filter: a
@@ -743,12 +756,14 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
             .map(|o| vec![o.oprname.clone()]),
         // Any name may be an object of the schema's.
         Renamed::Schema { .. } => None,
+        // Only reg* constants name these.
+        Renamed::Role { .. } | Renamed::Other => Some(Vec::new()),
     };
     let rewritten: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, false)
         .into_iter()
         .filter(|(_, _, expr)| names.as_ref().is_none_or(|n| mentions(expr.as_ref(), n)))
         .filter_map(|(slot, over, mut expr)| {
-            let refs = bindings_of(interp, over, expr.as_ref());
+            let refs = bindings_of(interp, over, expr.as_ref()).refs;
             let before = expr.clone();
             rewrite_slots(interp, &mut expr, &refs, renamed);
             (expr != before).then_some((slot, expr))
@@ -757,6 +772,7 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
     for (slot, expr) in rewritten {
         write_slot(interp, slot, expr);
     }
+    note_reg_constants(interp, renamed);
 }
 
 /// Store `expr` as the expression of `slot`.
@@ -923,46 +939,20 @@ fn has_unbound_name(expr: Option<&ast::Node>, names: &std::collections::HashSet<
             NodeRef::TypeName(tn) => single(&tn.names),
             NodeRef::CollateClause(cc) => single(&cc.collname),
             NodeRef::AExpr(ae) => single(&ae.name),
+            // A reg* constant: `name`, or `name(args)`.
             NodeRef::AConst(c) => matches!(&c.val,
-                Some(ast::AConstValue::String(s)) if names.contains(&s.sval)),
+                Some(ast::AConstValue::String(s))
+                    if names.contains(s.sval.split('(').next().unwrap_or_default().trim())),
             _ => false,
         })
     })
 }
 
-/// A sequence function taking its sequence as a `regclass` first argument.
-fn takes_regclass(name: &str) -> bool {
-    matches!(name, "nextval" | "currval" | "setval")
-}
-
-/// The string of a `regclass` constant `c`, naming relation `name`
-/// unqualified, bound: qualified with the schema of the relation the
-/// current search path finds.
-fn bind_regclass_literal(interp: &PgCatalog, c: &mut ast::AConst) {
-    let Some(ast::AConstValue::String(s)) = c.val.as_mut() else {
-        return;
-    };
-    let Ok(names) = crate::reg_input::qualified_name_list(&s.sval) else {
-        return;
-    };
-    let [name] = names.as_slice() else {
-        return;
-    };
-    if let Some(class) = interp.resolve_table(None, name)
-        && !left_as_written(interp, class.relnamespace)
-        && let Some(ns) = interp.namespace_name(class.relnamespace)
-    {
-        s.sval = crate::qualified_name::QualifiedName::new(ns, &class.relname).to_string();
-    }
-}
-
 /// Qualify the names of `expr` that `refs` resolved to objects outside
 /// `pg_catalog` with their schemas.
-fn bind_slots(
-    interp: &PgCatalog,
-    expr: &mut Option<ast::Node>,
-    refs: &crate::ddl::policies::PolicyRefs,
-) {
+fn bind_slots(interp: &PgCatalog, expr: &mut Option<ast::Node>, bindings: &Bindings) {
+    let refs = &bindings.refs;
+    let literals = &bindings.literals;
     use typedpg_pg_query::NodeMut;
     let schema = |ns: crate::oid::PgNamespaceOid| -> Option<String> {
         (!left_as_written(interp, ns))
@@ -983,12 +973,6 @@ fn bind_slots(
             {
                 requalify(&mut fc.funcname, Some(&ns), None);
             }
-            if takes_regclass(&proc.proname)
-                && left_as_written(interp, proc.pronamespace)
-                && let Some(Some(ast::Node::AConst(c))) = fc.args.first_mut()
-            {
-                bind_regclass_literal(interp, c);
-            }
         }
         NodeMut::TypeName(tn) => {
             if tn.names.len() == 1
@@ -1002,17 +986,16 @@ fn bind_slots(
                 requalify(&mut tn.names, Some(&ns), None);
             }
         }
-        NodeMut::TypeCast(tc) => {
-            let regclass = tc
-                .type_name
-                .as_ref()
-                .and_then(|tn| refs.types.get(&tn.location))
-                .and_then(|t| interp.pg_type.get(t))
-                .is_some_and(|t| {
-                    t.typname == "regclass" && left_as_written(interp, t.typnamespace)
-                });
-            if regclass && let Some(ast::Node::AConst(c)) = tc.arg.as_mut() {
-                bind_regclass_literal(interp, c);
+        // A reg* constant names its object qualified, as its OID would.
+        NodeMut::AConst(c) => {
+            if let Some(typname) = literals
+                .get(&c.location)
+                .and_then(|&t| reg_type_name(interp, t))
+                && let Some(ast::AConstValue::String(s)) = c.val.as_mut()
+                && let Some(object) = crate::reg_input::resolve(typname, &s.sval, interp)
+                && let Some(text) = reg_text(interp, typname, &object, true)
+            {
+                s.sval = text;
             }
         }
         NodeMut::CollateClause(cc) => {
@@ -1045,24 +1028,27 @@ fn bind_slots(
 /// After a statement: bind the stored expressions it wrote (see above).
 /// One already bound has no unqualified name of an object outside
 /// `pg_catalog` left, and is skipped.
-pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) {
+pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), super::DdlError> {
+    apply_reg_constants(interp);
+    refuse_unstorable_constants(interp)?;
     let names = user_object_names(interp);
     if names.is_empty() {
-        return;
+        return Ok(());
     }
     let bound: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, true)
         .into_iter()
         .filter(|(_, _, expr)| has_unbound_name(expr.as_ref(), &names))
         .filter_map(|(slot, over, mut expr)| {
-            let refs = bindings_of(interp, over, expr.as_ref());
+            let bindings = bindings_of(interp, over, expr.as_ref());
             let before = expr.clone();
-            bind_slots(interp, &mut expr, &refs);
+            bind_slots(interp, &mut expr, &bindings);
             (expr != before).then_some((slot, expr))
         })
         .collect();
     for (slot, expr) in bound {
         write_slot(interp, slot, expr);
     }
+    Ok(())
 }
 
 /// Whether ruleutils would print routine `name` of schema `ns` unqualified
@@ -1119,30 +1105,6 @@ fn qualifier(
     (!left_as_written(interp, ns)).then(|| (ns, n.sval.clone()))
 }
 
-/// `regclassout`: the string of `regclass` constant `c` qualified only if
-/// the relation is not visible.
-fn render_regclass_literal(interp: &PgCatalog, c: &mut ast::AConst) {
-    let Some(ast::AConstValue::String(s)) = c.val.as_mut() else {
-        return;
-    };
-    let Ok(names) = crate::reg_input::qualified_name_list(&s.sval) else {
-        return;
-    };
-    let [schema, name] = names.as_slice() else {
-        return;
-    };
-    let Some(ns) = interp.namespace_oid(schema) else {
-        return;
-    };
-    if left_as_written(interp, ns) {
-        return;
-    }
-    let bound = interp.class_by_qname.get(&(ns, name.clone()));
-    if bound.is_some() && interp.resolve_table(None, name).map(|c| &c.oid) == bound {
-        s.sval = typedpg_core::quote_identifier(name);
-    }
-}
-
 /// `expr`, a stored expression, as ruleutils prints it under the current
 /// search path: a schema qualification is dropped wherever an unqualified
 /// lookup finds the same object.
@@ -1159,15 +1121,24 @@ pub(crate) fn render(interp: &PgCatalog, expr: Option<&ast::Node>) -> Option<ast
                 {
                     fc.funcname.remove(0);
                 }
+                // `nextval('seq')`: a regclass constant.
                 let sequence_function = match fc.funcname.as_slice() {
-                    [Some(ast::Node::String(n))] => takes_regclass(&n.sval),
+                    [Some(ast::Node::String(n))] => {
+                        matches!(n.sval.as_str(), "nextval" | "currval" | "setval")
+                    }
                     [Some(ast::Node::String(s)), Some(ast::Node::String(n))] => {
-                        s.sval == "pg_catalog" && takes_regclass(&n.sval)
+                        s.sval == "pg_catalog"
+                            && matches!(n.sval.as_str(), "nextval" | "currval" | "setval")
                     }
                     _ => false,
                 };
-                if sequence_function && let Some(Some(ast::Node::AConst(c))) = fc.args.first_mut() {
-                    render_regclass_literal(interp, c);
+                if sequence_function
+                    && let Some(Some(ast::Node::AConst(c))) = fc.args.first_mut()
+                    && let Some(ast::AConstValue::String(s)) = c.val.as_mut()
+                    && let Some(object) = crate::reg_input::resolve("regclass", &s.sval, interp)
+                    && let Some(text) = reg_text(interp, "regclass", &object, false)
+                {
+                    s.sval = text;
                 }
             }
             NodeMut::TypeName(tn) => {
@@ -1180,12 +1151,22 @@ pub(crate) fn render(interp: &PgCatalog, expr: Option<&ast::Node>) -> Option<ast
                     tn.names.remove(0);
                 }
             }
+            // `'name'::regtype` and the like.
             NodeMut::TypeCast(tc) => {
-                let regclass = tc.type_name.as_ref().is_some_and(|tn| {
-                    matches!(tn.names.last(), Some(Some(ast::Node::String(s))) if s.sval == "regclass")
+                let typname = tc.type_name.as_ref().and_then(|tn| match tn.names.last() {
+                    Some(Some(ast::Node::String(s))) => crate::reg_input::REG_TYPES
+                        .iter()
+                        .find(|r| **r == s.sval)
+                        .copied(),
+                    _ => None,
                 });
-                if regclass && let Some(ast::Node::AConst(c)) = tc.arg.as_mut() {
-                    render_regclass_literal(interp, c);
+                if let Some(typname) = typname
+                    && let Some(ast::Node::AConst(c)) = tc.arg.as_mut()
+                    && let Some(ast::AConstValue::String(s)) = c.val.as_mut()
+                    && let Some(object) = crate::reg_input::resolve(typname, &s.sval, interp)
+                    && let Some(text) = reg_text(interp, typname, &object, false)
+                {
+                    s.sval = text;
                 }
             }
             NodeMut::CollateClause(cc) => {
@@ -1209,6 +1190,456 @@ pub(crate) fn render(interp: &PgCatalog, expr: Option<&ast::Node>) -> Option<ast
         });
     });
     out
+}
+
+// ─── reg* constants ────────────────────────────────────────────────────────
+//
+// PG stores a reg* constant (`'s.f'::regproc`, `nextval('s.sq')`) as the
+// OID its input function found, and prints it with its output function:
+// qualified only where the current search path wouldn't find that object
+// (regclassout, regprocout, format_procedure, format_operator,
+// format_type_be, regcollationout, regconfigout, regdictionaryout;
+// regnamespaceout and regroleout print the bare name). The analyzer keeps
+// the string: bound qualified at creation, rewritten when the object it
+// names is renamed or moved ([`note_reg_constants`]), printed as the
+// output function would where a stored expression is read back.
+
+/// `t`'s name when it is one of the reg* types naming an object.
+fn reg_type_name(interp: &PgCatalog, t: PgTypeOid) -> Option<&'static str> {
+    let ty = interp.pg_type.get(&t)?;
+    if interp.namespace_name(ty.typnamespace) != Some("pg_catalog") {
+        return None;
+    }
+    crate::reg_input::REG_TYPES
+        .iter()
+        .find(|r| **r == ty.typname)
+        .copied()
+}
+
+/// `name` in schema `ns`: qualified when `bind` (bound to an object
+/// outside `pg_catalog`) or when not `visible`.
+fn qualified_unless(
+    interp: &PgCatalog,
+    ns: crate::oid::PgNamespaceOid,
+    name: &str,
+    visible: bool,
+    bind: bool,
+) -> String {
+    let qualify = if bind {
+        !left_as_written(interp, ns)
+    } else {
+        !visible
+    };
+    match interp.namespace_name(ns) {
+        Some(schema) if qualify => {
+            crate::qualified_name::QualifiedName::new(schema, name).to_string()
+        }
+        _ => typedpg_core::quote_identifier(name),
+    }
+}
+
+/// `format_type_be` of `t` (bound: a type outside `pg_catalog` qualified).
+fn reg_type_text(interp: &PgCatalog, t: PgTypeOid, bind: bool) -> String {
+    let Some(ty) = interp.pg_type.get(&t) else {
+        return String::new();
+    };
+    if interp.namespace_name(ty.typnamespace) == Some("pg_catalog") {
+        return crate::ddl::util::format_type_for_message(interp, t);
+    }
+    if let Some(elem) = ty.typelem
+        && ty.typname.starts_with('_')
+    {
+        return format!("{}[]", reg_type_text(interp, elem, bind));
+    }
+    let visible = interp
+        .resolve_type_by_name(None, &ty.typname)
+        .is_some_and(|v| v.oid == t);
+    qualified_unless(interp, ty.typnamespace, &ty.typname, visible, bind)
+}
+
+/// The text the output function of reg* type `typname` prints for
+/// `object` — or, when `bind`, the text binding it: every object outside
+/// `pg_catalog` qualified.
+pub(crate) fn reg_text(
+    interp: &PgCatalog,
+    typname: &str,
+    object: &crate::reg_input::RegObject,
+    bind: bool,
+) -> Option<String> {
+    use crate::reg_input::RegObject;
+    Some(match object {
+        RegObject::Class(c) => {
+            let class = interp.pg_class.get(c)?;
+            let visible = interp
+                .resolve_table(None, &class.relname)
+                .is_some_and(|v| v.oid == *c);
+            qualified_unless(interp, class.relnamespace, &class.relname, visible, bind)
+        }
+        RegObject::Proc(p) => {
+            let proc = interp.pg_proc.get(p)?;
+            if typname == "regproc" {
+                // regprocout: unqualified when the name alone finds it,
+                // uniquely.
+                let found = interp.find_functions(None, &proc.proname);
+                let visible = found.len() == 1 && found[0].oid == *p;
+                qualified_unless(interp, proc.pronamespace, &proc.proname, visible, bind)
+            } else {
+                // format_procedure: FunctionIsVisible, then the argument
+                // types.
+                let visible = interp
+                    .schemas_for_function_lookup(None)
+                    .into_iter()
+                    .find_map(|ns| {
+                        interp
+                            .find_functions(interp.namespace_name(ns), &proc.proname)
+                            .into_iter()
+                            .find(|q| q.pronamespace == ns && q.proargtypes == proc.proargtypes)
+                            .map(|q| q.oid)
+                    })
+                    == Some(*p);
+                let args: Vec<String> = proc
+                    .proargtypes
+                    .iter()
+                    .map(|&t| reg_type_text(interp, t, bind))
+                    .collect();
+                format!(
+                    "{}({})",
+                    qualified_unless(interp, proc.pronamespace, &proc.proname, visible, bind),
+                    args.join(",")
+                )
+            }
+        }
+        RegObject::Operator(o) => {
+            let op = interp.pg_operator.get(o)?;
+            let path = interp.schemas_for_function_lookup(None);
+            if typname == "regoper" {
+                // regoperout: unqualified when the name alone finds it,
+                // uniquely.
+                let found: Vec<_> = interp
+                    .pg_operator
+                    .values()
+                    .filter(|x| x.oprname == op.oprname && path.contains(&x.oprnamespace))
+                    .collect();
+                let visible = found.len() == 1 && found[0].oid == *o;
+                qualified_unless(interp, op.oprnamespace, &op.oprname, visible, bind)
+            } else {
+                // format_operator: OperatorIsVisible, then the operand
+                // types (`NONE` for a prefix operator's left).
+                let visible = path.iter().find_map(|ns| {
+                    interp
+                        .pg_operator
+                        .values()
+                        .find(|x| {
+                            x.oprnamespace == *ns
+                                && x.oprname == op.oprname
+                                && x.oprleft == op.oprleft
+                                && x.oprright == op.oprright
+                        })
+                        .map(|x| x.oid)
+                }) == Some(*o);
+                let left = op
+                    .oprleft
+                    .map_or_else(|| "NONE".to_owned(), |t| reg_type_text(interp, t, bind));
+                format!(
+                    "{}({left},{})",
+                    qualified_unless(interp, op.oprnamespace, &op.oprname, visible, bind),
+                    reg_type_text(interp, op.oprright, bind)
+                )
+            }
+        }
+        RegObject::Type(t) => reg_type_text(interp, *t, bind),
+        RegObject::Collation(c) => {
+            let coll = interp.pg_collation.get(c)?;
+            let visible = interp
+                .resolve_collation(None, &coll.collname)
+                .is_some_and(|v| v.oid == *c);
+            qualified_unless(interp, coll.collnamespace, &coll.collname, visible, bind)
+        }
+        RegObject::Namespace(ns) => typedpg_core::quote_identifier(interp.namespace_name(*ns)?),
+        RegObject::Role(name) => typedpg_core::quote_identifier(name),
+        RegObject::TsObject(oid) => {
+            let object = interp.pg_ts_objects.iter().find(|o| o.oid == *oid)?;
+            // TSConfigIsVisible / TSDictionaryIsVisible.
+            let first = interp.schemas_for_lookup(None).into_iter().find(|ns| {
+                interp
+                    .pg_ts_objects
+                    .iter()
+                    .any(|o| o.kind == object.kind && o.name == object.name && o.namespace == *ns)
+            });
+            qualified_unless(
+                interp,
+                object.namespace,
+                &object.name,
+                first == Some(object.namespace),
+                bind,
+            )
+        }
+    })
+}
+
+/// What the output function of type `t` prints for the reg* constant
+/// written `text`, under the current search path; `None` when `t` isn't
+/// a reg* type or the constant names nothing.
+pub(crate) fn reg_output(interp: &PgCatalog, t: PgTypeOid, text: &str) -> Option<String> {
+    let typname = reg_type_name(interp, t)?;
+    let object = crate::reg_input::resolve(typname, text, interp)?;
+    reg_text(interp, typname, &object, false)
+}
+
+/// A reg* constant to bind again once a rename is applied: the slot, the
+/// constant's location, its type, and the object it named.
+type PendingReg = (Slot, i32, &'static str, crate::reg_input::RegObject);
+
+thread_local! {
+    /// The reg* constants a rename in the current statement may have left
+    /// naming their objects by an old name.
+    static PENDING_REG: std::cell::RefCell<Vec<PendingReg>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Before `renamed` is applied: note every reg* constant of the stored
+/// expressions with the object it names now, to write it again under the
+/// object's name once the statement has renamed it.
+fn note_reg_constants(interp: &PgCatalog, renamed: Renamed<'_>) {
+    use crate::reg_input::RegObject;
+    let mut pending = Vec::new();
+    for (slot, over, expr) in stored_expressions(interp, true) {
+        let has_string = expr.as_ref().is_some_and(|e| {
+            e.nodes().any(|(n, ..)| {
+                matches!(n, typedpg_pg_query::NodeRef::AConst(c)
+                    if matches!(c.val, Some(ast::AConstValue::String(_))))
+            })
+        });
+        if !has_string {
+            continue;
+        }
+        let literals = bindings_of(interp, over, expr.as_ref()).literals;
+        for (n, ..) in expr.iter().flat_map(|e| e.nodes()) {
+            let typedpg_pg_query::NodeRef::AConst(c) = n else {
+                continue;
+            };
+            let Some(ast::AConstValue::String(s)) = &c.val else {
+                continue;
+            };
+            let Some(typname) = literals
+                .get(&c.location)
+                .and_then(|&t| reg_type_name(interp, t))
+            else {
+                continue;
+            };
+            let Some(mut object) = crate::reg_input::resolve(typname, &s.sval, interp) else {
+                continue;
+            };
+            // A role's name is all a `regrole` constant has.
+            if let (Renamed::Role { old, new }, RegObject::Role(name)) = (renamed, &object)
+                && name == old
+            {
+                object = RegObject::Role(new.to_owned());
+            }
+            pending.push((slot.clone(), c.location, typname, object));
+        }
+    }
+    PENDING_REG.with(|p| p.borrow_mut().extend(pending));
+}
+
+/// A statement failed: the renames it noted didn't happen.
+pub(crate) fn discard_pending_reg_constants() {
+    PENDING_REG.with(|p| p.borrow_mut().clear());
+}
+
+/// After a statement: write the reg* constants [`note_reg_constants`]
+/// noted again, naming their objects as the catalog now does.
+fn apply_reg_constants(interp: &mut PgCatalog) {
+    let pending = PENDING_REG.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for (slot, location, typname, object) in pending {
+        let Some(text) = reg_text(interp, typname, &object, true) else {
+            continue;
+        };
+        let Some(mut expr) = read_slot(interp, &slot) else {
+            continue;
+        };
+        let mut changed = false;
+        edit_nodes(&mut expr, &mut |n| {
+            if let typedpg_pg_query::NodeMut::AConst(c) = n
+                && c.location == location
+                && let Some(ast::AConstValue::String(s)) = c.val.as_mut()
+                && s.sval != text
+            {
+                s.sval = text.clone();
+                changed = true;
+            }
+        });
+        if changed {
+            write_slot(interp, slot, expr);
+        }
+    }
+}
+
+/// The expression stored in `slot`, if it still exists.
+fn read_slot(interp: &PgCatalog, slot: &Slot) -> Option<Option<ast::Node>> {
+    stored_expressions(interp, true)
+        .into_iter()
+        .find(|(s, ..)| slot_eq(s, slot))
+        .map(|(_, _, e)| e)
+}
+
+fn slot_eq(a: &Slot, b: &Slot) -> bool {
+    match (a, b) {
+        (Slot::Check(x), Slot::Check(y)) => x == y,
+        (Slot::Default(r1, a1), Slot::Default(r2, a2)) => r1 == r2 && a1 == a2,
+        (Slot::IndexExpr(i1, n1), Slot::IndexExpr(i2, n2)) => i1 == i2 && n1 == n2,
+        (Slot::IndexPred(i1), Slot::IndexPred(i2)) => i1 == i2,
+        (Slot::PartitionKey(r1, n1), Slot::PartitionKey(r2, n2)) => r1 == r2 && n1 == n2,
+        (Slot::DomainCheck(d1, n1), Slot::DomainCheck(d2, n2)) => d1 == d2 && n1 == n2,
+        (Slot::DomainDefault(d1), Slot::DomainDefault(d2)) => d1 == d2,
+        (Slot::TriggerWhen(r1, n1), Slot::TriggerWhen(r2, n2)) => r1 == r2 && n1 == n2,
+        (Slot::Policy(r1, p1, c1), Slot::Policy(r2, p2, c2)) => r1 == r2 && p1 == p2 && c1 == c2,
+        _ => false,
+    }
+}
+
+/// The reg* types whose constants no stored expression may hold:
+/// find_expr_references_walker records no dependency on a role or a
+/// database, so it refuses them.
+const UNSTORABLE_REG_TYPES: &[&str] = &["regrole", "regdatabase"];
+
+/// Whether `t` (a domain: its base type) is one of
+/// [`UNSTORABLE_REG_TYPES`], which it returns.
+fn unstorable_type(interp: &PgCatalog, t: PgTypeOid) -> Option<&'static str> {
+    let ty = interp.pg_type.get(&interp.unwrap_domain(t))?;
+    if interp.namespace_name(ty.typnamespace) != Some("pg_catalog") {
+        return None;
+    }
+    UNSTORABLE_REG_TYPES
+        .iter()
+        .find(|r| **r == ty.typname)
+        .copied()
+}
+
+/// recordDependencyOnExpr over a stored expression holding a `regrole` or
+/// `regdatabase` constant: `constant of the type regrole cannot be used
+/// here`. Only an expression that can hold one is analyzed — casting to
+/// one of those types, over a relation with a column of one, or the
+/// default of such a column.
+fn refuse_unstorable_constants(interp: &PgCatalog) -> Result<(), super::DdlError> {
+    let has_cast = |expr: Option<&ast::Node>| {
+        expr.is_some_and(|e| {
+            e.nodes().any(|(n, ..)| {
+                matches!(n, typedpg_pg_query::NodeRef::TypeName(tn)
+                    if matches!(tn.names.last(), Some(Some(ast::Node::String(s)))
+                        if UNSTORABLE_REG_TYPES.contains(&s.sval.as_str())))
+            })
+        })
+    };
+    let relation_holds = |relid: PgClassOid| {
+        interp
+            .attributes_of(relid)
+            .iter()
+            .any(|a| unstorable_type(interp, a.atttypid).is_some())
+    };
+    let refused = |typname: &str| {
+        Err(super::DdlError::UnsupportedDdl(format!(
+            "constant of the type {typname} cannot be used here"
+        )))
+    };
+    for (slot, over, expr) in stored_expressions(interp, true) {
+        // A default of such a column: the constant it is coerced to.
+        if let Slot::Default(relid, attnum) = slot
+            && let Some(typname) = interp
+                .attributes_of(relid)
+                .iter()
+                .find(|a| a.attnum == attnum)
+                .and_then(|a| unstorable_type(interp, a.atttypid))
+            && matches!(expr, Some(ast::Node::AConst(ref c)) if !c.isnull)
+        {
+            return refused(typname);
+        }
+        let candidate = has_cast(expr.as_ref())
+            || match over {
+                Over::Row(relid) | Over::TriggerRow(relid) => relation_holds(relid),
+                Over::Value(base) => unstorable_type(interp, base).is_some(),
+                Over::Nothing => false,
+            };
+        if !candidate {
+            continue;
+        }
+        let literals = bindings_of(interp, over, expr.as_ref()).literals;
+        if let Some(typname) = literals.values().find_map(|&t| unstorable_type(interp, t)) {
+            return refused(typname);
+        }
+    }
+    Ok(())
+}
+
+// ─── Rebuilt by ALTER COLUMN TYPE ──────────────────────────────────────────
+
+/// ALTER COLUMN TYPE of column `attnum` (named `attname`) of `relid`,
+/// before the column changes: the CHECK constraints reading it, and the
+/// expressions and predicates of the indexes reading it, become the text
+/// `pg_get_constraintdef` / `pg_get_indexdef` print for them now
+/// (RememberConstraintForRebuilding, RememberIndexForRebuilding), which the
+/// rebuild then parses over the new type ([`crate::ddl::cooked::deparse`]).
+pub(crate) fn deparse_for_rebuild(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+    attname: &str,
+) {
+    let checks: Vec<crate::oid::PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == relid && c.contype == ConType::Check && c.conkey.contains(&attnum)
+        })
+        .map(|c| c.oid)
+        .collect();
+    for oid in checks {
+        let Some(mut def) = interp.check_defs.get(&oid).cloned() else {
+            continue;
+        };
+        let StoredExpr::Written(expr) = &def.expr else {
+            continue;
+        };
+        let Some(text) = crate::ddl::cooked::deparse(interp, relid, (**expr).as_ref()) else {
+            continue;
+        };
+        // What the rebuilt text resolves to before the change, which the
+        // recook after it compares with (`recook_checks_reading`).
+        def.trusted = crate::ddl::volatile::trusted_over_relation(interp, relid, Some(&text));
+        def.expr = StoredExpr::Written(Box::new(Some(text)));
+        interp.check_defs.insert(oid, def);
+    }
+    let reads = |ast: &crate::pg_catalog::SerializedAst| {
+        ast.ast.as_ref().is_some_and(|inner| {
+            inner.nodes().any(|(n, ..)| {
+                matches!(n, typedpg_pg_query::NodeRef::ColumnRef(cr)
+                    if cr.fields.last().and_then(|n| crate::ddl::util::node_string(n.as_ref()))
+                        == Some(attname))
+            })
+        })
+    };
+    let indexes: Vec<PgClassOid> = interp
+        .pg_index
+        .values()
+        .filter(|i| {
+            i.indrelid == relid
+                && (i.indkey.contains(&attnum)
+                    || i.indexprs.iter().any(reads)
+                    || i.indpred.as_ref().is_some_and(reads))
+        })
+        .map(|i| i.indexrelid)
+        .collect();
+    for index in indexes {
+        let Some(mut row) = interp.pg_index.get(&index).cloned() else {
+            continue;
+        };
+        for e in row.indexprs.iter_mut().chain(row.indpred.as_mut()) {
+            if let Some(text) = crate::ddl::cooked::deparse(interp, relid, e.ast.as_ref()) {
+                e.ast = Some(text);
+            }
+        }
+        interp.pg_index.insert(index, row);
+    }
 }
 
 #[cfg(test)]
@@ -1256,5 +1687,62 @@ mod tests {
         assert_eq!(names.iter().filter(|n| *n == "z").count(), 3, "{names:?}");
         assert!(!names.iter().any(|n| n == "a" || n == "pos"), "{names:?}");
         assert!(names.iter().any(|n| n == "pos2"), "{names:?}");
+    }
+    /// The routine name the deparsed CHECK of table `t` calls.
+    fn deparsed_call(db: &PgCatalog) -> Vec<String> {
+        let relid = db
+            .pg_class
+            .iter()
+            .find(|(_, c)| c.relname == "t")
+            .map(|(&oid, _)| oid)
+            .unwrap();
+        let def = db
+            .check_defs
+            .values()
+            .next()
+            .map(|d| d.expr.clone())
+            .unwrap();
+        let crate::ddl::tables::check_inherit::StoredExpr::Written(expr) = def else {
+            panic!("a written CHECK");
+        };
+        let deparsed = crate::ddl::cooked::deparse(db, relid, (*expr).as_ref()).unwrap();
+        let typedpg_pg_query::ast::Node::FuncCall(fc) = deparsed else {
+            panic!("a call: {deparsed:?}");
+        };
+        crate::expr::extract_string_fields(&fc.funcname)
+    }
+
+    #[test]
+    fn a_deparsed_call_is_named_for_its_actual_argument_types() {
+        // generate_function_name looks the name up with the arguments'
+        // types (exprType, after their coercions): `s.g(anyelement)` called
+        // on an integer is captured by `public.g(integer)` once that exists
+        // (an exact match beats a polymorphic one, whatever the schemas'
+        // order), so it is printed qualified — while its declared
+        // `anyelement` would still find it.
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE SCHEMA s;
+             CREATE FUNCTION s.g(anyelement) RETURNS bool LANGUAGE sql IMMUTABLE
+                 AS 'SELECT true';
+             SET search_path = s, public;
+             CREATE TABLE public.t (c int CHECK (g(c)));",
+        )
+        .unwrap();
+        let path = |db: &mut PgCatalog, names: &[&str]| {
+            db.search_path = names
+                .iter()
+                .map(|n| db.namespace_oid(n).unwrap())
+                .collect();
+        };
+        path(&mut db, &["s", "public"]);
+        assert_eq!(deparsed_call(&db), ["g"]);
+        db.apply_sql(
+            "CREATE FUNCTION public.g(int) RETURNS bool LANGUAGE sql IMMUTABLE
+                 AS 'SELECT false';",
+        )
+        .unwrap();
+        path(&mut db, &["s", "public"]);
+        assert_eq!(deparsed_call(&db), ["s", "g"]);
     }
 }

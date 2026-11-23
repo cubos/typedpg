@@ -6139,6 +6139,22 @@ mod tests {
     }
 
     #[test]
+    fn a_rebuilt_unique_expression_index_keys_its_call() {
+        // ALTER COLUMN TYPE rebuilds the index as pg_get_indexdef prints
+        // it, `lower((v)::text)`: the cast to the parameter's type is the
+        // coercion the query's `lower(v)` makes too.
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE vv (id bigint PRIMARY KEY, v varchar NOT NULL);
+             CREATE UNIQUE INDEX ON vv (lower(v));
+             ALTER TABLE vv ALTER v TYPE varchar(40);",
+        )
+        .unwrap();
+        assert!(select_one(&db, "SELECT id FROM vv WHERE lower(v) = $1"));
+        assert!(!select_one(&db, "SELECT id FROM vv WHERE upper(v) = $1"));
+    }
+
+    #[test]
     fn a_distinct_on_view_or_subquery_is_keyed_by_its_keys() {
         let db = projects_catalog();
         assert!(select_one(

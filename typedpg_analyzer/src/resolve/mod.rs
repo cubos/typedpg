@@ -1593,7 +1593,22 @@ fn validate_on_conflict_target(
             let mut exprs: Vec<String> = idx_exprs.iter().map(|n| node_fingerprint(*n)).collect();
             exprs.sort();
             exprs.dedup();
-            if cols != target_cols || exprs != target_exprs {
+            // PG compares the transformed trees (infer_arbiter_indexes):
+            // each inference expression must be one of the index's, and
+            // the index have no other — `lower(c)` is the index's
+            // `lower((c)::text)` over a varchar column.
+            let cooked_match = || {
+                let same = |a: Option<&ast::Node>, b: Option<&ast::Node>| {
+                    crate::ddl::cooked::same_index_expr(snapshot, (table_oid, a), (table_oid, b))
+                };
+                target_expr_nodes
+                    .iter()
+                    .all(|t| idx_exprs.iter().any(|&e| same(e, t.as_ref())))
+                    && idx_exprs
+                        .iter()
+                        .all(|&e| target_expr_nodes.iter().any(|t| same(e, t.as_ref())))
+            };
+            if cols != target_cols || (exprs != target_exprs && !cooked_match()) {
                 return false;
             }
             if !qualified
@@ -1606,7 +1621,16 @@ fn validate_on_conflict_target(
                 .indpred
                 .as_ref()
                 .and_then(|p| crate::ddl::stored_exprs::render(snapshot, decode(p)));
+            // As written, else as both print once transformed (a
+            // predicate rebuilt by ALTER COLUMN TYPE shows its coercions).
             predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref(), &types)
+                || pred.is_some()
+                    && predtest::predicate_implied_by(
+                        crate::ddl::cooked::deparse(snapshot, table_oid, pred.as_ref()).as_ref(),
+                        crate::ddl::cooked::deparse(snapshot, table_oid, where_clause.as_ref())
+                            .as_ref(),
+                        &types,
+                    )
         })
         .map(|idx| idx.indexrelid)
         .collect();

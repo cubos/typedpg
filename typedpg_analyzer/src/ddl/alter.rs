@@ -250,6 +250,8 @@ fn rename_relation(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlE
     let class = interp.pg_class.get(&class_oid).cloned();
     // A stored policy expression names its relations: follow the rename.
     crate::ddl::policies::rewrite_relation_refs(interp, class_oid, None, &new_name);
+    // A stored `regclass` constant names it.
+    crate::ddl::stored_exprs::follow_rename(interp, crate::ddl::stored_exprs::Renamed::Other);
     interp.rename_pg_class(class_oid, new_name.clone(), nsoid);
     // A renamed relation is no longer the seeded one of that name.
     interp.mark_relation_modified(class_oid);
@@ -798,6 +800,7 @@ fn set_relation_schema(
     let name = class.relname.clone();
     // A stored policy expression names its relations: follow the move.
     crate::ddl::policies::rewrite_relation_refs(interp, class_oid, Some(new_schema), &name);
+    crate::ddl::stored_exprs::follow_rename(interp, crate::ddl::stored_exprs::Renamed::Other);
     interp.rename_pg_class(class_oid, name.clone(), new_nsoid);
     for t in row_types {
         if let Some(typname) = interp.pg_type.get(&t).map(|t| t.typname.clone()) {

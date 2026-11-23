@@ -2237,6 +2237,9 @@ pub(crate) fn alter_column_type(
         )));
     }
 
+    // The CHECK constraints and indexes reading the column are rebuilt
+    // from the text ruleutils prints for them now.
+    crate::ddl::stored_exprs::deparse_for_rebuild(interp, relid, attr.attnum, &cmd.name);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
         && let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name)
     {

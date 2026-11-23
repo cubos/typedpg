@@ -1297,6 +1297,14 @@ pub fn rename_role(interp: &mut PgCatalog, old: &str, new_name: &str) -> Result<
     }
     let id = interp.roles.id_or_intern(&old);
     if new_name != old {
+        // A stored `regrole` constant names the role.
+        super::stored_exprs::follow_rename(
+            interp,
+            super::stored_exprs::Renamed::Role {
+                old: &old,
+                new: new_name,
+            },
+        );
         interp.roles.rename(id, new_name.to_owned());
     }
     Ok(())

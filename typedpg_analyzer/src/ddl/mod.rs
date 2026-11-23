@@ -521,11 +521,13 @@ fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError>
     }
     permissions::check_statement(db, stmt)?;
     fk_bypass::note(db, stmt);
-    dispatch_statement(db, stmt)?;
+    if let Err(e) = dispatch_statement(db, stmt) {
+        stored_exprs::discard_pending_reg_constants();
+        return Err(e);
+    }
     // The stored expressions it wrote are bound to the objects their names
     // find under the search path it ran with.
-    stored_exprs::bind_stored_expressions(db);
-    Ok(())
+    stored_exprs::bind_stored_expressions(db)
 }
 
 /// Apply a single parsed statement, by kind.

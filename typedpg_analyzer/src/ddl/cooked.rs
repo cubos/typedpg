@@ -1236,3 +1236,299 @@ pub(crate) fn index_predicate_is_true(
 ) -> bool {
     cook_index_expr(interp, rel, pred).is_some_and(|c| c.as_bool() == Some(true))
 }
+
+// ─── Deparsing (ruleutils) ─────────────────────────────────────────────────
+//
+// ALTER COLUMN TYPE rebuilds the CHECK constraints and indexes reading the
+// column from the text `pg_get_constraintdef` / `pg_get_indexdef` print
+// for them — before the column changes — and parses that text again over
+// the new type. The text is ruleutils' rendering of the stored tree:
+// function and operator arguments show their implicit coercions as casts
+// (`get_rule_expr` with `showimplicit`), a constant is printed as its
+// output function writes it, typed unless the parser would type it so
+// anyway (`get_const_expr`), and routines, operators and types are named
+// unqualified only where an unqualified lookup with the arguments' types
+// finds them (`generate_function_name`, `generate_operator_name`,
+// `format_type_be`). [`deparse`] builds that text's parse tree from the
+// cooked expression; what the cooker doesn't model stays as written.
+
+/// The parse tree of what ruleutils prints for `expr`, a stored expression
+/// over the row of `relid` (a CHECK constraint's, an index expression or
+/// predicate). `None` when it doesn't analyze.
+pub(crate) fn deparse(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+) -> Option<ast::Node> {
+    let cooked = cook(interp, relid, expr, None)?;
+    // Fresh source locations, apart from the original ones the parts kept
+    // as written carry: the bindings recorded over the tree are keyed by
+    // them.
+    let deparser = Deparser {
+        interp,
+        next_location: std::cell::Cell::new(DEPARSED_LOCATIONS),
+    };
+    deparser.node(&cooked)
+}
+
+/// Where the source locations of the nodes [`deparse`] makes start.
+const DEPARSED_LOCATIONS: i32 = 1 << 24;
+
+struct Deparser<'a> {
+    interp: &'a PgCatalog,
+    next_location: std::cell::Cell<i32>,
+}
+
+/// A `String` node.
+fn name_node(s: &str) -> Option<ast::Node> {
+    Some(ast::Node::String(typedpg_pg_query::NodeBox::new(
+        ast::String { sval: s.to_owned() },
+    )))
+}
+
+impl Deparser<'_> {
+    fn location(&self) -> i32 {
+        let l = self.next_location.get();
+        self.next_location.set(l + 1);
+        l
+    }
+
+    /// The schema to name object `ns`'s object in, or `None` when an
+    /// unqualified lookup `visible` finds it.
+    fn qualifier(&self, ns: crate::oid::PgNamespaceOid, visible: bool) -> Vec<Option<ast::Node>> {
+        match self.interp.namespace_name(ns) {
+            Some(n) if !visible => vec![name_node(n)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// `format_type_be`'s name for type `t`: qualified unless visible (a
+    /// built-in one by `pg_catalog.typname`, as the grammar writes them).
+    fn type_name(&self, t: PgTypeOid) -> Option<ast::Node> {
+        let ty = self.interp.pg_type.get(&t)?;
+        let catalog = self.interp.namespace_name(ty.typnamespace) == Some("pg_catalog");
+        let mut names = if catalog {
+            vec![name_node("pg_catalog")]
+        } else {
+            let visible = self
+                .interp
+                .resolve_type_by_name(None, &ty.typname)
+                .is_some_and(|v| v.oid == t);
+            self.qualifier(ty.typnamespace, visible)
+        };
+        names.push(name_node(&ty.typname));
+        Some(ast::Node::TypeName(typedpg_pg_query::NodeBox::new(
+            ast::TypeName {
+                names,
+                typemod: -1,
+                location: self.location(),
+                ..Default::default()
+            },
+        )))
+    }
+
+    /// `(arg)::t`.
+    fn cast(&self, arg: Option<ast::Node>, t: PgTypeOid) -> Option<ast::Node> {
+        let Some(ast::Node::TypeName(tn)) = self.type_name(t) else {
+            return None;
+        };
+        Some(ast::Node::TypeCast(typedpg_pg_query::NodeBox::new(
+            ast::TypeCast {
+                arg,
+                type_name: Some(tn),
+                location: self.location(),
+            },
+        )))
+    }
+
+    fn a_const(&self, val: Option<ast::AConstValue>) -> ast::Node {
+        ast::Node::AConst(typedpg_pg_query::NodeBox::new(ast::AConst {
+            isnull: val.is_none(),
+            location: self.location(),
+            val,
+        }))
+    }
+
+    fn string_const(&self, s: &str) -> ast::Node {
+        self.a_const(Some(ast::AConstValue::String(ast::String {
+            sval: s.to_owned(),
+        })))
+    }
+
+    /// `get_const_expr`: an `int4` bare unless negative, a float-looking
+    /// `numeric` bare, a boolean as `true` / `false`, anything else quoted
+    /// and cast to its type — a reg* constant written as its output
+    /// function prints the object it names.
+    fn constant(&self, t: PgTypeOid, value: Option<&str>) -> Option<ast::Node> {
+        let Some(v) = value else {
+            return self.cast(Some(self.a_const(None)), t);
+        };
+        if t == oid::INT4
+            && !v.starts_with('-')
+            && let Ok(i) = v.parse::<i32>()
+        {
+            return Some(self.a_const(Some(ast::AConstValue::Integer(ast::Integer { ival: i }))));
+        }
+        if t == oid::NUMERIC
+            && v.starts_with(|c: char| c.is_ascii_digit())
+            && v.contains(['.', 'e', 'E'])
+        {
+            return Some(self.a_const(Some(ast::AConstValue::Float(ast::Float {
+                fval: v.to_owned(),
+            }))));
+        }
+        if t == oid::BOOL {
+            return Some(self.a_const(Some(ast::AConstValue::Boolean(ast::Boolean {
+                boolval: v == "t",
+            }))));
+        }
+        let text =
+            crate::ddl::stored_exprs::reg_output(self.interp, t, v).unwrap_or_else(|| v.to_owned());
+        self.cast(Some(self.string_const(&text)), t)
+    }
+
+    /// `generate_function_name`: unqualified when an unqualified call with
+    /// the arguments' types resolves to routine `proc`.
+    fn function_name(&self, proc: PgProcOid, args: &[Cooked]) -> Option<Vec<Option<ast::Node>>> {
+        let row = self.interp.pg_proc.get(&proc)?;
+        let types: Option<Vec<PgTypeOid>> = args.iter().map(|a| a.ty.map(|t| t.oid)).collect();
+        let types = types.unwrap_or_else(|| row.proargtypes.clone());
+        let visible = crate::functions::resolve_function(
+            self.interp,
+            None,
+            &row.proname,
+            &types,
+            &crate::functions::CallNotation::default(),
+            false,
+            None,
+        )
+        .is_ok_and(|f| f.oid == proc);
+        let mut names = self.qualifier(row.pronamespace, visible);
+        names.push(name_node(&row.proname));
+        Some(names)
+    }
+
+    /// `generate_operator_name`: unqualified (else `OPERATOR(schema.op)`)
+    /// when the unqualified operator over the operands' types resolves to
+    /// `op`.
+    fn operator_name(&self, op: PgOperatorOid, args: &[Cooked]) -> Option<Vec<Option<ast::Node>>> {
+        let row = self.interp.pg_operator.get(&op)?;
+        let ty = |c: Option<&Cooked>| c.and_then(|c| c.ty).map(|t| t.oid);
+        let (left, right) = match args {
+            [l, r] => (
+                ty(Some(l)).or(row.oprleft),
+                ty(Some(r)).unwrap_or(row.oprright),
+            ),
+            [r] => (None, ty(Some(r)).unwrap_or(row.oprright)),
+            _ => (row.oprleft, row.oprright),
+        };
+        let visible = matches!(
+            self.interp.find_operator_detailed(&row.oprname, left, right),
+            crate::lookup::OperatorMatch::Found(r) if r.oid == op
+        );
+        let mut names = self.qualifier(row.oprnamespace, visible);
+        names.push(name_node(&row.oprname));
+        Some(names)
+    }
+
+    fn nodes(&self, args: &[Cooked]) -> Option<Vec<Option<ast::Node>>> {
+        args.iter().map(|a| self.node(a).map(Some)).collect()
+    }
+
+    fn node(&self, c: &Cooked) -> Option<ast::Node> {
+        Some(match &c.kind {
+            Kind::Var(name) => {
+                ast::Node::ColumnRef(typedpg_pg_query::NodeBox::new(ast::ColumnRef {
+                    fields: vec![name_node(name)],
+                    location: self.location(),
+                }))
+            }
+            Kind::Const(t, value) => return self.constant(*t, value.as_deref()),
+            Kind::Coerce(t, arg) => return self.cast(Some(self.node(arg)?), *t),
+            Kind::Op(op, args) => {
+                let name = self.operator_name(*op, args)?;
+                let mut nodes = self.nodes(args)?;
+                let rexpr = nodes.pop().flatten();
+                let lexpr = nodes.pop().flatten();
+                ast::Node::AExpr(typedpg_pg_query::NodeBox::new(ast::AExpr {
+                    kind: ast::AExprKind::AexprOp,
+                    name,
+                    lexpr,
+                    rexpr,
+                    location: self.location(),
+                    ..Default::default()
+                }))
+            }
+            Kind::ScalarArrayOp(op, use_or, args) => {
+                let name = self.operator_name(*op, args)?;
+                let mut nodes = self.nodes(args)?;
+                let rexpr = nodes.pop().flatten();
+                let lexpr = nodes.pop().flatten();
+                ast::Node::AExpr(typedpg_pg_query::NodeBox::new(ast::AExpr {
+                    kind: if *use_or {
+                        ast::AExprKind::AexprOpAny
+                    } else {
+                        ast::AExprKind::AexprOpAll
+                    },
+                    name,
+                    lexpr,
+                    rexpr,
+                    location: self.location(),
+                    ..Default::default()
+                }))
+            }
+            Kind::Func(proc, args) => {
+                ast::Node::FuncCall(typedpg_pg_query::NodeBox::new(ast::FuncCall {
+                    funcname: self.function_name(*proc, args)?,
+                    args: self.nodes(args)?,
+                    location: self.location(),
+                    ..Default::default()
+                }))
+            }
+            Kind::Array(elem, elems) => {
+                let array =
+                    ast::Node::AArrayExpr(typedpg_pg_query::NodeBox::new(ast::AArrayExpr {
+                        elements: self.nodes(elems)?,
+                        location: self.location(),
+                        ..Default::default()
+                    }));
+                // An empty one is cast to its type.
+                if elems.is_empty() {
+                    return self.cast(Some(array), self.interp.array_type_of(*elem)?);
+                }
+                array
+            }
+            Kind::Bool(k, args) => {
+                let boolop = [
+                    ast::BoolExprType::AndExpr,
+                    ast::BoolExprType::OrExpr,
+                    ast::BoolExprType::NotExpr,
+                ]
+                .into_iter()
+                .find(|b| *b as u8 == *k)?;
+                ast::Node::BoolExpr(typedpg_pg_query::NodeBox::new(ast::BoolExpr {
+                    boolop,
+                    args: self.nodes(args)?,
+                    location: self.location(),
+                }))
+            }
+            Kind::NullTest(is_null, arg) => {
+                ast::Node::NullTest(typedpg_pg_query::NodeBox::new(ast::NullTest {
+                    arg: self.node(arg),
+                    nulltesttype: if *is_null {
+                        ast::NullTestType::IsNull
+                    } else {
+                        ast::NullTestType::IsNotNull
+                    },
+                    argisrow: false,
+                    location: self.location(),
+                }))
+            }
+            // As written, its names printed as the current search path
+            // shows them.
+            Kind::Raw(node) => {
+                return crate::ddl::stored_exprs::render(self.interp, node.as_ref());
+            }
+        })
+    }
+}

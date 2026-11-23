@@ -917,6 +917,8 @@ pub(crate) fn rename(
     let at = position(interp, kind, &names_of(&l.items))?;
     let ns = interp.pg_ts_objects[at].namespace;
     check_free(interp, kind, &stmt.newname, ns)?;
+    // A stored `regconfig` / `regdictionary` constant names it.
+    super::stored_exprs::follow_rename(interp, super::stored_exprs::Renamed::Other);
     let old = std::mem::replace(&mut interp.pg_ts_objects[at].name, stmt.newname.clone());
     interp
         .ts_definitions
@@ -946,6 +948,7 @@ pub(crate) fn set_schema(
     };
     let name = interp.pg_ts_objects[at].name.clone();
     check_free(interp, kind, &name, new_ns)?;
+    super::stored_exprs::follow_rename(interp, super::stored_exprs::Renamed::Other);
     interp.pg_ts_objects[at].namespace = new_ns;
     interp
         .ts_definitions
