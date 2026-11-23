@@ -41,6 +41,11 @@ export const constructed = sql(`
  * Arrays whose text isn't `{a,b}`: a box array's elements are separated by
  * `;` (a box's own text holds commas), an int2vector's by spaces.
  */
+// A JSON parameter's `null` is SQL NULL (`?`: the parameter takes one); `jsonNull` is the JSON one.
+export const jsonKind = sql("SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text");
+// A parameter that can't be NULL takes no `null`.
+export const thingsWithMeta = sql("SELECT label FROM things WHERE (shape).meta @> $sub ORDER BY id");
+
 export const oddArrays = sql(`
   SELECT $boxes::box[] AS boxes,
          ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,
@@ -133,11 +138,13 @@ export type Checks = [
         color: Color | null;
         points: readonly (Point2 | null)[] | null;
         tags: readonly (string | null)[] | null;
-        meta: unknown;
+        meta: {} | null;
       } | null
     >
   >,
   Expect<Equal<Params<typeof labelsByColor>, { color: Color }>>,
+  Expect<Equal<Params<typeof jsonKind>, { doc: {} | null }>>,
+  Expect<Equal<Params<typeof thingsWithMeta>, { sub: {} }>>,
   Expect<
     Equal<
       Row<typeof constructed>,
@@ -160,3 +167,6 @@ export type Checks = [
     >
   >,
 ];
+
+// @ts-expect-error: `sub` can't be NULL, and a `null` there would be SQL NULL.
+export const nullSub: Params<typeof thingsWithMeta> = { sub: null };

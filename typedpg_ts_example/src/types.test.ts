@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
-import { type CopyRow, DecodeError, NoRowsError, type Params, range, emptyRange } from "@cubos/typedpg";
+import { type CopyRow, DecodeError, NoRowsError, type Params, jsonNull, range, emptyRange } from "@cubos/typedpg";
 
 import { type Connection, baseUrl, drivers, freshDatabase, plain, prng } from "./testdb.ts";
 import * as t from "./things.ts";
@@ -174,6 +174,13 @@ for (const [name, connect] of drivers) {
       });
     });
 
+    test("a JSON parameter's null is SQL NULL, jsonNull the JSON null", async () => {
+      assert.deepEqual(await t.jsonKind.fetchOne(c.db, { doc: null }), { kind: null, text: null });
+      assert.deepEqual(await t.jsonKind.fetchOne(c.db, { doc: jsonNull }), { kind: "null", text: "null" });
+      assert.deepEqual(await t.jsonKind.fetchOne(c.db, { doc: { a: jsonNull, b: null } }), { kind: "object", text: '{"a": null, "b": null}' });
+      assert.deepEqual(await t.thingsWithMeta.fetchAll(c.db, { sub: { never: jsonNull } }), []);
+    });
+
     test("an interval mixing signs is a DecodeError", async () => {
       await assert.rejects(t.mixedInterval.fetchOne(c.db), (e) => e instanceof DecodeError && /justify_interval/.test(e.message));
     });
@@ -186,7 +193,7 @@ for (const [name, connect] of drivers) {
       const maybe = <T>(f: () => T): T | null => (random() < 0.2 ? null : f());
       const arr = <T>(f: () => T, n = 4) => Array.from({ length: Math.floor(random() * n) }, f);
       const labels = ["red", "green", "with space", 'quo"te', "back\\slash", "NULL"] as const;
-      const json = (depth = 0): unknown =>
+      const json = (depth = 0): {} =>
         depth > 2 || random() < 0.4
           ? pick([str(), Math.round(random() * 1000) / 8, true, false])
           : random() < 0.5

@@ -934,7 +934,7 @@ as it describes a statement before binding it.
 | `time` | `Temporal.PlainTime` |
 | `timetz` | `string`: Temporal has no time of day with an offset |
 | `interval` | `Temporal.Duration`: years and months from its months, days, then hours down to microseconds from its time, as PostgreSQL prints it. A parameter's weeks are 7 days |
-| `json`, `jsonb` | `JsonValue`; parameters take `unknown` (stringified) |
+| `json`, `jsonb` | `JsonValue`; parameters take any value but `null` (stringified), and `null` where SQL NULL is allowed |
 | `bytea` | `Buffer`; parameters take any `Uint8Array` |
 | enum | the union of its labels: `"draft" \| "published"` |
 | domain | its base type, or the type `types` maps it to |
@@ -960,7 +960,11 @@ one whose fields disagree in sign (`1 mon -1 days`, which a Duration can't
 hold) is a `DecodeError` — `justify_interval()` makes an interval's signs
 agree.
 
-In a `json`/`jsonb` parameter, `null` is SQL NULL, not the JSON `null`.
+In a `json`/`jsonb` parameter, `null` is SQL NULL, and the parameter's type
+admits it only where the column or expression takes NULL. The JSON `null` is
+`jsonNull` (`import { jsonNull } from "@cubos/typedpg"`); inside a value
+(`{ a: null }`, `[1, null]`) a plain `null` is already the JSON one. Reading,
+both come back as `null`.
 
 ### Mapping types
 

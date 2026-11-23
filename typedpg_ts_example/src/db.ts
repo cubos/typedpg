@@ -19,9 +19,9 @@ export interface Queries {
       qty: number | null;
       tags: readonly (string | null)[] | null;
       colors: readonly ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
-      shapes: readonly ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null)[] | null;
+      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      shapes: readonly ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: readonly typedpg.Range<Temporal.Instant | Temporal.ZonedDateTime | Date>[] | null;
       amounts: typedpg.Range<string | number> | null;
@@ -34,7 +34,7 @@ export interface Queries {
       flags: readonly (boolean | null)[] | null;
       blobs: readonly (Uint8Array | null)[] | null;
       stamps: readonly (Temporal.Instant | Temporal.ZonedDateTime | Date | null)[] | null;
-      docs: readonly (unknown | null)[] | null;
+      docs: readonly ({} | null)[] | null;
       day: Temporal.PlainDate | null;
       at_local: Temporal.PlainDateTime | null;
       clock: string | null;
@@ -145,7 +145,7 @@ export interface Queries {
   };
   "SELECT $doc::jsonb AS doc": {
     params: {
-      doc: unknown;
+      doc: {};
     };
     row: {
       doc: typedpg.JsonValue;
@@ -267,9 +267,27 @@ export interface Queries {
     };
     value: Temporal.Duration;
   };
+  "SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text": {
+    params: {
+      doc: {} | null;
+    };
+    row: {
+      kind: string | null;
+      text: string | null;
+    };
+  };
   "SELECT label FROM things WHERE $color = ANY (colors) ORDER BY id": {
     params: {
       color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL";
+    };
+    row: {
+      label: string;
+    };
+    value: string;
+  };
+  "SELECT label FROM things WHERE (shape).meta @> $sub ORDER BY id": {
+    params: {
+      sub: {};
     };
     row: {
       label: string;
@@ -398,7 +416,7 @@ export interface CopyTargets {
       label: string;
       tags: readonly (string | null)[] | null;
       colors: readonly ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
+      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
       span: typedpg.Range<number> | null;
       attrs: Readonly<Record<string, string | null>> | null;
       big: bigint | number | string | null;
@@ -428,7 +446,9 @@ export const sql = createSql<Queries>({
   "SELECT id, label FROM things ORDER BY id": "{\"sql\":[\"SELECT id, label FROM things ORDER BY id\"],\"params\":[],\"columns\":[[\"id\",\"number\"],[\"label\",\"text\"]],\"subquery\":true}",
   "SELECT id, name, mood FROM users WHERE mood = $mood ORDER BY id": "{\"sql\":[\"SELECT id, name, mood FROM users WHERE mood = ($1::public.mood) ORDER BY id\"],\"params\":[[\"mood\",\"text\"]],\"columns\":[[\"id\",\"number\"],[\"name\",\"text\"],[\"mood\",\"text\"]],\"subquery\":true}",
   "SELECT interval '1 mon -1 days' AS iv": "{\"sql\":[\"SELECT interval '1 mon -1 days' AS iv\"],\"params\":[],\"columns\":[[\"iv\",\"interval\"]],\"subquery\":true}",
+  "SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text": "{\"sql\":[\"SELECT jsonb_typeof(($1::pg_catalog.jsonb)::jsonb) AS kind, ($1::pg_catalog.jsonb)::jsonb::text AS text\"],\"params\":[[\"doc\",\"json\"]],\"columns\":[[\"kind\",\"text\"],[\"text\",\"text\"]],\"subquery\":true}",
   "SELECT label FROM things WHERE $color = ANY (colors) ORDER BY id": "{\"sql\":[\"SELECT label FROM things WHERE ($1::public.color) = ANY (colors) ORDER BY id\"],\"params\":[[\"color\",\"text\"]],\"columns\":[[\"label\",\"text\"]],\"subquery\":true}",
+  "SELECT label FROM things WHERE (shape).meta @> $sub ORDER BY id": "{\"sql\":[\"SELECT label FROM things WHERE (shape).meta @> ($1::pg_catalog.jsonb) ORDER BY id\"],\"params\":[[\"sub\",\"json\"]],\"columns\":[[\"label\",\"text\"]],\"subquery\":true}",
   "SELECT name FROM users ORDER BY id": "{\"sql\":[\"SELECT name FROM users ORDER BY id\"],\"params\":[],\"columns\":[[\"name\",\"text\"]],\"subquery\":true}",
   "SELECT name FROM users WHERE id IN $..ids ORDER BY id": "{\"sql\":[\"SELECT name FROM users WHERE \",[\"list\",0,\"::pg_catalog.int4\",\"(SELECT NULL::pg_catalog.int4 WHERE false)\",\"id \",\"IN \",\"= ANY\",\"::pg_catalog.int4[]\"],\" ORDER BY id\"],\"params\":[],\"spreads\":[[\"ids\",[[\"ids\",\"number\",\"::pg_catalog.int4\"]],\"list\"]],\"columns\":[[\"name\",\"text\"]]}",
   "SELECT name FROM users WHERE id NOT IN $..ids ORDER BY id": "{\"sql\":[\"SELECT name FROM users WHERE \",[\"list\",0,\"::pg_catalog.int4\",\"(SELECT NULL::pg_catalog.int4 WHERE false)\",\"id \",\"NOT IN \",\"<> ALL\",\"::pg_catalog.int4[]\"],\" ORDER BY id\"],\"params\":[],\"spreads\":[[\"ids\",[[\"ids\",\"number\",\"::pg_catalog.int4\"]],\"list\"]],\"columns\":[[\"name\",\"text\"]]}",

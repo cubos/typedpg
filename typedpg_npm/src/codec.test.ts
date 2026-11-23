@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { type Range, decode, encode } from "./codec.js";
+import { jsonNull } from "./index.js";
 
 test("scalars", () => {
   assert.equal(decode("bool", "t"), true);
@@ -135,6 +136,11 @@ test("encode", () => {
   assert.equal(encode("bigint", 12n), "12");
   assert.equal(encode("json", { a: "x" }), '{"a":"x"}');
   assert.equal(encode("json", "x"), '"x"');
+  // `null` is SQL NULL; `jsonNull` the JSON null, at the top or nested.
+  assert.equal(encode("json", null), null);
+  assert.equal(encode("json", jsonNull), "null");
+  assert.equal(encode("json", { a: jsonNull, b: [jsonNull, null] }), '{"a":null,"b":[null,null]}');
+  assert.equal(encode(["array", "json"], [jsonNull, null]), '{"null",NULL}');
   assert.equal(encode("bytea", new Uint8Array([1, 255])), "\\x01ff");
   assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Buffer or a Uint8Array, not a string/);
   assert.equal(encode(["array", "text"], ["a", null, 'q"\\']), '{"a",NULL,"q\\"\\\\"}');

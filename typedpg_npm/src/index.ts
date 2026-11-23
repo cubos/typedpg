@@ -39,6 +39,12 @@ export type Fits<T extends U, U> = T;
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * The JSON `null`, for a `json`/`jsonb` parameter: a plain `null` there is
+ * SQL NULL. Anywhere inside a value, `null` already is the JSON one.
+ */
+export const jsonNull: { readonly toJSON: () => null } = Object.freeze({ toJSON: () => null });
+
 /** A query's types, as the generated `Queries` interface describes it. */
 export interface QueryTypes {
   params: object;

@@ -454,9 +454,12 @@ impl TypeMapper<'_> {
                 input: "string | number".into(),
                 codec: Codec::Text,
             },
+            // Any value but `null` / `undefined`: a parameter's `null` is SQL
+            // NULL, so the parameter's own nullability adds it; the JSON
+            // `null` is the runtime's `jsonNull`.
             "json" | "jsonb" => TsType {
                 output: format!("{RUNTIME_NS}.JsonValue"),
-                input: "unknown".into(),
+                input: "{}".into(),
                 codec: Codec::Json,
             },
             // Temporal's types, never a string: a parameter of one is never
@@ -603,6 +606,10 @@ mod tests {
             assert_eq!(m.map(&basic_ty("interval")).output, "Temporal.Duration");
             assert_eq!(m.map(&basic_ty("interval")).input, "Temporal.Duration");
             assert_eq!(m.map(&basic_ty("jsonb")).output, "typedpg.JsonValue");
+            // Not `unknown`, which holds `null`: SQL NULL comes from the
+            // parameter's nullability, the JSON `null` is `jsonNull`.
+            assert_eq!(m.map(&basic_ty("jsonb")).input, "{}");
+            assert_eq!(m.map(&basic_ty("json")).input, "{}");
         });
     }
 
