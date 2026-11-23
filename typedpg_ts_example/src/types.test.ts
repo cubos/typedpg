@@ -164,6 +164,26 @@ for (const [name, connect] of drivers) {
       }));
     });
 
+    test("anonymous records in arrays, sublinks and CASE decode", async () => {
+      assert.deepEqual(plain(await t.nestedRecords.fetchOne(c.db)), plain({
+        pairs: [
+          { f1: 1, f2: 'a"b,(c)', f3: 'quo"te' },
+          { f1: 2, f2: null, f3: "with space" },
+        ],
+        points: [
+          { f1: 1, f2: { x: 1.5, y: 1 } },
+          { f1: 2, f2: { x: 3, y: 2 } },
+        ],
+        nested: { f1: [{ f1: "x,y", f2: ["{}", null] }], f2: "NULL" },
+        picked: { f1: 1, f2: "yes" },
+        agg: [
+          { f1: 1, f2: false },
+          { f1: 2, f2: true },
+          { f1: 3, f2: false },
+        ],
+      }));
+    });
+
     test("box arrays and int2vectors decode, and both encode", async () => {
       const boxes = ["(1,1),(0,0)", null, "(3,3),(2,2)"];
       assert.deepEqual(await t.oddArrays.fetchOne(c.db, { boxes, frames: boxes, vec: [4, -5], oids: [26, 1259] }), {

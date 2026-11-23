@@ -494,7 +494,10 @@ pub mod __private {
     ///   domain — and `FromSql` impls (`Vec<i32>`, `Vec<serde_json::Value>`)
     ///   accept only their base element types;
     /// - the `reg*` OID alias types (`regclass`, `regtype`, …), `xid` and
-    ///   `cid` are `oid`s: an unsigned 4-byte integer, read as `u32`.
+    ///   `cid` are `oid`s: an unsigned 4-byte integer, read as `u32`;
+    /// - `record[]` is an array of `record`s: `tokio_postgres` knows it as a
+    ///   pseudo-type, which `Vec`'s impls refuse (and its `from_sql`
+    ///   panics on, expecting an array).
     ///
     /// Arrays of either are bound with their own element type OID in the
     /// array header, which `array_recv` checks.
@@ -532,6 +535,14 @@ pub mod __private {
     fn wire_type(ty: &Type) -> Option<Type> {
         if is_oid_like(ty) {
             return Some(Type::OID);
+        }
+        if *ty == Type::RECORD_ARRAY {
+            return Some(Type::new(
+                ty.name().to_owned(),
+                ty.oid(),
+                Kind::Array(Type::RECORD),
+                ty.schema().to_owned(),
+            ));
         }
         let Kind::Array(member) = ty.kind() else {
             return None;

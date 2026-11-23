@@ -80,7 +80,8 @@ fn elems_normalized(
 /// Like [`resolve_type`] but lets the caller override the structural shape
 /// when the OID is the pseudo `record` type (typmod -1 in PG terms). When
 /// `shape` is `Some` and the OID is `record`, we build a `Type::AnonymousRecord`
-/// from the shape recursively. Otherwise falls through to the OID-only path.
+/// from the shape recursively (for `record[]`, an array of one). Otherwise
+/// falls through to the OID-only path.
 fn resolve_type_with_shape(
     type_oid: PgTypeOid,
     typmod: Option<i32>,
@@ -115,6 +116,18 @@ fn resolve_type_with_shape(
             });
         }
         return Ok(Type::AnonymousRecord { fields: out });
+    }
+    // A `record[]` carrying a shape: its elements' (an array of `ROW(…)`s,
+    // `array_agg` of one, an ARRAY sublink over one).
+    if type_oid == oid::RECORD_ARRAY
+        && let Some(fields) = shape
+    {
+        let element = resolve_type_with_shape(oid::RECORD, None, None, Some(fields), snapshot)?;
+        return Ok(Type::Array {
+            element: Box::new(element),
+            element_nullable: None,
+            name: None,
+        });
     }
     let mut ty = resolve_type(type_oid, typmod, collation, snapshot)?;
     // A composite carrying a shape is a row read from a relation: its

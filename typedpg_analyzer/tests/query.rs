@@ -90,6 +90,8 @@ mod params;
 mod query_view;
 #[path = "query/records.rs"]
 mod records;
+#[path = "query/records_nested.rs"]
+mod records_nested;
 #[path = "query/refinements.rs"]
 mod refinements;
 #[path = "query/select.rs"]

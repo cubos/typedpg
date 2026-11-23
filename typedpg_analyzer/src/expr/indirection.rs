@@ -726,13 +726,26 @@ pub(crate) fn transform_array_expr_typed(
             .iter()
             .zip(&elems)
             .all(|(alone, t)| alone.unwrap_or(t.type_oid == coerce_type));
-    Ok((
-        ExprType::scalar_with_typmod(array_type, false, typmod)
-            .with_collation(state)
-            .with_elem_nullable(elem_nullable)
-            .with_elem_refine(elem_refine),
-        typed,
-    ))
+    let mut out = ExprType::scalar_with_typmod(array_type, false, typmod)
+        .with_collation(state)
+        .with_elem_nullable(elem_nullable)
+        .with_elem_refine(elem_refine);
+    // An array of records: its elements' row shape, when they all agree on
+    // one (a NULL element has none to agree on); a sub-array's is its
+    // elements'.
+    if array_type == oid::RECORD_ARRAY {
+        out.record_fields = super::merge_value_shapes(
+            arr.elements
+                .iter()
+                .zip(&elems)
+                .filter(|(e, t)| {
+                    t.type_oid != oid::UNKNOWN
+                        && !matches!(e.as_ref(), Some(ast::Node::AConst(c)) if c.isnull)
+                })
+                .map(|(_, t)| t.record_fields.as_ref()),
+        );
+    }
+    Ok((out, typed))
 }
 
 /// Whether an `ARRAY[…]` element of type `t` is a sub-array, making the
@@ -1261,20 +1274,32 @@ pub(crate) fn transform_container_subscripts(
     if is_slice {
         // `arr[lo:hi]` keeps the (base) array type. NULL iff the array or a
         // bound is NULL — out-of-range bounds yield an empty array.
-        Ok(
+        let mut out =
             ExprType::scalar_with_typmod(base, container.nullable || any_bound_nullable, typmod)
                 .with_collation(derive_collation([container], base, snapshot)?)
                 // Some of its elements (the bounds are clipped to the
                 // array's: a slice adds no NULL element).
                 .with_elem_nullable(container.elem_nullable)
-                .with_elem_refine(container.elem_refine.clone()),
-        )
+                .with_elem_refine(container.elem_refine.clone());
+        if base == oid::RECORD_ARRAY {
+            out.record_fields.clone_from(&container.record_fields);
+        }
+        Ok(out)
     } else {
         // `arr[i]` is always nullable (out-of-bounds → NULL, even with a
         // non-null array and index).
-        Ok(ExprType::scalar_with_typmod(elem, true, typmod)
+        let mut out = ExprType::scalar_with_typmod(elem, true, typmod)
             .with_collation(derive_collation([container], elem, snapshot)?)
             // One of its elements.
-            .with_refine(container.elem_refine.clone()))
+            .with_refine(container.elem_refine.clone());
+        // An element of a `record[]` has its row shape, which PG doesn't
+        // see (a SubscriptingRef is typed plain `record`).
+        if base == oid::RECORD_ARRAY {
+            out.record_fields = container
+                .record_fields
+                .as_ref()
+                .map(|s| RecordShape::hidden(s.fields.clone()));
+        }
+        Ok(out)
     }
 }

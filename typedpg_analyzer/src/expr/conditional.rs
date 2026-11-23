@@ -326,11 +326,12 @@ pub(crate) fn infer_coalesce(
         crate::nonnull::StrictNode::FloatFold,
         crate::nonnull::subst::folds_as_float(type_oid, snapshot),
     );
-    let out = ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
+    let mut out = ExprType::scalar_with_typmod(type_oid, all_nullable, typmod)
         .with_collation(derive_collation(&args, type_oid, snapshot)?)
         .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
         .with_refine(branches_refine(&branches, type_oid, snapshot))
         .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
+    out.record_fields = branches_record_fields(&branches, type_oid);
     // PostgreSQL 19 relabels a COALESCE it folds to expose its collation
     // (applyRelabelType): planning keeps the parsed one.
     Ok(out)
@@ -468,6 +469,28 @@ pub(crate) fn branches_elem_nullable(
         return None;
     }
     merge_elem_nullable(parts)
+}
+
+/// The row shape of a COALESCE / CASE / GREATEST / LEAST over `branches`
+/// whose result is a `record` (or `record[]`): the one every branch that
+/// can be the (non-NULL) result agrees on (see
+/// [`super::merge_value_shapes`]). A NULL constant is never the result.
+pub(crate) fn branches_record_fields(
+    branches: &[(Option<&ast::Node>, &ExprType)],
+    common: PgTypeOid,
+) -> Option<super::RecordShape> {
+    if !matches!(common, oid::RECORD | oid::RECORD_ARRAY) {
+        return None;
+    }
+    super::merge_value_shapes(
+        branches
+            .iter()
+            .filter(|(node, t)| {
+                t.type_oid != oid::UNKNOWN
+                    && !matches!(node, Some(ast::Node::AConst(c)) if c.isnull)
+            })
+            .map(|(_, t)| t.record_fields.as_ref()),
+    )
 }
 
 /// What every non-NULL element of a COALESCE / CASE over `branches` is,
@@ -859,11 +882,13 @@ pub(crate) fn infer_case(
         .filter(|(_, can)| *can)
         .map(|((n, t), _)| (*n, t))
         .collect();
-    let out = ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
-        .with_collation(collation)
-        .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-        .with_refine(branches_refine(&branches, type_oid, snapshot))
-        .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
+    let mut out =
+        ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
+            .with_collation(collation)
+            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
+            .with_refine(branches_refine(&branches, type_oid, snapshot))
+            .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
+    out.record_fields = branches_record_fields(&branches, type_oid);
     // PostgreSQL 19 relabels a CASE it folds to expose its collation
     // (applyRelabelType): planning keeps the parsed one.
     Ok(out)

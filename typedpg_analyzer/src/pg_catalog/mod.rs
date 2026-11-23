@@ -63,6 +63,8 @@ pub(crate) mod oid {
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
     pub const JSONB: PgTypeOid = PgTypeOid::from_raw(3802);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
+    /// `record[]` (`_record`): an array of anonymous records.
+    pub const RECORD_ARRAY: PgTypeOid = PgTypeOid::from_raw(2287);
     pub const VOID: PgTypeOid = PgTypeOid::from_raw(2278);
 }
 

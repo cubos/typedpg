@@ -481,6 +481,9 @@ pub(crate) struct ExprType {
     pub no_collation: Option<NoCollation>,
     /// What planning makes of this node's collation (see [`Planned`]).
     pub planned: Planned,
+    /// The row shape of the value's records: the value's own for a
+    /// `record` (or a composite read from a relation), its elements' for a
+    /// `record[]` (at any depth).
     pub record_fields: Option<RecordShape>,
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
@@ -568,6 +571,54 @@ pub(crate) fn merge_set_op_shapes(
         fields,
         hidden: left.hidden,
     })
+}
+
+/// The row shape of a value that is one of several records, or arrays of
+/// them (a CASE's or COALESCE's branches, an `ARRAY[…]`'s elements, the
+/// arguments of `array_append`): known only when every one's is, and they
+/// agree field for field — names and types — a field NULL where any
+/// one's may be. PG keeps no tuple descriptor for the result (an
+/// expression over records is typed plain `record`, typmod -1): the shape
+/// is hidden from it.
+pub(crate) fn merge_value_shapes<'a>(
+    shapes: impl IntoIterator<Item = Option<&'a RecordShape>>,
+) -> Option<RecordShape> {
+    fn merge(left: &RecordShape, right: &RecordShape) -> Option<RecordShape> {
+        if left.len() != right.len() {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(left.len());
+        for (l, r) in left.iter().zip(right.iter()) {
+            if l.name != r.name || l.ty.type_oid != r.ty.type_oid {
+                return None;
+            }
+            let mut ty = l.ty.clone();
+            ty.nullable |= r.ty.nullable;
+            ty.elem_nullable = merge_elem_nullable([l.ty.elem_nullable, r.ty.elem_nullable]);
+            ty.refine = crate::refine::Refinement::either([&l.ty.refine, &r.ty.refine]);
+            ty.elem_refine =
+                crate::refine::Refinement::either([&l.ty.elem_refine, &r.ty.elem_refine]);
+            // A nested record's shape is known where both sides' are.
+            ty.record_fields = match (&l.ty.record_fields, &r.ty.record_fields) {
+                (Some(l), Some(r)) => merge(l, r),
+                _ => None,
+            };
+            fields.push(RecordField {
+                name: l.name.clone(),
+                ty,
+            });
+        }
+        Some(RecordShape {
+            fields,
+            hidden: true,
+        })
+    }
+    let mut shapes = shapes.into_iter();
+    let mut out = RecordShape::hidden(shapes.next()??.fields.clone());
+    for shape in shapes {
+        out = merge(&out, shape?)?;
+    }
+    Some(out)
 }
 
 impl From<Vec<RecordField>> for RecordShape {
@@ -1786,7 +1837,7 @@ fn infer_expr_unlocated(
                 // skipped: `ROW(NULL, NULL) IS NULL` is true, so its `IS
                 // NULL` follows different semantics.
                 let composite = arg_type.type_oid == oid::RECORD
-                    || arg_type.record_fields.is_some()
+                    || (arg_type.record_fields.is_some() && arg_type.type_oid != oid::RECORD_ARRAY)
                     || crate::coerce::is_complex(arg_type.type_oid, snapshot);
                 if !composite {
                     // A parameter may be passed NULL whatever its own
@@ -1935,17 +1986,17 @@ fn infer_expr_unlocated(
                 }
                 refine.range = (range != crate::refine::IntRange::default()).then_some(range);
             }
-            Ok(
-                ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
-                    .with_collation(derive_collation(&args, resolved_type, snapshot)?)
-                    // The result is one of the (coerced) arguments.
-                    .with_elem_nullable(conditional::branches_elem_nullable(
-                        &branches,
-                        resolved_type,
-                        snapshot,
-                    ))
-                    .with_refine(refine),
-            )
+            let mut out = ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
+                .with_collation(derive_collation(&args, resolved_type, snapshot)?)
+                // The result is one of the (coerced) arguments.
+                .with_elem_nullable(conditional::branches_elem_nullable(
+                    &branches,
+                    resolved_type,
+                    snapshot,
+                ))
+                .with_refine(refine);
+            out.record_fields = conditional::branches_record_fields(&branches, resolved_type);
+            Ok(out)
         }
         ast::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
         ast::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),

@@ -940,7 +940,7 @@ as it describes a statement before binding it.
 | `bytea` | `Buffer`; parameters take any `Uint8Array` |
 | enum | the union of its labels: `"draft" \| "published"` |
 | domain | its base type, or the type `types` maps it to |
-| composite, `ROW(...)` | an object with a property per field, each with its nullability |
+| composite, `ROW(...)` | an object with a property per field, each with its nullability — also inside an array (`array_agg(ROW(a, b))`, `ARRAY(SELECT ROW(…))`), a subquery or a `CASE` / `COALESCE` whose rows share one shape; a record whose fields nobody knows (a `RETURNS record` function's, rows of different shapes) reads as its text form |
 | array | `T[]`, or `(T \| null)[]` unless the elements are known not null |
 | `int2vector`, `oidvector` | `number[]` |
 | range, multirange | `Range<T>`, `Range<T>[]` (`range(1, 10)`, `emptyRange` build them) |

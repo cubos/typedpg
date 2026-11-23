@@ -515,7 +515,7 @@ pub(crate) fn infer_func_call(
     // indirection sees the named columns with their substituted polymorphic
     // types (e.g. `_pg_expandarray(oid[]).x` → `oid`, not `anyelement`).
     let record_fields = if resolved.out_args.is_empty() {
-        None
+        builtin_record_fields(func, &resolved, &args)
     } else {
         let mut fields = RecordField::from_out_args(&resolved.out_args);
         // The rows a strict catalog SRF emits (`jsonb_each(j)`: a key, and
@@ -790,6 +790,74 @@ fn builtin_array_elem_nullable(
         | "regexp_matches(text,text,text)" => Some(true),
         _ => None,
     }
+}
+
+/// The row shape of the records a `pg_catalog` routine returns (a
+/// `record`, or the elements of a `record[]`), for the routines whose
+/// result is made of their arguments' records: an aggregate, constructor
+/// or rearrangement of values or arrays, a window function returning a
+/// row's value. Known when every argument it may take a record from
+/// agrees on one (see [`super::merge_value_shapes`]); `None` for the rest
+/// — `jsonb_populate_record(anyelement, jsonb)` returns its argument's
+/// row type, but with other values.
+fn builtin_record_fields(
+    func: &ast::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    args: &FuncArgs,
+) -> Option<RecordShape> {
+    if resolved.schema != "pg_catalog"
+        || !matches!(resolved.return_type_oid, oid::RECORD | oid::RECORD_ARRAY)
+    {
+        return None;
+    }
+    let sources: &[usize] = match resolved.signature.as_str() {
+        "array_agg(anynonarray)"
+        | "array_agg(anyarray)"
+        | "array_fill(anyelement,_int4)"
+        | "array_fill(anyelement,_int4,_int4)"
+        | "array_remove(anycompatiblearray,anycompatible)"
+        | "array_reverse(anyarray)"
+        | "array_shuffle(anyarray)"
+        | "array_sample(anyarray,int4)"
+        | "array_sort(anyarray)"
+        | "array_sort(anyarray,bool)"
+        | "array_sort(anyarray,bool,bool)"
+        | "trim_array(anyarray,int4)"
+        | "unnest(anyarray)"
+        | "any_value(anyelement)"
+        | "first_value(anyelement)"
+        | "last_value(anyelement)"
+        | "nth_value(anyelement,int4)"
+        | "lag(anyelement)"
+        | "lag(anyelement,int4)"
+        | "lead(anyelement)"
+        | "lead(anyelement,int4)" => &[0],
+        "array_append(anycompatiblearray,anycompatible)"
+        | "array_prepend(anycompatible,anycompatiblearray)"
+        | "array_cat(anycompatiblearray,anycompatiblearray)" => &[0, 1],
+        "array_replace(anycompatiblearray,anycompatible,anycompatible)"
+        | "lag(anycompatible,int4,anycompatible)"
+        | "lead(anycompatible,int4,anycompatible)" => &[0, 2],
+        _ => return None,
+    };
+    let is_null_const = |i: usize| {
+        matches!(
+            func.args.get(i).and_then(|a| a.as_ref()),
+            Some(ast::Node::AConst(c)) if c.isnull
+        )
+    };
+    super::merge_value_shapes(
+        sources
+            .iter()
+            .filter(|&&i| {
+                !is_null_const(i)
+                    && args
+                        .exprs
+                        .get(i)
+                        .is_some_and(|t| t.type_oid != oid::UNKNOWN)
+            })
+            .map(|&i| args.exprs.get(i).and_then(|t| t.record_fields.as_ref())),
+    )
 }
 
 /// What every non-NULL element of the array a `pg_catalog` routine
@@ -1423,7 +1491,7 @@ fn note_count_arg(
         return;
     };
     let composite = arg.type_oid == oid::RECORD
-        || arg.record_fields.is_some()
+        || (arg.record_fields.is_some() && arg.type_oid != oid::RECORD_ARRAY)
         || crate::coerce::is_complex(arg.type_oid, snapshot);
     if composite {
         return;

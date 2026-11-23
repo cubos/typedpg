@@ -1,0 +1,27 @@
+error: no Rust mapping for a record whose fields are unknown (output column `pairs`) — PostgreSQL knows a record's fields only where it is built from known ones (`ROW(…)`, a table's row, a function with OUT parameters): a function declared `RETURNS record` has none unless called in FROM with a column definition list (`FROM f() AS t(a int, b text)`), and records of different shapes mixed in one array, CASE or COALESCE have no single field list
+ --> src/bin/sql_unknown_record_fields.rs:6:5
+  |
+6 |     typedpg::sql!(db, "SELECT ARRAY[untyped_pair()] AS pairs")
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: no Rust mapping for a record whose fields are unknown (record field `f2`) — PostgreSQL knows a record's fields only where it is built from known ones (`ROW(…)`, a table's row, a function with OUT parameters): a function declared `RETURNS record` has none unless called in FROM with a column definition list (`FROM f() AS t(a int, b text)`), and records of different shapes mixed in one array, CASE or COALESCE have no single field list
+  --> src/bin/sql_unknown_record_fields.rs:13:5
+   |
+13 |     typedpg::sql!(db, "SELECT ROW(1, untyped_pair()) AS r")
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: no Rust mapping for a record whose fields are unknown (output column `r`) — PostgreSQL knows a record's fields only where it is built from known ones (`ROW(…)`, a table's row, a function with OUT parameters): a function declared `RETURNS record` has none unless called in FROM with a column definition list (`FROM f() AS t(a int, b text)`), and records of different shapes mixed in one array, CASE or COALESCE have no single field list
+  --> src/bin/sql_unknown_record_fields.rs:20:5
+   |
+20 | /     typedpg::sql!(
+21 | |         db,
+22 | |         "SELECT CASE WHEN age > 18 THEN ROW(id, name) ELSE ROW(name) END AS r FROM users"
+23 | |     )
+   | |_____^
+   |
+   = note: this error originates in the macro `typedpg::sql` (in Nightly builds, run with -Z macro-backtrace for more info)
+

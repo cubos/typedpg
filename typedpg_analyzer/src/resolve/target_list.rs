@@ -550,7 +550,22 @@ pub(crate) fn analyze_values_lists(
             planned_top: None,
             scan_stays: false,
             scan_var: None,
-            record_fields: None,
+            // A column of records: the row shape every cell agrees on (a
+            // NULL has none to agree on), which PG doesn't see.
+            record_fields: if matches!(common[i], oid::RECORD | oid::RECORD_ARRAY) {
+                crate::expr::merge_value_shapes(
+                    column_exprs[i]
+                        .iter()
+                        .zip(rows.iter().map(|r| r[i].as_ref()))
+                        .filter(|(t, node)| {
+                            t.type_oid != oid::UNKNOWN
+                                && !matches!(node, Some(ast::Node::AConst(c)) if c.isnull)
+                        })
+                        .map(|(t, _)| t.record_fields.as_ref()),
+                )
+            } else {
+                None
+            },
             elem_nullable: None,
             elem_refine: crate::refine::Refinement::NONE,
             refine: crate::refine::Refinement::NONE,

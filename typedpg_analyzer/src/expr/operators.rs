@@ -199,11 +199,18 @@ fn handle_nullif(
             vs.retain(|v| !rv.contains(v) || rv.len() > 1);
         }
     }
-    Ok(Some(
-        ExprType::scalar_with_typmod(result_oid, left.nullable || !never_equal, typmod)
-            .with_collation(state)
-            .with_refine(refine),
-    ))
+    let mut out = ExprType::scalar_with_typmod(result_oid, left.nullable || !never_equal, typmod)
+        .with_collation(state)
+        .with_refine(refine);
+    // The value, when not NULL, is the left one, with its row shape (PG
+    // types the NullIfExpr plain `record`, seeing none).
+    if matches!(result_oid, oid::RECORD | oid::RECORD_ARRAY) && left.type_oid == result_oid {
+        out.record_fields = left
+            .record_fields
+            .as_ref()
+            .map(|s| super::RecordShape::hidden(s.fields.clone()));
+    }
+    Ok(Some(out))
 }
 
 /// `expr IS [NOT] DISTINCT FROM other` — PG's `transformAExprDistinct`:

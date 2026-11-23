@@ -62,6 +62,14 @@ pub(crate) fn infer_sublink(
                     .with_elem_nullable(first.elem_nullable)
                     .with_elem_refine(first.elem_refine.clone());
                 t.planned = first.planned;
+                // A record (or records) keeps its column's row shape, which
+                // PG doesn't see: the SubLink is typed plain `record`.
+                if matches!(first.type_oid, oid::RECORD | oid::RECORD_ARRAY) {
+                    t.record_fields = first
+                        .record_fields
+                        .as_ref()
+                        .map(|s| super::RecordShape::hidden(s.fields.clone()));
+                }
                 return Ok(t);
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
@@ -272,8 +280,17 @@ pub(crate) fn infer_sublink(
             let mut elem_nullable = None;
             let mut elem_refine = crate::refine::Refinement::NONE;
             let mut planned = super::Planned::AsParsed;
+            let mut record_fields = None;
             if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 let (first, _) = single_sublink_column(sub, sel, ctx, params)?;
+                // The column's records are the array's elements (or its
+                // sub-arrays'), with their row shape.
+                if matches!(first.type_oid, oid::RECORD | oid::RECORD_ARRAY) {
+                    record_fields = first
+                        .record_fields
+                        .as_ref()
+                        .map(|s| super::RecordShape::hidden(s.fields.clone()));
+                }
                 // The array carries the column's typmod (exprTypmod of an
                 // ARRAY sublink is its subquery column's) and, implicitly,
                 // its collation.
@@ -310,6 +327,7 @@ pub(crate) fn infer_sublink(
                 .with_elem_nullable(elem_nullable)
                 .with_elem_refine(elem_refine);
             t.planned = planned;
+            t.record_fields = record_fields;
             Ok(t)
         }
         _ => Err(crate::error::RawError::unsupported(

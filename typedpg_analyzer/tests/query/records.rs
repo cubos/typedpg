@@ -1365,22 +1365,17 @@ fn array_agg_of_composite_column_returns_array_of_composite() {
 #[test]
 fn array_agg_of_row_constructor() {
     let db = setup();
-    // array_agg of an inline ROW: PG reports `record[]`, and so does the
-    // analyzer — but its elements are the bare `record` pseudo-type: the
-    // row's shape is not carried into the array. Document that quirk so a
-    // future fix doesn't silently change the surface.
+    // array_agg of an inline ROW: PG reports `record[]`, and the analyzer
+    // carries the row's shape into the elements (see records_nested.rs).
     let s = db
         .analyze("SELECT array_agg(ROW(u.id, u.name)) AS rs FROM users u")
         .unwrap();
-    let rs = &col(&s, "rs").pg_type;
-    assert!(
-        matches!(
-            rs,
-            Type::Array { element, .. }
-                if matches!(&**element, Type::Basic { schema, name, .. }
-                    if schema == "pg_catalog" && name == "record")
-        ),
-        "got: {rs:?}"
+    assert_cols(
+        &s,
+        vec![cn(
+            "rs",
+            array_of(anon_record(vec![rf("f1", int8()), rf("f2", text())])),
+        )],
     );
 }
 

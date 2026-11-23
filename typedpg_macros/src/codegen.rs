@@ -949,6 +949,12 @@ fn emit_one_record(
 
     for (i, field) in record.fields.iter().enumerate() {
         let fname = make_field_ident(&field.name);
+        if is_unknown_record(&field.ty) {
+            return Err(unknown_record_error(&format!(
+                "record field `{}`",
+                field.name
+            )));
+        }
         let mapping = resolve_type_mapping(&field.ty, config, registry)?;
         let site = &mapping.rust_type;
         let field_ty: syn::Type = if field.nullable {
@@ -3002,11 +3008,45 @@ fn naming_subject(error: syn::Error, subject: &str) -> syn::Error {
     syn::Error::new(error.span(), message)
 }
 
+/// True for the pseudo-type `record` (behind any arrays or domains): a
+/// record whose fields the analysis doesn't know.
+fn is_unknown_record(ty: &Type) -> bool {
+    match ty {
+        Type::Domain { base, .. } => is_unknown_record(base),
+        Type::Array { element, .. } => is_unknown_record(element),
+        Type::Basic { schema, name, .. } => schema == "pg_catalog" && name == "record",
+        _ => false,
+    }
+}
+
+/// The error for a value (output column or record field) that is a record
+/// whose fields are unknown ([`is_unknown_record`]): there is nothing to
+/// build a struct from, and PostgreSQL doesn't know them either.
+fn unknown_record_error(subject: &str) -> syn::Error {
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        format!(
+            "no Rust mapping for a record whose fields are unknown ({subject}) — PostgreSQL \
+             knows a record's fields only where it is built from known ones (`ROW(…)`, a \
+             table's row, a function with OUT parameters): a function declared `RETURNS \
+             record` has none unless called in FROM with a column definition list (`FROM \
+             f() AS t(a int, b text)`), and records of different shapes mixed in one \
+             array, CASE or COALESCE have no single field list"
+        ),
+    )
+}
+
 fn column_rust_type(
     col: &AnalyzedColumn,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
 ) -> Result<syn::Type, syn::Error> {
+    if is_unknown_record(&col.pg_type) {
+        return Err(unknown_record_error(&format!(
+            "output column `{}`",
+            col.name
+        )));
+    }
     let mapping = resolve_type_mapping(&col.pg_type, config, registry)
         .map_err(|e| naming_subject(e, &format!("output column `{}`", col.name)))?;
     let inner = mapping.rust_type;
