@@ -935,7 +935,7 @@ as it describes a statement before binding it.
 | `timetz` | `string`: Temporal has no time of day with an offset |
 | `interval` | `Temporal.Duration`: years and months from its months, days, then hours down to microseconds from its time, as PostgreSQL prints it. A parameter's weeks are 7 days |
 | `json`, `jsonb` | `JsonValue`; parameters take `unknown` (stringified) |
-| `bytea` | `Uint8Array` |
+| `bytea` | `Buffer`; parameters take any `Uint8Array` |
 | enum | the union of its labels: `"draft" \| "published"` |
 | domain | its base type, or the type `types` maps it to |
 | composite, `ROW(...)` | an object with a property per field, each with its nullability |

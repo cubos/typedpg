@@ -45,7 +45,7 @@ for (const [name, connect] of drivers) {
             tags: ["a", 'quo"te', null, "back\\slash", "comma,brace}"],
             prefs: { theme: "dark", fontSize: 14 },
             visits: 2n,
-            avatar: new Uint8Array([0, 1, 255]),
+            avatar: new Uint8Array([0, 1, 255]), // any Uint8Array binds; a Buffer comes back
           },
           { name: "Bia", email: null, mood: null, tags: [], prefs: null, visits: 0, avatar: null },
           { name: "Caio", email: null, mood: "sad", tags: [], prefs: null, visits: 9007199254740993n, avatar: null },
@@ -71,7 +71,7 @@ for (const [name, connect] of drivers) {
           prefs: { theme: "dark", fontSize: 14 },
           balance: "0.00",
           visits: 2n,
-          avatar: new Uint8Array([0, 1, 255]),
+          avatar: Buffer.from([0, 1, 255]),
           home: null,
           created_at: null,
         },
@@ -156,7 +156,7 @@ for (const [name, connect] of drivers) {
       assert.equal(row.f, 1.5);
       assert.ok(Number.isNaN(row.nan));
       assert.ok(row.now instanceof Temporal.Instant);
-      assert.deepEqual(row.b, new Uint8Array([0, 255]));
+      assert.deepEqual(row.b, Buffer.from([0, 255]));
       assert.equal(row.nothing, null);
     });
 

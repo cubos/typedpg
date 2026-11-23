@@ -162,7 +162,7 @@ export function encode(codec: Codec, value: unknown): string | null {
       // Bytes, not text: `Buffer.from` would take a string's UTF-8 bytes,
       // storing a hex digest's text, silently.
       if (typeof value === "string") {
-        throw new TypeError("typedpg: a bytea parameter must be a Uint8Array, not a string");
+        throw new TypeError("typedpg: a bytea parameter must be a Buffer or a Uint8Array, not a string");
       }
       return "\\x" + Buffer.from(value as Uint8Array).toString("hex");
     case "interval":
@@ -385,9 +385,9 @@ function unmark(value: unknown): unknown {
 }
 
 /** The hex format (`\x0102`, the default `bytea_output`) or the escape one. */
-function parseBytea(text: string): Uint8Array {
+function parseBytea(text: string): Buffer {
   if (text.startsWith("\\x")) {
-    return new Uint8Array(Buffer.from(text.slice(2), "hex"));
+    return Buffer.from(text.slice(2), "hex");
   }
   // `bytea_output = escape`: printable ASCII as is, `\\` and `\ooo` octal.
   const out: number[] = [];
@@ -405,7 +405,7 @@ function parseBytea(text: string): Uint8Array {
       i++;
     }
   }
-  return new Uint8Array(out);
+  return Buffer.from(out);
 }
 
 /**

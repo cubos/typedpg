@@ -11,7 +11,11 @@ test("scalars", () => {
   assert.ok(Number.isNaN(decode("number", "NaN")));
   assert.equal(decode("bigint", "9223372036854775807"), 9223372036854775807n);
   assert.deepEqual(decode("json", '{"a":[1,null]}'), { a: [1, null] });
-  assert.deepEqual(decode("bytea", "\\x00ff10"), new Uint8Array([0, 255, 16]));
+  assert.deepEqual(decode("bytea", "\\x00ff10"), Buffer.from([0, 255, 16]));
+  assert.ok(Buffer.isBuffer(decode("bytea", "\\x00ff10")));
+  // `bytea_output = escape`.
+  assert.ok(Buffer.isBuffer(decode("bytea", "a\\\\\\001")));
+  assert.deepEqual(decode("bytea", "a\\\\\\001"), Buffer.from([0x61, 0x5c, 1]));
 });
 
 test("timestamptz", () => {
@@ -116,7 +120,7 @@ test("encode", () => {
   assert.equal(encode("json", { a: "x" }), '{"a":"x"}');
   assert.equal(encode("json", "x"), '"x"');
   assert.equal(encode("bytea", new Uint8Array([1, 255])), "\\x01ff");
-  assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Uint8Array, not a string/);
+  assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Buffer or a Uint8Array, not a string/);
   assert.equal(encode(["array", "text"], ["a", null, 'q"\\']), '{"a",NULL,"q\\"\\\\"}');
   assert.equal(encode("text", null), null);
 });

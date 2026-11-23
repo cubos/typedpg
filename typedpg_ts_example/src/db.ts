@@ -165,7 +165,7 @@ export interface Queries {
       bigs: (bigint | null)[] | null;
       nums: (string | null)[] | null;
       flags: (boolean | null)[] | null;
-      blobs: (Uint8Array | null)[] | null;
+      blobs: (Buffer | null)[] | null;
       stamps: (Temporal.Instant | null)[] | null;
       docs: (typedpg.JsonValue | null)[] | null;
       day: Temporal.PlainDate | null;
@@ -192,7 +192,7 @@ export interface Queries {
       prefs: UserPrefs | null;
       balance: string;
       visits: bigint;
-      avatar: Uint8Array | null;
+      avatar: Buffer | null;
       home: { street: string | null; number: number | null } | null;
       created_at: Temporal.Instant;
     };
@@ -203,7 +203,7 @@ export interface Queries {
       f: number;
       nan: number;
       now: Temporal.Instant;
-      b: Uint8Array;
+      b: Buffer;
       nothing: string | null;
     };
   };
@@ -331,7 +331,7 @@ export interface Queries {
       bigs: (bigint | null)[] | null;
       nums: (string | null)[] | null;
       flags: (boolean | null)[] | null;
-      blobs: (Uint8Array | null)[] | null;
+      blobs: (Buffer | null)[] | null;
       stamps: (Temporal.Instant | null)[] | null;
       docs: (typedpg.JsonValue | null)[] | null;
       day: Temporal.PlainDate | null;

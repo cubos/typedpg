@@ -104,7 +104,7 @@ export type Checks = [
         prefs: UserPrefs | null;
         balance: string;
         visits: bigint;
-        avatar: Uint8Array | null;
+        avatar: Buffer | null;
         home: { street: string | null; number: number | null } | null;
         created_at: Temporal.Instant;
       }

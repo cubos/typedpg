@@ -45,7 +45,7 @@ pub enum Codec {
     Date,
     /// `time` ↔ `Temporal.PlainTime`.
     Time,
-    /// `bytea` ↔ `Uint8Array`.
+    /// `bytea` ↔ `Buffer` (parameters take any `Uint8Array`).
     Bytea,
     /// `interval` ↔ `Temporal.Duration`.
     Interval,
@@ -114,7 +114,7 @@ impl Codec {
             Codec::Timestamp => "Temporal.PlainDateTime".into(),
             Codec::Date => "Temporal.PlainDate".into(),
             Codec::Time => "Temporal.PlainTime".into(),
-            Codec::Bytea => "Uint8Array".into(),
+            Codec::Bytea => "Buffer".into(),
             Codec::Interval => "Temporal.Duration".into(),
             Codec::Vector => "readonly number[]".into(),
             Codec::Hstore => "Readonly<Record<string, string | null>>".into(),
@@ -470,7 +470,13 @@ impl TypeMapper<'_> {
             // `timetz` stays text: Temporal has no time of day with an
             // offset.
             "interval" => same("Temporal.Duration".into(), Codec::Interval),
-            "bytea" => same("Uint8Array".into(), Codec::Bytea),
+            // Node's own APIs speak `Buffer`; a parameter takes any `Uint8Array`
+            // (a `Buffer` is one).
+            "bytea" => TsType {
+                output: "Buffer".into(),
+                input: "Uint8Array".into(),
+                codec: Codec::Bytea,
+            },
             "void" => same("undefined".into(), Codec::Void),
             _ => text(),
         }

@@ -84,7 +84,7 @@ export type Checks = [
         bigs: (bigint | null)[] | null;
         nums: (string | null)[] | null;
         flags: (boolean | null)[] | null;
-        blobs: (Uint8Array | null)[] | null;
+        blobs: (Buffer | null)[] | null;
         stamps: (Temporal.Instant | null)[] | null;
         docs: (import("@cubos/typedpg").JsonValue | null)[] | null;
         day: Temporal.PlainDate | null;

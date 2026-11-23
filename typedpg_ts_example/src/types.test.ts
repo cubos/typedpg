@@ -64,7 +64,7 @@ const fixed: ThingParams = {
   bigs: [-9223372036854775808n, null, 0n],
   nums: ["1.50", null, "-0.000001", "NaN"],
   flags: [true, false, null],
-  blobs: [new Uint8Array([0, 255, 92, 34]), null, new Uint8Array([])],
+  blobs: [Buffer.from([0, 255, 92, 34]), null, Buffer.from([])],
   // Microseconds, a year before 1 (PG's BC) and after 9999.
   stamps: [
     instant("2024-02-29T12:34:56.789012Z"),
@@ -205,7 +205,7 @@ for (const [name, connect] of drivers) {
             Math.floor(random() * 1e12),
           ),
           bigs: arr(() => maybe(() => BigInt.asIntN(64, BigInt(Math.floor(random() * 2 ** 53)) * 1031n))),
-          blobs: arr(() => maybe(() => Uint8Array.from(arr(() => Math.floor(random() * 256), 8)))),
+          blobs: arr(() => maybe(() => Buffer.from(arr(() => Math.floor(random() * 256), 8)))),
         };
         const id = await t.insertThing.fetchValue(c.db, params);
         const { j, ...row } = await t.thingWithJson.fetchOne(c.db, { id });
