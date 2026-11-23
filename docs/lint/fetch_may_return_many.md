@@ -65,9 +65,13 @@ A query proven to return at most one row:
 - every column of a primary key, `UNIQUE` constraint or unique index pinned
   by `=` to a constant, a parameter or a column of an already-determined row
   (also across join `ON` conditions): `WHERE email = $email`. The value may
-  be any non-volatile expression of those, a cast included
-  (`ON c.code = e.code::integer`), or a scalar subquery that doesn't read
-  the row; `id IN (SELECT … LIMIT 1)` counts as `id = (SELECT …)`;
+  be any non-volatile expression of those, a cast, `COALESCE` or `CASE`
+  included (`ON c.code = e.code::integer`,
+  `ON u.principal = coalesce(s.holder, 'x')`), a `LATERAL` subquery's
+  column reading the row on its left, the merged column of a chain of
+  `USING` joins, or a scalar subquery that doesn't read the row (a bare
+  table name in it is that subquery's own whole row);
+  `id IN (SELECT … LIMIT 1)` counts as `id = (SELECT …)`;
 - a partial unique index whose predicate the `WHERE` implies
   (`… WHERE state IN ('queued', 'done')` by `state = 'done'`), and a unique
   index on a function of columns matched by the same call

@@ -737,7 +737,7 @@ fn with_clause(node: NodeRef<'_>) -> Option<&WithClause> {
 /// The columns a CTE body's `RETURNING` clause or target list yields.
 fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<CteColumn> {
     match body {
-        NodeRef::SelectStmt(select) => select_output_columns(ctx, select, env),
+        NodeRef::SelectStmt(select) => select_output_columns(ctx, select, env, None),
         NodeRef::InsertStmt(insert) => returning_columns(
             ctx,
             insert.relation.as_deref(),
@@ -766,18 +766,21 @@ fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<Cte
 /// The columns a `SELECT` body yields — a plain target list, a `VALUES` list
 /// or a set operation's arms — with each name, type and whether its
 /// collation compares bytewise. Used for a CTE's and a `FROM` subquery's
-/// output columns.
+/// output columns. `parent` is the namespace around the body (for a
+/// `LATERAL` subquery, the items to its left), which a column its own
+/// `FROM` doesn't hold is read from.
 pub(super) fn select_output_columns(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
     env: &CteEnv,
+    parent: Option<&FromScope<'_>>,
 ) -> Vec<CteColumn> {
     if select.op != SetOperation::SetopNone {
         let (Some(left), Some(right)) = (select.larg.as_deref(), select.rarg.as_deref()) else {
             return Vec::new();
         };
-        let mut columns = select_output_columns(ctx, left, env);
-        let other = select_output_columns(ctx, right, env);
+        let mut columns = select_output_columns(ctx, left, env, parent);
+        let other = select_output_columns(ctx, right, env, parent);
         if columns.len() != other.len() {
             return Vec::new();
         }
@@ -803,7 +806,7 @@ pub(super) fn select_output_columns(
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                let (typ, deterministic) = value_type(ctx, None, item.as_ref());
+                let (typ, deterministic) = value_type(ctx, None, None, item.as_ref());
                 CteColumn {
                     name: Some(format!("column{}", i + 1)),
                     typ,
@@ -819,7 +822,7 @@ pub(super) fn select_output_columns(
                 return Vec::new();
             }
             for (column, item) in out.iter_mut().zip(&list.items) {
-                let (typ, deterministic) = value_type(ctx, None, item.as_ref());
+                let (typ, deterministic) = value_type(ctx, None, None, item.as_ref());
                 if column.typ != typ || !column.deterministic || !deterministic {
                     column.typ = None;
                     column.deterministic = false;
@@ -838,7 +841,7 @@ pub(super) fn select_output_columns(
         let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        if target.val.is_none() {
+        if target.val.is_none() || composite_star(target.val.as_ref()) {
             return Vec::new();
         }
         let value = &target.val;
@@ -880,7 +883,7 @@ pub(super) fn select_output_columns(
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value.as_ref());
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), parent, value.as_ref());
         out.push(CteColumn {
             name: if target.name.is_empty() {
                 output_name(value.as_ref())
@@ -922,7 +925,7 @@ fn returning_columns(
         let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        if target.val.is_none() {
+        if target.val.is_none() || composite_star(target.val.as_ref()) {
             return Vec::new();
         }
         let value = &target.val;
@@ -977,7 +980,7 @@ fn returning_columns(
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value.as_ref());
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), None, value.as_ref());
         out.push(CteColumn {
             name: if target.name.is_empty() {
                 output_name(value.as_ref())
@@ -1020,6 +1023,7 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
+    outer: Option<&FromScope<'_>>,
     value: Option<&ast::Node>,
 ) -> (Option<crate::oid::PgTypeOid>, bool) {
     match value {
@@ -1034,7 +1038,26 @@ fn value_type(
                     .map_or((None, false), |(typ, deterministic)| {
                         (Some(typ), deterministic)
                     }),
-                dedup::Col::Opaque | dedup::Col::Other => (None, false),
+                dedup::Col::Opaque => (None, false),
+                // Not a column of the body's own FROM: the nearest level
+                // around it that holds the name decides — unless the body
+                // has a relation the qualifier names, which hides any
+                // farther one.
+                dedup::Col::Other => {
+                    let qualifier = match names.as_slice() {
+                        [_] => None,
+                        [qualifier, _] | [_, qualifier, _] => Some(*qualifier),
+                        _ => return (None, false),
+                    };
+                    if qualifier.is_some_and(|q| scope.rel_named(q).is_some()) {
+                        return (None, false);
+                    }
+                    outer
+                        .and_then(|outer| outer.resolve_value(ctx, column))
+                        .map_or((None, false), |(typ, deterministic)| {
+                            (Some(typ), deterministic)
+                        })
+                }
             }
         }
         Some(Node::ParamRef(param)) => {
@@ -1112,7 +1135,7 @@ fn value_type(
                 if result.is_none_or(|result| matches!(result, Node::AConst(c) if c.isnull)) {
                     continue;
                 }
-                let (Some(typ), deterministic) = value_type(ctx, scope, result) else {
+                let (Some(typ), deterministic) = value_type(ctx, scope, outer, result) else {
                     return (None, false);
                 };
                 known = match known {
@@ -1131,19 +1154,17 @@ fn value_type(
     }
 }
 
+/// Whether a target is `(composite).*`, which expands to the composite's
+/// fields: a list of its columns by position can't be made.
+fn composite_star(value: Option<&ast::Node>) -> bool {
+    matches!(value, Some(Node::AIndirection(indirection))
+        if matches!(indirection.indirection.last(), Some(Some(Node::AStar(_)))))
+}
+
 /// The column name PG gives a target that has none written, when it is
-/// certain: a bare column reference's last field. `FigureColname` derives
-/// other names from the expression (a cast from its argument, a function call
-/// from the function, `CASE` as `case`), which this doesn't reproduce, so
-/// anything else is unknown.
+/// certain (see [`crate::resolve::certain_colname`]).
 fn output_name(value: Option<&ast::Node>) -> Option<String> {
-    let Node::ColumnRef(column) = value? else {
-        return None;
-    };
-    let Fields::Names(names) = dedup::column_ref_fields(column) else {
-        return None;
-    };
-    names.last().map(|name| (*name).to_owned())
+    crate::resolve::certain_colname(value)
 }
 
 #[cfg(test)]
@@ -2633,7 +2654,7 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
             // its columns. (The FROM-subquery typing may fill these in on
             // its own; doing it here keeps the MERGE proof independent.)
             let source_env = visible_ctes(ctx, env, select.with_clause.as_deref(), None).after;
-            let columns = select_output_columns(ctx, select, &source_env);
+            let columns = select_output_columns(ctx, select, &source_env, None);
             if columns.len() == scope.rels[1].columns.len() {
                 scope.rels[1].cte_columns = columns
                     .iter()
@@ -3665,14 +3686,20 @@ mod tests {
         assert!(!aggregate_is_one_row(
             "SELECT (SELECT count(u.id) FROM (SELECT role FROM m) s) FROM u"
         ));
-        // A subquery output name that isn't certain refuses placement.
-        assert!(!aggregate_is_one_row(
+        // PG names `role || ''` `?column?` (FigureColname), so the
+        // aggregate reads the subquery's column.
+        assert!(aggregate_is_one_row(
             "SELECT (SELECT count(\"?column?\") FROM (SELECT role || '' FROM m) s) FROM u"
+        ));
+        // A subquery output name that isn't certain (PG names a scalar
+        // sublink after the sublink's own target) refuses placement.
+        assert!(!aggregate_is_one_row(
+            "SELECT (SELECT count(role) FROM (SELECT (SELECT role) FROM m) s) FROM u"
         ));
     }
 
     #[test]
-    fn a_cast_or_call_output_name_is_not_trusted() {
+    fn a_cast_or_call_output_name_follows_figure_colname() {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(
             "CREATE TABLE src (v int);
@@ -3707,10 +3734,10 @@ mod tests {
             "WITH c AS (SELECT v::int FROM src) \
              SELECT ARRAY(SELECT count(\"?column?\") FROM c) FROM outer_rows"
         ));
-        // A function call's name is not trusted either, even when PG names
-        // the column after the function: the relation's columns stay
-        // uncertain, so the count can't be placed on this level.
-        assert!(!aggregate_is_one_row(
+        // PG names a function call's column after the function: `"lower"`
+        // is the CTE's column, so the count is the inner level's aggregate
+        // and collapses it to one row.
+        assert!(aggregate_is_one_row(
             "WITH c AS (SELECT lower(v::text) FROM src) \
              SELECT ARRAY(SELECT count(\"lower\") FROM c) FROM outer_rows"
         ));
@@ -5436,6 +5463,12 @@ mod tests {
             "SELECT DISTINCT ON (org_id) org_id, o.id FROM owners o \
              WHERE o.org_id = $1 ORDER BY org_id, o.id",
         ));
+        // `t.owner_id + 0` is named `?column?`: `org_id` is the input column.
+        assert!(select_one(
+            &db,
+            "SELECT DISTINCT ON (org_id) t.owner_id + 0 FROM owners o \
+             JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
+        ));
         // A determined relation's column is one value even without a fact
         // about it.
         assert!(select_one(
@@ -5462,8 +5495,9 @@ mod tests {
             // `t.owner_id`, not the input `org_id` the WHERE fixes.
             "SELECT DISTINCT ON (org_id) t.owner_id AS org_id FROM owners o \
              JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
-            // A target whose output name isn't known may be the one meant.
-            "SELECT DISTINCT ON (org_id) t.owner_id + 0 FROM owners o \
+            // A target whose output name isn't known may be the one meant
+            // (PG names this one `org_id`, after the sublink's target).
+            "SELECT DISTINCT ON (org_id) (SELECT t.owner_id AS org_id) FROM owners o \
              JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
         ] {
             assert!(!select_one(&db, sql), "{sql}");

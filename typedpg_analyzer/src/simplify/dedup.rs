@@ -437,6 +437,12 @@ pub(super) struct Rel {
     /// unknown name can be the one a reference spells, so no lookup may
     /// bind to this relation.
     pub(super) columns_known: bool,
+    /// Whether [`Self::columns`] lists every column at its position, the
+    /// ones whose names aren't certain under a placeholder no reference
+    /// spells (a FROM subquery or CTE without a `*` target). A name it does
+    /// list is then that column: PG would reject the reference as ambiguous
+    /// if an uncertain name were the same.
+    pub(super) positioned: bool,
     /// For a CTE reference, a FROM subquery, a VALUES list or a FROM
     /// function: each column's type and whether its collation is
     /// deterministic, by attnum - 1. Empty for a base table.
@@ -455,7 +461,7 @@ pub(super) struct Rel {
 impl Rel {
     /// The attnum of the column this FROM item calls `name`.
     fn attnum(&self, name: &str) -> Option<i16> {
-        if !self.columns_known {
+        if !self.columns_known && !self.positioned {
             return None;
         }
         let mut found = self.columns.iter().filter(|(n, _)| n == name);
@@ -825,6 +831,7 @@ impl<'a> Scope<'a> {
             single_row: false,
             columns: Vec::new(),
             columns_known: false,
+            positioned: false,
             cte_columns: Vec::new(),
             reads_left: false,
             derived_keys: Vec::new(),
@@ -885,16 +892,8 @@ impl<'a> Scope<'a> {
                     .copied()
                     .filter(|name| {
                         let info = |mask: u64| {
-                            let mut found = (0..self.rels.len())
-                                .filter(|&r| mask & (1u64 << r) != 0)
-                                .filter_map(|r| {
-                                    let attnum = self.rels[r].attnum(name)?;
-                                    self.rels[r].column_info(ctx, attnum)
-                                });
-                            match (found.next(), found.next()) {
-                                (Some(info), None) => Some(info),
-                                _ => None,
-                            }
+                            let (r, attnum) = self.merged_column(mask, name)?;
+                            self.rels[r].column_info(ctx, attnum)
                         };
                         matches!(
                             (info(left), info(right)),
@@ -978,6 +977,7 @@ impl<'a> Scope<'a> {
                 single_row: info.single_row,
                 columns,
                 columns_known,
+                positioned: true,
                 cte_columns,
                 reads_left: false,
                 derived_keys: Vec::new(),
@@ -1143,6 +1143,7 @@ impl<'a> Scope<'a> {
             single_row: true,
             columns,
             columns_known,
+            positioned: columns_known,
             cte_columns,
             reads_left: !self.rels.is_empty(),
             derived_keys: Vec::new(),
@@ -1280,7 +1281,7 @@ impl<'a> Scope<'a> {
             columns_known = false;
         }
         let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
-        let cte_columns = super::cardinality::select_output_columns(ctx, select, &env)
+        let cte_columns = super::cardinality::select_output_columns(ctx, select, &env, parent)
             .into_iter()
             .map(|column| (column.typ, column.deterministic))
             .collect();
@@ -1295,6 +1296,7 @@ impl<'a> Scope<'a> {
             single_row,
             columns,
             columns_known,
+            positioned: !has_star,
             cte_columns,
             reads_left: sub.lateral,
             derived_keys: super::cardinality::distinct_on_output_key(ctx, select)
@@ -1383,6 +1385,7 @@ impl<'a> Scope<'a> {
             single_row: false,
             columns,
             columns_known: true,
+            positioned: true,
             cte_columns: Vec::new(),
             reads_left: false,
             derived_keys: Vec::new(),
@@ -1460,6 +1463,7 @@ impl<'a> Scope<'a> {
             single_row: false,
             columns,
             columns_known: true,
+            positioned: true,
             cte_columns,
             reads_left: false,
             derived_keys: vec![key],
@@ -1480,21 +1484,34 @@ impl<'a> Scope<'a> {
     /// rather than resolving to another relation (whose column would be a
     /// different one) or to an outer level (whose per-row value looks fixed).
     /// References qualified by a relation whose columns are all known still
-    /// resolve as before.
+    /// resolve as before. A relation that lists every column at its
+    /// position ([`Rel::positioned`]) resolves the names it lists: an
+    /// uncertain name equal to one of them would make PG reject the
+    /// reference as ambiguous, so only a name it doesn't list is opaque.
     pub(super) fn resolve(&self, names: &[&str]) -> Col {
         let any_unknown = || self.rels.iter().any(|rel| !rel.columns_known);
+        // Items whose columns aren't even listed by position (an opaque DML
+        // item, a `*` subquery): any name may be theirs.
+        let any_opaque = || {
+            self.rels
+                .iter()
+                .any(|rel| !rel.columns_known && !rel.positioned)
+        };
         let attnum = |r: usize, name: &str| {
-            if !self.rels[r].columns_known {
+            let rel = &self.rels[r];
+            if !rel.columns_known && !rel.positioned {
                 return Col::Opaque;
             }
-            self.rels[r]
-                .attnum(name)
-                .map_or(Col::Other, |attnum| Col::Rel(r, attnum))
+            match rel.attnum(name) {
+                Some(attnum) => Col::Rel(r, attnum),
+                None if rel.columns_known => Col::Other,
+                None => Col::Opaque,
+            }
         };
         match names {
             [name] => {
                 // The name could bind to a relation that doesn't list it.
-                if any_unknown() {
+                if any_opaque() {
                     return Col::Opaque;
                 }
                 let mut found = self
@@ -1504,6 +1521,7 @@ impl<'a> Scope<'a> {
                     .filter(|(_, rel)| rel.columns.iter().any(|(n, _)| n == name));
                 match (found.next(), found.next()) {
                     (Some((r, _)), None) => attnum(r, name),
+                    _ if any_unknown() => Col::Opaque,
                     _ => self.resolve_using(name),
                 }
             }
@@ -1511,7 +1529,7 @@ impl<'a> Scope<'a> {
                 Some(r) => attnum(r, name),
                 // An opaque item without a refname this lists could still be
                 // the one the qualifier names (a join item, a function).
-                None if any_unknown() => Col::Opaque,
+                None if any_opaque() => Col::Opaque,
                 None => Col::Other,
             },
             [schema, table, name] => {
@@ -1520,7 +1538,7 @@ impl<'a> Scope<'a> {
                 });
                 match (found.next(), found.next()) {
                     (Some((r, _)), None) => attnum(r, name),
-                    _ if any_unknown() => Col::Opaque,
+                    _ if any_opaque() => Col::Opaque,
                     _ => Col::Other,
                 }
             }
@@ -1560,16 +1578,43 @@ impl<'a> Scope<'a> {
             }) {
                 return Col::Other;
             }
-            let mut found = (0..self.rels.len())
-                .filter(|&r| side & (1u64 << r) != 0)
-                .filter(|&r| self.rels[r].columns.iter().any(|(n, _)| n == name))
-                .map(|r| (r, self.rels[r].attnum(name)));
-            return match (found.next(), found.next()) {
-                (Some((r, Some(attnum))), None) => Col::Rel(r, attnum),
-                _ => Col::Other,
-            };
+            return self
+                .merged_column(side, name)
+                .map_or(Col::Other, |(r, attnum)| Col::Rel(r, attnum));
         }
         Col::Other
+    }
+
+    /// The column of one relation that the join input `mask` outputs as
+    /// `name`: the one relation of `mask` that has it or, when `mask` is a
+    /// join whose USING merges `name` (its two inputs both have it), that
+    /// join's merged column — PG's `buildMergedJoinVar` takes the left
+    /// input's for an INNER or LEFT join, the right input's for a RIGHT
+    /// join, recursively down a chain of USING joins. A FULL join merges
+    /// with `COALESCE`, and a merge needing a coercion to a common type
+    /// yields a converted value: neither is a column. PG rejects a USING
+    /// name an input outputs twice, so another input holding it is not a
+    /// case to resolve.
+    fn merged_column(&self, mask: u64, name: &str) -> Option<(usize, i16)> {
+        let mut found = (0..self.rels.len())
+            .filter(|&r| mask & (1u64 << r) != 0)
+            .filter(|&r| self.rels[r].columns.iter().any(|(n, _)| n == name));
+        match (found.next(), found.next()) {
+            (Some(r), None) => Some((r, self.rels[r].attnum(name)?)),
+            (Some(_), Some(_)) => {
+                let join = self.joins.iter().find(|join| join.rels() == mask)?;
+                if !join.using_uncoerced.contains(&name) {
+                    return None;
+                }
+                let side = match join.kind {
+                    JoinType::JoinInner | JoinType::JoinLeft => join.left,
+                    JoinType::JoinRight => join.right,
+                    _ => return None,
+                };
+                self.merged_column(side, name)
+            }
+            _ => None,
+        }
     }
 
     /// `expr` as one side of an equality the proof reads: a column of this
@@ -1581,8 +1626,10 @@ impl<'a> Scope<'a> {
     /// With `scalar_sublinks` (the cardinality
     /// proof's wider form), also a scalar sublink uncorrelated with this
     /// level, a cast and a call to a non-volatile, non-set-returning
-    /// function or operator every argument of which is one of these — each
-    /// one value per evaluation of the row (see [`Self::call_operand`]).
+    /// function or operator every argument of which is one of these, and a
+    /// `CASE`, `COALESCE`, `IS [NOT] NULL`, boolean test or `AND` / `OR` /
+    /// `NOT` of them — each one value per evaluation of the row (see
+    /// [`Self::call_operand`]).
     fn operand(
         &self,
         ctx: &Ctx<'_>,
@@ -1600,7 +1647,12 @@ impl<'a> Scope<'a> {
                 // the column an unqualified reference spells. Reading it as
                 // an outer level's would make its per-row value look fixed,
                 // so no key fact is read from such a scope.
-                if names.len() == 1 && self.rels.iter().any(|rel| !rel.columns_known) {
+                if names.len() == 1
+                    && self
+                        .rels
+                        .iter()
+                        .any(|rel| !rel.columns_known && !rel.positioned)
+                {
                     return None;
                 }
                 let (rel, attnum, (typ, deterministic_collation)) = match self.resolve(&names) {
@@ -1699,8 +1751,155 @@ impl<'a> Scope<'a> {
             Node::AExpr(expr) if scalar_sublinks && expr.kind == AExprKind::AexprOp => {
                 self.operator_operand(ctx, expr, outer, scalar_sublinks, env)
             }
+            // A test of determined values is one value too: `IS [NOT] NULL`,
+            // `IS [NOT] TRUE` / `FALSE` / `UNKNOWN`, and `AND` / `OR` /
+            // `NOT` of boolean operands (none of them calls a function).
+            Node::NullTest(test) if scalar_sublinks => {
+                let arg = self.operand(ctx, test.arg.as_ref(), outer, scalar_sublinks, env)?;
+                Some(Operand {
+                    typ: oid::BOOL,
+                    column: None,
+                    rels: arg.rels,
+                    call: None,
+                })
+            }
+            Node::BooleanTest(test) if scalar_sublinks => {
+                let arg = self.operand(ctx, test.arg.as_ref(), outer, scalar_sublinks, env)?;
+                (arg.typ == oid::BOOL).then_some(Operand {
+                    typ: oid::BOOL,
+                    column: None,
+                    rels: arg.rels,
+                    call: None,
+                })
+            }
+            Node::BoolExpr(expr) if scalar_sublinks => {
+                let mut rels = 0;
+                for arg in &expr.args {
+                    let arg = self.operand(ctx, arg.as_ref(), outer, scalar_sublinks, env)?;
+                    (arg.typ == oid::BOOL).then_some(())?;
+                    rels |= arg.rels;
+                }
+                Some(Operand {
+                    typ: oid::BOOL,
+                    column: None,
+                    rels,
+                    call: None,
+                })
+            }
+            Node::CoalesceExpr(expr) if scalar_sublinks => {
+                let mut values = Vec::with_capacity(expr.args.len());
+                for arg in &expr.args {
+                    values.push(self.branch_operand(ctx, arg.as_ref(), outer, env)?);
+                }
+                self.common_operand(ctx, &values, 0)
+            }
+            Node::CaseExpr(case) if scalar_sublinks => self.case_operand(ctx, case, outer, env),
             _ => None,
         }
+    }
+
+    /// A `CASE` / `COALESCE` branch's value: an [`Self::operand`], or a
+    /// `NULL` constant (an `unknown` value, until the construct's common
+    /// type resolves it).
+    fn branch_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        expr: Option<&ast::Node>,
+        outer: Option<&FromScope<'_>>,
+        env: Option<&CteEnv>,
+    ) -> Option<Operand> {
+        match expr {
+            None => Some(Operand {
+                typ: oid::UNKNOWN,
+                column: None,
+                rels: 0,
+                call: None,
+            }),
+            Some(Node::AConst(c)) if c.isnull => Some(Operand {
+                typ: oid::UNKNOWN,
+                column: None,
+                rels: 0,
+                call: None,
+            }),
+            _ => self.operand(ctx, expr, outer, true, env),
+        }
+    }
+
+    /// The value of a construct choosing among `values` (a `CASE`'s results,
+    /// a `COALESCE`'s arguments), each converted to their common type the
+    /// way PG's `select_common_type` picks it (in PG's order: a `CASE` lists
+    /// its `ELSE` first), when no conversion runs a volatile function and
+    /// the type's equality is deterministic. `rels` adds what decides the
+    /// choice (a `CASE`'s conditions) to what the values read.
+    fn common_operand(&self, ctx: &Ctx<'_>, values: &[Operand], rels: u64) -> Option<Operand> {
+        let types: Vec<PgTypeOid> = values.iter().map(|value| value.typ).collect();
+        let typ = crate::coerce::select_common_type_from_oids(&types, ctx.catalog)?;
+        if !crate::coerce::verify_common_type_from_oids(typ, &types, ctx.catalog)
+            || !values
+                .iter()
+                .all(|value| coercion_is_nonvolatile(ctx, value.typ, typ))
+            || !deterministic_type(ctx, typ)
+        {
+            return None;
+        }
+        Some(Operand {
+            typ,
+            column: None,
+            rels: values.iter().fold(rels, |rels, value| rels | value.rels),
+            call: None,
+        })
+    }
+
+    /// A `CASE`'s one value per evaluation of the row: every condition and
+    /// result an operand (a searched `CASE`'s conditions boolean, a simple
+    /// one's tests a non-volatile `=` between its argument and each `WHEN`
+    /// value, as PG's `transformCaseExpr` builds them), joined by
+    /// [`Self::common_operand`]. A missing `ELSE` is `NULL`.
+    fn case_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        case: &ast::CaseExpr,
+        outer: Option<&FromScope<'_>>,
+        env: Option<&CteEnv>,
+    ) -> Option<Operand> {
+        let arg = match &case.arg {
+            Some(arg) => Some(self.operand(ctx, Some(arg), outer, true, env)?),
+            None => None,
+        };
+        let mut rels = arg.as_ref().map_or(0, |arg| arg.rels);
+        // PG puts the default result first: it weighs most in the choice of
+        // the common type.
+        let mut values = vec![self.branch_operand(ctx, case.defresult.as_ref(), outer, env)?];
+        for when in &case.args {
+            let Some(Node::CaseWhen(when)) = when else {
+                return None;
+            };
+            let condition = self.operand(ctx, when.expr.as_ref(), outer, true, env)?;
+            match &arg {
+                Some(arg) => {
+                    let op = ctx
+                        .catalog
+                        .find_operator("=", Some(arg.typ), condition.typ)?;
+                    let proc = op.code.and_then(|code| ctx.catalog.pg_proc.get(&code))?;
+                    if proc.provolatile == ProVolatile::Volatile
+                        || proc.proretset
+                        || proc.prokind != ProKind::Function
+                        || op.result_type_oid != oid::BOOL
+                        || !op
+                            .left_type_oid
+                            .is_some_and(|target| coercion_is_nonvolatile(ctx, arg.typ, target))
+                        || !coercion_is_nonvolatile(ctx, condition.typ, op.right_type_oid)
+                    {
+                        return None;
+                    }
+                }
+                None if condition.typ == oid::BOOL => {}
+                None => return None,
+            }
+            rels |= condition.rels;
+            values.push(self.branch_operand(ctx, when.result.as_ref(), outer, env)?);
+        }
+        self.common_operand(ctx, &values, rels)
     }
 
     /// A call's one value per evaluation of the row, when the routine it
@@ -2074,7 +2273,14 @@ impl<'a> Scope<'a> {
                         && if star {
                             local.rel_named(names[0]).is_some()
                         } else {
-                            matches!(local.resolve(&names), Col::Rel(..))
+                            match local.resolve(&names) {
+                                Col::Rel(..) => true,
+                                Col::Opaque => false,
+                                Col::Other => match names.as_slice() {
+                                    [name] => self.local_whole_row(local, name),
+                                    _ => false,
+                                },
+                            }
                         };
                     if !resolved_locally {
                         return false;
@@ -2084,6 +2290,28 @@ impl<'a> Scope<'a> {
             stack.extend(node.children().map(|child| (child, visible)));
         }
         true
+    }
+
+    /// Whether the bare name `name`, written where the sublink's own FROM
+    /// items are visible, is a whole-row reference to one of them rather
+    /// than anything of this level. PG's `transformColumnRef` reads a
+    /// one-field reference first as a column, searching every level from
+    /// the innermost out (`colNameToVar`), and only when no level has such
+    /// a column as a range variable's whole row (`refnameNamespaceItem`,
+    /// innermost first). So the name is the local relation's row when the
+    /// subquery has a relation by that refname and neither the subquery's
+    /// relations nor this level's have a column by that name (a system
+    /// column included); a farther level's column would not be this
+    /// level's either. Every relation's columns must be known.
+    fn local_whole_row(&self, local: &Scope<'_>, name: &str) -> bool {
+        let no_column = |rels: &[Rel]| {
+            rels.iter()
+                .all(|rel| rel.columns_known && !rel.columns.iter().any(|(n, _)| n == name))
+        };
+        local.rel_named(name).is_some()
+            && !super::proof::is_system_column(name)
+            && no_column(&local.rels)
+            && no_column(&self.rels)
     }
 
     /// Whether a column reference with these fields may bind to one of this
@@ -2283,25 +2511,14 @@ impl<'a> Scope<'a> {
         check_casts: bool,
     ) -> Vec<EqFact> {
         let side = |mask: u64| {
-            let mut found = (0..self.rels.len())
-                .filter(|&r| mask & (1 << r) != 0)
-                .filter(|&r| {
-                    self.rels[r].columns_known
-                        && self.rels[r].columns.iter().any(|(n, _)| n == name)
-                })
-                .map(|r| (r, self.rels[r].attnum(name)));
-            match (found.next(), found.next()) {
-                (Some((r, Some(attnum))), None) => {
-                    let (typ, deterministic_collation) = self.rels[r].column_info(ctx, attnum)?;
-                    deterministic_collation.then_some(Operand {
-                        typ,
-                        column: Some((r, attnum)),
-                        rels: 1 << r,
-                        call: None,
-                    })
-                }
-                _ => None,
-            }
+            let (r, attnum) = self.merged_column(mask, name)?;
+            let (typ, deterministic_collation) = self.rels[r].column_info(ctx, attnum)?;
+            deterministic_collation.then_some(Operand {
+                typ,
+                column: Some((r, attnum)),
+                rels: 1 << r,
+                call: None,
+            })
         };
         match (side(left), side(right)) {
             (Some(l), Some(r)) => self.facts_of(ctx, "=", &l, &r, check_casts),
@@ -3761,15 +3978,17 @@ fn target_list_has_star(select: &ast::SelectStmt) -> bool {
         return select.larg.as_deref().is_some_and(target_list_has_star);
     }
     select.target_list.iter().any(|target| {
-        matches!(
-            target,
-            Some(Node::ResTarget(target))
-                if matches!(
-                    target.val.as_ref(),
-                    Some(Node::ColumnRef(column))
-                        if matches!(column_ref_fields(column), Fields::Star(_))
-                )
-        )
+        let Some(Node::ResTarget(target)) = target else {
+            return false;
+        };
+        match target.val.as_ref() {
+            Some(Node::ColumnRef(column)) => matches!(column_ref_fields(column), Fields::Star(_)),
+            // `(composite).*` expands to the composite's fields.
+            Some(Node::AIndirection(indirection)) => {
+                matches!(indirection.indirection.last(), Some(Some(Node::AStar(_))))
+            }
+            _ => false,
+        }
     })
 }
 
@@ -3811,21 +4030,15 @@ fn subquery_output_names(select: &ast::SelectStmt) -> Option<(Vec<String>, bool)
 }
 
 /// The name PG gives a subquery target-list entry, when it is certain: the
-/// written alias, or a bare column reference's name. `FigureColname` derives
-/// other names from the expression (a cast from its argument, a call from the
-/// function, `CASE` as `case`), which this doesn't reproduce, so they are
-/// unknown.
+/// written alias, else `FigureColname`'s name for the expression
+/// ([`crate::resolve::certain_colname`]: a cast is named after its argument,
+/// a call after its function, `1 + 1` is `?column?`); unknown where PG
+/// names the entry after a scalar subquery's own first target.
 fn target_output_name(target: &ast::ResTarget) -> Option<String> {
     if !target.name.is_empty() {
         return Some(target.name.clone());
     }
-    match target.val.as_ref()? {
-        Node::ColumnRef(column) => match column_ref_fields(column) {
-            Fields::Names(names) => names.last().map(|name| (*name).to_owned()),
-            _ => None,
-        },
-        _ => None,
-    }
+    crate::resolve::certain_colname(target.val.as_ref())
 }
 
 /// A placeholder for a column whose PG name isn't certain. No SQL identifier

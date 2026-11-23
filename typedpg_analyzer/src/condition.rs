@@ -1009,6 +1009,38 @@ fn weakly_implies(
     if node_key("", old.0) == node_key("", new.0) {
         return true;
     }
+    // Three-valued `AND` is FALSE exactly when an operand is, and `OR` when
+    // every operand is. So a new `AND` is not FALSE exactly when each of
+    // its operands isn't, and an old `OR` is not FALSE exactly when one of
+    // its operands isn't: both split exactly. An old `AND` not FALSE makes
+    // each of its operands not FALSE, and a new `OR` is not FALSE once one
+    // of its operands isn't: dropping a conjunct, adding a disjunct, or
+    // reordering either widens nothing.
+    fn operands(
+        n: Option<&ast::Node>,
+        op: ast::BoolExprType,
+    ) -> Option<std::slice::Iter<'_, Option<ast::Node>>> {
+        match n {
+            Some(ast::Node::BoolExpr(b)) if b.boolop == op => Some(b.args.iter()),
+            _ => None,
+        }
+    }
+    if let Some(mut args) = operands(new.0, ast::BoolExprType::AndExpr) {
+        return args.all(|arg| weakly_implies(old, (arg.as_ref(), new.1)));
+    }
+    if let Some(mut args) = operands(old.0, ast::BoolExprType::OrExpr) {
+        return args.all(|arg| weakly_implies((arg.as_ref(), old.1), new));
+    }
+    if let Some(mut args) = operands(old.0, ast::BoolExprType::AndExpr)
+        && args.any(|arg| weakly_implies((arg.as_ref(), old.1), new))
+    {
+        return true;
+    }
+    if let Some(mut args) = operands(new.0, ast::BoolExprType::OrExpr)
+        && args.any(|arg| weakly_implies(old, (arg.as_ref(), new.1)))
+    {
+        return true;
+    }
     let (Some(old_case), Some(new_case)) = (case_arms(old.0, old.1), case_arms(new.0, new.1))
     else {
         return false;
@@ -1388,7 +1420,9 @@ impl PgCatalog {
     /// does (the `ELSE`s, which NULL reaches too), the old branch it takes
     /// must imply the new one — the same, recursively, or an old `false`.
     /// Adding a branch whose body is `true` to a `CASE … ELSE false END`,
-    /// or replacing a body by `true`, widens it. The comparisons must be
+    /// or replacing a body by `true`, widens it. At any depth, an `AND`
+    /// that lost operands, an `OR` that gained some, or either reordered is
+    /// implied too. The comparisons must be
     /// built-in ones of a type whose equal values print the same (no
     /// nondeterministic collation), so two different constants are two
     /// different values.

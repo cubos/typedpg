@@ -610,6 +610,34 @@ pub(crate) fn target_resname(rt: &ast::ResTarget) -> String {
     infer_column_name(rt.val.as_ref()).unwrap_or_else(|| "?column?".to_string())
 }
 
+/// The name PG gives an unaliased target expression (`FigureColname`, with
+/// `?column?` when it finds none), when the raw expression alone decides
+/// it: `None` where the name comes from what the expression's
+/// `FigureColnameInternal` path reaches only after analysis — a scalar
+/// subquery's (PG names it after the transformed subquery's first target,
+/// which may be a `*` expansion's) — or where the target is a `*`
+/// expansion of several columns (`t.*`, `(c).*`).
+pub fn certain_colname(node: Option<&ast::Node>) -> Option<String> {
+    fn certain(node: Option<&ast::Node>) -> bool {
+        let star =
+            |fields: &[Option<ast::Node>]| matches!(fields.last(), Some(Some(ast::Node::AStar(_))));
+        match node {
+            Some(ast::Node::ColumnRef(cr)) => !star(&cr.fields),
+            Some(ast::Node::AIndirection(ind)) => {
+                !star(&ind.indirection)
+                    && (!expr::extract_string_fields(&ind.indirection).is_empty()
+                        || certain(ind.arg.as_ref()))
+            }
+            Some(ast::Node::TypeCast(tc)) => certain(tc.arg.as_ref()),
+            Some(ast::Node::CollateClause(cc)) => certain(cc.arg.as_ref()),
+            Some(ast::Node::CaseExpr(case)) => certain(case.defresult.as_ref()),
+            Some(ast::Node::SubLink(sl)) => sl.sub_link_type != ast::SubLinkType::ExprSublink,
+            _ => true,
+        }
+    }
+    certain(node).then(|| infer_column_name(node).unwrap_or_else(|| "?column?".to_string()))
+}
+
 /// Try to infer a default column name from an expression (for unaliased
 /// columns, and an index expression's column, `FigureIndexColname`).
 pub(crate) fn infer_column_name(node: Option<&ast::Node>) -> Option<String> {
@@ -764,9 +792,9 @@ fn figure_colname(node: Option<&ast::Node>) -> (i32, Option<String>) {
 
 /// Name an `EXPR_SUBLINK` scalar subquery after its single output column —
 /// PG's `FigureColname` recurses into the subquery's first target (honouring
-/// an explicit alias, else the target expression's own name). Returns strength
-/// `2` when the target has a name, `(0, None)` otherwise (the subquery is then
-/// `?column?`, exactly as a bare expression would be).
+/// an explicit alias, else the target expression's own name, else `?column?`),
+/// with strength `2`. `(0, None)` when it can't tell: a `*` first target
+/// this doesn't expand.
 fn sublink_target_colname(sl: &ast::SubLink) -> (i32, Option<String>) {
     let Some(ast::Node::SelectStmt(top)) = sl.subselect.as_ref() else {
         return (0, None);
@@ -795,8 +823,65 @@ fn sublink_target_colname(sl: &ast::SubLink) -> (i32, Option<String>) {
     }
     // (Named once: before the subquery is analyzed, each level would
     // otherwise name the one below it twice — 2^depth.)
+    // A `*` target is named after the first column it expands to, which
+    // this doesn't list.
+    if let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref()
+        && matches!(cr.fields.last(), Some(Some(ast::Node::AStar(_))))
+    {
+        return (0, None);
+    }
+    // Any other target's `resname` is set — `?column?` when FigureColname
+    // finds no name — and the sublink takes it with strength 2: PG names
+    // `(SELECT 1)::int` `?column?`, not `int4`.
     match figure_colname(rt.val.as_ref()) {
-        (strength, name) if strength > 0 => (2, name),
-        _ => (0, None),
+        (strength, Some(name)) if strength > 0 => (2, Some(name)),
+        _ => (2, Some("?column?".to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use typedpg_pg_query::ast;
+
+    /// The name of `SELECT expression`'s one target, as
+    /// [`super::certain_colname`] gives it.
+    fn name(expression: &str) -> Option<String> {
+        let parsed = typedpg_pg_query::parse(&format!("SELECT {expression}")).unwrap();
+        let Some(ast::Node::SelectStmt(select)) = parsed.tree.stmts[0].stmt.as_ref() else {
+            panic!("{expression}");
+        };
+        let Some(ast::Node::ResTarget(target)) = select.target_list[0].as_ref() else {
+            panic!("{expression}");
+        };
+        super::certain_colname(target.val.as_ref())
+    }
+
+    /// Each name as PostgreSQL 19 gives it (checked with `SELECT … LIMIT 0`
+    /// against a server).
+    #[test]
+    fn certain_colname_follows_figure_colname() {
+        for (expression, expected) in [
+            ("m::text", Some("m")),
+            ("1 + 1", Some("?column?")),
+            ("1::int", Some("int4")),
+            ("CASE WHEN true THEN 1 ELSE m END", Some("m")),
+            ("CASE WHEN true THEN m END", Some("case")),
+            ("CASE WHEN true THEN 1 ELSE 1::int END", Some("case")),
+            ("coalesce(m, 1)", Some("coalesce")),
+            ("arr[1]", Some("arr")),
+            ("(c).owner", Some("owner")),
+            ("current_date", Some("current_date")),
+            ("m::text COLLATE \"C\"", Some("m")),
+            ("t.m", Some("m")),
+            ("EXISTS (SELECT 1)", Some("exists")),
+            // Named after the subquery's own target, or a `*` expansion's
+            // columns, which this leaves to the analysis.
+            ("(SELECT 1)", None),
+            ("(SELECT 1)::int", None),
+            ("t.*", None),
+            ("(c).*", None),
+        ] {
+            assert_eq!(name(expression).as_deref(), expected, "{expression}");
+        }
     }
 }

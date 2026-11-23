@@ -1904,6 +1904,7 @@ pub(crate) use rewrite::*;
 pub(crate) use row_guarantees::*;
 pub(crate) use select::*;
 pub(crate) use set_ops::*;
+pub use target_list::certain_colname;
 pub(crate) use target_list::*;
 pub(crate) use type_resolution::*;
 pub(crate) use walk::*;

@@ -7,7 +7,7 @@
 //! is not `id`).
 
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{AExprKind, MinMaxOp, Node, Node as N, ResTarget, SubLinkType};
+use typedpg_pg_query::ast::{Node as N, ResTarget};
 
 use super::{leftmost_start, scan_until, starts_clause};
 use crate::{Ctx, RawFinding, SqlEdit};
@@ -51,7 +51,10 @@ fn alias(ctx: &Ctx<'_>, target: &ResTarget, out: &mut Vec<RawFinding>) {
     let Some(value) = target.val.as_ref() else {
         return;
     };
-    if figure_colname(value).map(|(name, _)| name) != Some(target.name.as_str()) {
+    // `?column?` is no name the query chose: an alias spelling it stays.
+    if target.name == "?column?"
+        || typedpg_analyzer::certain_colname(Some(value)).as_deref() != Some(target.name.as_str())
+    {
         return;
     }
     let Some(start) = leftmost_start(value) else {
@@ -110,51 +113,6 @@ fn identifier_value(token: &str) -> Option<String> {
         .then(|| token.to_lowercase())
 }
 
-/// The last string of a name list (`pg_catalog.count` is `count`).
-fn last_string(nodes: &[Option<Node>]) -> Option<&str> {
-    nodes.iter().rev().find_map(|n| match n {
-        Some(N::String(s)) => Some(s.sval.as_str()),
-        _ => None,
-    })
-}
-
-/// FigureColnameInternal (parse_target.c): the name PostgreSQL gives an
-/// output column of expression `node` without an alias, and the strength
-/// of that choice (2 for a column or function name, 1 for a fallback such
-/// as `case`). `None` where it would be `?column?`, or where the analyzer
-/// does not model the choice.
-fn figure_colname(node: &Node) -> Option<(&str, u8)> {
-    match node {
-        N::ColumnRef(column) => match column.fields.last()? {
-            Some(N::String(s)) => Some((s.sval.as_str(), 2)),
-            _ => None,
-        },
-        N::FuncCall(call) => Some((last_string(&call.funcname)?, 2)),
-        N::AExpr(expr) if expr.kind == AExprKind::AexprNullif => Some(("nullif", 2)),
-        N::CoalesceExpr(_) => Some(("coalesce", 2)),
-        N::MinMaxExpr(expr) => Some((
-            match expr.op {
-                MinMaxOp::IsGreatest => "greatest",
-                MinMaxOp::IsLeast => "least",
-            },
-            2,
-        )),
-        N::AArrayExpr(_) => Some(("array", 2)),
-        N::RowExpr(_) => Some(("row", 2)),
-        N::SubLink(link) => match link.sub_link_type {
-            SubLinkType::ExistsSublink => Some(("exists", 2)),
-            SubLinkType::ArraySublink => Some(("array", 2)),
-            _ => None,
-        },
-        N::CaseExpr(_) => Some(("case", 1)),
-        N::TypeCast(cast) => match cast.arg.as_ref().and_then(figure_colname) {
-            Some((name, 2)) => Some((name, 2)),
-            _ => Some((last_string(&cast.type_name.as_ref()?.names)?, 1)),
-        },
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::Rule;
@@ -192,6 +150,18 @@ mod tests {
                 "SELECT id::int AS id FROM users",
                 "SELECT id::int FROM users",
             ),
+            // A cast is named after a column it reads, a `CASE` after an
+            // `ELSE` that has a name of its own.
+            (
+                "SELECT name::text AS name FROM users",
+                "SELECT name::text FROM users",
+            ),
+            (
+                "SELECT CASE WHEN id > 1 THEN 'x' ELSE name END AS name FROM users",
+                "SELECT CASE WHEN id > 1 THEN 'x' ELSE name END FROM users",
+            ),
+            ("SELECT 1::int AS int4", "SELECT 1::int"),
+            ("SELECT current_date AS current_date", "SELECT current_date"),
             (
                 "SELECT x.id FROM (SELECT id AS id FROM users) x",
                 "SELECT x.id FROM (SELECT id FROM users) x",
@@ -215,6 +185,10 @@ mod tests {
             "SELECT name AS \"Name\" FROM users",
             "SELECT 1 AS \"?column?\"",
             "SELECT id + 1 AS id FROM users",
+            // PG names it `id`, after its ELSE.
+            "SELECT CASE WHEN id > 1 THEN 1 ELSE id END AS \"case\" FROM users",
+            // PG names it after the subquery's own target, `?column?`.
+            "SELECT (SELECT 1)::int AS int4",
             // trim() is btrim(): its column is `btrim`.
             "SELECT trim(name) AS trim FROM users",
             "UPDATE users SET name = 'x' WHERE id = 1",

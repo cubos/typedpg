@@ -2698,6 +2698,63 @@ mod tests {
         }
     }
 
+    /// Dropping a conjunct, adding a disjunct or reordering either widens a
+    /// CHECK, in a `CASE` branch too; adding a conjunct or dropping a
+    /// disjunct narrows it.
+    #[test]
+    fn a_check_widened_by_dropping_a_conjunct() {
+        const EVENTS: &str = "CREATE TABLE ev (
+                id integer PRIMARY KEY,
+                type text NOT NULL,
+                content text,
+                result text,
+                CONSTRAINT ev_shape CHECK (CASE type
+                    WHEN 'a' THEN content IS NOT NULL AND result IS NULL
+                    WHEN 'b' THEN content IS NULL OR result IS NOT NULL
+                    END)
+            );";
+        let replace = |check: &str| {
+            format!(
+                "ALTER TABLE ev DROP CONSTRAINT ev_shape;\n\
+                 ALTER TABLE ev ADD CONSTRAINT ev_shape CHECK ({check});"
+            )
+        };
+        let queries = &["INSERT INTO ev (id, type, content) VALUES (1, 'a', 'x')"];
+        for widened in [
+            // `AND result IS NULL` dropped.
+            "CASE type WHEN 'a' THEN content IS NOT NULL \
+             WHEN 'b' THEN content IS NULL OR result IS NOT NULL END",
+            // The conjuncts and disjuncts reordered.
+            "CASE type WHEN 'a' THEN result IS NULL AND content IS NOT NULL \
+             WHEN 'b' THEN result IS NOT NULL OR content IS NULL END",
+            // A disjunct added.
+            "CASE type WHEN 'a' THEN content IS NOT NULL AND result IS NULL \
+             WHEN 'b' THEN content IS NULL OR result IS NOT NULL OR id > 0 END",
+        ] {
+            let findings = check(&[EVENTS], &[&replace(widened)], queries);
+            assert!(findings.is_empty(), "{widened}: {:?}", messages(&findings));
+        }
+        for narrowed in [
+            // A conjunct added.
+            "CASE type WHEN 'a' THEN content IS NOT NULL AND result IS NULL AND id > 0 \
+             WHEN 'b' THEN content IS NULL OR result IS NOT NULL END",
+            // A disjunct dropped.
+            "CASE type WHEN 'a' THEN content IS NOT NULL AND result IS NULL \
+             WHEN 'b' THEN content IS NULL END",
+            // A conjunct turned into a disjunct's.
+            "CASE type WHEN 'a' THEN content IS NOT NULL OR result IS NULL \
+             WHEN 'b' THEN content IS NULL AND result IS NOT NULL END",
+        ] {
+            let findings = check(&[EVENTS], &[&replace(narrowed)], queries);
+            assert_eq!(findings.len(), 1, "{narrowed}: {:?}", messages(&findings));
+            assert!(
+                messages(&findings)[0].contains("it may reject the rows the deployed code writes"),
+                "{narrowed}: {:?}",
+                messages(&findings)
+            );
+        }
+    }
+
     /// A value the deployed code doesn't know breaks it as far as what it
     /// decodes the column into narrows: a mapped Rust enum fails to decode
     /// a new label, a Rust `String` takes any; a TypeScript literal union

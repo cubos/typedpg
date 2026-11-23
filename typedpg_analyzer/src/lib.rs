@@ -130,7 +130,7 @@ pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
-    AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
+    AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList, certain_colname,
 };
 pub use simplify::{
     AppliedSimplification, OrderKey, OrderTies, RedundantJoin, RedundantJoinProof, Rule,

@@ -155,7 +155,10 @@ command takes it over (then only the view's own columns are checked).
   `WHEN 'b' THEN true` — or with a branch's body made `true`. The `CASE`s are
   compared value by value (simple or searched `WHEN type = 'a'`, constants
   of a type whose equal values print the same): each branch the old one
-  takes must imply the new one's, equal or an old `false`.
+  takes must imply the new one's, equal or an old `false`. An `AND` that
+  lost a term, an `OR` that gained one, or either reordered implies the
+  same, at any depth (`content IS NOT NULL AND result IS NULL` to
+  `content IS NOT NULL`).
 - In Rust, a new enum label or `CHECK` value of a column the code decodes
   into a `String` (an enum or domain `[types]` doesn't map, a `text`): any
   value decodes.
