@@ -29,28 +29,55 @@ warning[self_assignment]: assigning name its own value changes nothing
    ·                  ───────────
    ╰────
   help: remove the assignment, or assign the value meant
+
+warning[self_assignment]: assigning name its own value rewrites the row with the same value
+   ╭─[queries.sql:3:20]
+ 3 │ UPDATE users u SET name = u.name WHERE id = $id;
+   ·                    ─────────────
+   ╰────
+  help: assign the value meant
 ```
 
 `--fix` gives `UPDATE users SET email = $email WHERE id = $id`,
 `… DO UPDATE SET email = excluded.email` and
-`… WHEN MATCHED THEN UPDATE SET views = 0`. The second query is reported
-without a fix (see below).
+`… WHEN MATCHED THEN UPDATE SET views = 0`. The second query has no fix: a
+`SET` list can't be empty.
 
 ## Why
 
-`SET name = name` changes nothing, yet the statement runs and reports rows
-updated. It usually stands where something else was meant: a forgotten
-parameter, an unqualified column of another table, a copy-paste.
+`SET name = name` beside another assignment changes nothing. Alone, it
+rewrites the row as it is: a new row version and a row lock, the row
+counted as updated, and nothing else. Either way it usually stands where
+something else was meant: a forgotten parameter, an unqualified column of
+another table, a copy-paste.
 
 ## Reported when
 
 `SET col = col` or `SET col = t.col`, where `t` is the target table or its
 alias, in an `UPDATE` (also inside a CTE), an `ON CONFLICT DO UPDATE` (the
 existing row's value) or a `MERGE … WHEN MATCHED THEN UPDATE` (the matched
-row's value).
+row's value):
+
+- beside an assignment of another value: "changes nothing";
+- when every assignment of the `SET` list is one: "rewrites the row with
+  the same value". The help points an upsert to `DO NOTHING`, a `MERGE` to
+  `WHEN MATCHED THEN DO NOTHING`.
 
 ## Not reported
 
+- An `UPDATE OF col` trigger on the table or one of its partitions lists the
+  column: naming it in the `SET` list fires the trigger.
+- Every assignment is one, and the statement has `RETURNING`: the rewrite
+  is what returns the row. `INSERT … ON CONFLICT (k) DO UPDATE SET k = t.k
+  RETURNING id` is the idiom that returns the existing row's `id`, which
+  `DO NOTHING` doesn't; `UPDATE … SET k = k … RETURNING` locks and returns
+  the row.
+- Every assignment is one, and an `UPDATE` trigger sees the rewritten rows:
+  a `FOR EACH ROW` one, or a statement-level one with a `REFERENCING`
+  transition table, without an `UPDATE OF` list or with one listing an
+  assigned column (whatever its state or `WHEN`).
+- Every assignment is one, and the target is a view, has rewrite rules or
+  isn't resolved to a table: what the rewrite does there is unknown.
 - A value from elsewhere: `SET title = a.title FROM archived a`,
   `SET name = excluded.name`, a `MERGE` source column, an outer query's
   column.
@@ -60,11 +87,8 @@ row's value).
 
 ## Fix not offered
 
-- It is the only assignment: a `SET` list can't be empty.
+- Every assignment of the `SET` list is one: it can't be empty.
 - The target is a view or other non-table, or has rewrite rules.
-- An `UPDATE OF col` trigger on the table or one of its partitions lists the
-  column: it fires whenever the `SET` list names the column, so removing the
-  assignment would stop it firing.
 
 ## Configuration
 

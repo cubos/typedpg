@@ -141,6 +141,9 @@ pub(crate) struct NullabilityContext {
     derived_matched: Facts,
     derived_where: Facts,
     derived_local: Facts,
+    /// This level's FULL JOINs no path can implement (by index into
+    /// `joins`; see [`Self::unplannable_full_join`]).
+    unplannable_full: Vec<(usize, Option<i32>)>,
     /// Whether the current SELECT has a GROUP BY clause.
     /// When true, each group has ≥1 row, so aggregates with NOT NULL inputs
     /// produce NOT NULL results.
@@ -218,6 +221,32 @@ impl NullabilityContext {
         });
         self.recompute();
         self.joins.len() - 1
+    }
+
+    /// Note that join `join`, a FULL JOIN (a node in it at `location`),
+    /// has join clauses no merge or hash join can use (see
+    /// `resolve::full_join`).
+    pub fn note_unplannable_full_join(&mut self, join: usize, location: Option<i32>) {
+        self.unplannable_full.push((join, location));
+    }
+
+    /// Whether some FULL JOIN noted by [`Self::note_unplannable_full_join`]
+    /// is still one once `reduce_outer_joins` reduced the joins with
+    /// what the level's quals prove: the planner fails to build it
+    /// (`populate_joinrel_with_paths`).
+    /// `except`, a join under a qual that may be a constant FALSE, is
+    /// skipped (`restriction_is_constant_false`). `Some` of the location
+    /// noted with the first one.
+    pub fn unplannable_full_join(&self, except: Option<usize>) -> Option<Option<i32>> {
+        self.unplannable_full
+            .iter()
+            .find(|&&(j, _)| Some(j) != except && self.final_kinds.get(j) == Some(&JoinKind::Full))
+            .map(|&(_, location)| location)
+    }
+
+    /// The index the next join recorded gets.
+    pub fn joins_recorded(&self) -> usize {
+        self.joins.len()
     }
 
     /// Record the merged columns of join `join` (`USING` / `NATURAL`): for

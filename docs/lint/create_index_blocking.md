@@ -50,9 +50,20 @@ migration the lock lasts until the commit.
 On a table, partitioned table or foreign table created by an earlier
 migration file:
 
-- `CREATE INDEX` without `CONCURRENTLY`;
+- `CREATE INDEX` without `CONCURRENTLY` (but not `CREATE INDEX ON ONLY` a
+  partitioned table, nor `IF NOT EXISTS` naming an existing index, which
+  build nothing). On a partitioned table, only when a partition gets an
+  index built: one with a matching index adopts it, and a partitioned table
+  with no partition builds nothing;
 - `ALTER TABLE … ADD CONSTRAINT … PRIMARY KEY / UNIQUE / EXCLUDE`, or
-  `ADD COLUMN` with an inline `PRIMARY KEY` / `UNIQUE`.
+  `ADD COLUMN` with an inline `PRIMARY KEY` / `UNIQUE`;
+- `ALTER COLUMN … TYPE` that rewrites no row but can't keep an index of the
+  column: one whose collation changes, an expression or partial index, or a
+  partition's index attached to the partitioned table's (all built again
+  under `ACCESS EXCLUSIVE`);
+- `ATTACH PARTITION` of a table missing an index the partitioned table
+  has: PostgreSQL builds it under `ACCESS EXCLUSIVE`. Build it with
+  `CREATE INDEX CONCURRENTLY` first, and the attach adopts it.
 
 For `EXCLUDE`, which can't adopt an existing index, the help says to add it
 while the table is small or can be locked for the whole build.

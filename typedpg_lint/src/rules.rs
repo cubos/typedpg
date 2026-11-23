@@ -23,6 +23,8 @@ mod left_join_nullified;
 mod like_unescaped_param;
 mod limit_without_order;
 mod non_sargable_predicate;
+#[cfg(feature = "pg_sanity")]
+pub(crate) mod oracle;
 mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
@@ -36,6 +38,7 @@ mod scalar_subquery_may_return_many;
 mod self_assignment;
 mod simplifiable_case;
 mod timestamp_timezone_mix;
+mod unbounded_write;
 mod unreachable_case_branch;
 mod unstable_order;
 mod unused_cte;
@@ -47,7 +50,7 @@ const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
 pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
     match rule {
         Rule::NullComparison => null_comparison(ctx),
-        Rule::UnboundedWrite => unbounded_write(ctx),
+        Rule::UnboundedWrite => unbounded_write::findings(ctx),
         Rule::NotInNullable => not_in_nullable(ctx),
         Rule::RedundantNullCheck => redundant_null_check::findings(ctx),
         Rule::LimitWithoutOrder => limit_without_order::findings(ctx),
@@ -529,6 +532,14 @@ pub(super) fn scan_until(
 
 /// Whether `text` is a keyword that starts a clause after a select list, a
 /// condition or a `RETURNING` list.
+/// The start of expression `node` as written: its first token, or the
+/// parenthesis before it that a part of it closes (`((x)::int)::int > 2`
+/// starts at the first `(`, where [`leftmost_start`] gives `x`).
+pub(super) fn expression_start(ctx: &Ctx<'_>, node: &Node) -> Option<usize> {
+    let start = leftmost_start(node)?;
+    Some(node_span(ctx, node.to_ref()).map_or(start, |span| span.start.min(start)))
+}
+
 /// The span of boolean expression `node`: from its first token to the
 /// clause keyword or closing parenthesis that ends it — or, unless
 /// `whole`, to the `AND` (outside a `BETWEEN … AND`) or `OR` after it at
@@ -539,7 +550,7 @@ pub(super) fn condition_span(
     node: &Node,
     whole: bool,
 ) -> Option<std::ops::Range<usize>> {
-    let start = leftmost_start(node)?;
+    let start = expression_start(ctx, node)?;
     let or = matches!(node, N::BoolExpr(b) if b.boolop == BoolExprType::OrExpr);
     let mut between = false;
     let (end, _) = scan_until(ctx, start, |text| {
@@ -551,7 +562,7 @@ pub(super) fn condition_span(
             between = false;
             return false;
         }
-        starts_clause(text)
+        ends_condition(text)
             || (!whole
                 && (text.eq_ignore_ascii_case("AND") || (!or && text.eq_ignore_ascii_case("OR"))))
     });
@@ -627,6 +638,13 @@ pub(super) fn starts_clause(text: &str) -> bool {
     .iter()
     .any(|keyword| text.eq_ignore_ascii_case(keyword))
         || text == ";"
+}
+
+/// Whether a token at a condition's own depth ends it: a clause keyword,
+/// or a comma — no condition holds one outside parentheses, and a join's
+/// `ON` may be followed by the next FROM item (`… ON a.x = 1, LATERAL …`).
+pub(super) fn ends_condition(text: &str) -> bool {
+    starts_clause(text) || text == ","
 }
 
 pub(super) fn is_terminator(text: &str) -> bool {
@@ -802,56 +820,6 @@ fn not_in(ctx: &Ctx<'_>, sub: &SubLink, negated: bool, out: &mut Vec<RawFinding>
         message,
         help: Some(
             "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL".to_owned(),
-        ),
-        fix: Vec::new(),
-    });
-}
-
-// ── unbounded_write ────────────────────────────────────────────────────────
-
-fn unbounded_write(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    let mut out = Vec::new();
-    for (node, _) in ctx.tree.nodes() {
-        match node {
-            NodeRef::UpdateStmt(stmt) if stmt.where_clause.is_none() => {
-                write_finding(ctx, "UPDATE", "changes", stmt.relation.as_deref(), &mut out);
-            }
-            NodeRef::DeleteStmt(stmt) if stmt.where_clause.is_none() => {
-                write_finding(ctx, "DELETE", "removes", stmt.relation.as_deref(), &mut out);
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn write_finding(
-    ctx: &Ctx<'_>,
-    keyword: &str,
-    verb: &str,
-    relation: Option<&RangeVar>,
-    out: &mut Vec<RawFinding>,
-) {
-    let Some(relation) = relation else {
-        return;
-    };
-    let Some(relation_start) = location(relation.location) else {
-        return;
-    };
-    let start = ctx
-        .tokens
-        .iter()
-        .filter(|token| token.end <= relation_start)
-        .rfind(|token| ctx.sql[token.start..token.end].eq_ignore_ascii_case(keyword))
-        .map_or(relation_start, |token| token.start);
-    let end = relation_end(ctx, relation).unwrap_or(relation_start + relation.relname.len());
-    let table = table_name(relation);
-    out.push(RawFinding {
-        span: start..end.max(start + keyword.len()),
-        message: format!("{keyword} without WHERE {verb} every row of {table}"),
-        help: Some(
-            "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
-                .to_owned(),
         ),
         fix: Vec::new(),
     });

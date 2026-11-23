@@ -149,6 +149,38 @@ pub(crate) fn recook_checks_reading(interp: &mut PgCatalog, relid: PgClassOid, a
         });
         interp.check_defs.insert(oid, def);
     }
+    // ATPostAlterTypeCleanup re-adds a NOT VALID constraint from its
+    // definition — NOT VALID — and the re-add recurses: the descendants'
+    // copies it re-creates are not valid either, whatever they were.
+    let not_valid: Vec<String> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == relid
+                && c.contype == ConType::Check
+                && c.conislocal
+                && !c.convalidated
+                && c.conkey.contains(&attnum)
+        })
+        .map(|c| c.conname.clone())
+        .collect();
+    if not_valid.is_empty() {
+        return;
+    }
+    for child in super::inherit::all_inheritors(interp, relid) {
+        if child == relid {
+            continue;
+        }
+        for c in interp.pg_constraint.values_mut() {
+            if c.conrelid == child
+                && c.contype == ConType::Check
+                && !c.conislocal
+                && not_valid.contains(&c.conname)
+            {
+                c.convalidated = false;
+            }
+        }
+    }
 }
 
 /// Whether two CHECK constraints, of relations `rel_a` and `rel_b`, have

@@ -111,6 +111,20 @@ fn needs_toast_table(interp: &PgCatalog, relid: PgClassOid) -> bool {
     tuple_length > TOAST_TUPLE_THRESHOLD
 }
 
+/// Whether `relid` has a TOAST table after the statements so far: what
+/// [`note_toast_tables`] would record (for the catalog oracle).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn has_toast_table_now(interp: &PgCatalog, relid: PgClassOid) -> bool {
+    let kind = interp.pg_class.get(&relid).map(|c| c.relkind);
+    if !matches!(kind, Some(RelKind::Table | RelKind::MaterializedView)) {
+        return interp.toast_tables.contains(&relid);
+    }
+    if interp.toast_rewrites.contains(&relid) {
+        return needs_toast_table(interp, relid);
+    }
+    interp.toast_tables.contains(&relid) || needs_toast_table(interp, relid)
+}
+
 /// Record the TOAST tables the statements so far have made: every table
 /// and materialized view whose columns need one has one. Called before a
 /// statement that can remove columns or read the TOAST state — a column

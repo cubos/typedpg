@@ -49,7 +49,7 @@ use typedpg_pg_query::ast::{
     SetOperation, SubLinkType,
 };
 
-use super::{condition_span, leftmost_start, node_span, operator_name, scan_until, starts_clause};
+use super::{condition_span, ends_condition, leftmost_start, node_span, operator_name, scan_until};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 /// The clause a condition is in.
@@ -210,7 +210,7 @@ fn condition(ctx: &Ctx<'_>, qual: Option<&Node>, clause: Clause, out: &mut Vec<R
     // Scanned from the keyword, so parentheses around the condition are
     // part of it.
     let from = keyword.map_or(start, |(_, token)| token.end);
-    let (end, _) = scan_until(ctx, from, starts_clause);
+    let (end, _) = scan_until(ctx, from, ends_condition);
     let span = keyword.map_or(start, |(_, token)| token.start)..end.max(start + 1);
     let removable = value
         && match clause {
@@ -537,7 +537,7 @@ fn compares_with_null(ctx: &Ctx<'_>, node: &Node) -> bool {
 /// (outside a `BETWEEN … AND`), clause keyword or closing parenthesis that
 /// ends it.
 fn conjunct_span(ctx: &Ctx<'_>, arg: &Node) -> Option<std::ops::Range<usize>> {
-    let start = leftmost_start(arg)?;
+    let start = super::expression_start(ctx, arg)?;
     let mut between = false;
     let (end, _) = scan_until(ctx, start, |text| {
         if text.eq_ignore_ascii_case("BETWEEN") {
@@ -548,7 +548,7 @@ fn conjunct_span(ctx: &Ctx<'_>, arg: &Node) -> Option<std::ops::Range<usize>> {
             between = false;
             return false;
         }
-        text.eq_ignore_ascii_case("AND") || text.eq_ignore_ascii_case("OR") || starts_clause(text)
+        text.eq_ignore_ascii_case("AND") || text.eq_ignore_ascii_case("OR") || ends_condition(text)
     });
     Some(start..end.max(start + 1))
 }
@@ -668,6 +668,16 @@ mod tests {
                 "SELECT u.id FROM users u LEFT JOIN users v ON false",
                 "ON false",
             ),
+            // The next FROM item after a comma is no part of the ON.
+            (
+                "SELECT u.id FROM users u LEFT JOIN users v ON -1 = 0, posts p",
+                "ON -1 = 0",
+            ),
+            (
+                "SELECT u.id FROM users u LEFT JOIN users v ON v.id = u.id AND 1 = 2, \
+                 LATERAL (SELECT 1 FROM posts) p",
+                "1 = 2",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -675,6 +685,56 @@ mod tests {
             assert_eq!(&sql[findings[0].span.clone()], reported, "{sql}");
             assert!(findings[0].fix.is_empty(), "{sql}");
         }
+    }
+
+    /// A condition starting with parentheses its own operand closes is
+    /// reported whole, not from the operand's first token (where the span
+    /// was the `100` alone, and the lint oracle checked that instead).
+    #[test]
+    fn a_condition_opening_with_parentheses_is_reported_whole() {
+        let db = catalog();
+        for (sql, reported) in [
+            (
+                "SELECT id FROM users WHERE ((100)::integer)::integer >= 2",
+                "((100)::integer)::integer >= 2",
+            ),
+            (
+                "SELECT id FROM users WHERE name = 'x' AND ((1)::integer)::integer > 2",
+                "((1)::integer)::integer > 2",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], reported, "{sql}");
+        }
+    }
+
+    /// The reason may say "always true" of an operand while the condition
+    /// is never true: the lint oracle reads the conclusion (it took the
+    /// condition for always true, and found it refuted).
+    #[test]
+    fn an_operand_always_true_makes_a_condition_never_true() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE f (id integer PRIMARY KEY, flag boolean);
+             CREATE TABLE g (id integer PRIMARY KEY, f_id integer);",
+        )
+        .unwrap();
+        let sql = "SELECT g.id FROM g LEFT JOIN f ON f.id = g.f_id \
+                   WHERE (NULLIF(f.flag, false) = false OR g.id > 1)";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            &sql[findings[0].span.clone()],
+            "NULLIF(f.flag, false) = false"
+        );
+        assert!(
+            findings[0].message.ends_with(
+                "is always true where this is evaluated, so this condition is never true"
+            ),
+            "{}",
+            findings[0].message
+        );
     }
 
     #[test]
@@ -740,6 +800,48 @@ mod tests {
             sql[findings[0].span.clone()].to_owned(),
             findings[0].message.clone(),
         )
+    }
+
+    /// What decides the comparison is cited, not a CHECK of the table that
+    /// says nothing of the column: an enum's labels are its type's.
+    #[test]
+    fn the_enum_deciding_a_comparison_is_cited() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TYPE mech AS ENUM ('oauth');
+             CREATE TYPE two AS ENUM ('a', 'b');
+             CREATE TABLE acc (
+                 id int PRIMARY KEY,
+                 fp text CHECK (fp ~ '^[0-9a-f]{16}$'),
+                 m mech NOT NULL,
+                 t two NOT NULL CHECK (t = 'a'),
+                 n int CHECK (id > 0),
+                 flag boolean NOT NULL CHECK (id > 0)
+             );",
+        )
+        .unwrap();
+        for (sql, message) in [
+            (
+                "SELECT id FROM acc WHERE m = 'oauth'",
+                "`m` is always 'oauth' (enum \"mech\"), so this condition is always true",
+            ),
+            (
+                "SELECT id FROM acc WHERE t = 'b'",
+                "`t` is always 'a' (CHECK constraint \"acc_t_check\"), so this condition is \
+                 never true",
+            ),
+        ] {
+            let (_, got) = one(&db, sql);
+            assert_eq!(got, message, "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM acc WHERE n > 3000000000",
+            "SELECT id FROM acc WHERE flag IN (true, false)",
+        ] {
+            for finding in lint_rule(&db, sql, RULE) {
+                assert!(!finding.message.contains("CHECK"), "{sql}: {finding:?}");
+            }
+        }
     }
 
     #[test]

@@ -134,6 +134,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         let Some(ast::Node::IndexElem(elem)) = param.as_ref() else {
             continue;
         };
+        let expr_column = expression_column(db, indrelid, elem.expr.as_ref());
         let column_type = if !elem.name.is_empty() {
             // ComputeIndexAttrs: `column "x" does not exist`; a system
             // column resolves (and DefineIndex refuses it).
@@ -147,6 +148,30 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             indkey.push(an);
             let attr = db.attribute_by_name(indrelid, &elem.name);
             attr.map(|a| (a.atttypid, a.attcollation))
+        } else if let Some(an) = expr_column {
+            indkey.push(an);
+            // A COLLATE clause stripped off the column gives the key its
+            // collation.
+            let collated = matches!(elem.expr, Some(ast::Node::CollateClause(_)));
+            db.attributes_of(indrelid)
+                .iter()
+                .find(|a| a.attnum == an)
+                .map(|a| {
+                    let collation = if collated {
+                        match super::volatile::infer_over_relation(
+                            db,
+                            indrelid,
+                            elem.expr.as_ref(),
+                            None,
+                        ) {
+                            Some(Ok(t)) => expression_collation(db, &t),
+                            _ => a.attcollation,
+                        }
+                    } else {
+                        a.attcollation
+                    };
+                    (a.atttypid, collation)
+                })
         } else if elem.expr.is_some() {
             let expr = &elem.expr;
             indkey.push(0);
@@ -172,7 +197,7 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             column_type.and_then(|(_, c)| c),
             None,
         )?;
-        if elem.name.is_empty() {
+        if elem.name.is_empty() && expr_column.is_none() {
             check_expression_key_collation(db, column_type.map(|(t, _)| t), key.collation)?;
         }
         key_columns.push(key.column);
@@ -199,10 +224,13 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
             .ok_or_else(|| DdlError::Parse(format!("column \"{}\" does not exist", elem.name)))?;
         indkey.push(an);
     }
+    // DefineIndex's make_ands_implicit: a predicate that is the constant
+    // true is none.
     let indpred = stmt
         .where_clause
-        .is_some()
-        .then(|| serialize_node(stmt.where_clause.as_ref()));
+        .as_ref()
+        .filter(|w| !is_true_constant(w))
+        .map(|w| serialize_node(Some(w)));
     let usage = if stmt.primary {
         IndexUse::Primary
     } else if stmt.isconstraint {
@@ -585,6 +613,10 @@ struct ComputedKey {
 /// An index-backed constraint's index as DefineIndex resolves it.
 pub(crate) struct ConstraintIndex {
     pub(crate) am: String,
+    /// An exclusion constraint's expression keys (`indexprs`), in key order.
+    pub(crate) indexprs: Vec<SerializedAst>,
+    /// An exclusion constraint's WHERE (`indpred`).
+    pub(crate) indpred: Option<SerializedAst>,
     pub(crate) keys: IndexKeys,
     pub(crate) indclass: Vec<Option<PgOpclassOid>>,
     pub(crate) indcollation: Vec<Option<PgCollationOid>>,
@@ -876,6 +908,99 @@ fn check_exclusion_operator(
 /// collation, operator class, exclusion operator and ordering — and, on a
 /// partitioned table, that an EXCLUDE constraint compares every partition
 /// key column with its equality operator.
+/// ComputeIndexAttrs: an index expression whose transformed form is a
+/// plain column — `(a)`, `((t).a)`, `(a::text)` of a text column, any of
+/// them under top-level COLLATE clauses (which it strips: the collation is
+/// the key's) — is that column ("User wrote "(column)" ... Treat it like
+/// simple attribute anyway"): its attnum.
+pub(crate) fn expression_column(
+    db: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+) -> Option<i16> {
+    let mut expr = expr?;
+    while let ast::Node::CollateClause(c) = expr {
+        expr = c.arg.as_ref()?;
+    }
+    // A cast to the column's own type, without a typmod, coerces nothing
+    // (coerce_type returns the Var itself).
+    if let ast::Node::TypeCast(tc) = expr {
+        let tn = tc.type_name.as_ref()?;
+        let attnum = expression_column(db, relid, tc.arg.as_ref())?;
+        let attr = db
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)?;
+        let target = super::functions::typename_type_id(db, tn).ok()?;
+        return (tn.typmods.is_empty()
+            && tn.array_bounds.is_empty()
+            && attr.atttypmod.is_none()
+            && target == attr.atttypid)
+            .then_some(attnum);
+    }
+    let relname = db.pg_class.get(&relid).map(|c| c.relname.as_str());
+    let name = match expr {
+        ast::Node::ColumnRef(cr) => {
+            let names: Vec<&str> = cr
+                .fields
+                .iter()
+                .map(|f| super::util::node_string(f.as_ref()))
+                .collect::<Option<_>>()?;
+            match names.as_slice() {
+                [name] => *name,
+                [rel, name] if Some(*rel) == relname => *name,
+                _ => return None,
+            }
+        }
+        ast::Node::AIndirection(ind) if ind.indirection.len() == 1 => {
+            let selections = super::util::relation_row_selections(db, relid, Some(expr));
+            let &(_, field) = selections.first()?;
+            match ind.arg.as_ref() {
+                Some(ast::Node::ColumnRef(cr)) if std::ptr::eq(&**cr, selections[0].0) => field,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    db.attribute_by_name(relid, name)
+        .map(|a| a.attnum)
+        .or_else(|| system_attnum(name))
+}
+
+/// A boolean constant true as transformExpr leaves it: `true`, or a typed
+/// literal of boolean (`'t'::boolean`, `boolean 'yes'`).
+fn is_true_constant(node: &ast::Node) -> bool {
+    match node {
+        ast::Node::AConst(c) => matches!(&c.val, Some(ast::AConstValue::Boolean(b)) if b.boolval),
+        ast::Node::TypeCast(tc) => {
+            let is_bool = tc.type_name.as_ref().is_some_and(|tn| {
+                tn.typmods.is_empty()
+                    && tn.array_bounds.is_empty()
+                    && matches!(
+                        tn.names
+                            .iter()
+                            .filter_map(|n| super::util::node_string(n.as_ref()))
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                        ["bool"] | ["pg_catalog", "bool"] | ["boolean"]
+                    )
+            });
+            is_bool
+                && match tc.arg.as_ref() {
+                    Some(ast::Node::AConst(c)) => match &c.val {
+                        Some(ast::AConstValue::Boolean(b)) => b.boolval,
+                        Some(ast::AConstValue::String(s)) => {
+                            super::reloptions::parse_bool(&s.sval) == Some(true)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn define_constraint_index(
     db: &PgCatalog,
     relid: PgClassOid,
@@ -977,8 +1102,35 @@ pub(crate) fn define_constraint_index(
         check_exclusion_covers_partition_key(db, relid, conkey, &indcollation, &exclusion_oprs)?;
     }
     check_index_expression_types(db, &colnames, &expr_types)?;
+    // The expression keys (an expression that is a plain column was given
+    // its attnum) and the WHERE: the index's indexprs and indpred.
+    let indexprs = if exclusion {
+        conkey
+            .iter()
+            .enumerate()
+            .filter(|&(_, &attnum)| attnum == 0)
+            .filter_map(
+                |(i, _)| match c.exclusions.get(i).and_then(|p| p.as_ref()) {
+                    Some(ast::Node::List(l)) => match l.items.first().and_then(|n| n.as_ref()) {
+                        Some(ast::Node::IndexElem(e)) => Some(serialize_node(e.expr.as_ref())),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let indpred = c
+        .where_clause
+        .as_ref()
+        .filter(|w| !is_true_constant(w))
+        .map(|w| serialize_node(Some(w)));
     Ok(ConstraintIndex {
         am,
+        indexprs,
+        indpred,
         keys: IndexKeys {
             columns,
             nulls_not_distinct: c.nulls_not_distinct,
@@ -1223,6 +1375,69 @@ pub(crate) fn rebuild_indexes_for_column_type(
                 && Some(&c.conname) == name.as_ref()
         })
     };
+    // A partition's index attached to its parent's is not rebuilt from its
+    // own definition: RememberIndexForRebuilding leaves it to the parent's,
+    // whose DefineIndex creates it anew — named as a new clone is (from the
+    // parent index's column names), the old one gone.
+    for &index in &rebuilt {
+        let Some(parent) = db.index_parents.get(&index).copied() else {
+            continue;
+        };
+        let Some(class) = db.pg_class.get(&index).cloned() else {
+            continue;
+        };
+        let Some(table) = db.pg_class.get(&relid).cloned() else {
+            continue;
+        };
+        // The parent index is rebuilt too, from pg_get_indexdef: its columns
+        // are named after the table's columns now (the parent may come after
+        // its partitions here).
+        db.index_attnames.remove(&parent);
+        db.relcache_index_attnames.remove(&parent);
+        let colnames = relcache_index_attnames(db, parent);
+        let parent_con = super::tables::partidx::backing_constraint(db, parent);
+        let addition = super::util::index_name_addition(&colnames);
+        // The old name is free again.
+        db.rename_pg_class(index, String::new(), class.relnamespace);
+        let name = match parent_con.map(|c| c.contype) {
+            Some(crate::pg_catalog::ConType::PrimaryKey) => {
+                super::util::choose_constraint_index_name(
+                    db,
+                    table.relnamespace,
+                    &table.relname,
+                    "",
+                    "pkey",
+                )
+            }
+            Some(contype) => super::util::choose_constraint_index_name(
+                db,
+                table.relnamespace,
+                &table.relname,
+                &addition,
+                if contype == crate::pg_catalog::ConType::Unique {
+                    "key"
+                } else {
+                    "excl"
+                },
+            ),
+            None => super::util::choose_relation_name(
+                db,
+                table.relnamespace,
+                &table.relname,
+                &addition,
+                "idx",
+            ),
+        };
+        db.rename_pg_class(index, name.clone(), class.relnamespace);
+        // Its constraint, if any, is the clone's too, under the same name.
+        if let Some(con) = db
+            .pg_constraint
+            .values_mut()
+            .find(|c| c.conrelid == relid && c.conname == class.relname)
+        {
+            con.conname = name;
+        }
+    }
     let (constraints, plain): (Vec<PgClassOid>, Vec<PgClassOid>) =
         rebuilt.into_iter().partition(|&i| backs_constraint(db, i));
     for index in constraints.into_iter().chain(plain) {

@@ -24,9 +24,12 @@ mod not_in;
 pub(crate) mod proof;
 mod safe_builtins;
 
+#[cfg(feature = "pg_sanity")]
+pub(crate) use cardinality::picks_rows_arbitrarily;
 pub use cardinality::{
-    order_keys, order_ties, redundant_distinct_spans, redundant_group_keys, select_at_most_one_row,
-    statement_at_most_one_row, unique_order_prefix,
+    order_keys, order_ties, redundant_distinct_spans, redundant_group_keys,
+    relation_holds_at_most_one_row, select_at_most_one_row, statement_at_most_one_row,
+    statement_node_at_most_one_row, unique_order_prefix,
 };
 pub use dedup::{OrderKey, OrderTies};
 pub use fk_join::{RedundantJoin, RedundantJoinProof};

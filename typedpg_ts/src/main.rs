@@ -422,6 +422,7 @@ fn build_lint(
                             reference,
                             catalog: old_catalog,
                             queries: &queries[old],
+                            decoding: typedpg_lint::Decoding::TypeScript,
                         },
                         &typedpg_lint::NewSchema {
                             files,

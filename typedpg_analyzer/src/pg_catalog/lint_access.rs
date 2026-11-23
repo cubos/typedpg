@@ -40,6 +40,32 @@ impl PgCatalog {
     /// Whether row-level security is enabled on `relid`
     /// (`pg_class.relrowsecurity`): its SELECT policies then restrict the
     /// rows a statement sees, `RETURNING` included.
+    /// Whether type `oid` is a NOT NULL domain (or a domain over one): a
+    /// column of it holds no NULL, whatever its own `attnotnull`.
+    pub fn lint_type_is_not_null(&self, oid: crate::oid::PgTypeOid) -> bool {
+        self.type_is_not_null(oid)
+    }
+
+    /// The name of the `NOT VALID` NOT NULL constraint of column `column`
+    /// of relation `relid`, if it has one: rows already stored may hold a
+    /// NULL there, which fails any UPDATE of them.
+    pub fn lint_not_valid_not_null(&self, relid: PgClassOid, column: &str) -> Option<&str> {
+        let attnum = self
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum > 0 && a.attname == column)?
+            .attnum;
+        self.pg_constraint
+            .values()
+            .find(|c| {
+                c.conrelid == relid
+                    && c.contype == super::ConType::NotNull
+                    && !c.convalidated
+                    && c.conkey == [attnum]
+            })
+            .map(|c| c.conname.as_str())
+    }
+
     pub fn lint_relation_has_row_security(&self, relid: PgClassOid) -> bool {
         self.row_security.contains(&relid)
     }
@@ -99,6 +125,29 @@ impl PgCatalog {
                     triggers.iter().any(|trigger| {
                         trigger.events & crate::ddl::triggers::TRIGGER_TYPE_UPDATE != 0
                             && trigger.columns.iter().any(|c| c == column)
+                    })
+                })
+            })
+    }
+
+    /// Whether an `UPDATE` trigger of `relid`, or of a table inheriting
+    /// from it (a partition), sees the rows an `UPDATE` naming `columns` in
+    /// its SET list rewrites, whatever its state or `WHEN` condition: a
+    /// `FOR EACH ROW` one, or a statement-level one with a transition table,
+    /// without an `UPDATE OF` list or with one listing any of `columns`.
+    pub fn lint_update_trigger_sees_rows(&self, relid: PgClassOid, columns: &[&str]) -> bool {
+        std::iter::once(relid)
+            .chain(crate::resolve::inheritance_descendants(self, relid))
+            .any(|rel| {
+                self.triggers.get(&rel).is_some_and(|triggers| {
+                    triggers.iter().any(|trigger| {
+                        trigger.events & crate::ddl::triggers::TRIGGER_TYPE_UPDATE != 0
+                            && (trigger.row || !trigger.transition_tables.is_empty())
+                            && (trigger.columns.is_empty()
+                                || trigger
+                                    .columns
+                                    .iter()
+                                    .any(|c| columns.contains(&c.as_str())))
                     })
                 })
             })
@@ -251,6 +300,72 @@ impl PgCatalog {
                     Some(crate::ddl::tables::partbound::Bound::Default)
                 )
         })
+    }
+    /// Whether `oid` is a domain (or a domain over one) with a CHECK or NOT
+    /// NULL constraint: a column of it added with `ADD COLUMN` makes
+    /// PostgreSQL evaluate the constraints on every row, rewriting the table
+    /// (ATExecAddColumn, `DomainHasConstraints`).
+    pub fn lint_domain_has_constraints(&self, oid: PgTypeOid) -> bool {
+        let mut current = oid;
+        for _ in 0..64 {
+            let Some(ty) = self.pg_type.get(&current) else {
+                return false;
+            };
+            let Some(base) = ty.typbasetype else {
+                return false;
+            };
+            if ty.typnotnull
+                || self
+                    .domain_constraints
+                    .get(&current)
+                    .is_some_and(|constraints| !constraints.is_empty())
+            {
+                return true;
+            }
+            current = base;
+        }
+        false
+    }
+
+    /// Whether `relid` is a materialized view created `WITH NO DATA` (or
+    /// refreshed so) and not refreshed since.
+    pub fn lint_matview_unpopulated(&self, relid: PgClassOid) -> bool {
+        self.unpopulated_matviews.contains(&relid)
+    }
+
+    /// The names of the triggers on `relid`.
+    pub fn lint_relation_triggers(&self, relid: PgClassOid) -> Vec<&str> {
+        self.triggers
+            .get(&relid)
+            .map(|triggers| triggers.iter().map(|t| t.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The names of the rewrite rules on `relid`.
+    pub fn lint_relation_rules(&self, relid: PgClassOid) -> Vec<&str> {
+        self.rules
+            .get(&relid)
+            .map(|rules| rules.iter().map(|r| r.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The partitioned index `index` is attached to, when it is a
+    /// partition's index.
+    pub fn lint_index_parent(&self, index: PgClassOid) -> Option<PgClassOid> {
+        self.index_parents.get(&index).copied()
+    }
+
+    /// The typed tables (`CREATE TABLE … OF type`) of the composite type
+    /// `oid`.
+    pub fn lint_typed_tables(&self, oid: PgTypeOid) -> Vec<PgClassOid> {
+        let mut tables: Vec<PgClassOid> = self
+            .typed_tables
+            .iter()
+            .filter(|(_, ty)| **ty == oid)
+            .map(|(table, _)| *table)
+            .collect();
+        tables.sort();
+        tables
     }
 }
 

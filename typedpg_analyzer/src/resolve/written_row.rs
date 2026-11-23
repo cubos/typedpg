@@ -482,6 +482,57 @@ pub(crate) fn default_value(
     }
 }
 
+/// For the lint: the value an INSERT that leaves out column `attr` of
+/// `relid` stores, as a [`crate::condition::WrittenValue`] — its DEFAULT
+/// expression as the analyzer infers it, or NULL without a default. `None`
+/// when that isn't known: an identity, serial or generated column, a
+/// default that doesn't infer, a domain's default.
+pub(crate) fn default_written_value(
+    snapshot: &PgCatalog,
+    relid: PgClassOid,
+    attr: &crate::pg_catalog::PgAttribute,
+) -> Option<crate::condition::WrittenValue> {
+    use crate::condition::WrittenValue;
+    use crate::ddl::tables::check_inherit::StoredExpr;
+    if attr.attidentity.is_some() || attr.attgenerated.is_some() {
+        return None;
+    }
+    match snapshot.attr_default_exprs.get(&(relid, attr.attnum)) {
+        Some(StoredExpr::Written(expr)) => {
+            let scope = Scope::default();
+            let null_ctx = NullabilityContext::default();
+            let mut params = ParamCollector::default();
+            let (inferred, _) = crate::ddl::depend::collect(|| {
+                let _level = QueryLevel::enter();
+                let _skipped = expr::skipped_if(true);
+                expr::infer_expr(
+                    (**expr).as_ref(),
+                    expr::Ctx::new(&scope, &null_ctx, snapshot),
+                    &mut params,
+                    TypeGoal::assignment(attr.atttypid)
+                        .with_typmod(snapshot.effective_typmod(attr.atttypid, attr.atttypmod)),
+                )
+            });
+            let t = inferred.ok()?;
+            Some(WrittenValue::Expression {
+                type_oid: t.type_oid,
+                typmod: t.typmod,
+                nullable: t.nullable,
+                refinement: Box::new(t.refine.clone()),
+            })
+        }
+        Some(_) => None,
+        None if attr.atthasdef || snapshot.unwrap_domain(attr.atttypid) != attr.atttypid => None,
+        // NULL: an untyped value of no known contents.
+        None => Some(WrittenValue::Expression {
+            type_oid: crate::pg_catalog::oid::UNKNOWN,
+            typmod: None,
+            nullable: true,
+            refinement: Box::new(crate::refine::Refinement::NONE),
+        }),
+    }
+}
+
 /// The columns of base table `relid` proven non-NULL in a row of it known
 /// `k` about (see [`WriteTarget::row_not_null`]). A column of an
 /// inheritance parent is NOT NULL only if it is in each child too.

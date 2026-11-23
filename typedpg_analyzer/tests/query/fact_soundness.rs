@@ -803,3 +803,19 @@ fn a_null_a_domain_rejects_fails_every_execution() {
         db.analyze(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
     }
 }
+
+/// An `IN` list (or `= ANY` array) holding a NULL is never FALSE: `NOT`
+/// of it is NULL, not TRUE, for the rows no other item matches — the
+/// implicit ELSE NULL is reached.
+#[test]
+fn not_in_a_list_holding_null_is_never_true_alone() {
+    let db = catalog(
+        "CREATE TABLE t (id int PRIMARY KEY, kind text NOT NULL CHECK (kind IN ('b', 'x')));",
+    );
+    assert_nullable(
+        &db,
+        "SELECT CASE WHEN NOT (kind IN ('y', NULL)) THEN 1 END AS v, \
+                CASE WHEN NOT (kind = ANY (ARRAY['y', NULL])) THEN 1 END AS w FROM t",
+        &[("v", true), ("w", true)],
+    );
+}

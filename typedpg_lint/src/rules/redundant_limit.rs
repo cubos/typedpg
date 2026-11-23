@@ -12,6 +12,7 @@ use typedpg_analyzer::select_at_most_one_row;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{self, AConstValue, LimitOption, Token};
 
+use super::limit_without_order::implicit_fetch;
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
@@ -32,18 +33,31 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         if !select_at_most_one_row(ctx.catalog, ctx.view, select) {
             continue;
         }
-        let Some(clause) = limit_clause(ctx, count) else {
+        let Some(clause) = limit_clause(ctx, select, count) else {
             continue;
         };
         // Removing LIMIT lets PG evaluate the rest of the query on rows the
         // scan previously stopped before, so withhold the fix when an
         // expression of the select could raise on one of them.
         let error_free = ctx.view.select_is_error_free(ctx.catalog, select);
-        let count_text = &ctx.sql[clause.count.clone()];
-        let message = match clause.fetch {
-            None => format!("LIMIT {count_text} has no effect: the query returns at most one row"),
-            Some(first) => format!(
-                "FETCH {first} {count_text} has no effect: the query returns at most one row"
+        let message = match (clause.fetch, clause.count.clone()) {
+            (None, Some(count)) => format!(
+                "LIMIT {} has no effect: the query returns at most one row",
+                &ctx.sql[count]
+            ),
+            (Some(first), Some(count)) => format!(
+                "FETCH {first} {} has no effect: the query returns at most one row",
+                &ctx.sql[count]
+            ),
+            // `FETCH FIRST ROW ONLY`: quoted as written.
+            (_, None) => format!(
+                "{} has no effect: the query returns at most one row",
+                ctx.tokens
+                    .iter()
+                    .filter(|token| token.start >= clause.keyword && token.end <= clause.end)
+                    .map(|token| &ctx.sql[token.start..token.end])
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ),
         };
         let start = delete_start(ctx, clause.keyword);
@@ -79,27 +93,42 @@ fn is_positive_integer(node: &ast::Node) -> bool {
 struct LimitClause {
     /// The keyword's first byte (`LIMIT` or `FETCH`).
     keyword: usize,
-    /// The count literal's bytes.
-    count: std::ops::Range<usize>,
+    /// The count literal's bytes (`None` for `FETCH FIRST ROW ONLY`).
+    count: Option<std::ops::Range<usize>>,
     /// The clause's last byte: the count, or `ONLY` for a `FETCH`.
     end: usize,
     /// `Some("FIRST" | "NEXT")` when written as a `FETCH`.
     fetch: Option<&'static str>,
 }
 
-/// The clause `count` belongs to, read from the tokens around it.
-fn limit_clause(ctx: &Ctx<'_>, count: &ast::Node) -> Option<LimitClause> {
-    let at = first_location(NodeRef::AConst(match count {
+/// The clause `count` (`select`'s) belongs to, read from the tokens
+/// around it.
+fn limit_clause(ctx: &Ctx<'_>, select: &ast::SelectStmt, count: &ast::Node) -> Option<LimitClause> {
+    let Some(at) = first_location(NodeRef::AConst(match count {
         ast::Node::AConst(value) => value,
         _ => return None,
-    }))?;
+    })) else {
+        // The implicit 1 of `FETCH FIRST ROW ONLY` has no location.
+        let fetch = implicit_fetch(ctx, select)?;
+        let first = ctx.tokens.iter().find(|token| token.start > fetch.start)?;
+        return Some(LimitClause {
+            keyword: fetch.start,
+            count: None,
+            end: fetch.end,
+            fetch: Some(if is_keyword(ctx, first, "FIRST") {
+                "FIRST"
+            } else {
+                "NEXT"
+            }),
+        });
+    };
     let index = ctx.tokens.iter().position(|token| token.start == at)?;
     let current = ctx.tokens[index];
     let previous = ctx.tokens.get(index.checked_sub(1)?)?;
     if is_keyword(ctx, previous, "LIMIT") {
         return Some(LimitClause {
             keyword: previous.start,
-            count: current.start..current.end,
+            count: Some(current.start..current.end),
             end: current.end,
             fetch: None,
         });
@@ -114,7 +143,7 @@ fn limit_clause(ctx: &Ctx<'_>, count: &ast::Node) -> Option<LimitClause> {
             .find(|token| is_keyword(ctx, token, "ONLY"))?;
         return Some(LimitClause {
             keyword: before.start,
-            count: current.start..current.end,
+            count: Some(current.start..current.end),
             end: only.end,
             fetch: Some(if is_keyword(ctx, previous, "FIRST") {
                 "FIRST"
@@ -130,7 +159,7 @@ fn limit_clause(ctx: &Ctx<'_>, count: &ast::Node) -> Option<LimitClause> {
             .find(|token| is_keyword(ctx, token, "ONLY"))?;
         return Some(LimitClause {
             keyword: previous.start,
-            count: current.start..current.end,
+            count: Some(current.start..current.end),
             end: only.end,
             fetch: Some("FIRST"),
         });
@@ -299,6 +328,37 @@ mod tests {
             fixed(sql, &findings),
             "SELECT email FROM users WHERE email = $email"
         );
+    }
+
+    #[test]
+    fn a_fetch_without_a_count_is_removed_whole() {
+        // PG stores the implicit 1 with no location: the clause is read
+        // from the tokens.
+        let db = catalog();
+        for (sql, message, fixed_sql) in [
+            (
+                "SELECT email FROM users WHERE email = $email FETCH FIRST ROW ONLY",
+                "FETCH FIRST ROW ONLY has no effect: the query returns at most one row",
+                "SELECT email FROM users WHERE email = $email",
+            ),
+            (
+                "SELECT count(*) FROM users fetch next rows only",
+                "fetch next rows only has no effect: the query returns at most one row",
+                "SELECT count(*) FROM users",
+            ),
+            (
+                "SELECT (SELECT name FROM users WHERE id = $id FETCH FIRST ROW ONLY) AS name",
+                "FETCH FIRST ROW ONLY has no effect: the query returns at most one row",
+                "SELECT (SELECT name FROM users WHERE id = $id) AS name",
+            ),
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(findings[0].message, message);
+            assert_eq!(fixed(sql, &findings), fixed_sql);
+        }
+        // Rows it can still cut stay.
+        assert!(limit_findings(&db, "SELECT id FROM users FETCH FIRST ROW ONLY").is_empty());
     }
 
     #[test]

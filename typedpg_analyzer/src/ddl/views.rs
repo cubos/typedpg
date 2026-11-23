@@ -1185,10 +1185,17 @@ fn resolve_view_with_params(
             } else {
                 col.type_oid
             };
+            // exprTypmod of an expression of a domain type is -1 (a column
+            // of one has no typmod of its own; CoerceToDomain's is -1): the
+            // domain's typmod is its own.
+            let domain = snapshot
+                .pg_type
+                .get(&type_oid)
+                .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain);
             ResolvedColumn {
                 name,
                 type_oid,
-                typmod: col.typmod,
+                typmod: col.typmod.filter(|_| !domain),
                 not_null: !col.nullable,
                 collation: col
                     .collation
@@ -1229,7 +1236,7 @@ fn resolve_view_with_params(
 /// [`crate::pg_catalog::PgCatalog::serialize_expression`] and friends so
 /// the seed exporter can capture index expressions and predicates with
 /// fully resolved bindings, without re-implementing the walker.
-#[cfg(any(test, feature = "internal"))]
+#[cfg(any(test, feature = "internal", feature = "catalog_export"))]
 pub(crate) fn serialize_subnode(
     snapshot: &PgCatalog,
     sql: &str,
@@ -1238,7 +1245,7 @@ pub(crate) fn serialize_subnode(
     crate::stack::with_stack(|| serialize_subnode_here(snapshot, sql, pick))
 }
 
-#[cfg(any(test, feature = "internal"))]
+#[cfg(any(test, feature = "internal", feature = "catalog_export"))]
 fn serialize_subnode_here(
     snapshot: &PgCatalog,
     sql: &str,
@@ -1265,7 +1272,7 @@ fn serialize_subnode_here(
 /// `pick` for `serialize_expression`: pulls the value of the first target
 /// in `SELECT <expr>`. Returns `None` if the input wasn't a `SelectStmt`
 /// or has no targets.
-#[cfg(any(test, feature = "internal"))]
+#[cfg(any(test, feature = "internal", feature = "catalog_export"))]
 pub(crate) fn extract_first_target(stmt: Option<&ast::Node>) -> Option<&ast::Node> {
     let ast::Node::SelectStmt(sel) = stmt? else {
         return None;
@@ -1279,7 +1286,7 @@ pub(crate) fn extract_first_target(stmt: Option<&ast::Node>) -> Option<&ast::Nod
 
 /// `pick` for `serialize_predicate`: extracts the WHERE clause of
 /// `SELECT 1 WHERE <pred>`. Returns `None` if there is no WHERE.
-#[cfg(any(test, feature = "internal"))]
+#[cfg(any(test, feature = "internal", feature = "catalog_export"))]
 pub(crate) fn extract_where(stmt: Option<&ast::Node>) -> Option<&ast::Node> {
     let ast::Node::SelectStmt(sel) = stmt? else {
         return None;
@@ -1313,7 +1320,7 @@ pub(crate) struct BindingWalker {
 }
 
 impl BindingWalker {
-    #[cfg(any(test, feature = "internal"))]
+    #[cfg(any(test, feature = "internal", feature = "catalog_export"))]
     fn walk(&mut self, node: &ast::Node, snapshot: &PgCatalog) {
         let scope_stack: Vec<Vec<FromSource>> = Vec::new();
         self.walk_node(node, snapshot, &scope_stack);

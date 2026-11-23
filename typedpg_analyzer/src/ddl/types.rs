@@ -13,9 +13,7 @@ use crate::pg_catalog::{
 };
 
 use super::DdlError;
-use super::util::{
-    ensure_qualified_name, names_key, node_string, register_composite_to_record_cast,
-};
+use super::util::{ensure_qualified_name, names_key, node_string};
 use crate::pg_catalog::PgCatalog;
 
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
@@ -69,12 +67,12 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         None => base_collation,
     };
 
-    // Domains inherit category/preferred from their base type.
-    let (typcategory, typispreferred) = interp
+    // Domains inherit their base type's category, but DefineDomain makes
+    // them never preferred (`false, /* domain types are never preferred */`).
+    let typcategory = interp
         .pg_type
         .get(&base_type_oid)
-        .map(|t| (t.typcategory, t.typispreferred))
-        .unwrap_or((TypCategory::UserDefined, false));
+        .map_or(TypCategory::UserDefined, |t| t.typcategory);
 
     // `CREATE DOMAIN d AS T NOT NULL` lands in `stmt.constraints` as a
     // `Constraint { contype = CONSTR_NOTNULL }`. A DEFAULT is recorded only
@@ -191,7 +189,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typnamespace: nsoid,
         typtype: TypType::Domain,
         typcategory,
-        typispreferred,
+        typispreferred: false,
         typrelid: None,
         typelem: None,
         typarray: None,
@@ -558,6 +556,10 @@ pub fn alter_domain(
         [name] => (None, *name),
         _ => return Ok(()),
     };
+    // LookupTypeName: a qualified name's schema must exist.
+    if let Some(schema) = schema {
+        super::util::existing_namespace(interp, schema)?;
+    }
     let Some(type_oid) = interp.resolve_type_by_name(schema, name).map(|t| t.oid) else {
         return Err(DdlError::TypeNotFound(format!(
             "type \"{}\" does not exist",
@@ -893,7 +895,6 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
     });
 
     register_array_type(interp, nsoid, &name, type_oid)?;
-    register_composite_to_record_cast(interp, type_oid)?;
 
     // DefineCompositeType: the relation and its type belong to the current
     // role. The relation's relacl stays NULL (not a RELKIND the default ACLs
@@ -1618,6 +1619,32 @@ fn define_base_type(
             Some(n) => n.parse().unwrap_or(-1),
         };
     }
+    // CATEGORY: one non-control ASCII character (a category the analyzer
+    // has no name for is user-defined to it).
+    let typcategory = match get("category") {
+        Some(de) => {
+            let raw = match de.arg.as_ref() {
+                Some(ast::Node::TypeName(tn)) => tn
+                    .names
+                    .last()
+                    .and_then(|n| node_string(n.as_ref()))
+                    .unwrap_or_default()
+                    .to_owned(),
+                Some(ast::Node::String(s)) => s.sval.clone(),
+                _ => option_word(de).unwrap_or_default(),
+            };
+            let c = raw.bytes().next().unwrap_or(0);
+            if !(32..=126).contains(&c) {
+                return Err(DdlError::Parse(format!(
+                    "invalid type category \"{raw}\": must be simple ASCII"
+                )));
+            }
+            typcategory_of(c)
+        }
+        None => TypCategory::UserDefined,
+    };
+    let typispreferred = get("preferred").is_some_and(super::operators::def_bool);
+    let mut element = None;
     if let Some(de) = get("element")
         && let Some(ast::Node::TypeName(tn)) = de.arg.as_ref()
     {
@@ -1628,9 +1655,10 @@ fn define_base_type(
                 super::util::format_type_for_message(interp, elem)
             )));
         }
+        element = Some(elem);
     }
-    if get("passedbyvalue").is_some() {
-        phys.typbyval = true;
+    if let Some(de) = get("passedbyvalue") {
+        phys.typbyval = super::operators::def_bool(de);
     }
     if let Some(de) = get("alignment") {
         phys.typalign = match option_word(de).as_deref() {
@@ -1731,11 +1759,30 @@ fn define_base_type(
             builtin::BOOL,
         )?);
     }
-    let subscript = match get("subscript") {
-        Some(de) => subscript_handler(interp, de)?,
-        None => None,
+    let subscript = match (get("subscript"), element) {
+        (Some(de), _) => subscript_handler(interp, de)?,
+        // An ELEMENT without SUBSCRIPT: raw_array_subscript_handler, when
+        // it can be used (DefineType's backwards compatibility).
+        (None, Some(elem)) => {
+            let elem_len = interp.pg_type.get(&elem).map_or(-1, |t| t.typlen);
+            if phys.typlen > 0 && !phys.typbyval && elem_len > 0 {
+                interp
+                    .find_functions(Some("pg_catalog"), "raw_array_subscript_handler")
+                    .first()
+                    .map(|p| p.oid)
+            } else {
+                return Err(DdlError::Parse(
+                    "element type cannot be specified without a subscripting function".into(),
+                ));
+            }
+        }
+        (None, None) => None,
     };
     functions.extend(subscript);
+    // COLLATABLE = true: the database's default collation.
+    let typcollation = get("collatable")
+        .filter(|de| super::operators::def_bool(de))
+        .map(|_| crate::oid::PgCollationOid::from_raw(100));
 
     // TypeCreate's checks of the physical layout.
     if !(phys.typlen > 0 || phys.typlen == -1 || phys.typlen == -2) {
@@ -1784,7 +1831,10 @@ fn define_base_type(
 
     if let Some(t) = interp.pg_type.get_mut(&oid) {
         t.typtype = TypType::Base;
-        t.typcategory = TypCategory::UserDefined;
+        t.typcategory = typcategory;
+        t.typispreferred = typispreferred;
+        t.typelem = element;
+        t.typcollation = typcollation;
         t.typisdefined = true;
         t.typlen = phys.typlen;
         t.typbyval = phys.typbyval;
@@ -1814,6 +1864,29 @@ fn define_base_type(
     let owner = super::roles::current_role(interp);
     super::acl::type_created(interp, oid, nsoid, owner);
     Ok(())
+}
+
+/// The `pg_type.typcategory` of a CATEGORY character (an unnamed one is
+/// user-defined).
+fn typcategory_of(c: u8) -> TypCategory {
+    match c {
+        b'A' => TypCategory::Array,
+        b'B' => TypCategory::Boolean,
+        b'C' => TypCategory::Composite,
+        b'D' => TypCategory::DateTime,
+        b'E' => TypCategory::Enum,
+        b'G' => TypCategory::Geometric,
+        b'I' => TypCategory::Network,
+        b'N' => TypCategory::Numeric,
+        b'P' => TypCategory::Pseudo,
+        b'R' => TypCategory::Range,
+        b'S' => TypCategory::String,
+        b'T' => TypCategory::Timespan,
+        b'V' => TypCategory::BitString,
+        b'X' => TypCategory::Unknown,
+        b'Z' => TypCategory::Internal,
+        _ => TypCategory::UserDefined,
+    }
 }
 
 /// DefineType's `STORAGE = plain | external | extended | main`.
@@ -2296,6 +2369,13 @@ fn register_array_type(
     let array_oid = PgTypeOid::from_nonzero(interp.alloc_oid()?);
     let phys = TypePhysical::array(interp, element_oid);
     let typname = make_array_type_name(interp, nsoid, base_name);
+    // DefineType and DefineDomain give the array their element's collation
+    // (an enum's, a composite's or a range's array has none: neither has
+    // its element).
+    let typcollation = interp
+        .pg_type
+        .get(&element_oid)
+        .and_then(|t| t.typcollation);
     interp.insert_pg_type(PgType {
         oid: array_oid,
         typname,
@@ -2309,7 +2389,7 @@ fn register_array_type(
         typbasetype: None,
         typnotnull: false,
         typtypmod: None,
-        typcollation: None,
+        typcollation,
         typstorage: TypStorage::Extended,
         typlen: phys.typlen,
         typbyval: phys.typbyval,

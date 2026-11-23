@@ -24,6 +24,16 @@ pub(crate) struct PartSpec {
 }
 
 impl PartSpec {
+    /// `pg_partitioned_table.partstrat` (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn strategy_char(&self) -> char {
+        match self.strategy {
+            Strategy::List => 'l',
+            Strategy::Range => 'r',
+            Strategy::Hash => 'h',
+        }
+    }
+
     /// RENAME COLUMN `old` TO `new` of the partitioned table.
     pub(crate) fn rename_key_column(&mut self, old: &str, new: &str) {
         for k in &mut self.keys {

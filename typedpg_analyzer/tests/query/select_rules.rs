@@ -114,6 +114,16 @@ fn locking_clause_targets() {
         "SELECT * FROM (SELECT DISTINCT a FROM t) s, t t2 FOR UPDATE OF t2",
         "SELECT (SELECT count(*) FROM u) FROM t FOR UPDATE",
         "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF t",
+        // A subquery over VALUES (or a function) alone, pulled up into the
+        // nullable side, leaves no row mark there.
+        "SELECT * FROM t LEFT JOIN (VALUES (1, 'x')) v(x, y) ON v.x = t.id FOR UPDATE",
+        "SELECT * FROM t FULL JOIN (SELECT n FROM generate_series(1, 2) g(n)) s ON s.n = t.id \
+         FOR UPDATE OF s",
+        "SELECT * FROM (VALUES (1)) v(x) LEFT JOIN (VALUES (2)) w(x) ON w.x = v.x FOR UPDATE",
+        // The WHERE reduces the join (`NOT (… NOT IN …)` is `IN`).
+        "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.t_id IN (1, 2) FOR UPDATE",
+        "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id \
+         WHERE NOT (u.t_id NOT IN (SELECT id FROM t)) FOR UPDATE",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -122,6 +132,10 @@ fn locking_clause_targets() {
     for sql in [
         "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE",
         "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF u",
+        // Planned on its own (a LIMIT keeps it from being pulled up), the
+        // subquery's own entry carries the mark.
+        "SELECT * FROM t LEFT JOIN (SELECT x FROM (VALUES (1)) v(x) LIMIT 1) q ON q.x = t.id \
+         FOR UPDATE",
     ] {
         let err = assert_err_prefix(
             &db,
@@ -248,6 +262,35 @@ fn locking_clause_through_views_and_subqueries() {
             "{sql}: {err:?}"
         );
     }
+    // A qual above the outer join may reduce it to an inner one
+    // (`reduce_outer_joins`): the view's or subquery's own WHERE, or once
+    // pulled up, a qual of the level locking it.
+    db.apply_sql(
+        "CREATE VIEW vw AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.x <> '';",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vw FOR UPDATE",
+        "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.x = 'a') q \
+         FOR UPDATE",
+        "SELECT * FROM t t2 JOIN (SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id) q \
+         ON q.x = t2.b FOR UPDATE",
+        "SELECT * FROM (SELECT u.x FROM t RIGHT JOIN u ON u.t_id = t.id WHERE t.b || 'x' <= 'a' \
+         LIMIT 3) q FOR UPDATE",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The join's own ON reduces nothing.
+    let err = assert_err_prefix(
+        &db,
+        "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id AND u.x = 'a') q \
+         FOR UPDATE",
+        "FOR UPDATE cannot be applied to the nullable side of an outer join",
+    );
+    assert!(
+        matches!(err, AnalyzeError::FeatureNotSupported(_)),
+        "{err:?}"
+    );
     for sql in [
         "SELECT * FROM vp FOR UPDATE",
         "SELECT * FROM va, t FOR UPDATE OF t",
@@ -255,6 +298,120 @@ fn locking_clause_through_views_and_subqueries() {
         "SELECT * FROM t LEFT JOIN (SELECT * FROM u) q ON q.t_id = t.id FOR UPDATE OF t",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// The rewriter marks only a view's relations and subqueries for locking
+/// (`markQueryForLocking`), and the planner checks the view's query
+/// (`CheckSelectLocking` in `preprocess_rowmarks`) only when it has a row
+/// mark: a view reading functions or CTEs alone, or a set operation (whose
+/// arms are no part of its jointree), is locked through without error.
+#[test]
+fn a_view_without_row_marks_is_not_checked() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW vu AS SELECT id FROM t UNION SELECT id FROM u;
+         CREATE VIEW vf AS SELECT bool_or(v) AS c FROM unnest(ARRAY[true]) g(v) GROUP BY v;
+         CREATE VIEW vc AS WITH c AS (SELECT 1 AS v) SELECT count(*) FROM c;
+         CREATE VIEW vs AS SELECT bool_or(v) AS c FROM (SELECT * FROM unnest(ARRAY[true]) g(v)) s
+             GROUP BY v;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vu FOR UPDATE",
+        "SELECT * FROM vf FOR UPDATE",
+        "SELECT * FROM vc FOR UPDATE",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_err_prefix(
+        &db,
+        "SELECT * FROM vs FOR UPDATE",
+        "FOR UPDATE is not allowed with GROUP BY clause",
+    );
+}
+
+/// `reduce_outer_joins` reads the quals `eval_const_expressions` folded: a
+/// CASE with a constant WHEN is its branch, a COALESCE its one argument
+/// left past the NULL constants, an AND / OR loses its TRUE / FALSE
+/// arguments — so a qual strict in the nullable side only once folded
+/// reduces the join, and its rows can be locked.
+#[test]
+fn locking_the_nullable_side_sees_the_folded_quals() {
+    let db = setup();
+    let join = "SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id";
+    for qual in [
+        "CASE WHEN true THEN u.x END = 'a'",
+        "CASE WHEN 1 = 1 THEN u.x ELSE 'b' END = 'a'",
+        "CASE WHEN false THEN 'b' ELSE u.x END = 'a'",
+        "CASE WHEN NULL THEN 'b' WHEN true THEN u.x END = 'a'",
+        "COALESCE(NULL, u.x) = 'a'",
+        "u.x = 'a' OR false",
+        "u.x = 'a' OR NULL",
+        "NOT (u.x = 'a' AND true)",
+        // `x IS DISTINCT FROM NULL` is the NullTest `x IS NOT NULL`, the
+        // NULL once folded too.
+        "u.x IS DISTINCT FROM NULL::text",
+        "u.x IS DISTINCT FROM CASE t.a WHEN NULL THEN 'b' END",
+        // A custom plan's parameters are constants: a NULL `$1` folds
+        // these to `u.x = 'a'`.
+        "COALESCE($1, u.x) = 'a'",
+        "u.x = 'a' OR $1",
+    ] {
+        let sql = format!("{join} WHERE {qual} FOR UPDATE");
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for qual in [
+        "CASE WHEN t.a > 0 THEN u.x END = 'a'",
+        "u.x = 'a' OR true",
+        "u.x = 'a' OR t.a = 1",
+    ] {
+        let sql = format!("{join} WHERE {qual} FOR UPDATE");
+        assert_err_prefix(
+            &db,
+            &sql,
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        );
+    }
+}
+
+/// A view or subquery the planner doesn't pull up (a LIMIT, its own
+/// locking clause) is planned on its own — unless the planner proves it
+/// empty first (`relation_excluded_by_constraints`: a constant FALSE
+/// qual, or a custom plan's qual over a NULL parameter): then its
+/// nullable side is never refused. A view's query is only planned where a
+/// statement reads it: CREATE VIEW stores one that locks a nullable side.
+#[test]
+fn a_view_planned_alone_and_proven_empty_is_never_planned() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW vl AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id;
+         CREATE VIEW vlim AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id LIMIT 10;
+         CREATE VIEW vlock AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF u;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vlim WHERE false FOR UPDATE",
+        "SELECT * FROM vlim WHERE $1 FOR UPDATE",
+        "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id LIMIT 3) q \
+         WHERE false FOR UPDATE",
+        "SELECT * FROM vlock WHERE false",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        // Pulled up, the view's join is this level's: planned whatever the
+        // WHERE folds to.
+        "SELECT * FROM vl WHERE false FOR UPDATE",
+        "SELECT * FROM vlim FOR UPDATE",
+        "SELECT * FROM vlim, t WHERE false FOR UPDATE OF vlim",
+        "SELECT * FROM vlock",
+    ] {
+        assert_err_prefix(
+            &db,
+            sql,
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        );
     }
 }
 
@@ -352,6 +509,12 @@ fn distinct_on_must_match_leading_order_by() {
         "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b, a, id",
         "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a",
         "SELECT DISTINCT ON (1) a, b FROM t ORDER BY a",
+        // An item sorting a target sorted already is dropped (in either
+        // direction), however it names it.
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a, b, id, 1",
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a, b, id, 2 DESC",
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b, a DESC NULLS FIRST",
+        "SELECT DISTINCT ON (t.a) a AS x, b FROM t ORDER BY t.a, b, x",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

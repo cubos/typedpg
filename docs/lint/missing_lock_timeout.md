@@ -50,10 +50,26 @@ existed before the file started, with no non-zero `lock_timeout` in effect:
   `CLUSTER ON`, most storage parameters, `DETACH PARTITION … CONCURRENTLY`
   / `FINALIZE`). `ATTACH PARTITION` reports the attached table; an added
   foreign key, the referenced one.
-- `CREATE TABLE` with a foreign key to an existing table.
+- `ALTER TYPE … CASCADE` of a composite type with typed tables (reports
+  the typed table).
+- `CREATE TABLE … PARTITION OF` an existing table (`ACCESS EXCLUSIVE` on
+  it), or with a foreign key to an existing table.
 - `CREATE INDEX` / `DROP INDEX` without `CONCURRENTLY` (named by the
-  index's table), `DROP TABLE`, `TRUNCATE`.
-- `CREATE TRIGGER`, `CREATE POLICY`, `ALTER POLICY`, `CREATE RULE`.
+  index's table), `DROP TABLE`, `DROP MATERIALIZED VIEW`, `TRUNCATE`.
+- `CREATE TRIGGER`, `CREATE POLICY`, `ALTER POLICY`, `CREATE RULE`, and
+  dropping or renaming a trigger, policy, rule or constraint.
+- `ALTER TABLE` / `ALTER MATERIALIZED VIEW … RENAME` or `SET SCHEMA`
+  (and `ALTER INDEX` / `ALTER VIEW … RENAME` naming a table), `ALTER TYPE …
+  RENAME ATTRIBUTE … CASCADE` over a typed table, `ALTER … DEPENDS ON
+  EXTENSION`.
+- `CREATE FOREIGN TABLE … PARTITION OF` an existing table.
+- `DROP SCHEMA … CASCADE` over a table, `DROP TYPE` / `DROP DOMAIN …
+  CASCADE` over a column (or typed table), and any other `DROP` that takes
+  a table, column, constraint, index, trigger, policy or rule with it
+  (`DROP FUNCTION … CASCADE` dropping a trigger, `DROP EXTENSION … CASCADE`
+  dropping a column).
+- `ALTER DOMAIN` adding a `CHECK` (not `NOT VALID`) or `NOT NULL`, or
+  validating a constraint, on a domain a table uses (`SHARE`).
 - `LOCK TABLE` in `SHARE` mode or stronger, or with no mode.
 - `REFRESH MATERIALIZED VIEW`, `CLUSTER`, `REPACK`, `REINDEX` without
   `CONCURRENTLY`; `VACUUM FULL`.
@@ -73,7 +89,9 @@ foreign keys).
   value turn it off; a `ROLLBACK` undoes a `SET` made in its transaction.
 - A table created earlier in the same file.
 - Statements that block no writes: `CREATE INDEX CONCURRENTLY`,
-  `SET STATISTICS`, `LOCK TABLE … IN ROW EXCLUSIVE MODE`.
+  `SET STATISTICS`, `LOCK TABLE … IN ROW EXCLUSIVE MODE`, and
+  `REFRESH MATERIALIZED VIEW CONCURRENTLY` (its `EXCLUSIVE` lock lets the
+  view's readers through, and nothing else writes a materialized view).
 - Later statements of a file already reported.
 - A file unchanged since `--previous-deployment`, matched by `ignore`, or
   in `extra_migrations`.

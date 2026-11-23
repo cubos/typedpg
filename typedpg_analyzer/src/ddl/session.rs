@@ -1239,22 +1239,22 @@ fn constraint_deferrability(
                 .class_by_qname
                 .get(&(ns, c.conname.clone()))
                 .is_some_and(|index| interp.nonimmediate_indexes.contains(index)),
+            // A constraint trigger's: its trigger's (which RENAME TRIGGER
+            // doesn't rename).
+            ConType::Trigger => interp
+                .triggers
+                .get(&c.conrelid)
+                .into_iter()
+                .flatten()
+                .find(|t| t.constraint == Some(c.oid))
+                .and_then(|t| t.constraint_deferrable)
+                .unwrap_or(false),
             _ => false,
         });
     }
     for (domain, constraints) in &interp.domain_constraints {
         if interp.pg_type.get(domain).map(|t| t.typnamespace) == Some(ns) {
             out.extend(constraints.iter().filter(|c| c.name == name).map(|_| false));
-        }
-    }
-    for (relid, triggers) in &interp.triggers {
-        if interp.pg_class.get(relid).map(|r| r.relnamespace) == Some(ns) {
-            out.extend(
-                triggers
-                    .iter()
-                    .filter(|t| t.name == name)
-                    .filter_map(|t| t.constraint_deferrable),
-            );
         }
     }
     out

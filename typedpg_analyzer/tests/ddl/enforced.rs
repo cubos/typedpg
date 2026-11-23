@@ -253,11 +253,11 @@ fn alter_constraint_enforced_keeps_a_not_valid_key_not_valid() {
         &format!("{setup} ALTER TABLE fk3 ALTER CONSTRAINT f ENFORCED;"),
     )]);
     assert_eq!(f(&db), row("f", ConType::ForeignKey, true, false));
-    // A deferrability change rewrites the row with every attribute named,
-    // ENFORCED (validated) included, as PG 18 does.
+    // Nor with a deferrability change named with it: PostgreSQL 19 then
+    // rewrites nothing (PG 18 rewrote the row as validated).
     db.apply_sql("ALTER TABLE fk3 ALTER CONSTRAINT f ENFORCED DEFERRABLE;")
         .unwrap();
-    assert_eq!(f(&db), row("f", ConType::ForeignKey, true, true));
+    assert_eq!(f(&db), row("f", ConType::ForeignKey, true, false));
     // NOT ENFORCED, then ENFORCED: validated.
     let db = build_db(&[(
         "0001.sql",

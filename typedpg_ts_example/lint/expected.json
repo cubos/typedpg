@@ -118,8 +118,8 @@
       "endColumn": 29,
       "rule": "self_assignment",
       "severity": "warning",
-      "message": "assigning name its own value changes nothing",
-      "help": "remove the assignment, or assign the value meant"
+      "message": "assigning name its own value rewrites the row with the same value",
+      "help": "assign the value meant"
     }
   ],
   "failures": [

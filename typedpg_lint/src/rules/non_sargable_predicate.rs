@@ -6,14 +6,18 @@
 //!
 //! - A cast that converts the value (`created_at::date = $1`,
 //!   `id::text = $1`); a cast to the type it has, or to a binary-compatible
-//!   one (`varchar` to `text`), keeps the column.
+//!   one the index's operator family compares (`varchar` to `text` under
+//!   `text_ops`), keeps the column — `citext` relabeled to `text` under
+//!   `citext_ops` doesn't.
 //! - A function call with the column as an argument (`lower(email) = $1`,
 //!   `date_trunc('day', created_at) = $1`).
 //! - Arithmetic or concatenation with the column as an operand
 //!   (`id + 1 = $1`).
 //! - An implicit conversion the other operand's type forces on the column
 //!   (an `int4` column compared with a `numeric` value is converted to
-//!   `numeric`): the column's value is converted for every row.
+//!   `numeric`): the column's value is converted for every row. A
+//!   polymorphic operator (an enum's `anyenum` `=`) converts nothing (see
+//!   [`typedpg_analyzer::QueryView::value_conversion`]).
 //!
 //! Only reported when the comparison would otherwise have an index: the
 //! column (resolved to a plain or partitioned table of the same query
@@ -28,7 +32,7 @@
 //! daylight-saving change at midnight, a `date_trunc` value not truncated).
 //! No range is named where none is equivalent. No fix is offered.
 
-use typedpg_analyzer::{CastMethod, PgClassOid, PgTypeOid, RelKind, RelationRef};
+use typedpg_analyzer::{CastMethod, PgClassOid, PgOpclassOid, PgTypeOid, RelKind, RelationRef};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{AConstValue, AExpr, AExprKind, ColumnRef, Node};
 
@@ -557,11 +561,20 @@ fn wrapped_column_name(column: &ColumnRef) -> String {
 
 /// The indexed column `side` wraps, and how.
 fn wrapped_column<'a>(ctx: &Ctx<'_>, level: &Level, side: &'a Node) -> Option<Wrapped<'a>> {
+    // The type a binary-compatible conversion relabels the column to:
+    // PostgreSQL strips the relabeling when it matches an index, so the
+    // index serves the comparison when its operator family compares that
+    // type (`varchar` relabeled to `text` under `text_ops`), and not
+    // otherwise (`citext` relabeled to `text` under `citext_ops`).
+    let mut relabeled = None;
     let (column, wrap) = match side {
         Node::ColumnRef(column) => {
             let conversion = ctx.view.value_conversion(NodeRef::ColumnRef(column))?;
-            if conversion.explicit || binary_coercible(ctx, conversion.from, conversion.to) {
+            if conversion.explicit {
                 return None;
+            }
+            if binary_coercible(ctx, conversion.from, conversion.to) {
+                relabeled = Some(conversion.to);
             }
             (
                 &**column,
@@ -577,7 +590,7 @@ fn wrapped_column<'a>(ctx: &Ctx<'_>, level: &Level, side: &'a Node) -> Option<Wr
             };
             let conversion = ctx.view.value_conversion(NodeRef::ColumnRef(column))?;
             if binary_coercible(ctx, conversion.from, conversion.to) {
-                return None;
+                relabeled = Some(conversion.to);
             }
             (&**column, Wrap::Cast { to: conversion.to })
         }
@@ -652,7 +665,10 @@ fn wrapped_column<'a>(ctx: &Ctx<'_>, level: &Level, side: &'a Node) -> Option<Wr
         .iter()
         .find(|a| a.attnum > 0 && a.attname == name)?
         .attnum;
-    let index = leading_btree_index(ctx, table, attnum)?;
+    let (index, opclass) = leading_btree_index(ctx, table, attnum)?;
+    if relabeled.is_some_and(|to| family_compares(ctx, opclass, to)) {
+        return None;
+    }
     Some(Wrapped {
         column,
         source,
@@ -664,9 +680,13 @@ fn wrapped_column<'a>(ctx: &Ctx<'_>, level: &Level, side: &'a Node) -> Option<Wr
 }
 
 /// The name of a non-partial btree index of `table` led by column
-/// `attnum`, when the table has no expression index (which might match the
-/// wrapped expression).
-fn leading_btree_index(ctx: &Ctx<'_>, table: PgClassOid, attnum: i16) -> Option<String> {
+/// `attnum`, and its leading column's operator class, when the table has no
+/// expression index (which might match the wrapped expression).
+fn leading_btree_index(
+    ctx: &Ctx<'_>,
+    table: PgClassOid,
+    attnum: i16,
+) -> Option<(String, Option<PgOpclassOid>)> {
     let indexes: Vec<_> = ctx
         .catalog
         .iter_indexes()
@@ -683,9 +703,22 @@ fn leading_btree_index(ctx: &Ctx<'_>, table: PgClassOid, attnum: i16) -> Option<
             && index.indkey.first() == Some(&attnum)
             && ctx.catalog.index_access_method(index.indexrelid) == "btree"
     })?;
-    ctx.catalog
-        .class_row(index.indexrelid)
-        .map(|class| class.relname.clone())
+    ctx.catalog.class_row(index.indexrelid).map(|class| {
+        (
+            class.relname.clone(),
+            index.indclass.first().copied().flatten(),
+        )
+    })
+}
+
+/// Whether the btree operator family of `opclass` holds an operator whose
+/// left operand is of type `ty`: one an index scan can match a column
+/// relabeled to `ty` with. An unresolved operator class counts as one that
+/// does (no finding without the proof).
+fn family_compares(ctx: &Ctx<'_>, opclass: Option<PgOpclassOid>, ty: PgTypeOid) -> bool {
+    opclass
+        .and_then(|opclass| ctx.catalog.opclass_family_has_left_type(opclass, ty))
+        .unwrap_or(true)
 }
 
 /// Whether converting `from` to `to` keeps the value's bits, so an index on
@@ -840,6 +873,65 @@ mod tests {
             let h = findings[0].help.as_deref().unwrap();
             assert!(h.contains(help), "{sql}: {h}");
             assert!(findings[0].fix.is_empty());
+        }
+    }
+
+    /// A column reaching the operator unconverted — a polymorphic
+    /// parameter (`anyenum`, `anyarray`) takes it as it is, a domain is its
+    /// base type, a cross-type operator (`int4 = int8`) is in the index's
+    /// family — or relabeled to a type its index's operator family compares
+    /// (`varchar` as `text`) is served by the index: EXPLAIN shows an Index
+    /// Scan for every one of these on PostgreSQL. A relabeling the family
+    /// doesn't compare (`citext` as `text`: `citext_ops` has no `text`
+    /// operator, EXPLAIN shows a Filter) is reported.
+    #[test]
+    fn a_column_the_index_sees_through_its_conversion_is_not_reported() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE EXTENSION citext;
+             CREATE TYPE arch AS ENUM ('x86_64', 'aarch64');
+             CREATE TABLE fa (arch arch PRIMARY KEY, n int);
+             CREATE TABLE v (c varchar(10) PRIMARY KEY);
+             CREATE DOMAIN dt AS text;
+             CREATE TABLE d (c dt PRIMARY KEY);
+             CREATE TABLE i (c int4 PRIMARY KEY);
+             CREATE TABLE ar (c int[] PRIMARY KEY);
+             CREATE TABLE ci (c citext PRIMARY KEY);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT n FROM fa WHERE arch = 'x86_64'",
+            "SELECT n FROM fa WHERE arch = 'x86_64'::text::arch",
+            "SELECT n FROM fa WHERE arch IN ('x86_64', 'aarch64')",
+            "SELECT n FROM fa WHERE arch = ANY('{x86_64}'::arch[])",
+            "SELECT n FROM fa WHERE arch < $1",
+            "SELECT c FROM v WHERE c = 'a'::text",
+            "SELECT c FROM v WHERE c = $1",
+            "SELECT c FROM d WHERE c = 'a'::text",
+            "SELECT c FROM i WHERE c = 5::int8",
+            "SELECT c FROM ar WHERE c = '{1}'::int[]",
+            "SELECT c FROM ci WHERE c = 'a'",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        for (sql, message) in [
+            (
+                "SELECT c FROM ci WHERE c = 'a'::text",
+                "the column is converted from citext to text",
+            ),
+            (
+                "SELECT c FROM ci WHERE c::text = $1",
+                "the column is cast to text",
+            ),
+            (
+                "SELECT c FROM i WHERE c = 5::numeric",
+                "the column is converted from int4 to numeric",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(findings[0].message.contains(message), "{sql}: {findings:?}");
         }
     }
 

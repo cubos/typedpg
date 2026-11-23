@@ -221,6 +221,10 @@ pub(super) fn add_foreign_key(
         .as_ref()
         .ok_or_else(|| DdlError::Parse(format!("FOREIGN KEY on {relname} without REFERENCES")))?;
     let (target_schema, target_name) = range_var_names(pkrv, interp);
+    // table_openrv's RangeVarGetRelid: a qualified name's schema must exist.
+    if !pkrv.schemaname.is_empty() {
+        crate::ddl::util::existing_namespace(interp, &target_schema)?;
+    }
     let target = interp
         .namespace_oid(&target_schema)
         .and_then(|ns| {
@@ -707,6 +711,18 @@ impl FkDetails {
         self.initdeferred = initdeferred;
     }
 
+    /// `confupdtype`, `confdeltype` and `confmatchtype` (for the catalog
+    /// oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn catalog_codes(&self) -> (char, char, char) {
+        let code = |s: &str| s.chars().next().unwrap_or(' ');
+        (
+            code(&self.upd_action),
+            code(&self.del_action),
+            code(&self.match_type),
+        )
+    }
+
     /// `confmatchtype = 'f'`: `MATCH FULL`.
     pub(crate) fn match_full(&self) -> bool {
         self.match_type == "f"
@@ -879,7 +895,6 @@ fn attach_or_clone(
             }
         }
         if validate {
-            interp.fk_validity_unproven.remove(&candidate.oid);
             for_each_fk_clone(interp, candidate.oid, &|c| c.convalidated = true);
         }
         let mut details = details.or(parent_details.clone()).unwrap_or(FkDetails {

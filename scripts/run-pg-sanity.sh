@@ -17,6 +17,8 @@
 # Extra args are appended to the default
 # `--release --features pg_sanity -p typedpg_analyzer` invocation — callers
 # only pass filters / extra nextest flags, never the boilerplate.
+# `PG_SANITY_PACKAGE=typedpg_lint` runs the lint crate's suite instead, with
+# the lint oracle on (`scripts/run-lint-oracle.sh` does).
 
 set -euo pipefail
 
@@ -28,6 +30,8 @@ PG_USER="postgres"
 PG_PASS="postgres"
 PG_DB="postgres"
 
+# Every catalog holds two sessions, and a test may build several: the
+# default 100 connections run out under nextest's parallelism.
 # The cluster lives in memory (tmpfs): every test creates and drops its own
 # database, and on disk each DROP DATABASE waits for a checkpoint's fsyncs.
 # On Linux the tests also connect over a Unix socket shared through a bind
@@ -71,7 +75,7 @@ docker run -d --rm \
     -e POSTGRES_PASSWORD="$PG_PASS" \
     -e POSTGRES_DB="$PG_DB" \
     -p 127.0.0.1:0:5432 \
-    "$PG_IMAGE" >/dev/null
+    "$PG_IMAGE" -c max_connections=300 >/dev/null
 
 # Discover the host port the daemon picked. `docker port` reports
 # `0.0.0.0:NNNNN` (and on macOS often a v6 line too); take the first
@@ -111,18 +115,27 @@ else
     export POSTGRES_URL="host=127.0.0.1 port=$PG_PORT user=$PG_USER password=$PG_PASS dbname=$PG_DB"
 fi
 echo "pg_sanity: POSTGRES_URL=$POSTGRES_URL"
+# The catalog oracle (typedpg_analyzer/src/pg_sanity/catalog_state.rs):
+# after every migration, the system catalogs must agree too. On unless the
+# caller set it (PG_SANITY_CATALOG=0 turns it off;
+# PG_SANITY_CATALOG_LOG=<file> logs instead of panicking).
+export PG_SANITY_CATALOG="${PG_SANITY_CATALOG:-1}"
 echo "pg_sanity: running tests..."
 
 # The nullability soundness oracle (typedpg_analyzer/src/pg_sanity/
 # soundness.rs) appends each catalog's counters here; summed up below.
 TYPEDPG_SOUNDNESS_STATS="$(mktemp -t typedpg-soundness.XXXXXX)"
 export TYPEDPG_SOUNDNESS_STATS
+# The lint oracle (typedpg_lint/src/rules/oracle.rs) appends its own here.
+TYPEDPG_LINT_ORACLE_STATS="$(mktemp -t typedpg-lint-oracle.XXXXXX)"
+export TYPEDPG_LINT_ORACLE_STATS
+PG_SANITY_PACKAGE="${PG_SANITY_PACKAGE:-typedpg_analyzer}"
 
 # Defaults always apply; extra args (filters, --run-ignored, -E …) are
 # appended. Repeating `-p`/`--features` from the command line is harmless —
 # cargo merges duplicates.
 status=0
-cargo nextest run --release --features pg_sanity -p typedpg_analyzer "$@" || status=$?
+cargo nextest run --release --features pg_sanity -p "$PG_SANITY_PACKAGE" "$@" || status=$?
 
 echo "pg_sanity: nullability oracle —"
 awk -F'\t' '
@@ -145,10 +158,30 @@ awk -F'\t' '
             n["no_promise"], n["not_executable"], n["unsafe_calls"], n["no_param_sample"]
         printf "  simplified queries executed next to the written one: %d (%d scenario results compared)\n",
             n["equivalence_checked"], n["equivalence_compared"]
+        printf "    rows compared by count only (picked arbitrarily): %d; %d scenarios not compared (results differed under a volatile call); not executed: %d lacking a parameter sample\n",
+            n["equivalence_counts_only"], n["equivalence_volatile"], n["equivalence_no_param_sample"]
         k = 0
         for (s in skips) k++
         printf "  tables the seeder could not fill: %d distinct\n", k
         for (s in skips) printf "    %s\n", s
     }' "$TYPEDPG_SOUNDNESS_STATS"
 rm -f "$TYPEDPG_SOUNDNESS_STATS"
+
+if [[ -s "$TYPEDPG_LINT_ORACLE_STATS" ]]; then
+    echo "pg_sanity: lint oracle (probes per rule) —"
+    awk -F'\t' '
+        { n[$1 "\t" $2] += $3; rules[$1] = 1 }
+        END {
+            for (r in rules) {
+                line = ""
+                split("fix held|fix broken|fix inconclusive|claim held|claim broken|claim inconclusive|missed", kinds, "|")
+                for (k = 1; k <= 7; k++) {
+                    c = n[r "\t" kinds[k]]
+                    if (c) line = line sprintf("  %s=%d", kinds[k], c)
+                }
+                printf "  %-32s%s\n", r, line
+            }
+        }' "$TYPEDPG_LINT_ORACLE_STATS" | sort
+fi
+rm -f "$TYPEDPG_LINT_ORACLE_STATS"
 exit "$status"

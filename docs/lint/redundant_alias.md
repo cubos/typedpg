@@ -43,11 +43,13 @@ An alias in a select list or a `RETURNING` list (`INSERT`, `UPDATE`,
 | Expression | Name |
 |---|---|
 | `col`, `t.col` | the column name |
+| `(x).field`, `arr[1]` | the field name; the array's name |
 | a function call `f(…)` | the function name |
 | `NULLIF`, `COALESCE`, `GREATEST`, `LEAST` | `nullif`, `coalesce`, `greatest`, `least` |
 | `ARRAY[…]`, `ARRAY(SELECT …)`, `ROW(…)`, `EXISTS (…)` | `array`, `row`, `exists` |
-| `CASE …` | `case` |
-| `x::type` | the operand's name if it has one above (not `case`), else the type's |
+| `CURRENT_DATE`, `CURRENT_USER`, … | the keyword, lower case |
+| `CASE … ELSE x END` | `x`'s name if it has one above, else `case` |
+| `x::type`, `x COLLATE c` | `x`'s name if it has one above (not `case`), else the type's |
 
 An unquoted alias is folded to lower case (`AS COALESCE` is `coalesce`); a
 quoted one is compared as written. `expr alias` without `AS` counts too.
@@ -59,7 +61,8 @@ quoted one is compared as written. `expr alias` without `AS` counts too.
   `AS trim` is a real rename.
 - Expressions PostgreSQL names `?column?` (operators, literals):
   `SELECT id + 1 AS id FROM users`.
-- Scalar subqueries and SQL keywords such as `CURRENT_DATE`.
+- Scalar subqueries (named after the subquery's own column) and `*`
+  expansions.
 
 ## Configuration
 

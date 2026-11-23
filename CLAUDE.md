@@ -214,6 +214,15 @@ run via `scripts/run-pg-sanity.sh`). A differential fuzzer
 (`typedpg_analyzer/tests/fuzz/main.rs`, `#[ignore]`d) generates queries to surface
 new disagreements automatically.
 
+**Catalog state.** After every migration both sides accept, the mirror also
+compares the system catalogs (`pg_sanity/catalog_state.rs`, on by default in
+`scripts/run-pg-sanity.sh`; `PG_SANITY_CATALOG_LOG=<file>` logs instead of
+panicking): the server's user rows, exported like `seed.json`
+(`typedpg_analyzer::catalog_export`), must equal the analyzer's, OIDs
+mapped to names; what is compared and what is deliberately normalized is
+listed there. `tests/catalog_oracle` feeds it migration corpora
+(`CATALOG_CORPUS`) and random DDL, and minimizes a divergence.
+
 **Nullability soundness.** Describe says nothing about nullability, so the
 mirror also *executes* every accepted query, in a rolled-back transaction,
 over adversarial rows it seeds into every table (NULL in each nullable
@@ -224,6 +233,23 @@ and fails if a value inferred NOT NULL — a column, a `Some(false)` array
 element, a non-nullable record field — comes back NULL
 (`typedpg_analyzer/src/pg_sanity/soundness.rs`). A divergence there is a
 soundness bug in the analyzer: fix the inference, never the expectation.
+
+**Lint soundness.** `scripts/run-lint-oracle.sh` runs every lint finding over the
+same scenarios (`typedpg_lint/src/rules/oracle.rs`): a `--fix` must keep rows, row
+count, table contents and SQLSTATE, and a claim (never NULL, always true, at most one
+row, …) runs as an assertion or equivalent query. A broken claim is a rule bug.
+It also runs `breaks_deployed_queries` against PG (`typedpg_lint/src/deployed_oracle.rs`,
+its own tests and the `deployed_oracle_corpus` test): deployed queries are called with
+sampled values before and after the new migrations, over seeded rows; a call that breaks
+with no finding, or that runs where a finding says it can't, is a rule bug.
+
+**Migration rules.** Under `pg_sanity`, every `lint_migrations` call is replayed
+statement by statement on PG (`typedpg_lint/src/migration_oracle.rs`), recording the
+locks gained (`pg_locks`), rewrites and index builds (`relfilenode`) and scans
+(`pg_stat_xact_*`, `DEBUG1` "verifying table"). A message must match what PG did, and a
+write-blocking lock without `lock_timeout`, a rewrite, an index build or a scan under a
+write-blocking lock on an existing table must be reported. `scripts/run-migration-oracle.sh`
+runs its corpus (docs, the analyzer suite's migrations, generated `ALTER TABLE` & co.).
 
 **Declared constraints are trusted.** Nullability inference may rely on
 what the schema states — a foreign key's referenced row exists, a CHECK

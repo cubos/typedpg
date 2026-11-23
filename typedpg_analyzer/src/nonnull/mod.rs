@@ -220,7 +220,17 @@ pub(crate) struct StrictLog(
     RefCell<HashMap<i32, crate::oid::PgTypeOid>>,
     RefCell<HashMap<i32, crate::oid::PgProcOid>>,
     RefCell<HashMap<i32, ArrayElements>>,
+    RefCell<HashMap<i32, Option<ResolvedOp>>>,
 );
+
+/// The operator a binary `A_Expr` resolved to, and the type its left
+/// operand has once coerced to the operator's input (`exprType(leftarg)`
+/// of the `OpExpr`): what `op_mergejoinable` / `op_hashjoinable` read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedOp {
+    pub oid: crate::oid::PgOperatorOid,
+    pub input_type: crate::oid::PgTypeOid,
+}
 
 /// The elements of the array an `x op ANY / ALL (array)` reads: their type
 /// and what every non-NULL one of them is (nothing when the array's
@@ -268,6 +278,26 @@ impl StrictLog {
         }
     }
 
+    /// Record that the binary operator call at `location` resolved to
+    /// `op`. A node typed twice to different operators keeps none.
+    pub fn note_operator(&self, location: i32, op: ResolvedOp) {
+        if location < 0 {
+            return;
+        }
+        let mut map = self.5.borrow_mut();
+        let merged = match map.get(&location) {
+            Some(before) if *before != Some(op) => None,
+            _ => Some(op),
+        };
+        map.insert(location, merged);
+    }
+
+    /// The operator the binary operator call at `location` resolved to
+    /// (see [`StrictLog::note_operator`]).
+    pub fn operator_at(&self, location: i32) -> Option<ResolvedOp> {
+        self.5.borrow().get(&location).copied().flatten()
+    }
+
     /// Record that the untyped string literal at `location` was coerced
     /// to `type_oid`.
     pub fn note_literal_type(&self, location: i32, type_oid: crate::oid::PgTypeOid) {
@@ -290,6 +320,14 @@ impl StrictLog {
             .extend(other.3.borrow().iter().map(|(k, v)| (*k, *v)));
         for (&location, elems) in other.4.borrow().iter() {
             self.note_array_elements(location, elems.clone());
+        }
+        for (&location, op) in other.5.borrow().iter() {
+            match op {
+                Some(op) => self.note_operator(location, *op),
+                None => {
+                    self.5.borrow_mut().insert(location, None);
+                }
+            }
         }
     }
 
@@ -1068,7 +1106,13 @@ fn distinct_facts(
         return Facts::default();
     }
     let (l, r) = (&e.lexpr, &e.rexpr);
-    let is_null = |n: Option<&ast::Node>| matches!(n, Some(ast::Node::AConst(c)) if c.isnull);
+    // A NULL constant once folded (`NULL::int`, a CASE with no branch
+    // left): `eval_const_expressions` makes `x IS DISTINCT FROM NULL` the
+    // NullTest `x IS NOT NULL`.
+    let is_null = |n: Option<&ast::Node>| {
+        n.is_some()
+            && crate::expr::plan_fold::fold(n, snapshot) == crate::expr::plan_fold::Folded::Null
+    };
     let walk = |n: Option<&ast::Node>| nonnullable(n, false, scope, log, snapshot);
     let other = if is_null(r.as_ref()) {
         Some(l)
@@ -1117,6 +1161,22 @@ fn plain_row_fields(n: Option<&ast::Node>) -> Option<&[Option<ast::Node>]> {
     (!r.args.iter().any(|n| star(n.as_ref()))).then_some(r.args.as_slice())
 }
 
+/// `e` of `NOT (NOT e)`.
+fn double_negated(b: &ast::BoolExpr) -> Option<Option<&ast::Node>> {
+    match b.args.as_slice() {
+        [Some(ast::Node::BoolExpr(inner))]
+            if b.boolop == ast::BoolExprType::NotExpr
+                && inner.boolop == ast::BoolExprType::NotExpr =>
+        {
+            match inner.args.as_slice() {
+                [e] => Some(e.as_ref()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn is_row(n: Option<&ast::Node>) -> bool {
     matches!(n, Some(ast::Node::RowExpr(_)))
 }
@@ -1150,8 +1210,30 @@ fn nonnullable_node(
                 .args
                 .iter()
                 .fold(Facts::default(), |acc, a| acc.union(walk(a.as_ref(), true))),
+            // `eval_const_expressions` first drops an AND argument folding
+            // to TRUE and an OR one folding to FALSE
+            // (`simplify_and_arguments` / `simplify_or_arguments`) — in a
+            // qual, an OR one folding to NULL too (`canonicalize_qual`).
             ast::BoolExprType::AndExpr | ast::BoolExprType::OrExpr => {
-                intersection(b.args.iter().map(Option::as_ref), |a| walk(a, top_level))
+                let or = b.boolop == ast::BoolExprType::OrExpr;
+                let dropped = |a: Option<&ast::Node>| {
+                    let folded = if top_level {
+                        crate::expr::plan_fold::fold_qual(a, snapshot)
+                    } else {
+                        crate::expr::plan_fold::fold(a, snapshot)
+                    };
+                    folded == crate::expr::plan_fold::Folded::Bool(!or)
+                };
+                intersection(
+                    b.args.iter().map(Option::as_ref).filter(|a| !dropped(*a)),
+                    |a| walk(a, top_level),
+                )
+            }
+            // `NOT (NOT e)` is `e` (`negate_clause`, as the planner folds the
+            // expressions, before `reduce_outer_joins`): `NOT (x NOT IN
+            // (SELECT …))` is `x IN (SELECT …)`, strict in `x` at the top.
+            ast::BoolExprType::NotExpr if double_negated(b).is_some() => {
+                walk(double_negated(b).flatten(), top_level)
             }
             // NOT is strict. At the top level `NOT e` TRUE also means `e`
             // FALSE, so not TRUE: `NOT (x IS NULL)` proves `x`.
@@ -1309,6 +1391,16 @@ fn nonnullable_node(
             })
         }
         ast::Node::NamedArgExpr(na) => walk_opt(na.arg.as_ref(), top_level),
+        // What `eval_const_expressions` folds a CASE or a COALESCE to,
+        // before `reduce_outer_joins` reads the qual.
+        ast::Node::CaseExpr(c) => match folded_case(c, snapshot) {
+            Some(n) => walk(Some(n), top_level),
+            None => Facts::default(),
+        },
+        ast::Node::CoalesceExpr(c) => match folded_coalesce(c, snapshot) {
+            Some(n) => walk(Some(n), top_level),
+            None => Facts::default(),
+        },
         ast::Node::TypeCast(tc) => {
             if !log.is_strict(tc.location, StrictNode::Cast) {
                 return Facts::default();
@@ -1397,6 +1489,44 @@ fn nonnullable_node(
     }
 }
 
+/// The branch a CASE folds to when its WHENs fold to constants
+/// (`eval_const_expressions`: a WHEN folding to FALSE or NULL is dropped,
+/// one folding to TRUE ends the CASE with its result — unless a WHEN
+/// before it stays), its ELSE when every WHEN is dropped. `None` when it
+/// stays a CASE, or folds to the NULL of a missing ELSE.
+fn folded_case<'a>(c: &'a ast::CaseExpr, snapshot: &PgCatalog) -> Option<&'a ast::Node> {
+    use crate::expr::plan_fold::{self, Folded};
+    let test = c.arg.as_ref().map(|a| plan_fold::fold(Some(a), snapshot));
+    for w in &c.args {
+        let Some(ast::Node::CaseWhen(w)) = w.as_ref() else {
+            return None;
+        };
+        match plan_fold::case_when(test, w.expr.as_ref(), snapshot) {
+            Folded::Bool(false) | Folded::Null => {}
+            Folded::Bool(true) => return w.result.as_ref(),
+            Folded::Const | Folded::Var => return None,
+        }
+    }
+    c.defresult.as_ref()
+}
+
+/// The one argument a COALESCE folds to once `eval_const_expressions`
+/// dropped its NULL constants. `None` when it stays a COALESCE (or folds
+/// to a constant).
+fn folded_coalesce<'a>(c: &'a ast::CoalesceExpr, snapshot: &PgCatalog) -> Option<&'a ast::Node> {
+    use crate::expr::plan_fold::{self, Folded};
+    let mut left = c
+        .args
+        .iter()
+        .filter(|a| plan_fold::fold(a.as_ref(), snapshot) != Folded::Null);
+    match (left.next(), left.next()) {
+        (Some(only), None) if plan_fold::fold(only.as_ref(), snapshot) == Folded::Var => {
+            only.as_ref()
+        }
+        _ => None,
+    }
+}
+
 /// What `node` *not* being TRUE (FALSE or NULL) proves non-NULL — a CASE
 /// branch after `WHEN node`. Only tests that never yield NULL say
 /// anything: `x IS NULL` not TRUE is `x` non-NULL, while `x > 0` not TRUE
@@ -1461,6 +1591,9 @@ pub(crate) fn nonnullable_unless_false(
         // A comparison with constants not FALSE: what it says holds of its
         // column unless that is NULL (`kind = 'a'` not FALSE: `kind` is
         // NULL or `'a'`).
+        // An `IN` list or `= ANY` array holding a NULL is never FALSE (NULL
+        // where no other item matches): not FALSE, it says nothing.
+        Some(ast::Node::AExpr(e)) if null_item(e, scope, snapshot) => Facts::default(),
         Some(ast::Node::ColumnRef(_) | ast::Node::AExpr(_)) => {
             match value_pred(node, scope, log, snapshot) {
                 Some((col, p)) => Facts::pred(col, p),
@@ -1475,6 +1608,29 @@ pub(crate) fn nonnullable_unless_false(
         }));
     }
     facts
+}
+
+/// Whether `IN` list or `op ANY` / `op ALL` array `e` holds a NULL item
+/// (which [`column_pred`] leaves out of an `IN` / `ANY`: it never makes the
+/// test TRUE, only keeps it from being FALSE).
+fn null_item(e: &ast::AExpr, scope: &Scope, snapshot: &PgCatalog) -> bool {
+    use ast::AExprKind as K;
+    match e.kind {
+        K::AexprIn => matches!(e.rexpr.as_ref(), Some(ast::Node::List(l))
+            if l.items.iter().any(|i| matches!(i, Some(ast::Node::AConst(c)) if c.isnull))),
+        K::AexprOpAny | K::AexprOpAll => {
+            let Some((_, t)) = e
+                .lexpr
+                .as_ref()
+                .and_then(|l| compared_column(l, scope, snapshot))
+            else {
+                return false;
+            };
+            array_constants(e.rexpr.as_ref(), t, false, snapshot).is_none()
+                && array_constants(e.rexpr.as_ref(), t, true, snapshot).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn unless_true_node(
@@ -1544,6 +1700,9 @@ fn unless_true_node(
             ast::BoolExprType::NotExpr => match b.args.as_slice() {
                 [e] => {
                     let f = nonnullable_unless_false(e.as_ref(), scope, log, snapshot);
+                    if matches!(e, Some(ast::Node::AExpr(x)) if null_item(x, scope, snapshot)) {
+                        return f;
+                    }
                     // `NOT e` not TRUE: `e` not FALSE, so what `e` says
                     // holds of its column unless that is NULL.
                     match value_pred(e.as_ref(), scope, log, snapshot) {

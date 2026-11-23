@@ -10,6 +10,13 @@ description = "SQL lint rules for typedpg queries, migrations and schema"
 keywords = ["postgres", "postgresql", "sql", "linter"]
 categories = ["database", "development-tools"]
 
+[features]
+# The lint oracle: every finding's fix and claim checked against a real
+# PostgreSQL over adversarial rows (see `src/rules/oracle.rs`); run it with
+# `scripts/run-lint-oracle.sh`. It also turns on the migration oracle
+# (`src/migration_oracle.rs`), which replays every linted migration.
+pg_sanity = ["typedpg_analyzer/pg_sanity", "dep:postgres"]
+
 [dependencies]
 typedpg_analyzer = { path = "../typedpg_analyzer", version = "0.8.0", features = ["internal"] }
 typedpg_core = { path = "../typedpg_core", version = "0.8.0" }
@@ -18,3 +25,10 @@ serde = { version = "1", features = ["derive"] }
 # The documents keep the key order the report writes (SARIF readers show it), whatever else the build enables.
 serde_json = { version = "1", features = ["preserve_order"] }
 globset = "0.4"
+# The migration oracle (`pg_sanity`) replays migrations on a real PostgreSQL.
+postgres = { version = "0.19", optional = true }
+
+[dev-dependencies]
+# The lint oracle's corpus run (tests/lint_oracle.rs) reuses the analyzer
+# fuzzer's query generators, which draw from rand.
+rand = "0.10"

@@ -1884,8 +1884,12 @@ fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
     let names = extract_names(&e.name);
     let operator = names.last().map(String::as_str);
     // An operator all of whose implementations are strict folds a NULL
-    // operand to NULL (`NULL + x`).
+    // operand to NULL (`NULL + x`). Only a plain operator call: `x IS
+    // DISTINCT FROM NULL` and `NULLIF(x, NULL)` name the strict `=` but are
+    // never NULL / are `x`, an `IN` list with a NULL item is TRUE when
+    // another item matches, and `NULL = ANY ('{}')` is false.
     if folded.contains(&Certain::Null)
+        && kind == ast::AExprKind::AexprOp
         && operator.is_some_and(|op| operator_certain(op, snapshot, ProVolatile::Volatile, true))
     {
         return Certain::Null;
@@ -2065,6 +2069,9 @@ struct LevelQuals {
     outputs: Outputs,
     /// The alias of the FROM item it is in the level around it.
     item: Option<String>,
+    /// A level of its own (a statement, a scalar sublink's), whose outer
+    /// joins no qual of a level around may reduce.
+    own_level: bool,
     /// The CTEs it may read, by name.
     ctes: Vec<String>,
 }
@@ -2419,6 +2426,7 @@ impl PlanLevel {
                 row_marks,
                 outputs,
                 item,
+                own_level,
                 ctes: cte_names,
             }
         } else {
@@ -4051,6 +4059,66 @@ impl Reads<'_> {
         }
         self.from.iter().map(|f| count(self, f.as_ref())).sum()
     }
+}
+
+/// Whether a qual of the level around may reduce the outer joins of the
+/// current one (`reduce_outer_joins` over the query it is pulled up into,
+/// or over its own query with the quals `set_subquery_pathlist` pushes
+/// down into it): the level is a FROM subquery, a view or a CTE there, and
+/// a qual there (WHERE, a JOIN's ON) may read it — any qual, when its name
+/// there isn't known; when the level around is no SELECT, to be sure.
+pub(crate) fn outer_quals_may_reduce() -> bool {
+    LEVELS.with(|l| {
+        let l = l.borrow();
+        let Some((current, rest)) = l.split_last() else {
+            return false;
+        };
+        let Some(parent) = rest.last() else {
+            return false;
+        };
+        if current.own_level {
+            return false;
+        }
+        // SAFETY: the level around this one is on the stack, its nodes
+        // borrowed by the analysis.
+        let Some(psel) = parent.select.map(|s| unsafe { &*s }) else {
+            return true;
+        };
+        let mut quals = Vec::new();
+        if let Some(w) = psel.where_clause.as_ref() {
+            quals.push(w);
+        }
+        // A USING / NATURAL join's equalities, which aren't written.
+        let mut using = false;
+        fn join_quals<'n>(
+            n: Option<&'n ast::Node>,
+            out: &mut Vec<&'n ast::Node>,
+            using: &mut bool,
+        ) {
+            if let Some(ast::Node::JoinExpr(j)) = n {
+                out.extend(j.quals.as_ref());
+                *using |= j.is_natural || !j.using_clause.is_empty();
+                join_quals(j.larg.as_ref(), out, using);
+                join_quals(j.rarg.as_ref(), out, using);
+            }
+        }
+        for f in &psel.from_clause {
+            join_quals(f.as_ref(), &mut quals, &mut using);
+        }
+        let may_read = |q: &ast::Node, alias: &str| {
+            q.nodes().any(|(n, _)| match n {
+                typedpg_pg_query::NodeRef::ColumnRef(c) => {
+                    let fields = extract_names(&c.fields);
+                    fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
+                }
+                _ => false,
+            })
+        };
+        match current.item.as_deref() {
+            Some(alias) if !alias.is_empty() => using || quals.iter().any(|q| may_read(q, alias)),
+            _ => using || !quals.is_empty(),
+        }
+    })
 }
 
 /// Whether the plan of the current level may be a dummy one, whose nodes

@@ -76,11 +76,13 @@ use postgres::types::{Format, FromSql, IsNull, ToSql, Type as PgType};
 use postgres::{Client, Statement, Transaction};
 
 use super::{Divergence, DivergenceKind, NullParam};
+
+pub mod lint;
 use crate::resolve::AnalyzedQuery;
 use crate::types::Type;
 
 /// The PL/pgSQL helpers, created in the query session's `pg_temp`.
-const SEED_SQL: &str = include_str!("seed.sql");
+pub(crate) const SEED_SQL: &str = include_str!("seed.sql");
 
 /// Rows read per scenario: enough to see every seeded combination, bounded
 /// so a `generate_series` over millions stays cheap.
@@ -174,6 +176,14 @@ struct Stats {
     equivalence_checked: u64,
     /// Scenarios in which both ran and their results were compared.
     equivalence_compared: u64,
+    /// Simplified queries whose rows were compared by count only: a
+    /// `LIMIT`, `OFFSET` or `DISTINCT ON` picks some arbitrarily.
+    equivalence_counts_only: u64,
+    /// Scenarios whose results differed under a volatile call, which makes
+    /// two runs differ: not compared.
+    equivalence_volatile: u64,
+    /// Simplifications not executed: a NOT NULL parameter has no sample.
+    equivalence_no_param_sample: u64,
     /// Rows each seeding scenario inserted, summed over the checks.
     seeded_rows: BTreeMap<String, u64>,
     /// Successful executions per scenario.
@@ -184,6 +194,8 @@ struct Stats {
 pub(super) struct Soundness {
     enabled: bool,
     installed: bool,
+    /// Whether the lint oracle's assertion functions exist (see [`lint`]).
+    lint_installed: bool,
     /// Bumped on every DDL batch: seeding plans and parameter samples are
     /// valid for one schema generation only.
     schema_gen: u64,
@@ -199,6 +211,7 @@ impl Soundness {
         Self {
             enabled: std::env::var("PG_SANITY_NULLABILITY").map_or(true, |v| v != "0"),
             installed: false,
+            lint_installed: false,
             schema_gen: 0,
             plans: HashMap::new(),
             param_texts: HashMap::new(),
@@ -431,9 +444,19 @@ impl Soundness {
     /// order, too, of the outermost ORDER BY's keys when they are output
     /// columns — or another row count, or fails where the original
     /// doesn't. The original failing is fine: a rewrite may evaluate less.
+    ///
+    /// What differs between two runs of one statement is not compared
+    /// (the lint oracle has the same blind spots, see [`lint`]): every
+    /// sequence is set back before each run (they aren't transactional, so
+    /// an identity or serial column would differ), rows a `LIMIT`,
+    /// `OFFSET` or `DISTINCT ON` picks arbitrarily are compared by their
+    /// count ([`row_comparison`]), and the results of a query calling a
+    /// volatile function ([`nondeterministic`]) are only compared where
+    /// they agree.
     pub(super) fn equivalence(
         &mut self,
         client: &mut Client,
+        catalog: &crate::PgCatalog,
         original: (&str, &Statement),
         simplified: (&str, &Statement),
         ours: &AnalyzedQuery,
@@ -446,14 +469,31 @@ impl Soundness {
         if UNSAFE_CALLS.iter().any(|f| lower.contains(f)) {
             return None;
         }
+        // A volatile call's values differ between the two runs: results
+        // that differ then prove nothing (the simplified query failing
+        // where the written one runs still does).
+        let volatile = nondeterministic(original.0) || nondeterministic(simplified.0);
+        // Rows a nested LIMIT picks change even the row count with the plan.
+        if lint::picks_rows_below(original.0) {
+            return None;
+        }
         self.install(client);
-        let values = self.param_values(client, ours, original.1, finite_params)?;
+        let Some(values) = self.param_values(client, ours, original.1, finite_params) else {
+            self.stats.equivalence_no_param_sample += 1;
+            return None;
+        };
         self.stats.equivalence_checked += 1;
         let params: Vec<Param> = values.iter().map(|v| Param(v.clone())).collect();
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-        let order_keys = order_keys(original.0, ours);
-        let targets = written_tables(original.0);
+        let rows = row_comparison(catalog, original.0, ours);
+        if matches!(rows, Rows::Count) {
+            self.stats.equivalence_counts_only += 1;
+        }
+        let mut targets = written_tables(original.0);
+        targets.extend(written_tables(simplified.0));
+        targets.sort();
+        targets.dedup();
         let literals = query_literals(original.0);
 
         let mut tx = client
@@ -471,65 +511,39 @@ impl Soundness {
                     continue;
                 }
             }
-            let (written, written_tables) = run(&mut tx, original.1, &param_refs, &targets);
-            let (sent, sent_tables) = run(&mut tx, simplified.1, &param_refs, &targets);
-            let tables_differ = !matches!(written, Outcome::Failed(_))
-                && !matches!(sent, Outcome::Failed(_))
-                && written_tables != sent_tables;
-            let problem = match (&written, &sent) {
-                _ if tables_differ => Some(format!(
-                    "it leaves other table contents:\n  written:    {written_tables:?}\n  \
-                     simplified: {sent_tables:?}"
-                )),
-                (Outcome::Failed(_), _) | (Outcome::Truncated, _) | (_, Outcome::Truncated) => None,
+            // Both start from the sequences' values the seeding left.
+            let restore = sequence_state(&mut tx);
+            let written = run(&mut tx, original.1, &param_refs, &targets);
+            restore_sequences(&mut tx, restore.as_deref());
+            let sent = run(&mut tx, simplified.1, &param_refs, &targets);
+            let problem = match (&written.0, &sent.0) {
+                (Outcome::Failed(_), _) => None,
                 (_, Outcome::Failed(e)) => Some(format!("the simplified query fails: {e}")),
-                (Outcome::Count(a), Outcome::Count(b)) => {
-                    (a != b).then(|| format!("it affects {b} rows, the written one {a}"))
-                }
-                (Outcome::Rows(a), Outcome::Rows(b)) => {
-                    self.stats.equivalence_compared += 1;
-                    let (mut sa, mut sb) = (a.clone(), b.clone());
-                    sa.sort();
-                    sb.sort();
-                    if sa != sb {
-                        Some(format!(
-                            "it returns other rows:\n  written:    {a:?}\n  simplified: {b:?}"
-                        ))
-                    } else if let Some(keys) = &order_keys {
-                        let project = |rows: &[Row]| -> Vec<Row> {
-                            rows.iter()
-                                .map(|r| keys.iter().map(|&k| r[k].clone()).collect())
-                                .collect()
-                        };
-                        (project(a) != project(b)).then(|| {
-                            format!(
-                                "it returns the rows in another order:\n  written:    {a:?}\n  \
-                                 simplified: {b:?}"
-                            )
-                        })
-                    } else {
-                        None
+                _ => {
+                    match result_difference(
+                        (&written.0, &written.1),
+                        (&sent.0, &sent.1),
+                        &rows,
+                        NAMES,
+                    ) {
+                        Difference::Differs(_) if volatile => {
+                            self.stats.equivalence_volatile += 1;
+                            None
+                        }
+                        Difference::Differs(problem) => {
+                            self.stats.equivalence_compared += 1;
+                            Some(problem)
+                        }
+                        Difference::Same => {
+                            self.stats.equivalence_compared += 1;
+                            None
+                        }
+                        Difference::Uncompared => None,
                     }
                 }
-                _ => Some("one returns rows, the other a row count".to_owned()),
             };
             if let Some(problem) = problem {
-                let params = values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| match v {
-                        Some(v) => format!("${} = '{v}'", i + 1),
-                        None => format!("${} = NULL", i + 1),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let mut seeding = String::new();
-                for (name, plan) in &seeded {
-                    seeding.push_str(&format!("  [{name}]\n"));
-                    for insert in &plan.inserts {
-                        seeding.push_str(&format!("    {insert};\n"));
-                    }
-                }
+                let (params, seeding) = repro(&values, &seeded);
                 return Some(Divergence {
                     kind: DivergenceKind::Simplification,
                     message: format!(
@@ -678,6 +692,9 @@ impl Soundness {
             ("no_param_sample", s.no_param_sample),
             ("equivalence_checked", s.equivalence_checked),
             ("equivalence_compared", s.equivalence_compared),
+            ("equivalence_counts_only", s.equivalence_counts_only),
+            ("equivalence_volatile", s.equivalence_volatile),
+            ("equivalence_no_param_sample", s.equivalence_no_param_sample),
         ] {
             out.push_str(&format!("count\t{name}\t{n}\n"));
         }
@@ -707,6 +724,25 @@ impl Soundness {
     }
 }
 
+/// What the binary value `raw` (`None`: NULL) of result column `col`
+/// breaks of what the analysis says of the column: NULL where it isn't
+/// nullable (a NULL array element or record field included), or a value
+/// outside its refinement — worded as the nullability oracle reports it, a
+/// broken refinement ending in `(refinement: <what>)`. For the
+/// `breaks_deployed_queries` oracle (`typedpg_lint`), which checks what the
+/// deployed code's analysis promised against what the new schema returns.
+pub fn value_violation(col: &crate::resolve::AnalyzedColumn, raw: Option<&[u8]>) -> Option<String> {
+    match raw {
+        None if !col.nullable => Some("the value is NULL".to_owned()),
+        None => None,
+        Some(bytes) => inner_violation(&col.pg_type, bytes).or_else(|| {
+            refinement_violation(&col.pg_type, &col.refinement, bytes)
+                .or_else(|| elem_refinement_violation(&col.pg_type, &col.elem_refinement, bytes))
+                .or_else(|| field_refinement_violation(&col.pg_type, bytes))
+        }),
+    }
+}
+
 /// A result row, each value's raw binary bytes (`None` for NULL).
 type Row = Vec<Option<Vec<u8>>>;
 
@@ -722,6 +758,197 @@ enum Outcome {
 
 /// A table's name and its rows as text, sorted.
 type TableContents = (String, Vec<Option<String>>);
+
+/// How the equivalence check names its two statements in a difference.
+const NAMES: (&str, &str) = ("written", "simplified");
+
+/// The statements setting every sequence back to its current state, or
+/// `None` without sequences. Sequences are not transactional: two
+/// statements compared in one transaction start from the same values only
+/// when they are set back before the second.
+fn sequence_state(tx: &mut Transaction<'_>) -> Option<String> {
+    tx.query_one(
+        "SELECT pg_catalog.string_agg(pg_catalog.format('SELECT pg_catalog.setval(%L, %s, %s)', \
+             pg_catalog.format('%I.%I', schemaname, sequencename), \
+             coalesce(last_value, start_value), (last_value IS NOT NULL)::text), '; ') \
+         FROM pg_catalog.pg_sequences",
+        &[],
+    )
+    .ok()
+    .and_then(|row| row.get::<_, Option<String>>(0))
+}
+
+/// Run what [`sequence_state`] returned.
+fn restore_sequences(tx: &mut Transaction<'_>, restore: Option<&str>) {
+    if let Some(restore) = restore {
+        tx.batch_execute(restore).unwrap_or_else(|e| {
+            panic!(
+                "pg_sanity: restoring the sequences failed: {}",
+                super::render_pg_error(&e)
+            )
+        });
+    }
+}
+
+/// Whether `sql` calls a function whose value differs between two runs of
+/// it in one transaction.
+fn nondeterministic(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    [
+        "random(",
+        "random_normal",
+        "clock_timestamp",
+        "statement_timestamp",
+        "timeofday",
+        "gen_random",
+        "uuidv",
+        "nextval",
+        "setval",
+        "txid_current",
+        "pg_current_xact",
+        "pg_backend_pid",
+    ]
+    .iter()
+    .any(|f| lower.contains(f))
+}
+
+/// How two results' rows are compared.
+enum Rows {
+    /// As multisets, and in the order of these output columns.
+    All(Option<Vec<usize>>),
+    /// By count (and the written tables by their row counts).
+    Count,
+}
+
+/// How the rows of `sql` (analyzed as `ours`) and of a query that must
+/// return the same can be compared. Rows some select picks arbitrarily
+/// ([`crate::simplify::picks_rows_arbitrarily`]: a `LIMIT`, `OFFSET` or
+/// `DISTINCT ON` whose `ORDER BY` can tie), a `TABLESAMPLE`'s, or a system
+/// column's physical value (`ctid`, `xmin`, …) differ between runs: only
+/// their count is compared then.
+fn row_comparison(catalog: &crate::PgCatalog, sql: &str, ours: &AnalyzedQuery) -> Rows {
+    use typedpg_pg_query::NodeRef;
+    let lower = sql.to_ascii_lowercase();
+    let physical = ["ctid", "xmin", "xmax", "cmin", "cmax"]
+        .iter()
+        .any(|c| lower.contains(c));
+    let sampled = typedpg_pg_query::parse(sql).map_or(true, |parsed| {
+        parsed
+            .tree
+            .nodes()
+            .any(|(n, _)| matches!(n, NodeRef::RangeTableSample(_)))
+    });
+    if physical || sampled || crate::simplify::picks_rows_arbitrarily(catalog, sql, ours) {
+        Rows::Count
+    } else {
+        Rows::All(order_keys(sql, ours))
+    }
+}
+
+/// What comparing two results where both statements ran showed.
+enum Difference {
+    Same,
+    Differs(String),
+    /// More rows than [`MAX_ROWS`] (and the same tables): not compared.
+    Uncompared,
+}
+
+/// Compare two statements' results (outcome and the tables they wrote),
+/// neither of which failed: the same table contents, row count, and rows
+/// as `rows` says. `names` label the two in the message.
+fn result_difference(
+    (written, written_tables): (&Outcome, &[TableContents]),
+    (sent, sent_tables): (&Outcome, &[TableContents]),
+    rows: &Rows,
+    (a_name, b_name): (&str, &str),
+) -> Difference {
+    let width = a_name.len().max(b_name.len()) + 1;
+    let both = |a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| {
+        format!(
+            "  {:width$} {a:?}\n  {:width$} {b:?}",
+            format!("{a_name}:"),
+            format!("{b_name}:")
+        )
+    };
+    let tables_differ = match rows {
+        Rows::All(_) => written_tables != sent_tables,
+        Rows::Count => written_tables
+            .iter()
+            .map(|(t, r)| (t, r.len()))
+            .ne(sent_tables.iter().map(|(t, r)| (t, r.len()))),
+    };
+    if tables_differ {
+        return Difference::Differs(format!(
+            "it leaves other table contents:\n{}",
+            both(&written_tables, &sent_tables)
+        ));
+    }
+    match (written, sent) {
+        (Outcome::Truncated, _) | (_, Outcome::Truncated) => Difference::Uncompared,
+        (Outcome::Count(a), Outcome::Count(b)) if a != b => {
+            Difference::Differs(format!("it affects {b} rows, the {a_name} query {a}"))
+        }
+        (Outcome::Count(_), Outcome::Count(_)) => Difference::Same,
+        (Outcome::Rows(a), Outcome::Rows(b)) => {
+            let rows_differ = match rows {
+                Rows::All(_) => {
+                    let (mut sa, mut sb) = (a.clone(), b.clone());
+                    sa.sort();
+                    sb.sort();
+                    sa != sb
+                }
+                Rows::Count => a.len() != b.len(),
+            };
+            if rows_differ {
+                return Difference::Differs(match rows {
+                    Rows::All(_) => format!("it returns other rows:\n{}", both(a, b)),
+                    Rows::Count => format!(
+                        "it returns {} rows, the {a_name} query {}:\n{}",
+                        b.len(),
+                        a.len(),
+                        both(a, b)
+                    ),
+                });
+            }
+            if let Rows::All(Some(keys)) = rows {
+                let project = |rows: &[Row]| -> Vec<Row> {
+                    rows.iter()
+                        .map(|r| keys.iter().map(|&k| r[k].clone()).collect())
+                        .collect()
+                };
+                if project(a) != project(b) {
+                    return Difference::Differs(format!(
+                        "it returns the rows in another order:\n{}",
+                        both(a, b)
+                    ));
+                }
+            }
+            Difference::Same
+        }
+        _ => Difference::Differs("one returns rows, the other a row count".to_owned()),
+    }
+}
+
+/// A divergence's parameters and seeding, rendered.
+fn repro(values: &[Option<String>], seeded: &[(&str, SeedPlan)]) -> (String, String) {
+    let params = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| match v {
+            Some(v) => format!("${} = '{v}'", i + 1),
+            None => format!("${} = NULL", i + 1),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut seeding = String::new();
+    for (name, plan) in seeded {
+        seeding.push_str(&format!("  [{name}]\n"));
+        for insert in &plan.inserts {
+            seeding.push_str(&format!("    {insert};\n"));
+        }
+    }
+    (params, seeding)
+}
 
 /// The tables `sql` writes to (its INSERT / UPDATE / DELETE / MERGE
 /// targets, in data-modifying CTEs too), as SQL names.
@@ -1344,7 +1571,7 @@ fn query_literals(sql: &str) -> Vec<String> {
 }
 
 /// A result value as raw binary bytes (`None` for NULL), whatever its type.
-struct Raw<'a>(Option<&'a [u8]>);
+pub struct Raw<'a>(pub Option<&'a [u8]>);
 
 impl<'a> FromSql<'a> for Raw<'a> {
     fn from_sql(
@@ -1365,7 +1592,7 @@ impl<'a> FromSql<'a> for Raw<'a> {
 
 /// A parameter bound in text format (`Some`), or NULL.
 #[derive(Debug)]
-struct Param(Option<String>);
+pub struct Param(pub Option<String>);
 
 impl ToSql for Param {
     fn to_sql(

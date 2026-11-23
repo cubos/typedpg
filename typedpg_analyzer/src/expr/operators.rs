@@ -1351,6 +1351,22 @@ fn infer_generic_binary_op(
             crate::ddl::policies::note_operator_ref(expr.location, op.oid);
             ctx.note_cooked_operator(expr, op.oid);
             ctx.note_proc(op.code);
+            // `exprType(leftarg)` of the OpExpr: the operator's declared
+            // left type, unless polymorphic (`anyarray = anyarray` keeps
+            // the operand's own type).
+            if let Some(input) = op
+                .left_type_oid
+                .filter(|d| !crate::polymorphic::is_polymorphic(*d))
+                .or(left_oid_resolved)
+            {
+                ctx.note_resolved_operator(
+                    expr.location,
+                    crate::nonnull::ResolvedOp {
+                        oid: op.oid,
+                        input_type: snapshot.unwrap_domain(input),
+                    },
+                );
+            }
             // The operator is a call of its function, which the executor
             // initializes like a `FuncExpr`'s — and a STRICT one with a
             // certainly NULL operand is replaced by NULL before that.

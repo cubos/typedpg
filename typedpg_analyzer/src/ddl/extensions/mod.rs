@@ -308,7 +308,9 @@ impl OtherMembers {
                 .filter(|k| !self.languages.contains(k))
                 .map(|&l| ObjectAddress::language(l)),
         );
-        // A relation's indexes and row type are its own, not members.
+        // A relation's indexes are its own, not members; a composite type's
+        // relation neither (heap_create_with_catalog: its type is the
+        // member).
         members.extend(
             interp
                 .pg_class
@@ -319,6 +321,7 @@ impl OtherMembers {
                             c.relkind,
                             crate::pg_catalog::RelKind::Index
                                 | crate::pg_catalog::RelKind::PartitionedIndex
+                                | crate::pg_catalog::RelKind::CompositeType
                         )
                 })
                 .map(|(&k, _)| ObjectAddress::relation(k)),
@@ -892,7 +895,9 @@ pub fn alter_extension_contents(
 }
 
 /// `ALTER EXTENSION name SET SCHEMA s` (AlterExtensionNamespace): the
-/// extension's types (with their array types) and functions move.
+/// extension's members move (AlterObjectNamespace_oid) — types (with their
+/// array types), functions, operators, operator classes and families,
+/// collations and relations.
 pub(crate) fn set_extension_schema(
     interp: &mut PgCatalog,
     name: &str,
@@ -932,6 +937,40 @@ pub(crate) fn set_extension_schema(
             let proc = PgProcOid::from_nonzero(objid.into_nonzero());
             if let Some(name) = interp.pg_proc.get(&proc).map(|p| p.proname.clone()) {
                 interp.rename_pg_proc(proc, name, new_nsoid);
+            }
+        } else if classid == crate::pg_catalog::PG_OPERATOR_RELID {
+            interp.move_pg_operator(
+                crate::oid::PgOperatorOid::from_nonzero(objid.into_nonzero()),
+                new_nsoid,
+            );
+        } else if classid == super::depend::PG_OPCLASS_RELID
+            || classid == super::depend::PG_OPFAMILY_RELID
+        {
+            super::opclass::move_am_object(
+                interp,
+                classid == super::depend::PG_OPCLASS_RELID,
+                objid,
+                new_nsoid,
+            );
+        } else if classid == crate::pg_catalog::PG_COLLATION_RELID {
+            let coll = crate::oid::PgCollationOid::from_nonzero(objid.into_nonzero());
+            if let Some(mut row) = interp.remove_pg_collation(coll) {
+                row.collnamespace = new_nsoid;
+                interp.insert_pg_collation(row);
+            }
+        } else if classid == crate::pg_catalog::PG_CLASS_RELID {
+            // A relation moves with its row type (and that type's array).
+            let rel = PgClassOid::from_nonzero(objid.into_nonzero());
+            if let Some(class) = interp.pg_class.get(&rel).cloned() {
+                interp.rename_pg_class(rel, class.relname, new_nsoid);
+                if let Some(rowtype) = class.reltype {
+                    let array = interp.array_type_of(rowtype);
+                    for t in std::iter::once(rowtype).chain(array) {
+                        if let Some(name) = interp.pg_type.get(&t).map(|r| r.typname.clone()) {
+                            interp.rename_pg_type(t, name, new_nsoid);
+                        }
+                    }
+                }
             }
         }
     }

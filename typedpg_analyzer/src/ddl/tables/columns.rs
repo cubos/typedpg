@@ -932,6 +932,7 @@ pub(crate) fn parse_column_def(
         compression: (!cd.compression.is_empty()).then(|| cd.compression.clone()),
         storage: None,
         identity_options,
+        sequence_of_column_type: true,
         nn_local: not_null,
         nn_name,
         nn_no_inherit,
@@ -1055,6 +1056,23 @@ pub(crate) fn set_identity(
         }
         super::check_not_system_column(interp, relid, &cmd.name)?;
     }
+    // transformAlterTableStmt's generateSerialExtraStmts makes the
+    // identity's sequence of the column's type, which DefineSequence's
+    // init_params refuses unless it is an integer one — a domain over one
+    // too — before ATExecAddIdentity looks at the column.
+    if is_add
+        && let Some(attr) = interp.attribute_by_name(relid, &cmd.name)
+        && ![
+            crate::pg_catalog::oid::INT2,
+            crate::pg_catalog::oid::INT4,
+            crate::pg_catalog::oid::INT8,
+        ]
+        .contains(&attr.atttypid)
+    {
+        return Err(DdlError::Parse(
+            "identity column type must be smallint, integer, or bigint".into(),
+        ));
+    }
     let rel = relname_of(interp, relid);
     // A view's columns are never declared NOT NULL (what the analyzer
     // infers of them aside).
@@ -1152,6 +1170,7 @@ pub(crate) fn set_identity(
             attnum,
             crate::pg_catalog::DepType::Internal,
             &options,
+            true,
             owner,
         )?;
     }
@@ -1359,10 +1378,16 @@ fn add_column_to(
         interp.pg_class.get(&relid).and_then(|c| c.reltype),
         col.generated == Some(AttGenerated::Virtual),
     )?;
+    // A column added to an inheritance child is inherited; one ALTER TYPE
+    // ... CASCADE adds to a typed table is its own (ATTypedTableRecursion
+    // passes the column definition as written).
+    let inherited = rec.recursing && !interp.typed_tables.contains_key(&relid);
+    // relnatts + 1: past the dropped columns too.
     let next_attnum = interp
         .attributes_of(relid)
         .iter()
         .map(|a| a.attnum)
+        .chain(interp.attnum_high_water.get(&relid).copied())
         .max()
         .unwrap_or(0)
         + 1;
@@ -1381,8 +1406,8 @@ fn add_column_to(
             .identity
             .filter(|_| !rec.recursing || super::inherit_cmd::is_partition(interp, relid)),
         attcollation: col.collation,
-        attislocal: !rec.recursing,
-        attinhcount: i16::from(rec.recursing),
+        attislocal: !inherited,
+        attinhcount: i16::from(inherited),
     });
     if let Some(storage) = storage {
         super::column_options::record_attr_storage(interp, relid, next_attnum, storage);
@@ -1431,6 +1456,7 @@ fn add_column_to(
             next_attnum,
             deptype,
             &col.identity_options,
+            col.sequence_of_column_type,
             owner,
         )?;
     }

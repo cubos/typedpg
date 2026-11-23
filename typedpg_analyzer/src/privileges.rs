@@ -6147,6 +6147,61 @@ impl PgCatalog {
                 .any(|policy| clause(policy).is_some_and(|c| never_true(&c)))
     }
 
+    /// For the lint (`breaks_deployed_queries`): what row-level security
+    /// checks a row against when role `role` writes it into relation
+    /// `relid` by command `cmd` — `a` INSERT: the new row against the INSERT
+    /// policies' WITH CHECK (their USING without one); `w` UPDATE: the new
+    /// row against the UPDATE policies' WITH CHECK (their USING without
+    /// one), and with `existing` the row updated against their USING too,
+    /// which an `ON CONFLICT DO UPDATE` or a MERGE raises on rather than
+    /// skipping the row. `None` when row-level security doesn't apply to
+    /// the role (or the catalog doesn't know it).
+    pub fn row_security_write_checks(
+        &self,
+        relid: PgClassOid,
+        role: &str,
+        cmd: char,
+        existing: bool,
+    ) -> Option<RowSecurityChecks> {
+        let who = self.roles.id(role)?;
+        if !self.row_security_applies(relid, who) {
+            return None;
+        }
+        let key = |node: Option<&Node>| {
+            use typedpg_pg_query::Equal;
+            let mut key = String::new();
+            node.cloned().equal_key(&mut key);
+            key
+        };
+        let checks = |policy: &Policy| -> (String, bool) {
+            let (using, with_check) = self.policy_qual(relid, policy);
+            let mut clauses = vec![with_check.or_else(|| using.clone())];
+            if existing && cmd == 'w' {
+                clauses.push(using);
+            }
+            let text = clauses
+                .iter()
+                .map(|c| key(c.as_ref()))
+                .collect::<Vec<_>>()
+                .join(" & ");
+            let always = clauses.iter().all(|c| {
+                c.as_ref().is_some_and(|c| {
+                    crate::expr::plan_fold::certainly_true(Some(c), self) == Some(true)
+                })
+            });
+            (text, always)
+        };
+        let (permissive, restrictive) = self.policies_for(relid, cmd, who);
+        let permissive: Vec<(String, bool)> = permissive.iter().map(checks).collect();
+        let restrictive: Vec<(String, bool)> = restrictive.iter().map(checks).collect();
+        Some(RowSecurityChecks {
+            passes_every_row: permissive.iter().any(|(_, always)| *always)
+                && restrictive.iter().all(|(_, always)| *always),
+            permissive: permissive.into_iter().map(|(k, _)| k).collect(),
+            restrictive: restrictive.into_iter().map(|(k, _)| k).collect(),
+        })
+    }
+
     /// The policies of `relid` that apply to command `cmd` for `who`
     /// (`get_policies_for_relation`): the command's own or `ALL` policies,
     /// addressed to PUBLIC or to a role `who` has the privileges of, split
@@ -8121,6 +8176,20 @@ fn relkind_word(relkind: RelKind) -> &'static str {
         RelKind::ForeignTable => "foreign table",
         _ => "table",
     }
+}
+
+/// What row-level security checks the rows a command writes against (see
+/// [`PgCatalog::row_security_write_checks`]): each policy's clauses as a
+/// key (equal clauses, equal keys).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowSecurityChecks {
+    /// The permissive policies': a row passing one passes them.
+    pub permissive: std::collections::BTreeSet<String>,
+    /// The restrictive policies': a row must pass each.
+    pub restrictive: std::collections::BTreeSet<String>,
+    /// Whether every row passes (a permissive policy and every restrictive
+    /// one certainly TRUE).
+    pub passes_every_row: bool,
 }
 
 #[cfg(test)]

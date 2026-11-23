@@ -521,9 +521,11 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     }
     // AggregateCreate (PostgreSQL 19): the support function takes and
     // returns internal.
+    let mut prosupport = None;
     if let Some(sname) = opts.support.as_ref() {
         let (oid, rettype) = lookup_agg_function(interp, sname, &[INTERNAL], None)?;
         referenced.push(ObjectAddress::proc(oid));
+        prosupport = Some(oid);
         if rettype != INTERNAL {
             return Err(DdlError::UnsupportedDdl(format!(
                 "return type of support function {} is not internal",
@@ -562,7 +564,7 @@ pub fn define_aggregate(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
         provolatile: ProVolatile::Immutable,
         proargdefaulttypes: Vec::new(),
         prolang: crate::pg_catalog::INTERNAL_LANGUAGE,
-        prosupport: None,
+        prosupport,
     };
     let proc = super::functions::procedure_create(interp, proc, stmt.replace)?;
     // AggregateCreate's own replacement rules.

@@ -498,14 +498,30 @@ mod tests {
     #[test]
     fn a_limit_of_one_is_proof_enough() {
         let db = catalog();
-        let sql = "SELECT id, name FROM users LIMIT 1";
-        assert!(
-            only(
-                lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
-            )
-            .is_empty()
-        );
+        for sql in [
+            "SELECT id, name FROM users LIMIT 1",
+            "SELECT id, name FROM users FETCH FIRST ROW ONLY",
+            "SELECT id, name FROM users FETCH NEXT ROWS ONLY",
+        ] {
+            assert!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                    Rule::FetchMayReturnMany
+                )
+                .is_empty(),
+                "{sql}"
+            );
+            // And `fetch_all` on it returns at most one row.
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchAll, "fetch_all")]),
+                    Rule::FetchAllSingleRow
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -1273,5 +1289,167 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    /// How many `fetch_may_return_many` findings a `.fetch_optional()` of
+    /// `sql` gets.
+    fn optional_findings(db: &PgCatalog, sql: &str) -> usize {
+        only(
+            lint(
+                db,
+                sql,
+                &[rust(CallMethod::FetchOptional, "fetch_optional")],
+            ),
+            Rule::FetchMayReturnMany,
+        )
+        .len()
+    }
+
+    /// A bare table name in a sublink is a whole-row reference to the
+    /// sublink's own relation when no level has a column by that name: the
+    /// sublink stays uncorrelated, so its one row bounds the `IN`. An outer
+    /// column by that name wins (PG's `colNameToVar` searches every level
+    /// before reading a relation's name), correlating it.
+    #[test]
+    fn fetch_optional_on_an_in_with_a_whole_row_reference_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE jq (id bigint PRIMARY KEY, owner text, state text);
+             CREATE TABLE holder (id bigint PRIMARY KEY, jq text);
+             CREATE FUNCTION claimable(j jq, a text, b text) RETURNS boolean STABLE
+                LANGUAGE sql AS $$ SELECT j.state = a $$;",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT id FROM jq WHERE id IN \
+             (SELECT id FROM jq WHERE claimable(jq, 'a', NULL) ORDER BY id LIMIT 1)",
+            "SELECT id FROM jq WHERE id IN \
+             (SELECT id FROM jq WHERE jq IS NOT NULL ORDER BY id LIMIT 1)",
+            "UPDATE jq SET owner = 'x' WHERE id IN \
+             (SELECT id FROM jq WHERE claimable(jq, 'a', NULL) ORDER BY id LIMIT 1) \
+             RETURNING id",
+        ] {
+            assert_eq!(optional_findings(&db, sql), 0, "{sql}");
+        }
+        // `jq` is `holder.jq`, a column of the outer level.
+        let sql = "SELECT id FROM holder WHERE id IN \
+                   (SELECT jq.id FROM jq WHERE jq IS NOT NULL ORDER BY jq.id LIMIT 1)";
+        assert_eq!(optional_findings(&db, sql), 1, "{sql}");
+        // `jq` names the outer relation when the sublink's is aliased.
+        let sql = "SELECT id FROM jq WHERE id IN \
+                   (SELECT j.id FROM jq j WHERE jq IS NOT NULL ORDER BY j.id LIMIT 1)";
+        assert_eq!(optional_findings(&db, sql), 1, "{sql}");
+    }
+
+    /// A non-volatile expression of determined values is one value, so it
+    /// determines the unique key it is equated with: a `COALESCE`, a
+    /// `CASE`, or a `LATERAL` subquery's column reading the row on its
+    /// left. A volatile one, or a subquery of many rows, doesn't.
+    #[test]
+    fn fetch_optional_on_a_key_equated_with_an_expression_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE principals (id bigint PRIMARY KEY, principal text UNIQUE);
+             CREATE TABLE sessions (
+                id bigint PRIMARY KEY,
+                lease_holder text,
+                ended_at timestamptz
+             );",
+        )
+        .unwrap();
+        let join = |on: &str| {
+            format!(
+                "SELECT s.id, u.id FROM sessions s \
+                 LEFT JOIN principals u ON u.principal = {on} WHERE s.id = $1"
+            )
+        };
+        for on in [
+            "s.lease_holder",
+            "coalesce(s.lease_holder, 'x')",
+            "CASE WHEN s.ended_at IS NULL THEN 'a' ELSE 'b' END",
+            "CASE WHEN $2::boolean THEN s.lease_holder ELSE 'b' END",
+            "CASE WHEN s.ended_at IS NOT NULL AND NOT $2::boolean THEN s.lease_holder END",
+            "CASE s.lease_holder WHEN 'a' THEN 'b' ELSE s.lease_holder END",
+        ] {
+            let sql = join(on);
+            assert_eq!(optional_findings(&db, &sql), 0, "{sql}");
+        }
+        for on in [
+            "coalesce(s.lease_holder, random()::text)",
+            "CASE WHEN random() > 0.5 THEN 'a' ELSE 'b' END",
+        ] {
+            let sql = join(on);
+            assert_eq!(optional_findings(&db, &sql), 1, "{sql}");
+        }
+        let sql = "SELECT s.id, u.id FROM sessions s \
+                   CROSS JOIN LATERAL (SELECT s.lease_holder AS p) h \
+                   LEFT JOIN principals u ON u.principal = h.p WHERE s.id = $1";
+        assert_eq!(optional_findings(&db, sql), 0, "{sql}");
+        let sql = "SELECT s.id, u.id FROM sessions s \
+                   CROSS JOIN LATERAL (SELECT p.principal AS p FROM principals p) h \
+                   LEFT JOIN principals u ON u.principal = h.p WHERE s.id = $1";
+        assert_eq!(optional_findings(&db, sql), 1, "{sql}");
+    }
+
+    /// The merged column of a chain of USING joins is the first input's
+    /// (PG's `buildMergedJoinVar` takes an INNER or LEFT join's left
+    /// input's), so a later USING equates the key with it. A merge that
+    /// converts to a common type is no column.
+    #[test]
+    fn fetch_optional_on_a_chain_of_using_joins_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE est (b bigint, o bigint, d bigint, PRIMARY KEY (b, o, d));
+             CREATE TABLE emp (b bigint PRIMARY KEY, name text);
+             CREATE TABLE emp4 (b integer PRIMARY KEY, name text);
+             CREATE TABLE simples (b bigint PRIMARY KEY, x text);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT e.o, emp.name, sm.x FROM est e JOIN emp USING (b) \
+             LEFT JOIN simples sm USING (b) WHERE e.b = $1 AND e.o = $2 AND e.d = $3",
+            "SELECT e.o, emp.name, sm.x FROM est e LEFT JOIN emp USING (b) \
+             LEFT JOIN simples sm USING (b) WHERE e.b = $1 AND e.o = $2 AND e.d = $3",
+            "SELECT e.o, sm.x FROM est e JOIN emp USING (b) JOIN simples sm USING (b) \
+             WHERE b = $1 AND e.o = $2 AND e.d = $3",
+        ] {
+            assert_eq!(optional_findings(&db, sql), 0, "{sql}");
+        }
+        // `b` of `est JOIN emp4` is a `bigint` conversion of either side.
+        let sql = "SELECT e.o, sm.x FROM est e JOIN emp4 USING (b) \
+                   LEFT JOIN simples sm USING (b) WHERE e.b = $1 AND e.o = $2 AND e.d = $3";
+        assert_eq!(optional_findings(&db, sql), 1, "{sql}");
+    }
+
+    /// A FROM subquery's unaliased target is named as PG's `FigureColname`
+    /// names it (`m::text` is `m`), and a name it can't tell leaves the
+    /// other columns resolvable: only a reference to that one is unknown.
+    #[test]
+    fn fetch_optional_through_a_subquery_with_unaliased_targets_is_fine() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TYPE pair AS (x bigint, y bigint);
+             CREATE TABLE ch (id bigint PRIMARY KEY, agent_id bigint NOT NULL, m integer, p pair);
+             CREATE TABLE ag (id bigint PRIMARY KEY, slug text);",
+        )
+        .unwrap();
+        for target in ["m::text AS m", "m::text", "(SELECT 1)", "m + 1"] {
+            let sql = format!(
+                "SELECT n.id, a.slug FROM (SELECT id, agent_id, {target} FROM ch WHERE id = $1) n \
+                 JOIN ag a ON a.id = n.agent_id"
+            );
+            assert_eq!(optional_findings(&db, &sql), 0, "{sql}");
+        }
+        // PG names `(SELECT agent_id)` `agent_id`, which this doesn't tell.
+        let sql = "SELECT n.id, a.slug FROM \
+                   (SELECT id, (SELECT agent_id) FROM ch WHERE id = $1) n \
+                   JOIN ag a ON a.id = n.agent_id";
+        assert_eq!(optional_findings(&db, sql), 1, "{sql}");
+        // `(p).*` expands to several columns: `agent_id`'s position is not
+        // the one listed.
+        let sql = "SELECT n.id, a.slug FROM \
+                   (SELECT id, (p).*, agent_id FROM ch WHERE id = $1) n \
+                   JOIN ag a ON a.id = n.agent_id";
+        assert_eq!(optional_findings(&db, sql), 1, "{sql}");
     }
 }

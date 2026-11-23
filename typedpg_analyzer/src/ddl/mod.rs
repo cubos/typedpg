@@ -56,7 +56,7 @@ pub mod util;
 pub mod views;
 pub(crate) mod volatile;
 
-#[cfg(any(test, feature = "internal"))]
+#[cfg(any(test, feature = "internal", feature = "catalog_export"))]
 pub(crate) use views::serialize_subnode;
 
 use typedpg_pg_query::ast;

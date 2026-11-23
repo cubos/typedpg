@@ -432,12 +432,6 @@ pub struct PgCatalog {
     /// `replica` (or to a value it doesn't state): rows it wrote meanwhile
     /// skipped every foreign key's check (`ddl::fk_bypass`).
     pub(crate) fk_replica_role_set: bool,
-    /// Foreign keys (and clones) PG marked validated without checking the
-    /// rows: `ALTER CONSTRAINT ... ENFORCED` together with a change of
-    /// deferrability rewrites an enforced NOT VALID key's row as validated
-    /// (AlterConstrUpdateConstraintEntry), and a later VALIDATE CONSTRAINT
-    /// then skips it. Only NOT ENFORCED → ENFORCED checks them again.
-    pub(crate) fk_validity_unproven: Shared<std::collections::HashSet<PgConstraintOid>>,
     /// The `indisclustered` index of each table (CLUSTER ... USING,
     /// ALTER TABLE ... CLUSTER ON).
     pub(crate) clustered_indexes: Shared<HashMap<PgClassOid, PgClassOid>>,
@@ -590,6 +584,10 @@ pub struct PgCatalog {
     /// `attstorage` of the columns whose storage isn't their type's
     /// `typstorage` (a STORAGE clause, ALTER COLUMN SET STORAGE).
     pub(crate) attr_storage: Shared<HashMap<(PgClassOid, i16), TypStorage>>,
+    /// Each relation's highest attnum yet (`relnatts`): PG keeps a dropped
+    /// column's pg_attribute row, so a column added after it takes the
+    /// next attnum, not the one after the last column left.
+    pub(crate) attnum_high_water: Shared<HashMap<PgClassOid, i16>>,
     /// `attcompression` of the columns with a compression method set
     /// (`pglz` / `lz4`; a column without one uses the server's default).
     pub(crate) attr_compression: Shared<HashMap<(PgClassOid, i16), &'static str>>,
@@ -653,6 +651,19 @@ pub struct PgCatalog {
     /// analyzer assertion.
     #[cfg(feature = "pg_sanity")]
     pg_sanity_skip: bool,
+
+    /// Every migration applied so far, in order, for the corpus recorder
+    /// (see [`crate::corpus`]).
+    #[cfg(feature = "record_corpus")]
+    corpus_ddl: Vec<std::sync::Arc<str>>,
+    /// The migrations applied successfully so far, for the migration
+    /// oracle's corpus (see [`crate::corpus::record_migrations`]).
+    #[cfg(feature = "record_corpus")]
+    corpus_migrations: Vec<std::sync::Arc<str>>,
+    /// Set by [`Self::skip_pg_sanity`]: the migrations after it are not
+    /// recorded for the migration oracle.
+    #[cfg(feature = "record_corpus")]
+    corpus_migrations_skip: bool,
 }
 
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
@@ -975,7 +986,6 @@ impl PgCatalog {
             ri_triggers_ever_disabled: Shared::default(),
             fk_checks_bypassed: false,
             fk_replica_role_set: false,
-            fk_validity_unproven: Shared::default(),
             clustered_indexes: Shared::default(),
             statistics: Shared::default(),
             index_access_methods: Shared::default(),
@@ -1022,6 +1032,7 @@ impl PgCatalog {
             security_invoker_views: Shared::default(),
             modified_relations: Shared::default(),
             attr_storage: Shared::default(),
+            attnum_high_water: Shared::default(),
             attr_compression: Shared::default(),
             uncertain_collations: Shared::default(),
             column_deps: Default::default(),
@@ -1036,6 +1047,12 @@ impl PgCatalog {
             pg_sanity_tainted: false,
             #[cfg(feature = "pg_sanity")]
             pg_sanity_skip: false,
+            #[cfg(feature = "record_corpus")]
+            corpus_ddl: Vec::new(),
+            #[cfg(feature = "record_corpus")]
+            corpus_migrations: Vec::new(),
+            #[cfg(feature = "record_corpus")]
+            corpus_migrations_skip: false,
         }
     }
 
@@ -1267,6 +1284,14 @@ impl PgCatalog {
                 }
             }
         }
+        #[cfg(feature = "record_corpus")]
+        {
+            self.corpus_ddl.push(std::sync::Arc::from(stripped));
+            if result.is_ok() && !self.corpus_migrations_skip {
+                self.corpus_migrations.push(std::sync::Arc::from(stripped));
+                crate::corpus::record_migrations(&self.corpus_migrations);
+            }
+        }
         result.map_err(|error| crate::ddl::MigrationFailure { error, location })
     }
 
@@ -1275,7 +1300,7 @@ impl PgCatalog {
     /// the serialized AST + bindings. Used by the seed exporter to capture
     /// `pg_index.indexprs` from `pg_get_indexdef` output without requiring
     /// the seed crate to depend on the binding walker directly.
-    #[cfg(any(test, feature = "internal"))]
+    #[cfg(any(test, feature = "internal", feature = "catalog_export"))]
     pub fn serialize_expression(&self, expr_sql: &str) -> Result<SerializedAst, DdlError> {
         let select = format!("SELECT {expr_sql}");
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_first_target)
@@ -1437,6 +1462,24 @@ impl PgCatalog {
             .map_or("btree", String::as_str)
     }
 
+    /// Whether the operator family of operator class `opclass` holds an
+    /// operator of its access method whose left operand is of type `ty`
+    /// (`pg_amop.amoplefttype`). `None` when `opclass` is unknown.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn opclass_family_has_left_type(
+        &self,
+        opclass: crate::oid::PgOpclassOid,
+        ty: PgTypeOid,
+    ) -> Option<bool> {
+        let class = self.pg_opclass.iter().find(|c| c.oid == opclass)?;
+        Some(self.pg_amop.iter().any(|amop| {
+            amop.amopmethod == class.opcmethod
+                && amop.amopfamily == class.opcfamily
+                && amop.amopfamilynamespace == class.opcfamilynamespace
+                && amop.amoplefttype == ty
+        }))
+    }
+
     /// Whether `index` backs a PRIMARY KEY / UNIQUE / EXCLUDE constraint.
     #[cfg(any(test, feature = "internal"))]
     pub fn index_backs_constraint(&self, index: PgClassOid) -> bool {
@@ -1468,6 +1511,16 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn call_is_volatile(&self, call: &typedpg_pg_query::ast::FuncCall) -> bool {
         crate::ddl::volatile::surely_volatile(call, self)
+    }
+
+    /// Whether `expr` calls a surely VOLATILE function once
+    /// expression_planner has inlined the simple SQL functions it calls
+    /// (`inline_function`): a VOLATILE SQL function whose body is `SELECT
+    /// 1` is no longer volatile. What `contain_volatile_functions` sees of
+    /// a column DEFAULT in ATExecAddColumn.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn expression_is_volatile(&self, expr: &typedpg_pg_query::ast::Node) -> bool {
+        crate::ddl::volatile::volatile_after_inlining(expr, self, 0)
     }
 
     /// Whether altering `column` of `relid` to `type_name` rewrites the
@@ -1526,7 +1579,7 @@ impl PgCatalog {
 
     /// Like [`Self::serialize_expression`] but for partial-index predicates
     /// — parses `SELECT 1 WHERE <pred>` and serializes the WHERE node.
-    #[cfg(any(test, feature = "internal"))]
+    #[cfg(any(test, feature = "internal", feature = "catalog_export"))]
     pub fn serialize_predicate(&self, pred_sql: &str) -> Result<SerializedAst, DdlError> {
         let select = format!("SELECT 1 WHERE {pred_sql}");
         crate::ddl::serialize_subnode(self, &select, crate::ddl::views::extract_where)
@@ -1590,6 +1643,11 @@ impl PgCatalog {
         #[cfg(feature = "pg_sanity")]
         if !self.pg_sanity_tainted && !self.pg_sanity_skip {
             self.run_pg_sanity_analyze_check(&_analysis_sql, &result);
+        }
+
+        #[cfg(feature = "record_corpus")]
+        if result.is_ok() {
+            crate::corpus::record(&self.corpus_ddl, sql);
         }
 
         result
@@ -2107,6 +2165,12 @@ impl PgCatalog {
         {
             self.pg_sanity_skip = true;
         }
+        // What the mirror must not run, the migration oracle must not
+        // replay either.
+        #[cfg(feature = "record_corpus")]
+        {
+            self.corpus_migrations_skip = true;
+        }
     }
 
     /// Apply migrations as the migration runner does, with its
@@ -2209,6 +2273,7 @@ impl PgCatalog {
             server.assert_apply_matches(sql, result);
             if result.is_ok() {
                 server.assert_privileges_match(self);
+                server.check_catalog_state(self);
             }
         });
     }
@@ -2223,6 +2288,7 @@ impl PgCatalog {
             let divergence = server.compare_extension_apply_matches(sql, result);
             if result.is_ok() && matches!(divergence, Some(None)) {
                 server.assert_privileges_match(self);
+                server.check_catalog_state(self);
             }
             divergence
         }) {
@@ -2249,7 +2315,7 @@ impl PgCatalog {
     ) {
         let finite_params = self.finite_param_oids();
         self.with_pg_sanity::<()>(|server| {
-            server.assert_analyze_matches(analysis_sql, result, &finite_params)
+            server.assert_analyze_matches(self, analysis_sql, result, &finite_params)
         });
     }
 
@@ -2271,8 +2337,31 @@ impl PgCatalog {
         }];
         ours.sql = rewritten.to_owned();
         let finite = self.finite_param_oids();
-        self.with_pg_sanity(|server| server.check_rewrite(&analysis_sql, &ours, &finite))
+        self.with_pg_sanity(|server| server.check_rewrite(self, &analysis_sql, &ours, &finite))
             .flatten()
+    }
+
+    /// Run the lint oracle's `probes` (see [`crate::LintProbe`]) for the
+    /// query whose analyzed text is `analysis_sql` (a [`QueryView::sql`])
+    /// and analysis `analyzed`: one result per probe. Every probe is
+    /// inconclusive without a live mirror.
+    #[cfg(feature = "pg_sanity")]
+    pub fn pg_sanity_lint_probes(
+        &self,
+        analysis_sql: &str,
+        analyzed: &AnalyzedQuery,
+        probes: &[crate::LintProbe],
+    ) -> Vec<crate::LintProbeResult> {
+        let none =
+            |why: &str| vec![crate::LintProbeResult::Inconclusive(why.to_owned()); probes.len()];
+        if self.pg_sanity_tainted || self.pg_sanity_skip {
+            return none("the catalog has no live mirror");
+        }
+        let finite = self.finite_param_oids();
+        self.with_pg_sanity(|server| {
+            server.lint_probes(self, analysis_sql, analyzed, probes, &finite)
+        })
+        .unwrap_or_else(|| none("the catalog has no live mirror"))
     }
 
     /// Run the role oracle on `analysis` as if the analyzer had produced it
@@ -2316,7 +2405,12 @@ impl PgCatalog {
         }
         let divergence = self
             .with_pg_sanity(|server| {
-                server.compare_analyze_matches(&analysis_sql, &result, &self.finite_param_oids())
+                server.compare_analyze_matches(
+                    self,
+                    &analysis_sql,
+                    &result,
+                    &self.finite_param_oids(),
+                )
             })
             .flatten();
         (result, divergence)
@@ -2490,6 +2584,7 @@ impl PgCatalog {
         self.default_sequence_perms
             .retain(|(relid, _), _| *relid != oid);
         self.attr_storage.retain(|(relid, _), _| *relid != oid);
+        self.attnum_high_water.remove(&oid);
         self.attr_compression.retain(|(relid, _), _| *relid != oid);
         self.uncertain_collations.retain(|(relid, _)| *relid != oid);
         for p in &mut self.publications {
@@ -2524,6 +2619,8 @@ impl PgCatalog {
     }
 
     pub(crate) fn insert_pg_attribute(&mut self, attr: PgAttribute) {
+        let high = self.attnum_high_water.entry(attr.attrelid).or_insert(0);
+        *high = (*high).max(attr.attnum);
         let attrs = self.pg_attribute.entry(attr.attrelid).or_default();
         attrs.push(attr);
         attrs.sort_by_key(|a| a.attnum);
@@ -2678,15 +2775,9 @@ impl PgCatalog {
         self.pg_cast.insert(row.oid, row);
     }
 
-    /// The `pg_cast` row for `source → target` as PostgreSQL has it, for
-    /// the commands naming a cast (DROP CAST, COMMENT ON CAST): no cast
-    /// targets `record` there — the row type → record casts the analyzer
-    /// keeps (`register_composite_to_record_cast`) stand for a coercion
-    /// PG makes without one.
+    /// The `pg_cast` row for `source → target`, for the commands naming a
+    /// cast (DROP CAST, COMMENT ON CAST).
     pub(crate) fn catalog_cast(&self, source: PgTypeOid, target: PgTypeOid) -> Option<PgCastOid> {
-        if target == oid::RECORD {
-            return None;
-        }
         self.cast_by_pair.get(&(source, target)).copied()
     }
 
@@ -3728,7 +3819,10 @@ impl QueryView {
     /// argument type, the common type of a `CASE`, `COALESCE`, `GREATEST` /
     /// `LEAST` or a `UNION` column, an `INSERT` / `UPDATE` column's type, or
     /// a written cast. `None` when it is not converted (an untyped literal
-    /// or parameter typed by its context included), when the analyzer saw
+    /// or parameter typed by its context included, and a value a
+    /// polymorphic parameter takes as it is: an enum's `anyenum` `=`; an
+    /// `anycompatible` one, whose common type may convert it, records no
+    /// conversion either), when the analyzer saw
     /// no such site, or when it inferred the site two ways.
     pub fn value_conversion(
         &self,

@@ -3,8 +3,10 @@
 //! condition doesn't relate its sides — so every row of one pairs with
 //! every row of the other. Items are connected by a `WHERE`, `JOIN … ON` or
 //! `HAVING` condition (an `AND` argument of one) that references both, or
-//! transitively through other items; by `USING` / `NATURAL`; and by an
-//! explicit `CROSS JOIN`, which says the product is meant.
+//! transitively through other items; by two `AND` arguments equating a
+//! column of each to the same parameter or outer column (`a.t = $t AND
+//! b.t = $t` is `a.t = b.t`); by `USING` / `NATURAL`; and by an explicit
+//! `CROSS JOIN`, which says the product is meant.
 //!
 //! What each column reference names comes from the analyzer (see
 //! [`typedpg_analyzer::QueryView::column_ref_binding`]), so an unqualified
@@ -15,7 +17,12 @@
 //! Not reported, as an item whose product is cheap or meant:
 //! - an item proven to return at most one row: a subquery the analyzer's
 //!   cardinality proof accepts (`(SELECT count(*) FROM t)`, a one-row
-//!   `VALUES`) or with a `LIMIT 1`, or a reference to such a `WITH` query;
+//!   `VALUES`) or with a `LIMIT 1`, a reference to such a `WITH` query (an
+//!   `INSERT` / `UPDATE` / `DELETE … RETURNING` the proof bounds to one row
+//!   too), or a table whose unique key the conditions that filter only it
+//!   equate to constants or parameters: the `WHERE` conjuncts, and the `ON`
+//!   conjuncts of an inner join or of an outer join it is the nullable side
+//!   of (`users u, posts p WHERE u.id = $u`);
 //! - a function in FROM (`generate_series`, `unnest`, `to_tsquery(…)`):
 //!   whether it returns a set is not resolved here, and a set-returning
 //!   one is the usual way to multiply rows on purpose. Like a `LATERAL`
@@ -26,11 +33,14 @@
 
 use std::collections::HashMap;
 
-use typedpg_analyzer::select_at_most_one_row;
-use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{AConstValue, BoolExprType, LimitOption, Node, Node as N, SelectStmt};
+use typedpg_analyzer::{select_at_most_one_row, statement_node_at_most_one_row};
+use typedpg_pg_query::ast::{
+    AConstValue, AExprKind, BoolExpr, BoolExprType, JoinType, LimitOption, Node, Node as N,
+    RangeVar, SelectStmt,
+};
+use typedpg_pg_query::{NodeBox, NodeRef};
 
-use super::{location, scan_until, starts_clause};
+use super::{location, operator_name, scan_until, starts_clause};
 use crate::{Ctx, RawFinding};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
@@ -52,8 +62,12 @@ fn one_row_ctes(ctx: &Ctx<'_>) -> HashMap<String, bool> {
     let mut ctes: HashMap<String, bool> = HashMap::new();
     for (node, _) in ctx.tree.nodes() {
         if let NodeRef::CommonTableExpr(cte) = node {
-            let one_row = matches!(cte.ctequery.as_ref(), Some(N::SelectStmt(body))
-                if at_most_one_row(ctx, body));
+            let one_row = match cte.ctequery.as_ref() {
+                Some(N::SelectStmt(body)) => at_most_one_row(ctx, body),
+                // A data-modifying `WITH` query's `RETURNING` rows.
+                Some(body) => statement_node_at_most_one_row(ctx.catalog, ctx.view, body.to_ref()),
+                None => false,
+            };
             *ctes.entry(cte.ctename.clone()).or_insert(true) &= one_row;
         }
     }
@@ -93,6 +107,12 @@ struct Level<'a> {
     /// The subtrees of `LATERAL` items and FROM functions, whose references
     /// to the items on their left connect them.
     lateral: Vec<(usize, &'a Node)>,
+    /// The leaves that are a table (not a `WITH` query), which a key
+    /// lookup may bound to one row.
+    tables: Vec<(usize, &'a RangeVar)>,
+    /// Each `ON` condition with the leaves whose rows it filters: both
+    /// sides of an inner join, the nullable side of an outer one.
+    filters: Vec<(&'a Node, std::ops::Range<usize>)>,
 }
 
 impl Level<'_> {
@@ -130,6 +150,8 @@ fn level(
         parent: Vec::new(),
         conditions: Vec::new(),
         lateral: Vec::new(),
+        tables: Vec::new(),
+        filters: Vec::new(),
     };
     for item in select.from_clause.iter().flatten() {
         if from_item(ctx, item, one_row_ctes, &mut level).is_none() {
@@ -146,6 +168,8 @@ fn level(
     for condition in std::mem::take(&mut level.conditions) {
         split_and(condition, &mut conjuncts);
     }
+    // The leaves each parameter or outer column is equated to.
+    let mut equated: HashMap<Value, Vec<usize>> = HashMap::new();
     for conjunct in conjuncts {
         let Some(leaves) = referenced(ctx, conjunct, &level, false) else {
             let all: Vec<usize> = (0..level.leaves.len()).collect();
@@ -153,7 +177,14 @@ fn level(
             continue;
         };
         level.union_all(&leaves);
+        if let Some((leaf, value)) = value_equality(ctx, conjunct, &level) {
+            equated.entry(value).or_default().push(leaf);
+        }
     }
+    for leaves in equated.values() {
+        level.union_all(leaves);
+    }
+    one_row_tables(ctx, select, &mut level);
     for (leaf, subtree) in std::mem::take(&mut level.lateral) {
         // A FROM function's arguments resolve in the level itself, a
         // LATERAL subquery's references out of it in the level around it:
@@ -203,6 +234,109 @@ fn level(
     }
 }
 
+/// A value one evaluation of the level sees once: a parameter, or a column
+/// of an enclosing query level (by its entry's name and its own).
+#[derive(PartialEq, Eq, Hash)]
+enum Value {
+    Param(i32),
+    Outer(String, String),
+}
+
+/// The leaf and value of a `column = value` conjunct (either way round)
+/// equating a column of one leaf of the level to a [`Value`].
+fn value_equality(ctx: &Ctx<'_>, conjunct: &Node, level: &Level<'_>) -> Option<(usize, Value)> {
+    let N::AExpr(expr) = conjunct else {
+        return None;
+    };
+    if expr.kind != AExprKind::AexprOp || operator_name(expr) != Some("=") {
+        return None;
+    }
+    let (left, right) = (expr.lexpr.as_ref()?, expr.rexpr.as_ref()?);
+    let leaf = |node: &Node| {
+        let N::ColumnRef(column) = node else {
+            return None;
+        };
+        let binding = ctx.view.column_ref_binding(column.location)?;
+        if binding.outer {
+            return None;
+        }
+        match level.names.get(binding.source.as_deref()?)?.as_slice() {
+            [leaf] => Some(*leaf),
+            _ => None,
+        }
+    };
+    let value = |node: &Node| match node {
+        N::ParamRef(param) => Some(Value::Param(param.number)),
+        N::ColumnRef(column) => {
+            let binding = ctx.view.column_ref_binding(column.location)?;
+            let Some(N::String(name)) = column.fields.last()? else {
+                return None;
+            };
+            if !binding.outer {
+                return None;
+            }
+            Some(Value::Outer(binding.source.clone()?, name.sval.clone()))
+        }
+        _ => None,
+    };
+    match (leaf(left), leaf(right)) {
+        (Some(leaf), None) => Some((leaf, value(right)?)),
+        (None, Some(leaf)) => Some((leaf, value(left)?)),
+        _ => None,
+    }
+}
+
+/// Mark as not reportable each table leaf the conditions filtering only it
+/// bound to at most one row: the `WHERE` conjuncts and the `ON` conjuncts
+/// of the joins filtering its rows that reference no other leaf, judged
+/// by the analyzer's cardinality proof over the table alone.
+fn one_row_tables(ctx: &Ctx<'_>, select: &SelectStmt, level: &mut Level<'_>) {
+    let all = 0..level.leaves.len();
+    let mut filters: Vec<(&Node, std::ops::Range<usize>)> = Vec::new();
+    filters.extend(select.where_clause.as_ref().map(|w| (w, all.clone())));
+    filters.extend(level.filters.iter().cloned());
+    for &(leaf, range) in &level.tables {
+        if !level.leaves[leaf].reportable {
+            continue;
+        }
+        let mut own = Vec::new();
+        for (condition, leaves) in &filters {
+            if !leaves.contains(&leaf) {
+                continue;
+            }
+            let mut conjuncts = Vec::new();
+            split_and(condition, &mut conjuncts);
+            own.extend(conjuncts.into_iter().filter(|conjunct| {
+                referenced(ctx, conjunct, level, false)
+                    .is_some_and(|refs| !refs.is_empty() && refs.iter().all(|&r| r == leaf))
+            }));
+        }
+        if own.is_empty() {
+            continue;
+        }
+        let where_clause = if let [conjunct] = own.as_slice() {
+            (*conjunct).clone()
+        } else {
+            N::BoolExpr(NodeBox::new(BoolExpr {
+                boolop: BoolExprType::AndExpr,
+                args: own
+                    .into_iter()
+                    .map(|conjunct| Some(conjunct.clone()))
+                    .collect(),
+                location: -1,
+            }))
+        };
+        let lookup = SelectStmt {
+            from_clause: vec![Some(N::RangeVar(NodeBox::new(range.clone())))],
+            where_clause: Some(where_clause),
+            ..SelectStmt::default()
+        };
+        if select_at_most_one_row(ctx.catalog, ctx.view, &lookup) {
+            level.leaves[leaf].reportable = false;
+        }
+    }
+}
+
 fn display(leaf: &Leaf) -> String {
     match &leaf.name {
         Some(name) => typedpg_core::quote_identifier(name),
@@ -238,9 +372,12 @@ fn from_item<'a>(
                 .alias
                 .as_ref()
                 .map_or(range.relname.clone(), |alias| alias.aliasname.clone());
-            let one_row = range.schemaname.is_empty()
-                && one_row_ctes.get(&range.relname).copied() == Some(true);
-            add(level, Some(name), location(range.location)?, !one_row);
+            let cte = range.schemaname.is_empty() && one_row_ctes.contains_key(&range.relname);
+            let one_row = cte && one_row_ctes.get(&range.relname).copied() == Some(true);
+            let leaf = add(level, Some(name), location(range.location)?, !one_row);
+            if !cte {
+                level.tables.push((leaf, range));
+            }
         }
         N::RangeTableSample(sample) => {
             let N::RangeVar(range) = sample.relation.as_ref()? else {
@@ -292,6 +429,15 @@ fn from_item<'a>(
             }
             if let Some(quals) = join.quals.as_ref() {
                 level.conditions.push(quals);
+                let filtered = match join.jointype {
+                    JoinType::JoinInner => Some(left.start..right.end),
+                    JoinType::JoinLeft => Some(right.clone()),
+                    JoinType::JoinRight => Some(left.clone()),
+                    _ => None,
+                };
+                if let Some(filtered) = filtered {
+                    level.filters.push((quals, filtered));
+                }
             }
             let inside: Vec<usize> = (left.start..right.end).collect();
             for alias in [join.alias.as_ref(), join.join_using_alias.as_ref()]
@@ -431,6 +577,43 @@ mod tests {
             assert_eq!(&sql[findings[0].span.clone()], reported, "{sql}");
             assert_eq!(findings[0].message, message, "{sql}");
             assert!(findings[0].fix.is_empty());
+        }
+    }
+
+    #[test]
+    fn one_row_tables_and_shared_values_are_not_reported() {
+        let db = catalog();
+        for sql in [
+            // Key lookups on both sides.
+            "SELECT 1 FROM posts p, users u WHERE p.id = $p AND u.email = $u",
+            "SELECT 1 FROM posts p JOIN users u ON u.email = $u",
+            "SELECT 1 FROM posts p LEFT JOIN users u ON u.email = $u",
+            "SELECT 1 FROM posts p, users u WHERE u.id = 1",
+            // A one-row data-modifying WITH query.
+            "WITH w AS (UPDATE users SET name = 'x' WHERE id = $w RETURNING id)              SELECT 1 FROM posts p, w",
+            "WITH w AS (INSERT INTO users (id, email) VALUES (1, 'a') RETURNING id)              SELECT 1 FROM posts p JOIN w ON true",
+            // The same parameter or outer column on both sides.
+            "SELECT 1 FROM users u, posts p WHERE u.id = $t AND p.user_id = $t",
+            "SELECT 1 FROM users u JOIN posts p ON p.user_id = $t WHERE $t = u.id",
+            "SELECT (SELECT count(*) FROM users u, posts p              WHERE u.id = o.user_id AND p.user_id = o.user_id) FROM posts o",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        for sql in [
+            // Not a key: many users may have that name.
+            "SELECT 1 FROM posts p, users u WHERE u.name = $n",
+            // The preserved side of an outer join isn't filtered by its ON.
+            "SELECT 1 FROM users u LEFT JOIN posts p ON u.email = $u",
+            // A key lookup OR something else.
+            "SELECT 1 FROM posts p, users u WHERE u.id = $1 OR u.name = 'x'",
+            // Different parameters.
+            "SELECT 1 FROM users u, posts p WHERE u.name = $a AND p.title = $b",
+            // A data-modifying WITH query that may return many rows.
+            "WITH w AS (UPDATE users SET name = 'x' WHERE name = $n RETURNING id)              SELECT 1 FROM posts p, w",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
         }
     }
 

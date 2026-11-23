@@ -411,8 +411,14 @@ fn analyze_insert_here(
             });
     check_rewrite(snapshot, tgt.oid, &rw)?;
     // The planner infers the arbiter index after the rewriter ran.
-    if let (Some(on_conflict), Some(arbiter)) = (&ins.on_conflict_clause, &arbiter) {
-        validate_on_conflict_target(on_conflict, arbiter, snapshot, tgt.oid, &tgt.relname)?;
+    if let Some(on_conflict) = &ins.on_conflict_clause {
+        let arbiters = match &arbiter {
+            Some(arbiter) => {
+                validate_on_conflict_target(on_conflict, arbiter, snapshot, tgt.oid, &tgt.relname)?
+            }
+            None => None,
+        };
+        check_deferrable_arbiters(ins, on_conflict, arbiters, &tgt, snapshot)?;
     }
     // Every execution evaluates the rows the SELECT yields. (Not followed
     // in a WITH, whose earlier CTEs its names could mean.)
@@ -433,6 +439,89 @@ fn analyze_insert_here(
     }
 
     Ok((columns, None))
+}
+
+/// `ExecCheckIndexConstraints` (execIndexing.c): the executor refuses a
+/// deferrable unique or exclusion index (`!indimmediate`) as an ON
+/// CONFLICT arbiter — 55000, as a row's check reaches that index. The
+/// arbiters are the ones the target inferred, or every unique and
+/// exclusion index without one; they are checked by OID
+/// (`RelationGetIndexList`), so an immediate one before may find the
+/// conflict and end the check first. Reported only when every execution
+/// raises it: the INSERT surely stores a row (VALUES, DEFAULT VALUES, a
+/// SELECT that always yields one) that no BEFORE ROW trigger may drop.
+fn check_deferrable_arbiters(
+    ins: &ast::InsertStmt,
+    on_conflict: &ast::OnConflictClause,
+    arbiters: Option<super::Arbiters>,
+    tgt: &InsertTarget,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    if !crate::resolve::executes() || returning_rewritten(snapshot, tgt.oid, &[DmlEvent::Insert]) {
+        return Ok(());
+    }
+    let arbiters = match arbiters {
+        Some(a) => a,
+        None if on_conflict.infer.is_none() => {
+            // Through an updatable view, the base relation's indexes.
+            let mut table = tgt.oid;
+            while let Some(upd) = snapshot.view_updatability.get(&table) {
+                let Some(base) = upd.base else {
+                    return Ok(());
+                };
+                table = base;
+            }
+            super::Arbiters {
+                table,
+                indexes: snapshot
+                    .pg_index
+                    .values()
+                    .filter(|i| i.indrelid == table && (i.indisunique || i.indisexclusion))
+                    .map(|i| i.indexrelid)
+                    .collect(),
+            }
+        }
+        None => return Ok(()),
+    };
+    let deferrable = |i: &crate::oid::PgClassOid| snapshot.nonimmediate_indexes.contains(i);
+    let Some(first) = arbiters.indexes.iter().copied().filter(deferrable).min() else {
+        return Ok(());
+    };
+    if arbiters
+        .indexes
+        .iter()
+        .any(|i| *i < first && !deferrable(i))
+    {
+        return Ok(());
+    }
+    let surely_stores = match ins.select_stmt.as_ref() {
+        // DEFAULT VALUES.
+        None => true,
+        Some(ast::Node::SelectStmt(sel)) => {
+            !sel.values_lists.is_empty()
+                || select_row::surely_yields_row(sel, ins.with_clause.as_deref(), snapshot)
+        }
+        Some(_) => false,
+    };
+    if !surely_stores
+        || crate::resolve::written_row::before_row_trigger_rewrites(
+            snapshot,
+            arbiters.table,
+            DmlEvent::Insert,
+        )
+    {
+        return Ok(());
+    }
+    Err(crate::error::RawError::new(
+        AnalyzeError::ObjectNotInPrerequisiteState(
+            "ON CONFLICT does not support deferrable unique constraints/exclusion constraints \
+             as arbiters"
+                .into(),
+        ),
+        None,
+        None,
+    )
+    .finalize_implicit())
 }
 
 /// What every row an INSERT stores holds, by base column: the values
@@ -3125,6 +3214,9 @@ fn analyze_update_here(
         null_ctx.add_where_facts(facts);
         old_facts = Some(all);
     }
+    // The planner's: a FULL JOIN in FROM / USING no merge or hash join
+    // implements.
+    super::select::check_full_joins(&null_ctx, None, snapshot)?;
 
     let ret_scope = with_written_target(
         &scope,
@@ -3379,6 +3471,9 @@ fn analyze_delete_here(
         null_ctx.add_where_facts(facts);
         old_facts = Some(all);
     }
+    // The planner's: a FULL JOIN in FROM / USING no merge or hash join
+    // implements.
+    super::select::check_full_joins(&null_ctx, None, snapshot)?;
     // A deleted row is a stored row past WHERE: its CHECK constraints and
     // generated columns hold too.
     if has_returning(del.returning_clause.as_deref())

@@ -11,7 +11,10 @@
 //! (the generated code checks it), a parameter whose type changes or that no
 //! longer accepts NULL, an `INSERT` that leaves out a column that is now
 //! `NOT NULL` without a default, and a result value that may now be one the
-//! deployed code does not know (a new enum label, a CHECK that admits more).
+//! deployed code does not know (a new enum label, a CHECK that admits more)
+//! where what it decodes the value into narrows to the old ones (see
+//! [`Decoding`]: a TypeScript literal union, a mapped Rust type — not a
+//! Rust `String`).
 //!
 //! What the deployed code writes is checked too: an `INSERT` (its `ON
 //! CONFLICT DO UPDATE SET` included), `UPDATE`, `MERGE` or `copy_in!`
@@ -20,7 +23,9 @@
 //! `varbit(n)`, a `numeric` with fewer digits before the decimal point (a
 //! value fails) or after it (a value is rounded), a new `NOT NULL`, a CHECK
 //! of the table or the column's domain with a conjunct the deployed schema
-//! doesn't have, `NOT VALID` ones included (they bind the rows written).
+//! doesn't have, `NOT VALID` ones included (they bind the rows written),
+//! unless its CHECKs imply it (see [`PgCatalog::check_part_implied_by`]: a
+//! `CASE` widened by a branch).
 //! A parameter or a COPY field may be any value; a value the query computes
 //! (a constant, a `CASE` of them, a column of an `INSERT … SELECT`) is
 //! checked with what the analyzer knows of it, and is reported only when it
@@ -110,6 +115,99 @@ pub struct Deployment<'a> {
     pub catalog: &'a PgCatalog,
     /// The deployed code's queries for this database.
     pub queries: &'a [DeployedQuery],
+    /// What the deployed code decodes a result value into.
+    pub decoding: Decoding<'a>,
+}
+
+/// What the deployed code decodes a result value into, which decides
+/// whether a value it doesn't know — a new enum label, a value a widened
+/// CHECK admits — breaks it.
+#[derive(Debug, Clone, Copy)]
+pub enum Decoding<'a> {
+    /// Rust (`sql!`), with the deployed code's `[types]` map for the
+    /// database (keys as [`typedpg_core::config::ResolvedConfig::types`]).
+    /// A type it maps (an enum, a domain, or an array of either) decodes
+    /// into the application's type, which fails on a label it doesn't
+    /// have; anything else decodes into a type that takes any value of the
+    /// column's (an unmapped enum, a text with a CHECK into `String`), so a
+    /// new value breaks nothing.
+    Rust {
+        types: &'a HashMap<QualifiedName, String>,
+    },
+    /// TypeScript: the generated module types a value the analysis narrows
+    /// (an enum's labels, a CHECK's values) as their literal union, while
+    /// the runtime passes the text through unchecked — a value outside the
+    /// union reaches code compiled never to see it.
+    TypeScript,
+}
+
+impl Decoding<'_> {
+    /// The application type the deployed code decodes a value of `ty` into
+    /// when `[types]` maps it (as the `sql!` macro looks it up: a domain,
+    /// else what it is over; an array's element).
+    fn rust_type(&self, ty: &Type) -> Option<&str> {
+        let Decoding::Rust { types } = self else {
+            return None;
+        };
+        let lookup = |schema: &str, name: &str| {
+            types
+                .get(&QualifiedName::new(schema.to_owned(), name.to_owned()))
+                .map(String::as_str)
+        };
+        match ty {
+            Type::Domain {
+                schema, name, base, ..
+            } => lookup(schema, name).or_else(|| self.rust_type(base)),
+            Type::Array { element, .. } => self.rust_type(element),
+            Type::Composite { schema, name, .. }
+            | Type::Enum { schema, name, .. }
+            | Type::Basic { schema, name, .. }
+            | Type::Range { schema, name, .. } => lookup(schema, name),
+            Type::AnonymousRecord { .. } => None,
+        }
+    }
+
+    /// How `added`, enum labels a value of `ty` (the deployed schema's
+    /// type) may now be, breaks the deployed code, worded after
+    /// `may now be …`; `None` when it doesn't.
+    pub(crate) fn unknown_labels(&self, ty: &Type, added: &BTreeSet<String>) -> Option<String> {
+        match self {
+            Decoding::Rust { .. } => self.rust_type(ty).map(|rust| {
+                format!(
+                    "may now be {}, a label the deployed code's {rust} does not have: decoding it \
+                     fails",
+                    quoted(added)
+                )
+            }),
+            Decoding::TypeScript => Some(format!(
+                "may now be {}, a value the deployed code does not know",
+                quoted(added)
+            )),
+        }
+    }
+
+    /// Whether a value of `ty` (the deployed schema's type) the analysis
+    /// knew to be one of a few values breaks the deployed code by being
+    /// another: in TypeScript, typed as their literal union; in Rust, only
+    /// decoding into a mapped type that isn't an enum (whose new labels
+    /// [`Self::unknown_labels`] reports: a value among its old labels
+    /// decodes).
+    pub(crate) fn narrows_values(&self, ty: &Type) -> bool {
+        match self {
+            Decoding::Rust { .. } => self.rust_type(ty).is_some() && !is_enum(ty),
+            Decoding::TypeScript => true,
+        }
+    }
+}
+
+/// Whether `ty` is an enum, an array of one, or a domain over either.
+fn is_enum(ty: &Type) -> bool {
+    match ty {
+        Type::Enum { .. } => true,
+        Type::Domain { base, .. } => is_enum(base),
+        Type::Array { element, .. } => is_enum(element),
+        _ => false,
+    }
 }
 
 /// The new schema: the migrations that build it and the catalog they built.
@@ -192,7 +290,7 @@ pub fn breaks_deployed_queries(
         if olds.is_empty() {
             continue;
         }
-        let changes = query_changes(query, &olds, deployment.catalog, schema.catalog);
+        let changes = query_changes(query, &olds, deployment, schema.catalog);
         if !changes.is_empty() {
             broken.push((query, olds, changes));
         }
@@ -398,7 +496,7 @@ impl MigrationObserver for Replay<'_, '_> {
             if unplaced.is_empty() {
                 continue;
             }
-            let now: HashSet<String> = query_changes(query, olds, self.deployment.catalog, &state)
+            let now: HashSet<String> = query_changes(query, olds, self.deployment, &state)
                 .into_iter()
                 .map(|change| change.subject)
                 .collect();
@@ -470,17 +568,17 @@ fn analyze(
 }
 
 /// What changes for a deployed query analyzed as `olds` (one analysis per
-/// role it runs as) against `old_catalog` when it runs against
+/// role it runs as) against the deployment's catalog when it runs against
 /// `new_catalog`: the changes for every role, each subject once.
 fn query_changes(
     query: &DeployedQuery,
     olds: &[RoleAnalysis<'_>],
-    old_catalog: &PgCatalog,
+    deployment: &Deployment<'_>,
     new_catalog: &PgCatalog,
 ) -> Vec<Change> {
     let mut out: Vec<Change> = Vec::new();
     for (role, old) in olds {
-        for change in changes(query, *role, old, old_catalog, new_catalog) {
+        for change in changes(query, *role, old, deployment, new_catalog) {
             if !out.iter().any(|c| c.subject == change.subject) {
                 out.push(change);
             }
@@ -489,15 +587,16 @@ fn query_changes(
     out
 }
 
-/// What changes for a deployed query analyzed as `old` against
-/// `old_catalog`, as `role`, when it runs against `new_catalog`.
+/// What changes for a deployed query analyzed as `old` against the
+/// deployment's catalog, as `role`, when it runs against `new_catalog`.
 fn changes(
     query: &DeployedQuery,
     role: Option<&str>,
     old: &Analysis,
-    old_catalog: &PgCatalog,
+    deployment: &Deployment<'_>,
     new_catalog: &PgCatalog,
 ) -> Vec<Change> {
+    let old_catalog = deployment.catalog;
     let new = match analyze(new_catalog, query, role) {
         Ok(new) => new,
         Err(error) => {
@@ -525,8 +624,8 @@ fn changes(
                 role,
                 old,
                 new,
-                old_catalog,
-                new_catalog,
+                (old_catalog, new_catalog),
+                &deployment.decoding,
                 &mut out,
             );
         }
@@ -545,11 +644,11 @@ fn statement_changes(
     role: Option<&str>,
     old: &AnalyzedQuery,
     new: &AnalyzedQuery,
-    old_catalog: &PgCatalog,
-    new_catalog: &PgCatalog,
+    (old_catalog, new_catalog): (&PgCatalog, &PgCatalog),
+    decoding: &Decoding<'_>,
     out: &mut Vec<Change>,
 ) {
-    columns(&old.columns, &new.columns, out);
+    columns(&old.columns, &new.columns, decoding, out);
     for old_param in &old.params {
         let Some(new_param) = new.params.iter().find(|p| p.name == old_param.name) else {
             continue;
@@ -602,6 +701,7 @@ fn statement_changes(
     writes(&view, old_view.as_ref().ok(), old_catalog, new_catalog, out);
     if let Some(role) = role {
         row_security(&view, role, old_catalog, new_catalog, out);
+        row_security_writes(&view, role, old_catalog, new_catalog, out);
     }
 }
 
@@ -658,6 +758,11 @@ fn copy_changes(
     let inserted = Inserted {
         given: new.columns.iter().map(|c| c.name.clone()).collect(),
         exposed: None,
+        // COPY fills in a column it leaves out with its default alone
+        // (`BeginCopyFrom`): a NOT NULL domain's constraint isn't checked
+        // on the NULL, as the planner's `coerce_null_to_domain` does for
+        // an INSERT.
+        domain_checked: false,
     };
     omitted(
         &statement,
@@ -669,7 +774,8 @@ fn copy_changes(
         new_catalog,
         out,
     );
-    let written: Vec<(String, Vec<Value<'_>>)> = new
+    let defaults = default_values(new_catalog, new.relid, &inserted.given);
+    let mut written: Vec<(String, Vec<Value<'_>>)> = new
         .columns
         .iter()
         .map(|c| {
@@ -681,16 +787,92 @@ fn copy_changes(
             )
         })
         .collect();
+    let mut row: HashMap<String, &WrittenValue> = HashMap::new();
+    for (column, value) in &defaults {
+        written.push((column.clone(), vec![default_value(value)]));
+        row.insert(column.clone(), value);
+    }
+    let defaulted: Vec<String> = defaults.iter().map(|(c, _)| c.clone()).collect();
     narrowed(
-        &statement,
-        &name,
-        (old_table.oid, new.relid),
-        &written,
-        &[],
+        &Written {
+            statement: &statement,
+            name: &name,
+            relids: (old_table.oid, new.relid),
+            columns: &written,
+            rows: &[(false, row)],
+            defaulted: &defaulted,
+            changed_defaults: &changed_defaults(
+                defaulted.iter(),
+                (old_table.oid, new.relid),
+                old_catalog,
+                new_catalog,
+            ),
+        },
         old_catalog,
         new_catalog,
         out,
     );
+}
+
+/// The columns of relation `relid` of `catalog` an INSERT (or a COPY)
+/// giving only `given` leaves out, with the value each one stores (see
+/// [`PgCatalog::lint_column_default_value`]; a column whose value isn't
+/// known is left out).
+fn default_values(
+    catalog: &PgCatalog,
+    relid: PgClassOid,
+    given: &[String],
+) -> Vec<(String, WrittenValue)> {
+    catalog
+        .attributes_of(relid)
+        .iter()
+        .filter(|a| a.attnum > 0 && !given.contains(&a.attname))
+        .filter_map(|a| {
+            catalog
+                .lint_column_default_value(relid, &a.attname)
+                .map(|value| (a.attname.clone(), value))
+        })
+        .collect()
+}
+
+/// The columns of `columns` (of the relation whose OIDs are `relids`)
+/// whose default the new schema changes.
+fn changed_defaults<'c>(
+    columns: impl Iterator<Item = &'c String>,
+    relids: (PgClassOid, PgClassOid),
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+) -> Vec<String> {
+    columns
+        .filter(|column| {
+            old_catalog.lint_column_default_value(relids.0, column)
+                != new_catalog.lint_column_default_value(relids.1, column)
+        })
+        .cloned()
+        .collect()
+}
+
+/// A column's default, as a value written ([`default_values`]).
+fn default_value(value: &WrittenValue) -> Value<'_> {
+    match value {
+        WrittenValue::Expression {
+            type_oid,
+            refinement,
+            ..
+        } if *type_oid == UNKNOWN && refinement.values.is_none() => Value::Null { default: None },
+        WrittenValue::Expression {
+            type_oid,
+            typmod,
+            nullable,
+            refinement,
+        } => Value::Expression {
+            type_oid: *type_oid,
+            typmod: *typmod,
+            nullable: *nullable,
+            refinement,
+        },
+        _ => Value::Input { may_be_null: true },
+    }
 }
 
 /// The schema and name of relation `relid` of `catalog`.
@@ -759,8 +941,89 @@ fn row_security(
     }
 }
 
+/// The tables the query writes (directly: through a view, the view owner's
+/// policies apply) whose row-level security now checks the rows `role`
+/// writes against more than the deployed schema did, where it doesn't deny
+/// the command outright ([`row_security`] says that): it applies to the
+/// role now and not before, a restrictive policy is new or changed, or a
+/// permissive one is gone or changed — unless a permissive policy and every
+/// restrictive one are certainly TRUE. A row a policy's WITH CHECK (an
+/// UPDATE's USING too, for an `ON CONFLICT DO UPDATE` or a MERGE) rejects
+/// fails the statement.
+fn row_security_writes(
+    view: &QueryView,
+    role: &str,
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    for statement in view.writes() {
+        if statement.base.is_some() {
+            continue;
+        }
+        let Some((schema, relname)) = relation_name(new_catalog, statement.relid) else {
+            continue;
+        };
+        let Some(old_table) = old_catalog.resolve_table(Some(&schema), &relname) else {
+            continue;
+        };
+        let name = display_name(&schema, &relname);
+        let text = match statement.command {
+            WriteCommand::Insert => format!("its INSERT into {name}"),
+            WriteCommand::Update => format!("its UPDATE of {name}"),
+            WriteCommand::Merge => format!("its MERGE into {name}"),
+        };
+        let mut commands = Vec::new();
+        if inserts(view, statement) {
+            commands.push(('a', false));
+        }
+        if statement.columns.iter().any(|c| c.update) || statement.command == WriteCommand::Update {
+            commands.push(('w', statement.command != WriteCommand::Update));
+        }
+        for (command, existing) in commands {
+            if new_catalog.row_security_denies(statement.relid, role, command) {
+                continue;
+            }
+            let Some(new) =
+                new_catalog.row_security_write_checks(statement.relid, role, command, existing)
+            else {
+                continue;
+            };
+            if new.passes_every_row {
+                continue;
+            }
+            let narrower =
+                match old_catalog.row_security_write_checks(old_table.oid, role, command, existing)
+                {
+                    None => true,
+                    Some(old) => {
+                        old.passes_every_row
+                            || !new.restrictive.is_subset(&old.restrictive)
+                            || !old.permissive.is_subset(&new.permissive)
+                    }
+                };
+            if !narrower {
+                continue;
+            }
+            out.push(Change {
+                subject: format!("row security check {name} {command} {role}"),
+                text: format!(
+                    "{text} may fail as role \"{role}\": row-level security now checks the rows \
+                     it writes against policies the deployed schema didn't, and a row they reject \
+                     fails"
+                ),
+            });
+        }
+    }
+}
+
 /// What changes in the result columns the deployed code reads.
-fn columns(old: &[AnalyzedColumn], new: &[AnalyzedColumn], out: &mut Vec<Change>) {
+fn columns(
+    old: &[AnalyzedColumn],
+    new: &[AnalyzedColumn],
+    decoding: &Decoding<'_>,
+    out: &mut Vec<Change>,
+) {
     let names = |columns: &[AnalyzedColumn]| {
         columns
             .iter()
@@ -778,7 +1041,7 @@ fn columns(old: &[AnalyzedColumn], new: &[AnalyzedColumn], out: &mut Vec<Change>
             });
             continue;
         };
-        output(column, now, out);
+        output(column, now, decoding, out);
     }
     if !gone && (old.len() != new.len() || old.iter().zip(new).any(|(a, b)| a.name != b.name)) {
         out.push(Change {
@@ -793,8 +1056,14 @@ fn columns(old: &[AnalyzedColumn], new: &[AnalyzedColumn], out: &mut Vec<Change>
     }
 }
 
-/// What changes in one result column the deployed code reads.
-fn output(old: &AnalyzedColumn, new: &AnalyzedColumn, out: &mut Vec<Change>) {
+/// What changes in one result column the deployed code reads, which it
+/// decodes as `decoding` says.
+fn output(
+    old: &AnalyzedColumn,
+    new: &AnalyzedColumn,
+    decoding: &Decoding<'_>,
+    out: &mut Vec<Change>,
+) {
     let name = &old.name;
     let subject = |what: &str| format!("column {name} {what}");
     if shape(&old.pg_type) != shape(&new.pg_type) {
@@ -815,16 +1084,19 @@ fn output(old: &AnalyzedColumn, new: &AnalyzedColumn, out: &mut Vec<Change>) {
         });
     }
     let added = added_labels(&old.pg_type, &new.pg_type);
-    if !added.is_empty() {
+    if !added.is_empty()
+        && let Some(text) = decoding.unknown_labels(&old.pg_type, &added)
+    {
         out.push(Change {
             subject: subject("labels"),
-            text: format!(
-                "result column \"{name}\" may now be {}, a value the deployed code does not know",
-                quoted(&added)
-            ),
+            text: format!("result column \"{name}\" {text}"),
         });
     }
-    if let Some(text) = widened(&old.refinement, &new.refinement) {
+    if let Some(text) = widened(
+        &old.refinement,
+        &new.refinement,
+        decoding.narrows_values(&old.pg_type),
+    ) {
         out.push(Change {
             subject: subject("refinement"),
             text: format!("result column \"{name}\" {text}"),
@@ -835,6 +1107,7 @@ fn output(old: &AnalyzedColumn, new: &AnalyzedColumn, out: &mut Vec<Change>) {
         &new.pg_type,
         &format!("result column \"{name}\""),
         &subject,
+        decoding,
         out,
     );
     if let (Some(old_element), Some(new_element)) =
@@ -846,7 +1119,11 @@ fn output(old: &AnalyzedColumn, new: &AnalyzedColumn, out: &mut Vec<Change>) {
                 text: format!("the elements of result column \"{name}\" may now be NULL"),
             });
         }
-        if let Some(text) = widened(&old.elem_refinement, &new.elem_refinement) {
+        if let Some(text) = widened(
+            &old.elem_refinement,
+            &new.elem_refinement,
+            decoding.narrows_values(old_element.0),
+        ) {
             out.push(Change {
                 subject: subject("element refinement"),
                 text: format!("the elements of result column \"{name}\" {text}"),
@@ -864,6 +1141,7 @@ fn record_fields(
     new: &Type,
     of: &str,
     subject: &dyn Fn(&str) -> String,
+    decoding: &Decoding<'_>,
     out: &mut Vec<Change>,
 ) {
     let fields = |ty: &Type| match ty {
@@ -881,19 +1159,24 @@ fn record_fields(
                 text: format!("{field} may now be NULL"),
             });
         }
-        if let Some(text) = widened(&a.refinement, &b.refinement) {
+        if let Some(text) = widened(&a.refinement, &b.refinement, decoding.narrows_values(&a.ty)) {
             out.push(Change {
                 subject: subject(&format!("{field} refinement")),
                 text: format!("{field} {text}"),
             });
         }
-        if let Some(text) = widened(&a.elem_refinement, &b.elem_refinement) {
+        let element = array_element(&a.ty).map_or(&a.ty, |(element, _)| element);
+        if let Some(text) = widened(
+            &a.elem_refinement,
+            &b.elem_refinement,
+            decoding.narrows_values(element),
+        ) {
             out.push(Change {
                 subject: subject(&format!("{field} element refinement")),
                 text: format!("the elements of {field} {text}"),
             });
         }
-        record_fields(&a.ty, &b.ty, &field, subject, out);
+        record_fields(&a.ty, &b.ty, &field, subject, decoding, out);
     }
 }
 
@@ -1238,6 +1521,31 @@ fn writes(
             WriteCommand::Merge => format!("its MERGE into {into}"),
         };
         let relids = (old_table.oid, stored.2);
+        let inserting = inserts(view, statement);
+        // What an inserted row leaves out stores its default (a view's
+        // default filling it in is not known here).
+        let defaults = if inserting {
+            let mut given: Vec<String> = given_columns(statement);
+            if let Some(base) = &statement.base {
+                given.extend(base.defaulted.iter().cloned());
+            }
+            default_values(new_catalog, stored.2, &given)
+        } else {
+            Vec::new()
+        };
+        // What `SET c = DEFAULT` writes, by target column: its default
+        // (through a view, the view's).
+        let set_defaults: Vec<(String, WrittenValue)> = statement
+            .columns
+            .iter()
+            .filter(|c| c.update && matches!(c.value, WrittenValue::Default))
+            .filter_map(|c| {
+                new_catalog
+                    .lint_column_default_value(statement.relid, &c.column)
+                    .map(|v| (c.column.clone(), v))
+            })
+            .collect();
+        let mut set_default_columns: Vec<String> = Vec::new();
         let mut written: Vec<(String, Vec<Value<'_>>)> = Vec::new();
         // Each target list's values, by stored column, and whether it is
         // an UPDATE's.
@@ -1257,6 +1565,16 @@ fn writes(
                 // without one.
                 WrittenValue::Default if column.update => {
                     if new_catalog.lint_column_has_default(statement.relid, &column.column) {
+                        if let Some((_, value)) =
+                            set_defaults.iter().find(|(c, _)| *c == column.column)
+                        {
+                            set_default_columns.push(base_column.clone());
+                            let value = default_value(value);
+                            match written.iter_mut().find(|(c, _)| *c == base_column) {
+                                Some((_, values)) => values.push(value),
+                                None => written.push((base_column, vec![value])),
+                            }
+                        }
                         continue;
                     }
                     Value::Null {
@@ -1296,10 +1614,29 @@ fn writes(
                 None => written.push((base_column, vec![value])),
             }
         }
-        if statement.command == WriteCommand::Insert {
+        for (update, values) in &mut rows {
+            if !*update {
+                for (column, value) in &defaults {
+                    values.insert(column.clone(), value);
+                }
+            }
+        }
+        // (A column an UPDATE action writes is said to be written.)
+        let mut defaulted: Vec<String> = Vec::new();
+        for (column, value) in &defaults {
+            match written.iter_mut().find(|(c, _)| c == column) {
+                Some((_, values)) => values.push(default_value(value)),
+                None => {
+                    written.push((column.clone(), vec![default_value(value)]));
+                    defaulted.push(column.clone());
+                }
+            }
+        }
+        if inserting {
             let mut inserted = Inserted {
                 given: Vec::new(),
                 exposed: None,
+                domain_checked: true,
             };
             for column in statement.columns.iter().filter(|c| !c.update) {
                 if let Some(base_column) = to_base(&column.column)
@@ -1336,16 +1673,43 @@ fn writes(
                 out,
             );
         }
-        narrowed(
-            &text,
-            &name,
+        let changed_defaults = changed_defaults(
+            defaulted.iter().chain(&set_default_columns),
             relids,
-            &written,
-            &rows,
+            old_catalog,
+            new_catalog,
+        );
+        narrowed(
+            &Written {
+                statement: &text,
+                name: &name,
+                relids,
+                columns: &written,
+                rows: &rows,
+                defaulted: &defaulted,
+                changed_defaults: &changed_defaults,
+            },
             old_catalog,
             new_catalog,
             out,
         );
+    }
+}
+
+/// Whether `statement` (of `view`) inserts rows: an INSERT, or a MERGE with
+/// an INSERT action (a `WHEN NOT MATCHED THEN INSERT`, which leaves out the
+/// columns it gives no value for, as an INSERT does).
+fn inserts(view: &QueryView, statement: &typedpg_analyzer::WriteStatement) -> bool {
+    match statement.command {
+        WriteCommand::Insert => true,
+        WriteCommand::Update => false,
+        WriteCommand::Merge => {
+            statement.columns.iter().any(|c| !c.update)
+                || view.tree.nodes().any(|(node, _)| {
+                    matches!(node, typedpg_pg_query::NodeRef::MergeWhenClause(clause)
+                        if clause.command_type == typedpg_pg_query::ast::CmdType::CmdInsert)
+                })
+        }
     }
 }
 
@@ -1397,6 +1761,19 @@ struct Inserted {
     /// Through a view: its name, as the message says it, and the stored
     /// columns it exposes. `None` for a table.
     exposed: Option<(String, Vec<String>)>,
+    /// Whether the NULL stored into a column left out without a default
+    /// meets its NOT NULL domain's constraint (an INSERT's does, a COPY's
+    /// doesn't).
+    domain_checked: bool,
+}
+
+/// [`attribute`], for a closure's reference.
+fn attribute_of(
+    catalog: &PgCatalog,
+    relid: PgClassOid,
+    column: &str,
+) -> Option<typedpg_analyzer::PgAttribute> {
+    attribute(catalog, relid, column)
 }
 
 /// A column of relation `relid` of `catalog`, by name.
@@ -1436,8 +1813,10 @@ fn omitted(
     out: &mut Vec<Change>,
 ) {
     let required = |catalog: &PgCatalog, relid: PgClassOid, column: &str| {
-        attribute(catalog, relid, column)
-            .is_some_and(|a| a.attnotnull && !catalog.lint_column_has_default(relid, column))
+        attribute(catalog, relid, column).is_some_and(|a| {
+            (a.attnotnull || inserted.domain_checked && not_null(catalog, &a))
+                && !catalog.lint_column_has_default(relid, column)
+        })
     };
     for attribute in new_catalog.attributes_of(relids.1) {
         if attribute.attnum <= 0
@@ -1476,6 +1855,34 @@ fn omitted(
     }
 }
 
+/// What a statement writes into a relation, for [`narrowed`].
+#[derive(Clone, Copy)]
+struct Written<'w, 'v> {
+    /// The statement, as the message says it: `its INSERT into t`.
+    statement: &'w str,
+    /// The relation, as the message says it.
+    name: &'w str,
+    /// Its OID in the old and the new catalog.
+    relids: (PgClassOid, PgClassOid),
+    /// Each column written, with the values written into it.
+    columns: &'w [(String, Vec<Value<'v>>)],
+    /// Each target list's values.
+    rows: &'w [Row<'v>],
+    /// The columns of `columns` an inserted row leaves out, written their
+    /// default.
+    defaulted: &'w [String],
+    /// The columns of `columns` written their default (left out, or `SET c
+    /// = DEFAULT`) whose default the new schema changes: every constraint
+    /// is new to that value.
+    changed_defaults: &'w [String],
+}
+
+/// Whether column `attribute` of `catalog` holds no NULL: `NOT NULL`, or
+/// of a NOT NULL domain (which an omitted value, NULL, fails as well).
+fn not_null(catalog: &PgCatalog, attribute: &typedpg_analyzer::PgAttribute) -> bool {
+    attribute.attnotnull || catalog.lint_type_is_not_null(attribute.atttypid)
+}
+
 /// The columns `written` (each with the values written into it) of the
 /// relation `statement` (`its INSERT into t`) writes — `relids`: its OID in
 /// the old and the new catalog, `name` as the message says it — whose new
@@ -1502,17 +1909,21 @@ fn omitted(
 /// changes is left to its own type change; a column a new UNIQUE, primary
 /// key or exclusion constraint covers is not reported (it depends on the
 /// data).
-#[allow(clippy::too_many_arguments)]
 fn narrowed(
-    statement: &str,
-    name: &str,
-    relids: (PgClassOid, PgClassOid),
-    written: &[(String, Vec<Value<'_>>)],
-    rows: &[Row<'_>],
+    what: &Written<'_, '_>,
     old_catalog: &PgCatalog,
     new_catalog: &PgCatalog,
     out: &mut Vec<Change>,
 ) {
+    let Written {
+        statement,
+        name,
+        relids,
+        columns: written,
+        rows,
+        defaulted,
+        changed_defaults,
+    } = *what;
     // The new conjuncts the analyzer can't read exactly of a written
     // column, by constraint: each conjunct's key, with the written columns
     // it reads.
@@ -1533,11 +1944,32 @@ fn narrowed(
             continue;
         }
         let subject = |what: &str| format!("write {name} {column} {what}");
-        let column_text = format!("{statement} writes column {}", quote_identifier(column));
+        let left_out = defaulted.contains(column);
+        let new_default = changed_defaults.contains(column) && values.len() == 1;
+        let column_text = if new_default && left_out {
+            format!(
+                "{statement} leaves out column {}, written its new default",
+                quote_identifier(column)
+            )
+        } else if new_default {
+            format!(
+                "{statement} writes column {} its new default",
+                quote_identifier(column)
+            )
+        } else if left_out {
+            format!(
+                "{statement} leaves out column {}, written its default",
+                quote_identifier(column)
+            )
+        } else {
+            format!("{statement} writes column {}", quote_identifier(column))
+        };
         let new_limit = new_catalog.lint_value_limit(new.atttypid, new.atttypmod);
         if let Some(limit) = new_limit
             && let Some(text) = narrower_type(
-                old_catalog.lint_value_limit(old.atttypid, old.atttypmod),
+                old_catalog
+                    .lint_value_limit(old.atttypid, old.atttypmod)
+                    .filter(|_| !new_default),
                 new_limit,
             )
             && values
@@ -1553,15 +1985,17 @@ fn narrowed(
                 ),
             });
         }
-        // A NOT NULL a parameter breaks is its own change.
-        if new.attnotnull {
+        // A NOT NULL a parameter breaks is its own change — unless it is
+        // the domain's, which leaves the parameter nullable. One a column
+        // left out without a default breaks is [`omitted`]'s.
+        if not_null(new_catalog, &new) && !left_out {
             let default_dropped = values.iter().any(|value| value.null_only_now());
             let text = if default_dropped {
                 Some(format!(
                     "{column_text} as DEFAULT, which is now NULL, the column having no default, \
                      while it is NOT NULL: writing NULL fails"
                 ))
-            } else if old.attnotnull {
+            } else if not_null(old_catalog, &old) {
                 None
             } else if values
                 .iter()
@@ -1574,7 +2008,9 @@ fn narrowed(
             } else if values.iter().any(|value| {
                 matches!(
                     value,
-                    Value::Expression { nullable: true, .. } | Value::Null { .. }
+                    Value::Expression { nullable: true, .. }
+                        | Value::Null { .. }
+                        | Value::Input { may_be_null: true }
                 )
             }) {
                 Some(format!(
@@ -1596,6 +2032,7 @@ fn narrowed(
         let new_constraints = new_catalog.column_write_constraints(relids.1, column);
         let known: HashSet<&str> = old_constraints
             .iter()
+            .filter(|_| !new_default)
             .flat_map(|c| &c.parts)
             .map(|part| part.key.as_str())
             .collect();
@@ -1606,13 +2043,30 @@ fn narrowed(
                 .fold(Refinement::NONE, |all, allowed| all.and(allowed))
         };
         let (old_allowed, new_allowed) = (all(&old_constraints), all(&new_constraints));
+        let old_allowed = if new_default {
+            Refinement::NONE
+        } else {
+            old_allowed
+        };
         // What the new conjuncts allow, and the constraints they are of.
         let mut allowed = Refinement::NONE;
         let mut limiting: Vec<&str> = Vec::new();
         let mut non_null: Vec<&str> = Vec::new();
         for constraint in &new_constraints {
             for part in &constraint.parts {
-                if known.contains(part.key.as_str()) {
+                // A conjunct the deployed schema's CHECKs imply lets
+                // through every row they did: widening a `CASE` by a
+                // branch is no new restriction.
+                if known.contains(part.key.as_str())
+                    || (part.reading == CheckReading::Other
+                        && !new_default
+                        && new_catalog.check_part_implied_by(
+                            relids.1,
+                            &part.key,
+                            old_catalog,
+                            relids.0,
+                        ))
+                {
                     continue;
                 }
                 match &part.reading {
@@ -1659,6 +2113,7 @@ fn narrowed(
                 .unwrap_or_else(|| "fewer values".to_owned());
             let before = old_catalog
                 .describe_column_values(relids.0, column, &old_allowed)
+                .filter(|_| !new_default)
                 .map(|before| format!(" instead of {before}"))
                 .unwrap_or_default();
             out.push(Change {
@@ -1690,6 +2145,7 @@ fn narrowed(
             });
         }
     }
+    kept_values(statement, name, relids, rows, old_catalog, new_catalog, out);
     for (source, parts) in unreduced {
         // What each conjunct makes of the rows: rejected when one rejects
         // a row, silent when every one passes every row.
@@ -1732,6 +2188,124 @@ fn narrowed(
                      rows the deployed code writes"
                 )
             },
+        });
+    }
+}
+
+/// The new `NOT VALID` CHECK conjuncts of the relation `statement` (`its
+/// UPDATE of t`) writes — `relids`: its OID in the old and the new catalog,
+/// `name` as the message says it — that read only columns an UPDATE target
+/// list of `rows` (an UPDATE's SET, an `ON CONFLICT DO UPDATE SET`, a
+/// MERGE's `UPDATE SET`) doesn't write: PostgreSQL checks the whole new row
+/// version against every CHECK of the table (`ExecConstraints`), so a row
+/// already stored that breaks a constraint not validated fails the UPDATE
+/// whatever it writes. (A validated one holds for every stored row; a
+/// conjunct reading a written column is the written value's, see
+/// [`narrowed`].)
+fn kept_values(
+    statement: &str,
+    name: &str,
+    relids: (PgClassOid, PgClassOid),
+    rows: &[Row<'_>],
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    let updates: Vec<&HashMap<String, &WrittenValue>> = rows
+        .iter()
+        .filter(|(update, _)| *update)
+        .map(|(_, values)| values)
+        .collect();
+    if updates.is_empty() {
+        return;
+    }
+    let constraints = |catalog: &PgCatalog, relid: PgClassOid| {
+        let mut all: Vec<typedpg_analyzer::WriteConstraint> = Vec::new();
+        for attribute in catalog.attributes_of(relid) {
+            if attribute.attnum <= 0 {
+                continue;
+            }
+            for constraint in catalog.column_write_constraints(relid, &attribute.attname) {
+                if !all.iter().any(|c| c.source == constraint.source) {
+                    all.push(constraint);
+                }
+            }
+        }
+        all
+    };
+    let old_constraints = constraints(old_catalog, relids.0);
+    let known: HashSet<&str> = old_constraints
+        .iter()
+        .flat_map(|c| &c.parts)
+        .map(|part| part.key.as_str())
+        .collect();
+    // A NOT NULL not validated, on a column the deployed schema let be
+    // NULL and an UPDATE keeps.
+    for attribute in new_catalog.attributes_of(relids.1) {
+        if attribute.attnum <= 0
+            || updates
+                .iter()
+                .all(|values| values.contains_key(&attribute.attname))
+        {
+            continue;
+        }
+        let Some(constraint) = new_catalog.lint_not_valid_not_null(relids.1, &attribute.attname)
+        else {
+            continue;
+        };
+        if attribute_of(old_catalog, relids.0, &attribute.attname).is_none_or(|old| old.attnotnull)
+        {
+            continue;
+        }
+        out.push(Change {
+            subject: format!("keep {name} not null {}", attribute.attname),
+            text: format!(
+                "{statement} keeps the stored value of column {}, which the new NOT VALID NOT \
+                 NULL constraint \"{constraint}\" covers: updating a row already stored that \
+                 holds a NULL there fails",
+                quote_identifier(&attribute.attname)
+            ),
+        });
+    }
+    for constraint in constraints(new_catalog, relids.1) {
+        if !constraint.not_valid {
+            continue;
+        }
+        let mut kept: Vec<&str> = Vec::new();
+        for part in &constraint.parts {
+            if known.contains(part.key.as_str())
+                || new_catalog.check_part_implied_by(relids.1, &part.key, old_catalog, relids.0)
+            {
+                continue;
+            }
+            let unwritten = updates
+                .iter()
+                .any(|values| part.columns.iter().all(|c| !values.contains_key(c)));
+            if unwritten {
+                for column in &part.columns {
+                    if !kept.contains(&column.as_str()) {
+                        kept.push(column);
+                    }
+                }
+            }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        let list: Vec<String> = kept.iter().map(|c| quote_identifier(c)).collect();
+        out.push(Change {
+            subject: format!("keep {name} {}", constraint.source),
+            text: format!(
+                "{statement} keeps the stored {} {}, which the new NOT VALID {} reads: updating a \
+                 row already stored that breaks it fails",
+                if kept.len() == 1 {
+                    "value of column"
+                } else {
+                    "values of columns"
+                },
+                list.join(", "),
+                constraint.source
+            ),
         });
     }
 }
@@ -1932,9 +2506,11 @@ fn array_element(ty: &Type) -> Option<(&Type, Option<bool>)> {
 
 /// How a value refined as `old` may now break it, refined as `new`, worded
 /// after the column's name; `None` when every value of `new` is one of
-/// `old`.
-fn widened(old: &Refinement, new: &Refinement) -> Option<String> {
-    let widenings = old.widenings(new);
+/// `old`. Being another of a few values breaks it only when the deployed
+/// code's type narrows them (`values`, see [`Decoding::narrows_values`]).
+fn widened(old: &Refinement, new: &Refinement, values: bool) -> Option<String> {
+    let mut widenings = old.widenings(new);
+    widenings.values &= values;
     if !widenings.any() {
         return None;
     }
@@ -2026,6 +2602,18 @@ mod tests {
         roles: &[&str],
         kind: DeployedKind,
     ) -> Vec<MigrationFinding> {
+        check_decoded(old, new, queries, roles, kind, Decoding::TypeScript)
+    }
+
+    /// [`check`], for deployed code that decodes as `decoding` says.
+    fn check_decoded(
+        old: &[&str],
+        new: &[&str],
+        queries: &[&str],
+        roles: &[&str],
+        kind: DeployedKind,
+        decoding: Decoding<'_>,
+    ) -> Vec<MigrationFinding> {
         let old_catalog = catalog(old);
         let all: Vec<&str> = old.iter().chain(new).copied().collect();
         let new_catalog = catalog(&all);
@@ -2048,11 +2636,12 @@ mod tests {
                 kind,
             })
             .collect();
-        breaks_deployed_queries(
+        let findings = breaks_deployed_queries(
             &Deployment {
                 reference: "origin/main",
                 catalog: &old_catalog,
                 queries: &queries,
+                decoding,
             },
             &NewSchema {
                 files: &files,
@@ -2062,7 +2651,19 @@ mod tests {
                 prepare: &|_| Ok(()),
             },
             &LintOptions::default(),
-        )
+        );
+        // The findings checked by running the queries on PostgreSQL
+        // before and after the new migrations.
+        #[cfg(feature = "pg_sanity")]
+        crate::deployed_oracle::assert_agrees(&crate::deployed_oracle::Case {
+            old: &old.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            new: &new.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            queries: &queries,
+            findings: &findings,
+            old_catalog: &old_catalog,
+            decoding,
+        });
+        findings
     }
 
     fn messages(findings: &[MigrationFinding]) -> Vec<String> {
@@ -2485,6 +3086,179 @@ mod tests {
         assert_eq!(
             &migration[findings[0].finding.span.clone()],
             "ALTER TABLE users ADD CONSTRAINT users_kind_check CHECK (kind IN ('b'))"
+        );
+    }
+
+    /// A new CHECK the deployed schema's CHECKs imply restricts nothing:
+    /// a `CASE` widened by a branch, or a body replaced by `true`. One that
+    /// takes a value's branch away, or changes its body, still may reject
+    /// the rows.
+    #[test]
+    fn a_check_widened_by_a_case_branch() {
+        const EVENTS: &str = "CREATE TABLE ev (
+                id integer PRIMARY KEY,
+                type text NOT NULL,
+                payload jsonb NOT NULL,
+                CONSTRAINT ev_payload CHECK (CASE type
+                    WHEN 'a' THEN payload ? 'x'
+                    WHEN 'b' THEN payload ? 'y'
+                    ELSE false END)
+            );";
+        let replace = |check: &str| {
+            format!(
+                "ALTER TABLE ev DROP CONSTRAINT ev_payload;\n\
+                 ALTER TABLE ev ADD CONSTRAINT ev_payload CHECK ({check});"
+            )
+        };
+        let queries = &[
+            "INSERT INTO ev (id, type, payload) VALUES ($id, $type, $payload)",
+            "UPDATE ev SET type = $type, payload = $payload WHERE id = $id",
+        ];
+        for widened in [
+            // A branch added.
+            "CASE type WHEN 'a' THEN payload ? 'x' WHEN 'b' THEN payload ? 'y' \
+             WHEN 'c' THEN true ELSE false END",
+            // In another order, a body now true, the ELSE now NULL.
+            "CASE type WHEN 'c' THEN payload ? 'z' WHEN 'b' THEN true \
+             WHEN 'a' THEN payload ? 'x' END",
+            // The searched form of the same.
+            "CASE WHEN type = 'a' THEN payload ? 'x' WHEN type = 'b' THEN payload ? 'y' \
+             WHEN type = 'c' THEN true ELSE false END",
+        ] {
+            let findings = check(&[EVENTS], &[&replace(widened)], queries);
+            assert!(findings.is_empty(), "{widened}: {:?}", messages(&findings));
+        }
+        for narrowed in [
+            // 'b' now goes to ELSE false.
+            "CASE type WHEN 'a' THEN payload ? 'x' ELSE false END",
+            // 'a' requires another key.
+            "CASE type WHEN 'a' THEN payload ? 'z' WHEN 'b' THEN payload ? 'y' ELSE false END",
+            // An earlier branch shadows 'a'.
+            "CASE WHEN type = 'b' THEN payload ? 'y' WHEN payload ? 'q' THEN false \
+             WHEN type = 'a' THEN payload ? 'x' ELSE false END",
+        ] {
+            let findings = check(&[EVENTS], &[&replace(narrowed)], queries);
+            assert!(
+                messages(&findings)
+                    .iter()
+                    .all(|m| m.contains("it may reject the rows the deployed code writes")),
+                "{narrowed}: {:?}",
+                messages(&findings)
+            );
+            assert_eq!(findings.len(), 2, "{narrowed}: {:?}", messages(&findings));
+        }
+    }
+
+    /// Dropping a conjunct, adding a disjunct or reordering either widens a
+    /// CHECK, in a `CASE` branch too; adding a conjunct or dropping a
+    /// disjunct narrows it.
+    #[test]
+    fn a_check_widened_by_dropping_a_conjunct() {
+        const EVENTS: &str = "CREATE TABLE ev (
+                id integer PRIMARY KEY,
+                type text NOT NULL,
+                content text,
+                result text,
+                CONSTRAINT ev_shape CHECK (CASE type
+                    WHEN 'a' THEN content IS NOT NULL AND result IS NULL
+                    WHEN 'b' THEN content IS NULL OR result IS NOT NULL
+                    END)
+            );";
+        let replace = |check: &str| {
+            format!(
+                "ALTER TABLE ev DROP CONSTRAINT ev_shape;\n\
+                 ALTER TABLE ev ADD CONSTRAINT ev_shape CHECK ({check});"
+            )
+        };
+        let queries = &["INSERT INTO ev (id, type, content) VALUES (1, 'a', 'x')"];
+        for widened in [
+            // `AND result IS NULL` dropped.
+            "CASE type WHEN 'a' THEN content IS NOT NULL \
+             WHEN 'b' THEN content IS NULL OR result IS NOT NULL END",
+            // The conjuncts and disjuncts reordered.
+            "CASE type WHEN 'a' THEN result IS NULL AND content IS NOT NULL \
+             WHEN 'b' THEN result IS NOT NULL OR content IS NULL END",
+            // A disjunct added.
+            "CASE type WHEN 'a' THEN content IS NOT NULL AND result IS NULL \
+             WHEN 'b' THEN content IS NULL OR result IS NOT NULL OR id > 0 END",
+        ] {
+            let findings = check(&[EVENTS], &[&replace(widened)], queries);
+            assert!(findings.is_empty(), "{widened}: {:?}", messages(&findings));
+        }
+        for narrowed in [
+            // A conjunct added.
+            "CASE type WHEN 'a' THEN content IS NOT NULL AND result IS NULL AND id > 0 \
+             WHEN 'b' THEN content IS NULL OR result IS NOT NULL END",
+            // A disjunct dropped.
+            "CASE type WHEN 'a' THEN content IS NOT NULL AND result IS NULL \
+             WHEN 'b' THEN content IS NULL END",
+            // A conjunct turned into a disjunct's.
+            "CASE type WHEN 'a' THEN content IS NOT NULL OR result IS NULL \
+             WHEN 'b' THEN content IS NULL AND result IS NOT NULL END",
+        ] {
+            let findings = check(&[EVENTS], &[&replace(narrowed)], queries);
+            assert_eq!(findings.len(), 1, "{narrowed}: {:?}", messages(&findings));
+            assert!(
+                messages(&findings)[0].contains("it may reject the rows the deployed code writes"),
+                "{narrowed}: {:?}",
+                messages(&findings)
+            );
+        }
+    }
+
+    /// A value the deployed code doesn't know breaks it as far as what it
+    /// decodes the column into narrows: a mapped Rust enum fails to decode
+    /// a new label, a Rust `String` takes any; a TypeScript literal union
+    /// is passed another value unchecked.
+    #[test]
+    fn a_new_value_breaks_what_the_deployed_code_decodes_it_into() {
+        let migration = "ALTER TYPE status ADD VALUE 'deleted';
+             ALTER TABLE users DROP CONSTRAINT users_kind_check;
+             ALTER TABLE users ADD CONSTRAINT users_kind_check CHECK (kind IN ('a', 'b', 'c'));";
+        let queries = &["SELECT status, kind FROM users"];
+        let decoded = |decoding| {
+            messages(&check_decoded(
+                &[USERS],
+                &[migration],
+                queries,
+                &[],
+                DeployedKind::Query,
+                decoding,
+            ))
+        };
+        // Unmapped: both decode into `String`.
+        let types = HashMap::new();
+        assert_eq!(
+            decoded(Decoding::Rust { types: &types }),
+            Vec::<String>::new()
+        );
+        // A mapped enum fails on the new label.
+        let types = HashMap::from([(
+            QualifiedName::new("public".to_owned(), "status".to_owned()),
+            "crate::Status".to_owned(),
+        )]);
+        assert_eq!(
+            decoded(Decoding::Rust { types: &types }),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): result \
+              column \"status\" may now be 'deleted', a label the deployed code's crate::Status \
+              does not have: decoding it fails"
+            ]
+        );
+        // TypeScript: both literal unions.
+        let all = decoded(Decoding::TypeScript).join("\n");
+        assert!(
+            all.contains(
+                "result column \"status\" may now be 'deleted', a value the deployed code does \
+                 not know"
+            ),
+            "{all}"
+        );
+        assert!(
+            all.contains(
+                "result column \"kind\" may now be 'c', a value the deployed code does not know"
+            ),
+            "{all}"
         );
     }
 
@@ -3306,6 +4080,8 @@ mod tests {
             "INSERT INTO p (id, lo, hi) VALUES (1, NULL, 2)",
             "INSERT INTO p (id, lo, hi) SELECT x, 1, 1 FROM u",
             "UPDATE p SET lo = 1, hi = CASE WHEN $big THEN 10 ELSE 2 END WHERE id = $id",
+            // A column the INSERT leaves out is its default: NULL here.
+            "INSERT INTO p (id, lo) VALUES (1, 1)",
         ] {
             let findings = check(&[PAIRS], &[lo_hi], &[sql]);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
@@ -3328,11 +4104,6 @@ mod tests {
             (
                 "UPDATE p SET lo = 1 WHERE id = $id",
                 may_reject("its UPDATE of p writes column lo", "p_lo_hi"),
-            ),
-            // A column the INSERT leaves out is its default.
-            (
-                "INSERT INTO p (id, lo) VALUES (1, 1)",
-                may_reject("its INSERT into p writes column lo", "p_lo_hi"),
             ),
             (
                 "INSERT INTO p (id, lo, hi) VALUES (1, $lo, 2)",
@@ -3692,5 +4463,250 @@ mod tests {
             "its INSERT into fv (a view of f) leaves out column b, now NOT NULL without a \
              default, so inserting any row fails"
         );
+    }
+
+    #[test]
+    fn a_not_valid_check_binds_what_an_update_keeps() {
+        let old = "CREATE TABLE a (id integer PRIMARY KEY, name text, kind text NOT NULL);";
+        let not_valid = ["ALTER TABLE a ADD CONSTRAINT a_kind CHECK (kind = 'a') NOT VALID;"];
+        // A row already stored may break it: updating it fails, whatever
+        // the UPDATE writes.
+        for (sql, statement) in [
+            (
+                "UPDATE a SET name = $name WHERE id = $id",
+                "its UPDATE of a",
+            ),
+            (
+                "INSERT INTO a (id, kind) VALUES ($id, 'a') ON CONFLICT (id) DO UPDATE SET name = $name",
+                "its INSERT into a",
+            ),
+            (
+                "MERGE INTO a USING (SELECT $id::integer AS id) v ON a.id = v.id \
+                 WHEN MATCHED THEN UPDATE SET name = 'x'",
+                "its MERGE into a",
+            ),
+        ] {
+            assert_eq!(
+                only(&check(&[old], &not_valid, &[sql])),
+                format!(
+                    "{statement} keeps the stored value of column kind, which the new NOT VALID \
+                     CHECK constraint \"a_kind\" reads: updating a row already stored that breaks \
+                     it fails"
+                ),
+                "{sql}"
+            );
+        }
+        // A NOT NULL not validated binds them as well.
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE a ADD CONSTRAINT a_name NOT NULL name NOT VALID;"],
+                &["UPDATE a SET kind = $kind WHERE id = $id"],
+            )),
+            "its UPDATE of a keeps the stored value of column name, which the new NOT VALID NOT \
+             NULL constraint \"a_name\" covers: updating a row already stored that holds a NULL \
+             there fails"
+        );
+        // Validated, every stored row holds it; an INSERT keeps nothing.
+        for (new, sql) in [
+            (
+                "ALTER TABLE a ADD CONSTRAINT a_kind CHECK (kind = 'a');",
+                "UPDATE a SET name = $name WHERE id = $id",
+            ),
+            (not_valid[0], "INSERT INTO a (id, kind) VALUES ($id, 'a')"),
+            (not_valid[0], "DELETE FROM a WHERE id = $id"),
+        ] {
+            let findings = check(&[old], &[new], &[sql]);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn a_not_null_domain_rejects_what_a_write_leaves_null() {
+        let old = "CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+                   CREATE TABLE d (id integer PRIMARY KEY, score posint);
+                   CREATE TABLE u (x integer NOT NULL);";
+        let new = ["ALTER DOMAIN posint SET NOT NULL;"];
+        // An INSERT leaving the column out stores NULL, which the domain
+        // rejects (the planner's coerce_null_to_domain)...
+        assert_eq!(
+            only(&check(
+                &[old],
+                &new,
+                &["INSERT INTO d (id) SELECT x FROM u"]
+            )),
+            "its INSERT into d leaves out column score, now NOT NULL without a default, so \
+             inserting any row fails"
+        );
+        assert_eq!(
+            only(&check(
+                &[old],
+                &new,
+                &[
+                    "MERGE INTO d USING u ON d.id = u.x WHEN NOT MATCHED THEN INSERT (id) VALUES (u.x)"
+                ],
+            )),
+            "its MERGE into d leaves out column score, now NOT NULL without a default, so \
+             inserting any row fails"
+        );
+        // ...and so does a parameter that may be NULL, which the analysis
+        // still lets be.
+        assert_eq!(
+            only(&check(
+                &[old],
+                &new,
+                &["UPDATE d SET score = $score WHERE id = $id"]
+            )),
+            "its UPDATE of d writes column score, now NOT NULL, with a value that may be NULL: \
+             writing NULL fails"
+        );
+        // COPY fills in a column it leaves out without checking the domain.
+        assert!(check_copy(&[old], &new, &["d (id)"]).is_empty());
+    }
+
+    #[test]
+    fn a_merge_insert_leaving_out_a_new_not_null_column() {
+        let old = "CREATE TABLE m (id integer PRIMARY KEY, name text, tenant integer);
+                   CREATE TABLE u (x integer NOT NULL);";
+        let new = ["ALTER TABLE m ALTER COLUMN tenant SET NOT NULL;"];
+        assert_eq!(
+            only(&check(
+                &[old],
+                &new,
+                &[
+                    "MERGE INTO m USING u ON m.id = u.x WHEN MATCHED THEN UPDATE SET name = 'x' \
+                   WHEN NOT MATCHED THEN INSERT (id, name) VALUES (u.x, 'y')"
+                ],
+            )),
+            "its MERGE into m leaves out column tenant, now NOT NULL without a default, so \
+             inserting any row fails"
+        );
+        // A MERGE that only updates inserts nothing.
+        let findings = check(
+            &[old],
+            &new,
+            &["MERGE INTO m USING u ON m.id = u.x WHEN MATCHED THEN UPDATE SET name = 'x'"],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_new_check_meets_the_default_of_a_column_left_out() {
+        let old = "CREATE TABLE k (id integer PRIMARY KEY, kind text NOT NULL DEFAULT 'a',
+                                   nick text);
+                   CREATE TABLE u (x integer NOT NULL);";
+        let sql = "INSERT INTO k (id) VALUES ($id)";
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE k ADD CONSTRAINT k_kind CHECK (kind = 'b') NOT VALID;"],
+                &[sql],
+            )),
+            "its INSERT into k leaves out column kind, written its default, which CHECK \
+             constraint \"k_kind\" now limits it to 'b': writing another value fails"
+        );
+        // `SET c = DEFAULT` writes it too.
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE k ADD CONSTRAINT k_kind CHECK (kind = 'b');"],
+                &["UPDATE k SET kind = DEFAULT WHERE id = $id"],
+            )),
+            "its UPDATE of k writes column kind, which CHECK constraint \"k_kind\" now limits it \
+             to 'b': writing another value fails"
+        );
+        // A new default the deployed schema's CHECK rejects.
+        let checked = "CREATE TABLE c (id integer PRIMARY KEY,
+                                       kind text NOT NULL DEFAULT 'a' CHECK (kind IN ('a', 'b')));";
+        assert_eq!(
+            only(&check(
+                &[checked],
+                &["ALTER TABLE c ALTER COLUMN kind SET DEFAULT 'c';"],
+                &["INSERT INTO c (id) VALUES ($id)"],
+            )),
+            "its INSERT into c leaves out column kind, written its new default, which CHECK \
+             constraint \"c_kind_check\" now limits it to one of 'a', 'b': writing another value \
+             fails"
+        );
+        assert!(
+            check(
+                &[checked],
+                &["ALTER TABLE c ALTER COLUMN kind SET DEFAULT 'b';"],
+                &["INSERT INTO c (id) VALUES ($id)"],
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            only(&check(
+                &[old],
+                &["ALTER TABLE k ADD CONSTRAINT k_nick CHECK (nick IS NOT NULL) NOT VALID;"],
+                // (A VALUES row the analysis rejects outright.)
+                &["INSERT INTO k (id) SELECT x FROM u"],
+            )),
+            "its INSERT into k leaves out column nick, written its default, which CHECK \
+             constraint \"k_nick\" now requires to be non-NULL, with a value that may be NULL: \
+             writing NULL fails"
+        );
+        // A default the new CHECK lets through, a NULL that passes it.
+        for new in [
+            "ALTER TABLE k ADD CONSTRAINT k_kind CHECK (kind IN ('a', 'b'));",
+            "ALTER TABLE k ADD CONSTRAINT k_nick CHECK (nick <> '');",
+        ] {
+            let findings = check(&[old], &[new], &[sql]);
+            assert!(findings.is_empty(), "{new}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn row_security_checking_the_rows_written() {
+        let old = "CREATE ROLE app;
+                   CREATE TABLE r (id integer PRIMARY KEY, kind text NOT NULL DEFAULT 'a');
+                   GRANT SELECT, INSERT, UPDATE ON r TO app;";
+        let insert = "INSERT INTO r (id) VALUES ($id)";
+        let update = "UPDATE r SET kind = $kind WHERE id = $id";
+        let may_fail = |statement: &str| {
+            format!(
+                "{statement} may fail as role \"app\": row-level security now checks the rows it \
+                 writes against policies the deployed schema didn't, and a row they reject fails"
+            )
+        };
+        let checked = ["ALTER TABLE r ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON r TO app USING (true) WITH CHECK (kind = 'a');"];
+        assert_eq!(
+            only(&check_as(&[old], &checked, &[insert], &["app"])),
+            may_fail("its INSERT into r")
+        );
+        assert_eq!(
+            only(&check_as(&[old], &checked, &[update], &["app"])),
+            may_fail("its UPDATE of r")
+        );
+        // A new restrictive policy.
+        let with_policy = "ALTER TABLE r ENABLE ROW LEVEL SECURITY;
+                           CREATE POLICY p ON r TO app USING (true);";
+        assert_eq!(
+            only(&check_as(
+                &[old, with_policy],
+                &["CREATE POLICY q ON r AS RESTRICTIVE FOR INSERT TO app WITH CHECK (kind = 'b');"],
+                &[insert],
+                &["app"],
+            )),
+            may_fail("its INSERT into r")
+        );
+        // A policy every row passes, or another command's.
+        for (old, new) in [
+            (
+                vec![old],
+                "ALTER TABLE r ENABLE ROW LEVEL SECURITY; CREATE POLICY p ON r TO app USING (true);",
+            ),
+            (
+                vec![old, with_policy],
+                "CREATE POLICY q ON r AS RESTRICTIVE FOR UPDATE TO app USING (kind = 'b');",
+            ),
+        ] {
+            let findings = check_as(&old, &[new], &[insert], &["app"]);
+            assert!(findings.is_empty(), "{new}: {findings:?}");
+        }
+        // Without a role, nothing is checked as one.
+        assert!(check(&[old], &checked, &[insert]).is_empty());
     }
 }

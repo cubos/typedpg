@@ -31,7 +31,23 @@
 //! Every accepted query is also executed over adversarial data to check
 //! the analyzer's nullability: see [`soundness`].
 
+mod catalog_extras;
+mod catalog_state;
 mod soundness;
+
+/// What the `breaks_deployed_queries` oracle (`typedpg_lint`) reuses of
+/// the mirror: scratch databases, the seeder, text-format parameters, raw
+/// results and the nullability oracle's value checks.
+#[doc(hidden)]
+pub mod support {
+    pub use super::soundness::{Param, Raw, value_violation};
+    pub use super::{scratch_db_name, with_dbname};
+    pub use postgres;
+    /// The seeding helpers (`pg_temp.typedpg_seed`, …), see `seed.sql`.
+    pub const SEED_SQL: &str = super::soundness::SEED_SQL;
+}
+
+pub use soundness::lint::{CLAIM_VIOLATED, LintProbe, LintProbeResult};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +180,19 @@ pub(crate) struct PgSanityServer {
     /// Every role the catalog saw created by a migration, so `Drop` can drop
     /// them from the shared cluster after the scratch database goes.
     created_roles: Vec<String>,
+    /// `PG_SANITY_MIRROR_ONLY=1`: migrations are still applied to the
+    /// server, but nothing is compared — no outcome, privilege, Describe
+    /// or role check. For the lint oracle (`typedpg_lint`'s `pg_sanity`
+    /// feature), which needs the schema and seeded rows, and whose crate's
+    /// tests build catalogs the mirror can't follow (clones sharing one
+    /// server, migrations the runner's transaction wraps).
+    mirror_only: bool,
+    /// Every migration sent to the server, with its outcome: the repro the
+    /// catalog oracle prints.
+    history: Vec<String>,
+    /// The catalog oracle reported this catalog once already: what follows
+    /// inherits the divergence.
+    catalog_diverged: bool,
 }
 
 /// Serializes the migrations writing a shared (cluster-wide) catalog
@@ -326,6 +355,9 @@ impl PgSanityServer {
             type_name_cache: HashMap::new(),
             soundness: soundness::Soundness::new(),
             created_roles: Vec::new(),
+            mirror_only: std::env::var("PG_SANITY_MIRROR_ONLY").is_ok_and(|v| v == "1"),
+            history: Vec::new(),
+            catalog_diverged: false,
         })
     }
 
@@ -337,6 +369,10 @@ impl PgSanityServer {
         sql: &str,
         our_result: &Result<(), E>,
     ) {
+        if self.mirror_only {
+            let _ = self.run_migration(sql);
+            return;
+        }
         if let Some(div) = self.compare_apply_matches(sql, our_result) {
             panic!("{}", div.message);
         }
@@ -399,6 +435,10 @@ impl PgSanityServer {
             });
         }
         drop(lock);
+        self.history.push(match &pg_result {
+            Ok(()) => format!("{sql}\n-- (succeeded)"),
+            Err(e) => format!("{sql}\n-- (failed: {})", render_pg_error(e)),
+        });
         // A type renamed or moved to another schema keeps its OID: the
         // names cached for the old catalog may be stale.
         self.type_name_cache.clear();
@@ -442,6 +482,9 @@ impl PgSanityServer {
         {
             return None;
         }
+        if self.mirror_only {
+            return Some(None);
+        }
         Some(compare_apply_outcome(sql, our_result, &pg_result))
     }
 
@@ -451,11 +494,17 @@ impl PgSanityServer {
     /// name disagrees.
     pub(crate) fn assert_analyze_matches(
         &mut self,
+        catalog: &crate::PgCatalog,
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
         finite_params: &std::collections::HashSet<u32>,
     ) {
-        if let Some(div) = self.compare_analyze_matches(analysis_sql, our_result, finite_params) {
+        if self.mirror_only {
+            return;
+        }
+        if let Some(div) =
+            self.compare_analyze_matches(catalog, analysis_sql, our_result, finite_params)
+        {
             panic!("{}", div.message);
         }
     }
@@ -468,6 +517,7 @@ impl PgSanityServer {
     /// oracle's own tests: a deliberately wrong rewrite must be caught.
     pub(crate) fn check_rewrite(
         &mut self,
+        catalog: &crate::PgCatalog,
         written: &str,
         ours: &AnalyzedQuery,
         finite_params: &std::collections::HashSet<u32>,
@@ -476,11 +526,32 @@ impl PgSanityServer {
             .query_client
             .prepare(written)
             .unwrap_or_else(|e| panic!("pg_sanity: the written query must prepare: {e}"));
-        self.check_simplification(written, ours, &original, finite_params)
+        self.check_simplification(catalog, written, ours, &original, finite_params)
+    }
+
+    /// Run the lint oracle's `probes` next to `analysis_sql` (see
+    /// [`soundness::lint`]).
+    pub(crate) fn lint_probes(
+        &mut self,
+        catalog: &crate::PgCatalog,
+        analysis_sql: &str,
+        ours: &AnalyzedQuery,
+        probes: &[LintProbe],
+        finite_params: &std::collections::HashSet<u32>,
+    ) -> Vec<LintProbeResult> {
+        self.soundness.lint_probes(
+            &mut self.query_client,
+            catalog,
+            analysis_sql,
+            ours,
+            probes,
+            finite_params,
+        )
     }
 
     fn check_simplification(
         &mut self,
+        catalog: &crate::PgCatalog,
         original_sql: &str,
         ours: &AnalyzedQuery,
         original: &postgres::Statement,
@@ -523,6 +594,7 @@ impl PgSanityServer {
         }
         self.soundness.equivalence(
             &mut self.query_client,
+            catalog,
             (original_sql, original),
             (&ours.sql, &simplified),
             ours,
@@ -540,6 +612,7 @@ impl PgSanityServer {
     /// indicate the mirror itself is broken, not an analyzer bug.
     pub(crate) fn compare_analyze_matches(
         &mut self,
+        catalog: &crate::PgCatalog,
         analysis_sql: &str,
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
         finite_params: &std::collections::HashSet<u32>,
@@ -696,7 +769,7 @@ impl PgSanityServer {
                 if ours.simplifications.is_empty() {
                     return None;
                 }
-                self.check_simplification(analysis_sql, ours, stmt, finite_params)
+                self.check_simplification(catalog, analysis_sql, ours, stmt, finite_params)
             }
             (Err(e), Err(_)) => {
                 let our_msg = format!("{e}");
@@ -790,6 +863,9 @@ impl PgSanityServer {
     /// owner of every object the migrations created. Panics on the first
     /// disagreement.
     pub(crate) fn assert_privileges_match(&mut self, db: &crate::pg_catalog::PgCatalog) {
+        if self.mirror_only {
+            return;
+        }
         let created = db.created_roles();
         let session_user: String = self
             .client
@@ -838,6 +914,145 @@ impl PgSanityServer {
         if let Some(message) = divergence {
             panic!("{message}");
         }
+    }
+
+    /// The catalog oracle (see [`catalog_state`]): after a migration both
+    /// sides accepted, the server's system catalogs and the analyzer's must
+    /// hold the same rows for every object the migrations created, but for
+    /// OIDs. On with `PG_SANITY_CATALOG=1` (panics on the first divergence)
+    /// or `PG_SANITY_CATALOG_LOG=<file>` (appends each catalog's first
+    /// divergence to the file and goes on). `PG_SANITY_CATALOG_IGNORE` —
+    /// substrings separated by `|` — drops the difference lines containing
+    /// one (a corpus run against a server whose extensions are other
+    /// versions than the analyzer's).
+    pub(crate) fn check_catalog_state(&mut self, db: &crate::pg_catalog::PgCatalog) {
+        let log = std::env::var_os("PG_SANITY_CATALOG_LOG");
+        let on = log.is_some() || std::env::var("PG_SANITY_CATALOG").is_ok_and(|v| v == "1");
+        if !on || self.mirror_only || self.catalog_diverged {
+            return;
+        }
+        let ignored = std::env::var("PG_SANITY_CATALOG_IGNORE").unwrap_or_default();
+        let ignored: Vec<&str> = ignored.split('|').filter(|s| !s.is_empty()).collect();
+        let differences: Vec<String> = self
+            .catalog_differences(db)
+            .into_iter()
+            .filter(|line| !ignored.iter().any(|s| line.contains(s)))
+            .collect();
+        if differences.is_empty() {
+            return;
+        }
+        self.catalog_diverged = true;
+        let message = format!(
+            "pg_sanity: the catalogs diverged after these migrations:\n{}\n\
+             --- differences:\n{}\n",
+            self.history.join("\n\n"),
+            differences.join("\n")
+        );
+        match log {
+            Some(path) => {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap_or_else(|e| panic!("pg_sanity: open {path:?}: {e}"));
+                let test = std::thread::current()
+                    .name()
+                    .unwrap_or("<unnamed>")
+                    .to_owned();
+                // One write per record: concurrent test processes append to
+                // the same file.
+                let record = format!("=== {test}\n{message}");
+                file.write_all(record.as_bytes())
+                    .unwrap_or_else(|e| panic!("pg_sanity: write {path:?}: {e}"));
+            }
+            None => panic!("{message}"),
+        }
+    }
+
+    /// The catalog oracle's comparison: every difference between the
+    /// server's user rows and the analyzer's, normalized.
+    fn catalog_differences(&mut self, db: &crate::pg_catalog::PgCatalog) -> Vec<String> {
+        let fail = |e: postgres::Error| -> ! {
+            panic!("pg_sanity: catalog export failed: {}", render_pg_error(&e))
+        };
+        let mut pg = crate::catalog_export::export_user_objects(&mut self.client)
+            .unwrap_or_else(|e| fail(e));
+        // Another session's temporary schema (the query session's helper
+        // functions) is no migration's.
+        let hidden: std::collections::HashSet<u32> = self
+            .client
+            .query(
+                "SELECT n.oid FROM pg_catalog.pg_namespace n \
+                 WHERE n.nspname ~ '^pg_(toast_)?temp_[0-9]+$' \
+                   AND regexp_replace(n.nspname, '^pg_(toast_)?temp_', '') \
+                       IS DISTINCT FROM ( \
+                         SELECT regexp_replace(m.nspname, '^pg_temp_', '') \
+                         FROM pg_catalog.pg_namespace m \
+                         WHERE m.oid = pg_catalog.pg_my_temp_schema())",
+                &[],
+            )
+            .unwrap_or_else(|e| fail(e))
+            .iter()
+            .map(|r| r.get::<_, u32>(0))
+            .collect();
+        catalog_state::hide_namespaces(&mut pg, &hidden);
+        let mut pg_aux = catalog_state::Aux {
+            extras: catalog_extras::from_server(&mut self.client).unwrap_or_else(|e| fail(e)),
+            ..Default::default()
+        };
+        for row in self
+            .client
+            .query(
+                "SELECT 2601::oid, oid, 'access method ' || amname FROM pg_catalog.pg_am \
+                   WHERE oid >= 16384 \
+                 UNION ALL \
+                 SELECT 2328::oid, oid, 'foreign-data wrapper ' || fdwname \
+                   FROM pg_catalog.pg_foreign_data_wrapper WHERE oid >= 16384 \
+                 UNION ALL \
+                 SELECT 2612::oid, oid, lanname::text FROM pg_catalog.pg_language",
+                &[],
+            )
+            .unwrap_or_else(|e| fail(e))
+        {
+            pg_aux
+                .names
+                .insert((row.get::<_, u32>(0), row.get::<_, u32>(1)), row.get(2));
+        }
+
+        let mut ours = db.to_seed();
+        // A partition's index: PG records its parent index in
+        // pg_inherits, the analyzer in `index_parents`.
+        for (&child, &parent) in db.index_parents.iter() {
+            ours.pg_inherits.push(crate::pg_catalog::PgInherits {
+                inhrelid: child,
+                inhparent: parent,
+                inhseqno: 1,
+            });
+        }
+        let session_user: String = self
+            .client
+            .query_one("SELECT session_user::text", &[])
+            .unwrap_or_else(|e| fail(e))
+            .get(0);
+        let mut our_aux = catalog_state::Aux {
+            extras: catalog_extras::from_model(db, &|role| pg_role_name(db, role, &session_user)),
+            ..Default::default()
+        };
+        for (name, oid) in &db.access_method_oids {
+            our_aux
+                .names
+                .insert((2601, oid.get()), format!("access method {name}"));
+        }
+        for (name, oid) in db.foreign_data.wrappers() {
+            our_aux
+                .names
+                .insert((2328, oid.get()), format!("foreign-data wrapper {name}"));
+        }
+        catalog_state::diff(
+            &catalog_state::normalize(&ours, db, &our_aux),
+            &catalog_state::normalize(&pg, db, &pg_aux),
+        )
     }
 
     /// Remember the roles the catalog has seen created. Called after every
@@ -2150,6 +2365,9 @@ impl PgSanityServer {
         role: &str,
         ours: &Result<crate::resolve::AnalyzedQuery, crate::AnalyzeError>,
     ) {
+        if self.mirror_only {
+            return;
+        }
         if let Some(div) = self.compare_role_matches(sql, role, ours) {
             panic!("{}", div.message);
         }
@@ -2587,7 +2805,7 @@ impl Drop for PgSanityServer {
 /// Build a unique-ish scratch database name: `pg_sanity_<pid>_<counter>_<nanos>`.
 /// Underscores-only so it doesn't need quoting; lowercase prefix dodges any
 /// PG identifier folding subtleties.
-fn scratch_db_name() -> String {
+pub fn scratch_db_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2602,7 +2820,7 @@ fn scratch_db_name() -> String {
 /// given name. Parse via `postgres::config::Config` to validate, then
 /// rebuild the keyword=value form manually — `Config` has accessors but
 /// no public `Display` for keyword form.
-fn with_dbname(conn_str: &str, dbname: &str) -> Result<String, String> {
+pub fn with_dbname(conn_str: &str, dbname: &str) -> Result<String, String> {
     let config: Config = conn_str
         .parse()
         .map_err(|e| format!("pg_sanity: invalid POSTGRES_URL ({conn_str:?}): {e}"))?;

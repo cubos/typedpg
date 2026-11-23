@@ -55,6 +55,9 @@ usual way to add a partition, so the scan hits exactly the large tables.
 
 ## Reported when
 
+`CREATE TABLE … PARTITION OF` with a bound scans the default partition the
+same way, and is reported when the partitioned table has one.
+
 The attached table was created by an earlier migration file, and its
 validated `CHECK` and `NOT NULL` constraints don't imply the partition
 constraint:
@@ -72,9 +75,10 @@ constraint:
   `BETWEEN`, combined with `AND` / `OR`, count; anything else proves
   nothing.
 - Constants of another type are compared between integer types, `date`
-  against `timestamp`, and an integer on a `numeric` column. Not against
-  `timestamptz` (it depends on the time zone), and not a constant cast to
-  another type, e.g. `f >= 1::float4` on a `float8` column.
+  against `timestamp`, and an integer on a `numeric` or `float8` column.
+  Not against `timestamptz` (it depends on the time zone), and not a
+  constant cast to another type, e.g. `f >= 1::float4` on a `float8`
+  column.
 - Strings are compared only under `C`, `POSIX`, `ucs_basic`, `pg_c_utf8` or
   `pg_unicode_fast` collations; under the default or a locale collation only
   a `CHECK` with exactly the bound's constants is proven.

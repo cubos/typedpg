@@ -38,9 +38,13 @@
 mod analysis_diff;
 mod array_input;
 mod builtin_nullability;
+#[cfg(feature = "catalog_export")]
+pub mod catalog_export;
 mod clause;
 mod coerce;
 mod condition;
+#[cfg(feature = "record_corpus")]
+mod corpus;
 mod datetime_input;
 mod ddl;
 mod decimal;
@@ -69,7 +73,10 @@ mod pgmsg;
 mod polymorphic;
 mod privileges;
 #[cfg(feature = "pg_sanity")]
-pub use pg_sanity::{Divergence, DivergenceKind};
+#[doc(hidden)]
+pub use pg_sanity::support as pg_sanity_support;
+#[cfg(feature = "pg_sanity")]
+pub use pg_sanity::{CLAIM_VIOLATED, Divergence, DivergenceKind, LintProbe, LintProbeResult};
 mod range_input;
 mod refine;
 mod refine_bounds;
@@ -124,16 +131,18 @@ pub use pg_catalog::{
     NullifiedJoin, PgCatalog, QueryView, RelationRef, SublinkNullability, UserObjectCounts,
     ValueLimit,
 };
+pub use privileges::RowSecurityChecks;
 pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{
     AnalyzedColumn, AnalyzedCopyIn, AnalyzedParam, AnalyzedQuery, AnalyzedSpread,
-    AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList,
+    AnalyzedSpreadField, ArrayForm, SpreadKind, ValuesItem, ValuesList, certain_colname,
 };
 pub use simplify::{
     AppliedSimplification, OrderKey, OrderTies, RedundantJoin, RedundantJoinProof, Rule,
     SimplifyOptions, order_keys, order_ties, redundant_distinct_spans, redundant_group_keys,
-    select_at_most_one_row, statement_at_most_one_row, unique_order_prefix,
+    relation_holds_at_most_one_row, select_at_most_one_row, statement_at_most_one_row,
+    statement_node_at_most_one_row, unique_order_prefix,
 };
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the

@@ -1005,6 +1005,50 @@ pub(crate) fn rename_or_move_am_object(
     Ok(())
 }
 
+/// Move the operator class (`is_class`) or family `oid` to `to_ns`, as
+/// ALTER EXTENSION SET SCHEMA moves a member: a family's classes and
+/// operators keep naming it.
+pub(crate) fn move_am_object(
+    interp: &mut PgCatalog,
+    is_class: bool,
+    oid: crate::oid::PgGenericOid,
+    to_ns: PgNamespaceOid,
+) {
+    if is_class {
+        if let Some(c) = interp
+            .pg_opclass
+            .iter_mut()
+            .find(|c| c.oid.get() == oid.get())
+        {
+            c.opcnamespace = to_ns;
+        }
+        return;
+    }
+    let Some((name, namespace, method)) = interp
+        .pg_opfamily
+        .iter()
+        .find(|f| f.oid == oid)
+        .map(|f| (f.opfname.clone(), f.opfnamespace, f.opfmethod.clone()))
+    else {
+        return;
+    };
+    for f in &mut interp.pg_opfamily {
+        if f.oid == oid {
+            f.opfnamespace = to_ns;
+        }
+    }
+    for o in &mut interp.pg_amop {
+        if o.amopfamily == name && o.amopfamilynamespace == namespace && o.amopmethod == method {
+            o.amopfamilynamespace = to_ns;
+        }
+    }
+    for c in &mut interp.pg_opclass {
+        if c.opcfamily == name && c.opcfamilynamespace == namespace && c.opcmethod == method {
+            c.opcfamilynamespace = to_ns;
+        }
+    }
+}
+
 /// IsBinaryCoercible, including the polymorphic opclass input types.
 fn binary_coercible(interp: &PgCatalog, src: PgTypeOid, target: PgTypeOid) -> bool {
     if src == target || interp.is_binary_coercible(src, target) {

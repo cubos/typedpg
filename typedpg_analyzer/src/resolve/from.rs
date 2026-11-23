@@ -1323,6 +1323,14 @@ fn process_join_expr(
     // reports a spurious "parameter gap".
     let mut on_facts = crate::nonnull::Facts::default();
     let mut equalities: Option<Vec<(crate::nonnull::Col, crate::nonnull::Col)>> = None;
+    let side_aliases = |side: SourceSpan, scope: &Scope| -> std::collections::HashSet<String> {
+        side.sources(scope)
+            .iter()
+            .map(|s| s.alias.clone())
+            .collect()
+    };
+    // A FULL JOIN the planner can build no path for (see `full_join`).
+    let mut full_unplannable = false;
     if let quals @ Some(_) = &join.quals {
         // transformJoinOnClause: the ON clause sees just the join's two
         // sides (plus outer levels); the FROM items beside the join are in
@@ -1430,6 +1438,14 @@ fn process_join_expr(
             crate::nonnull::note_settled_null_tests(qual, &on_scope, &log, snapshot);
         }
         equalities = on_equalities(quals.as_ref(), &on_scope, &log, snapshot);
+        full_unplannable = join_type == JoinType::JoinFull
+            && super::full_join::on_clause_unplannable(
+                quals.as_ref(),
+                expr::Ctx::new(&on_scope, null_ctx, snapshot),
+                &log,
+                &side_aliases(left, scope),
+                &side_aliases(right, scope),
+            );
     }
 
     // `JOIN … USING (cols)` / `NATURAL JOIN` merge the join columns: the
@@ -1467,6 +1483,11 @@ fn process_join_expr(
             join_type,
         )?;
         on_facts = std::mem::take(&mut on_facts).union(facts);
+        full_unplannable = join_type == JoinType::JoinFull
+            && super::full_join::using_unplannable(
+                &parts.iter().map(|p| p.eq_op).collect::<Vec<_>>(),
+                snapshot,
+            );
         equalities = parts
             .iter()
             .map(|p| p.eq_strict.then(|| (p.left.0.clone(), p.right.0.clone())))
@@ -1513,6 +1534,24 @@ fn process_join_expr(
         always_matches,
         full_sides,
     );
+    // `populate_joinrel_with_paths` skips a FULL JOIN of two relations
+    // both proven empty (`is_dummy_rel`), or under a constant FALSE qual
+    // (`restriction_is_constant_false`); `reduce_outer_joins` may have
+    // reduced it first (checked once the level's quals are known).
+    let side_may_be_dummy = |side: SourceSpan, item: Option<&ast::Node>| {
+        super::full_join::item_may_be_dummy(item, snapshot)
+            || side
+                .sources(scope)
+                .iter()
+                .any(|s| expr::plan_fold::level_may_exclude(&s.alias))
+    };
+    if full_unplannable
+        && expr::plan_time_checks()
+        && !(side_may_be_dummy(left, join.larg.as_ref())
+            && side_may_be_dummy(right, join.rarg.as_ref()))
+    {
+        null_ctx.note_unplannable_full_join(join_idx, super::full_join::join_location(join));
+    }
 
     let merged_inserted = merged.is_some();
     if let Some((merged, parts)) = merged {
@@ -2052,6 +2091,14 @@ fn merge_using_columns(
             right: ((r.table_alias.clone(), r.name.clone()), r.base_not_null),
             inside_not_null: (l_not_null, r_not_null),
             eq_strict,
+            eq_op: eq.as_ref().map(|op| crate::nonnull::ResolvedOp {
+                oid: op.oid,
+                input_type: snapshot.unwrap_domain(
+                    op.left_type_oid
+                        .filter(|d| !crate::polymorphic::is_polymorphic(*d))
+                        .unwrap_or(l.type_oid),
+                ),
+            }),
         });
         let base_not_null = match join_type {
             JoinType::JoinLeft => l_not_null,
@@ -2109,6 +2156,9 @@ struct MergedParts {
     right: (crate::nonnull::Col, bool),
     inside_not_null: (bool, bool),
     eq_strict: bool,
+    /// The operator `l = r` resolved to (see
+    /// [`crate::nonnull::ResolvedOp`]).
+    eq_op: Option<crate::nonnull::ResolvedOp>,
 }
 
 /// Apply a FROM item's column-alias list (`users AS t(a, b, c)`) to the
@@ -3495,13 +3545,20 @@ pub(crate) fn pushed_lock_error(
                 .collect()
         })
         .unwrap_or_default();
+    // A qual above an outer join may reduce it (`reduce_outer_joins`): a
+    // relation on its nullable side that one of them names may be no
+    // nullable side at all once planned, so only one no qual above names
+    // is refused (whether the qual is strict is the planner's to decide;
+    // the analyzer only rejects what fails every execution).
     fn item(
         n: Option<&ast::Node>,
         nullable: bool,
+        above: &[&ast::Node],
         ctes: &[String],
         snapshot: &PgCatalog,
     ) -> Option<crate::scope::LockBlock> {
         use crate::scope::LockBlock;
+        let refused = |alias: &str| nullable && !above.iter().any(|q| qual_may_name(q, alias));
         match n? {
             ast::Node::RangeVar(rv) => {
                 if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
@@ -3509,21 +3566,35 @@ pub(crate) fn pushed_lock_error(
                 }
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
                 let class = snapshot.resolve_table(schema, &rv.relname)?;
-                if nullable {
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
+                if refused(alias) {
                     return Some(LockBlock::NullableSide);
+                }
+                if nullable {
+                    return None;
                 }
                 view_lock_error(class, snapshot)
             }
             ast::Node::RangeSubselect(rs) => {
-                if nullable {
-                    return Some(LockBlock::NullableSide);
-                }
+                let alias = rs.alias.as_ref().map_or("", |a| a.aliasname.as_str());
                 match rs.subquery.as_ref()? {
+                    ast::Node::SelectStmt(s) if nullable => (refused(alias)
+                        && pushed_lock_marks_rows(s, snapshot))
+                    .then_some(LockBlock::NullableSide)
+                    .or_else(|| match pushed_lock_error(s, snapshot) {
+                        Some(LockBlock::NullableSide) => None,
+                        other => other,
+                    }),
                     ast::Node::SelectStmt(s) => pushed_lock_error(s, snapshot),
-                    _ => None,
+                    _ => refused(alias).then_some(LockBlock::NullableSide),
                 }
             }
-            ast::Node::RangeTableSample(ts) => item(ts.relation.as_ref(), nullable, ctes, snapshot),
+            ast::Node::RangeTableSample(ts) => {
+                item(ts.relation.as_ref(), nullable, above, ctes, snapshot)
+            }
             ast::Node::JoinExpr(j) => {
                 let (l, r) = match j.jointype {
                     JoinType::JoinLeft => (nullable, true),
@@ -3531,16 +3602,114 @@ pub(crate) fn pushed_lock_error(
                     JoinType::JoinFull => (true, true),
                     _ => (nullable, nullable),
                 };
-                item(j.larg.as_ref(), l, ctes, snapshot)
-                    .or_else(|| item(j.rarg.as_ref(), r, ctes, snapshot))
+                // The join's own ON is above the joins below it, not above
+                // its own sides.
+                let mut below: Vec<&ast::Node> = above.to_vec();
+                below.extend(j.quals.as_ref());
+                let side = |n: Option<&ast::Node>| match n {
+                    Some(ast::Node::JoinExpr(_)) => below.as_slice(),
+                    _ => above,
+                };
+                item(j.larg.as_ref(), l, side(j.larg.as_ref()), ctes, snapshot)
+                    .or_else(|| item(j.rarg.as_ref(), r, side(j.rarg.as_ref()), ctes, snapshot))
             }
             // Functions, VALUES, JSON_TABLE… are unaffected by FOR UPDATE.
             _ => None,
         }
     }
+    let above: Vec<&ast::Node> = sel.where_clause.iter().collect();
     sel.from_clause
         .iter()
-        .find_map(|n| item(n.as_ref(), false, &ctes, snapshot))
+        .find_map(|n| item(n.as_ref(), false, &above, &ctes, snapshot))
+}
+
+/// Whether qual `q` may read a column of FROM entry `alias`: it names
+/// `alias`, or reads an unqualified column (which could be its).
+pub(crate) fn qual_may_name(q: &ast::Node, alias: &str) -> bool {
+    use typedpg_pg_query::NodeRef;
+    q.nodes().any(|(n, _)| match n {
+        NodeRef::ColumnRef(c) => {
+            let fields = crate::expr::extract_string_fields(&c.fields);
+            fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
+        }
+        _ => false,
+    })
+}
+
+/// Whether a locking clause pushed into FROM subquery `sel` marks a row
+/// in the outer query: the subquery is planned on its own (a LIMIT or
+/// OFFSET keeps it from being pulled up, and its own range-table entry
+/// carries the mark), or once pulled up a relation of its own carries the
+/// pushed-down mark. A subquery over VALUES or functions alone marks
+/// nothing: on the nullable side of an outer join, `make_outerjoininfo`
+/// finds no row mark there.
+pub(crate) fn pushed_lock_marks_rows(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
+    fn item(n: Option<&ast::Node>, ctes: &[String], snapshot: &PgCatalog) -> bool {
+        match n {
+            Some(ast::Node::RangeVar(rv)) => {
+                !(rv.schemaname.is_empty() && ctes.contains(&rv.relname))
+                    && snapshot
+                        .resolve_table(
+                            (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str()),
+                            &rv.relname,
+                        )
+                        .is_some()
+            }
+            Some(ast::Node::RangeSubselect(rs)) => match rs.subquery.as_ref() {
+                Some(ast::Node::SelectStmt(s)) => pushed_lock_marks_rows(s, snapshot),
+                _ => true,
+            },
+            Some(ast::Node::RangeTableSample(ts)) => item(ts.relation.as_ref(), ctes, snapshot),
+            Some(ast::Node::JoinExpr(j)) => {
+                item(j.larg.as_ref(), ctes, snapshot) || item(j.rarg.as_ref(), ctes, snapshot)
+            }
+            _ => false,
+        }
+    }
+    if sel.limit_count.is_some() || sel.limit_offset.is_some() || sel.larg.is_some() {
+        return true;
+    }
+    let ctes: Vec<String> = sel
+        .with_clause
+        .iter()
+        .flat_map(|w| w.ctes.iter())
+        .filter_map(|c| match c.as_ref()? {
+            ast::Node::CommonTableExpr(c) => Some(c.ctename.clone()),
+            _ => None,
+        })
+        .collect();
+    sel.from_clause
+        .iter()
+        .any(|n| item(n.as_ref(), &ctes, snapshot))
+}
+
+/// Whether `markQueryForLocking` marks some range-table entry of a view's
+/// query `sel`: a relation or a subquery in its FROM tree (a view there
+/// is one too), not a function, a CTE, nor a set operation's arms.
+fn view_query_marks_rows(sel: &ast::SelectStmt) -> bool {
+    fn item(n: Option<&ast::Node>, ctes: &[&str]) -> bool {
+        match n {
+            Some(ast::Node::RangeVar(rv)) => {
+                !(rv.schemaname.is_empty() && ctes.contains(&rv.relname.as_str()))
+            }
+            Some(ast::Node::RangeSubselect(_)) => true,
+            Some(ast::Node::RangeTableSample(ts)) => item(ts.relation.as_ref(), ctes),
+            Some(ast::Node::JoinExpr(j)) => {
+                item(j.larg.as_ref(), ctes) || item(j.rarg.as_ref(), ctes)
+            }
+            _ => false,
+        }
+    }
+    let ctes: Vec<&str> = sel
+        .with_clause
+        .iter()
+        .flat_map(|w| w.ctes.iter())
+        .filter_map(|c| match c.as_ref()? {
+            ast::Node::CommonTableExpr(c) => Some(c.ctename.as_str()),
+            _ => None,
+        })
+        .collect();
+    sel.op == SetOperation::SetopNone && sel.from_clause.iter().any(|n| item(n.as_ref(), &ctes))
 }
 
 /// [`pushed_lock_error`] for a view's stored query (`None` for a table).
@@ -3552,6 +3721,12 @@ pub(crate) fn view_lock_error(
         return None;
     }
     match crate::ddl::views::view_query(snapshot, class.oid)? {
+        // The rewriter marks the view's relations and subqueries
+        // (`markQueryForLocking`): one without any — reading functions or
+        // CTEs alone, or a set operation, whose jointree is empty — gets
+        // no row mark, so the planner checks nothing (`preprocess_rowmarks`
+        // runs `CheckSelectLocking` only over row marks).
+        ast::Node::SelectStmt(s) if !view_query_marks_rows(&s) => None,
         // The stored query's names were resolved when the view was defined:
         // analyzing it here is no statement's parse analysis, so it requires
         // no schema's USAGE (PG looks none up).

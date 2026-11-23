@@ -63,17 +63,33 @@ On a table created by an earlier migration file, an `ALTER TABLE` that:
 
 - adds a `CHECK` or `FOREIGN KEY` constraint without `NOT VALID`;
 - adds a column with an inline `CHECK`;
-- adds a column with an inline `REFERENCES` when some column added by the
-  same statement has a default (`DEFAULT …`, even `DEFAULT NULL`, a `serial`
-  type, a generated expression), or the statement also adds a foreign key
-  constraint.
+- adds a column with an inline `REFERENCES` when that column has a default
+  (`DEFAULT …`, even `DEFAULT NULL`, a `serial` type, a generated
+  expression);
+- changes a column's type without a rewrite while a validated `CHECK`
+  reads it: PostgreSQL adds the check again and validates every row;
+- makes a `NOT ENFORCED` constraint `ENFORCED` (`ALTER CONSTRAINT …
+  ENFORCED`), which validates it;
+- gives a virtual generated column a new expression (`SET EXPRESSION`)
+  while a `CHECK` or `NOT NULL` reads it;
+- detaches a partition of a table a foreign key references: PostgreSQL
+  checks every row of the referencing table.
+
+A partitioned table with no partition (and a foreign table) has no rows to
+check, and is not reported; neither is a foreign key every partition
+already has (validated), which PostgreSQL adopts instead of checking.
+
+And an `ALTER DOMAIN` that adds a `CHECK` (even `NOT VALID`'s later
+`VALIDATE CONSTRAINT`) or a `NOT NULL` to a domain a table uses: it checks
+every row under a `SHARE` lock, blocking writes, and for a domain the
+`NOT VALID` split doesn't help.
 
 ## Not reported
 
 - `NOT VALID` constraints.
-- A new column with `REFERENCES` and no default in the statement: it holds
-  only `NULL`s, and PostgreSQL skips the check. An identity column added
-  alongside doesn't count as a default.
+- A new column with `REFERENCES` and no default: it holds only `NULL`s,
+  and PostgreSQL skips the check, whatever the statement's other columns
+  and constraints are. An identity column doesn't count as a default.
 - `ADD COLUMN IF NOT EXISTS` on a column that already exists.
 - A table created earlier in the same file.
 - `PRIMARY KEY`, `UNIQUE` and `EXCLUDE`:

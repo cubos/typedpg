@@ -172,6 +172,24 @@ pub(crate) fn note_conversion(
     let Some(key) = node.and_then(|node| key(node.to_ref())) else {
         return;
     };
+    // A polymorphic parameter converts nothing: coerce_type returns the
+    // value as it is (`"any"`, `anyelement`, `anyenum`, `anyarray`, …; a
+    // domain is at most relabeled to its base type, which keeps its bits).
+    // The `anycompatible` family is the exception: its common type may
+    // convert the value, to a type this declared one doesn't name, so the
+    // site records no fact at all.
+    const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+    if crate::polymorphic::is_polymorphic(to) || to == ANY {
+        if crate::polymorphic::is_anycompatible(to) {
+            return;
+        }
+        FACTS.with(|facts| {
+            if let Some(facts) = facts.borrow_mut().as_mut() {
+                merge(&mut facts.conversions, key, None);
+            }
+        });
+        return;
+    }
     let from = snapshot.unwrap_domain(from);
     let to = snapshot.unwrap_domain(to);
     let conversion = (from != oid::UNKNOWN && to != oid::UNKNOWN && from != to)

@@ -718,8 +718,6 @@ fn enforced_key(
     let strict = |con: &crate::pg_catalog::PgConstraint| {
         con.conenforced
             && con.convalidated
-            // Validated by a row rewrite, not by checking the rows.
-            && !catalog.fk_validity_unproven.contains(&con.oid)
             && !con.conperiod
             && catalog
                 .fk_details

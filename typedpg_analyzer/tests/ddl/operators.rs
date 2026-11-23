@@ -261,6 +261,56 @@ fn commutator_and_negator_links_are_kept_like_pg() {
 }
 
 #[test]
+fn hashes_and_merges_are_recorded_and_stay_once_set() {
+    // OperatorCreate stores MERGES / HASHES (`oprcanmerge` / `oprcanhash`,
+    // what the planner reads to pick merge and hash joins); AlterOperator
+    // sets them, but refuses to turn one off once set. The built-in
+    // operators come with theirs from the seed.
+    const FNS: &str = "
+        CREATE FUNCTION myeq(int, int) RETURNS bool LANGUAGE sql AS 'select $1 = $2';";
+    let db = build(&[(
+        "0001.sql",
+        &format!(
+            "{FNS}
+             CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq, hashes, merges);
+             CREATE OPERATOR =#= (leftarg = int, rightarg = int, function = myeq);
+             CREATE OPERATOR =%= (leftarg = int, rightarg = int, function = myeq);
+             ALTER OPERATOR =%= (int, int) SET (MERGES);
+             ALTER OPERATOR === (int, int) SET (HASHES = true);"
+        ),
+    )]);
+    let ops = db.pg_operator();
+    let flags = |name: &str, left: u32| {
+        let o = ops
+            .values()
+            .find(|o| o.oprname == name && o.oprleft.map(|t| t.get()) == Some(left))
+            .unwrap();
+        (o.oprcanmerge, o.oprcanhash)
+    };
+    assert_eq!(flags("===", 23), (true, true));
+    assert_eq!(flags("=#=", 23), (false, false));
+    assert_eq!(flags("=%=", 23), (true, false));
+    // int4eq, and point's `~=`.
+    assert_eq!(flags("=", 23), (true, true));
+    assert_eq!(flags("~=", 600), (false, false));
+    for attr in ["hashes", "merges"] {
+        assert_ddl_err!(
+            try_apply(&[(
+                "0001.sql",
+                &format!(
+                    "{FNS}
+                     CREATE OPERATOR === (leftarg = int, rightarg = int, function = myeq,
+                         hashes, merges);
+                     ALTER OPERATOR === (int, int) SET ({attr} = false);"
+                ),
+            )]),
+            DdlError::Parse(_),
+            &format!("operator attribute \"{attr}\" cannot be changed if it has already been set")
+        );
+    }
+}
+
+#[test]
 fn a_commutator_reference_makes_a_shell_operator() {
     let db = build(&[(
         "0001.sql",

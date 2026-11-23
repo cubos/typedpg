@@ -36,6 +36,58 @@ fn union_with_incompatible_unknown_literal_rejected() {
     );
 }
 
+/// An arm sorting or grouping by its literal output (DISTINCT, DISTINCT
+/// ON, ORDER BY, GROUP BY) made it `text` already (`addTargetToSortList`):
+/// it is no `unknown` the other arm's type takes in.
+#[test]
+fn an_arm_sorting_its_literal_makes_it_text() {
+    let db = PgCatalog::new().unwrap();
+    for (sql, ty) in [
+        (
+            "SELECT c FROM ((SELECT DISTINCT 'y' AS c) UNION (SELECT 'a'::varchar)) s",
+            text(),
+        ),
+        (
+            "SELECT c FROM ((SELECT 'y' AS c ORDER BY 1) UNION (SELECT 'a'::varchar)) s",
+            text(),
+        ),
+        (
+            "SELECT c FROM ((SELECT 'y' AS c GROUP BY 1) UNION (SELECT 'a'::varchar)) s",
+            text(),
+        ),
+        (
+            "SELECT c FROM ((SELECT DISTINCT ON (1) 'y' AS c) UNION (SELECT 'a'::varchar)) s",
+            text(),
+        ),
+        (
+            "SELECT c FROM ((SELECT 'y' AS c ORDER BY c LIMIT 5) UNION SELECT 'a'::varchar) s",
+            text(),
+        ),
+        // The first arm's type wins between text and varchar.
+        (
+            "SELECT c FROM (SELECT 'a'::varchar AS c UNION (SELECT DISTINCT 'y')) s",
+            varchar(),
+        ),
+        // Unsorted, the literal takes the other arm's type.
+        (
+            "SELECT c FROM ((SELECT 'y' AS c) UNION (SELECT 'a'::varchar)) s",
+            varchar(),
+        ),
+    ] {
+        let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_cols(&s, vec![c("c", ty)]);
+    }
+    let err = db
+        .analyze("(SELECT DISTINCT 'x' AS c) UNION SELECT 1")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("UNION types text and integer cannot be matched"),
+        "{err}"
+    );
+    assert!(matches!(err, AnalyzeError::DatatypeMismatch(_)), "{err:?}");
+}
+
 /// select_common_type keeps the first arm's type when two types of one
 /// category don't coerce either way implicitly; coerce_to_common_type then
 /// fails converting the other arm (42846), naming the operation.

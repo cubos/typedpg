@@ -39,8 +39,9 @@ without one fail. ORMs and admin tools also expect a key.
 ## Reported when
 
 A table or partitioned table in a user schema has no `PRIMARY KEY` after the
-last migration. The finding goes on its `CREATE TABLE`; a later migration
-adding the key resolves it.
+last migration. The finding goes on the statement that created it (`CREATE
+TABLE`, `CREATE TABLE AS`, `SELECT INTO`, `CREATE SCHEMA … CREATE TABLE`, …);
+a later migration adding the key resolves it.
 
 A `UNIQUE` constraint on `NOT NULL` columns doesn't count, and neither does
 an inheritance parent's key: `CREATE TABLE child () INHERITS (parent)` is

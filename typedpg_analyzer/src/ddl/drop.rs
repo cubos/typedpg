@@ -731,11 +731,15 @@ pub(crate) fn drop_relation_by_oid(interp: &mut PgCatalog, class_oid: PgClassOid
     }
 
     if let Some(reltype) = class.reltype {
-        // Find and drop the array type whose typelem points at the composite.
-        if let Some(arr_oid) = interp.array_type_of(reltype) {
-            interp.remove_pg_type(arr_oid);
+        // Find and drop the array type whose typelem points at the composite;
+        // what the types depended on goes with them (an extension's
+        // membership: an extension script dropping a view).
+        let array = interp.array_type_of(reltype);
+        for t in array.into_iter().chain(std::iter::once(reltype)) {
+            interp.remove_pg_type(t);
+            let obj = crate::oid::PgGenericOid::from_nonzero(t.into_nonzero());
+            interp.remove_dependencies_of(PG_TYPE_RELID, obj);
         }
-        interp.remove_pg_type(reltype);
     }
 }
 
@@ -1205,18 +1209,93 @@ pub(crate) fn drop_type_cascade(interp: &mut PgCatalog, type_oid: PgTypeOid) {
     drop_type_oid(interp, type_oid, deps);
 }
 
+/// What goes with column `attnum` of `relid` when a cascade drops it
+/// (findDependentObjects): the constraints and indexes over it — its
+/// not-null and CHECK constraints, a key or index containing it — and its
+/// default, statistics, privileges and options.
+fn drop_column_objects(interp: &mut PgCatalog, relid: PgClassOid, attnum: i16) {
+    let indexes: Vec<PgClassOid> = interp
+        .pg_index
+        .values()
+        .filter(|i| i.indrelid == relid && i.indkey.contains(&attnum))
+        .map(|i| i.indexrelid)
+        .collect();
+    let index_names: Vec<String> = indexes
+        .iter()
+        .filter_map(|i| interp.pg_class.get(i).map(|c| c.relname.clone()))
+        .collect();
+    interp.pg_constraint.retain(|_, c| {
+        !(c.conrelid == relid && (c.conkey.contains(&attnum) || index_names.contains(&c.conname)))
+    });
+    for index in indexes {
+        interp.remove_pg_index(index);
+        interp.remove_pg_class(index);
+        let obj = crate::oid::PgGenericOid::from_nonzero(index.into_nonzero());
+        interp.remove_dependencies_of(PG_CLASS_RELID, obj);
+        interp.remove_dependencies_on(PG_CLASS_RELID, obj);
+    }
+    interp.attr_default_types.remove(&(relid, attnum));
+    interp.attr_default_exprs.remove(&(relid, attnum));
+    interp.attr_storage.remove(&(relid, attnum));
+    interp.attr_compression.remove(&(relid, attnum));
+    interp.generated_refs.remove(&(relid, attnum));
+    interp.acls.forget_column(relid, attnum);
+    interp.foreign_data.forget_column(relid, attnum);
+    super::statistics::drop_column_statistics(interp, relid, attnum);
+    super::defaults::forget_default_dependencies(interp, relid, attnum);
+}
+
 /// Remove `type_oid` and what `deps` found depending on it.
 fn drop_type_oid(interp: &mut PgCatalog, type_oid: PgTypeOid, deps: TypeDependents) {
     for &table in &deps.typed_tables {
         drop_relation_by_oid(interp, table);
     }
+    // A view with a column of the type goes whole (its rule depends on
+    // the type), and so does a view reading a table column that goes.
+    let mut dropped_views: Vec<PgClassOid> = deps.views.clone();
     for relid in &deps.relations {
+        let is_view = matches!(
+            interp.pg_class.get(relid).map(|c| c.relkind),
+            Some(RelKind::View | RelKind::MaterializedView)
+        );
+        if is_view {
+            dropped_views.push(*relid);
+            continue;
+        }
+        let columns: Vec<String> = interp
+            .attributes_of(*relid)
+            .iter()
+            .filter(|a| deps.own_types.contains(&a.atttypid))
+            .map(|a| a.attname.clone())
+            .collect();
+        for column in columns {
+            dropped_views.extend(views::find_views_depending_on_column(
+                interp, *relid, &column,
+            ));
+        }
+    }
+    dropped_views.sort();
+    dropped_views.dedup();
+    dropped_views.retain(|v| interp.pg_class.contains_key(v));
+    if !dropped_views.is_empty() {
+        views::drop_views(interp, &dropped_views);
+    }
+    for relid in &deps.relations {
+        if !interp.pg_class.contains_key(relid) {
+            continue;
+        }
+        let dropped: Vec<i16> = interp
+            .attributes_of(*relid)
+            .iter()
+            .filter(|a| deps.own_types.contains(&a.atttypid))
+            .map(|a| a.attnum)
+            .collect();
+        for attnum in dropped {
+            drop_column_objects(interp, *relid, attnum);
+        }
         if let Some(attrs) = interp.pg_attribute.get_mut(relid) {
             attrs.retain(|a| !deps.own_types.contains(&a.atttypid));
         }
-    }
-    if !deps.views.is_empty() {
-        views::drop_views(interp, &deps.views);
     }
     drop_functions_cascade(interp, &deps.functions);
     for proc in deps.constructors {
@@ -1539,6 +1618,7 @@ fn drop_function(
                 if let Some(oid) = dropped {
                     interp.remove_dependencies_of(super::depend::PG_TRIGGER_RELID, oid);
                 }
+                super::triggers::prune_trigger_constraints(interp, relid);
             }
         }
         // So does an event trigger.

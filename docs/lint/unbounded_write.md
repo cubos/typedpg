@@ -40,14 +40,20 @@ deliberate case visible in review.
 
 ## Reported when
 
-Any `UPDATE` or `DELETE` without `WHERE`, including one inside a CTE. Only
-the presence of `WHERE` is checked, not what it says.
+Any `UPDATE` or `DELETE` without `WHERE`, including one inside a CTE, on a
+table that may hold more than one row. Only the presence of `WHERE` is
+checked, not what it says.
 
 ## Not reported
 
 - Any `WHERE`, including `WHERE CURRENT OF`, `DELETE … USING … WHERE …`, and
   conditions that are always true: `WHERE true` is reported by
   [`constant_condition`](constant_condition.md) instead.
+- A table that provably holds at most one row, written without `WHERE` by
+  design: a primary key or unique key whose every column is `NOT NULL` and
+  fixed to one value by a validated `CHECK` (`id boolean PRIMARY KEY CHECK
+  (id)`, `id int PRIMARY KEY CHECK (id = 1)`), on a plain table with no
+  inheritance children and no rewrite rules.
 - `TRUNCATE`, `MERGE`, `INSERT … ON CONFLICT DO UPDATE`.
 - Migrations.
 

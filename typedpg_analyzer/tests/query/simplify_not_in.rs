@@ -699,6 +699,127 @@ fn the_oracle_compares_dml_table_contents() {
     );
 }
 
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_sets_sequences_back_before_each_run() {
+    // Sequences aren't transactional: without setting them back, the
+    // second run's identity values differ from the first's.
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE items (id int GENERATED ALWAYS AS IDENTITY, name text NOT NULL);")
+        .unwrap();
+    let written = "INSERT INTO items (name) VALUES ('a') RETURNING id";
+    assert!(
+        db.pg_sanity_check_rewrite(
+            written,
+            "INSERT INTO items (name) VALUES ('a' || '') RETURNING id"
+        )
+        .is_none()
+    );
+    let divergence = db
+        .pg_sanity_check_rewrite(
+            written,
+            "INSERT INTO items (name) VALUES ('b') RETURNING id",
+        )
+        .expect("the oracle sees the difference");
+    assert!(
+        divergence.message.contains("table contents"),
+        "{divergence}"
+    );
+}
+
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_compares_arbitrarily_picked_rows_by_count() {
+    let db = setup();
+    // Which row LIMIT picks is arbitrary without a total ORDER BY: only the
+    // count is compared.
+    for (written, rewritten) in [
+        (
+            "SELECT id FROM customers LIMIT 1",
+            "SELECT id FROM customers ORDER BY id DESC LIMIT 1",
+        ),
+        (
+            "SELECT id FROM customers ORDER BY code LIMIT 1",
+            "SELECT id FROM customers ORDER BY code, id DESC LIMIT 1",
+        ),
+        (
+            "SELECT id FROM customers FETCH FIRST ROW ONLY",
+            "SELECT id FROM customers ORDER BY id DESC FETCH FIRST ROW ONLY",
+        ),
+        (
+            "SELECT DISTINCT ON (code) id FROM customers",
+            "SELECT DISTINCT ON (code) id FROM customers ORDER BY code, id DESC",
+        ),
+    ] {
+        assert!(
+            db.pg_sanity_check_rewrite(written, rewritten).is_none(),
+            "{written}"
+        );
+    }
+    let divergence = db
+        .pg_sanity_check_rewrite(
+            "SELECT id FROM customers LIMIT 1",
+            "SELECT id FROM customers LIMIT 2",
+        )
+        .expect("the counts differ");
+    assert!(
+        divergence.message.contains("returns 2 rows"),
+        "{divergence}"
+    );
+    // A total order picks the same rows every time: they are compared.
+    let divergence = db
+        .pg_sanity_check_rewrite(
+            "SELECT id FROM customers ORDER BY id LIMIT 1",
+            "SELECT id FROM customers ORDER BY id DESC LIMIT 1",
+        )
+        .expect("the rows differ");
+    assert!(
+        divergence.message.contains("returns other rows"),
+        "{divergence}"
+    );
+}
+
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_does_not_compare_volatile_results() {
+    let db = setup();
+    // Two runs of random() differ: results that differ prove nothing.
+    let sql = "SELECT id, random() AS r FROM customers";
+    assert!(db.pg_sanity_check_rewrite(sql, sql).is_none());
+    // Failing where the written query runs still does.
+    let divergence = db
+        .pg_sanity_check_rewrite(
+            sql,
+            "SELECT id, random() + 1 / (id - id) AS r FROM customers",
+        )
+        .expect("the simplified query fails");
+    assert!(
+        divergence.message.contains("the simplified query fails"),
+        "{divergence}"
+    );
+}
+
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_counts_the_rows_a_limit_picks_arbitrarily() {
+    // Which row a LIMIT without ORDER BY keeps is the plan's choice (a
+    // DISTINCT dropped over a key reads another one first): only the
+    // count is compared.
+    let db = setup();
+    let written = "SELECT DISTINCT id FROM customers LIMIT 1";
+    assert!(
+        db.pg_sanity_check_rewrite(written, "SELECT id FROM customers ORDER BY id DESC LIMIT 1")
+            .is_none()
+    );
+    let divergence = db
+        .pg_sanity_check_rewrite(written, "SELECT id FROM customers LIMIT 2")
+        .expect("the oracle sees the other count");
+    assert!(
+        divergence.message.contains("returns 2 rows"),
+        "{divergence}"
+    );
+}
+
 #[test]
 fn a_user_implicit_cast_before_the_equality_is_not_trusted() {
     // `int = text` resolves to the built-in `int = int` through the user's

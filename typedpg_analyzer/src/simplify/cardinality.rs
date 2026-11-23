@@ -97,7 +97,9 @@ pub fn redundant_distinct_spans(
 
 /// Whether the `ORDER BY` keys of `select` — a node borrowed from
 /// `view.tree` at any nesting depth — can tie: two rows the schema allows
-/// sharing every key (see [`dedup::OrderTies`]). `Unknown` for a query
+/// sharing every key (see [`dedup::OrderTies`]). A `WHERE` equality to a
+/// column of an enclosing query level fixes a column like a parameter does
+/// (it is one value per evaluation of `select`). `Unknown` for a query
 /// with spreads.
 pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> dedup::OrderTies {
     if !view.analyzed.spreads.is_empty() {
@@ -109,7 +111,40 @@ pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) ->
         catalog,
         analyzed: &view.analyzed,
     };
-    dedup::order_ties(&ctx, &dedup::cte_names(&view.tree), select)
+    order_ties_in(&ctx, select)
+}
+
+/// [`order_ties`] of `select`, a node of `ctx`'s tree.
+fn order_ties_in(ctx: &Ctx<'_>, select: &SelectStmt) -> dedup::OrderTies {
+    let ties = dedup::order_ties(ctx, &dedup::cte_names(ctx.tree), select, None);
+    if !matches!(ties, dedup::OrderTies::Ties(_)) {
+        return ties;
+    }
+    // Again with the levels around `select`, which only the walk from the
+    // statement's root knows.
+    let mut found = None;
+    let env = CteEnv::default();
+    for raw in &ctx.tree.stmts {
+        if let Some(root) = raw.stmt.as_ref() {
+            find_select(
+                ctx,
+                root.to_ref(),
+                None,
+                &env,
+                select,
+                SelectCheck::OrderUnique,
+                &mut found,
+            );
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    if found == Some(true) {
+        dedup::OrderTies::Unique
+    } else {
+        ties
+    }
 }
 
 /// What each `ORDER BY` item of `select` — a node borrowed from `view.tree`
@@ -263,21 +298,150 @@ pub fn redundant_group_keys(
 /// reference to one proves nothing — and a `MERGE` needs its target
 /// determined by the `ON` condition and its source at most one row.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
-    if !view.analyzed.spreads.is_empty() {
-        return false;
-    }
     let ctx = Ctx {
         sql: &view.sql,
         tree: &view.tree,
         catalog,
         analyzed: &view.analyzed,
     };
+    select_at_most_one_row_of(&ctx, select)
+}
+
+/// Whether two runs of `sql` (analyzed as `analyzed`) over the same rows
+/// may pick different ones: a select whose `LIMIT`, `OFFSET` or `DISTINCT
+/// ON` picks among rows its `ORDER BY` doesn't tell apart (its keys can tie,
+/// or the proof can't tell, see [`order_ties`]), unless it has at most one
+/// row to pick from. `FETCH … WITH TIES` without an `OFFSET` returns every
+/// tie, which is no choice. For the pg_sanity oracles, which compare the
+/// rows of two queries: picked rows can only be compared by their count.
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn picks_rows_arbitrarily(
+    catalog: &PgCatalog,
+    sql: &str,
+    analyzed: &crate::resolve::AnalyzedQuery,
+) -> bool {
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return true;
+    };
+    let ctx = Ctx {
+        sql,
+        tree: &parsed.tree,
+        catalog,
+        analyzed,
+    };
+    let is_null = |node: &Node| matches!(node, Node::AConst(c) if c.isnull);
+    let is_zero = |node: &Node| {
+        matches!(node, Node::AConst(c)
+            if !c.isnull && matches!(&c.val, Some(AConstValue::Integer(i)) if i.ival == 0))
+    };
+    parsed.tree.nodes().any(|(node, _)| {
+        let NodeRef::SelectStmt(select) = node else {
+            return false;
+        };
+        let distinct_on = matches!(select.distinct_clause.first(), Some(Some(_)));
+        let limits = select
+            .limit_count
+            .as_ref()
+            .is_some_and(|count| !is_null(count) && !is_zero(count));
+        let offsets = select
+            .limit_offset
+            .as_ref()
+            .is_some_and(|offset| !is_null(offset) && !is_zero(offset));
+        if !(distinct_on || limits || offsets) {
+            return false;
+        }
+        if !analyzed.spreads.is_empty() {
+            return true;
+        }
+        if select.limit_option == LimitOption::WithTies && !offsets && !distinct_on {
+            return false;
+        }
+        if !distinct_on && select_at_most_one_row_of(&ctx, select) {
+            return false;
+        }
+        select.sort_clause.is_empty()
+            || !(order_covers_output(select)
+                || matches!(order_ties_in(&ctx, select), dedup::OrderTies::Unique))
+    })
+}
+
+/// Whether `select`'s `ORDER BY` keys are its output columns (by position,
+/// or by a name only one output column has) and cover every one: rows
+/// that tie then show the same values (equal under the sort, if not always
+/// byte for byte: `1.0` and `1.00`), whichever of them is picked.
+#[cfg(feature = "pg_sanity")]
+fn order_covers_output(select: &SelectStmt) -> bool {
+    let mut first = select;
+    while first.op != SetOperation::SetopNone {
+        match first.larg.as_deref() {
+            Some(larg) => first = larg,
+            None => return false,
+        }
+    }
+    let mut names: Vec<Option<&str>> = Vec::with_capacity(first.target_list.len());
+    for target in &first.target_list {
+        let Some(Node::ResTarget(target)) = target else {
+            return false;
+        };
+        let column = match target.val.as_ref() {
+            Some(Node::ColumnRef(c)) => match c.fields.last() {
+                Some(Some(Node::String(name))) => Some(name.sval.as_str()),
+                // `*` or `t.*`: the columns are unknown.
+                _ => return false,
+            },
+            _ => None,
+        };
+        // Set operations take the first arm's names; PG resolves a bare
+        // name in a plain select's ORDER BY to an output column first.
+        names.push(if target.name.is_empty() {
+            column
+        } else {
+            Some(target.name.as_str())
+        });
+    }
+    let mut covered = vec![false; names.len()];
+    for sort in &select.sort_clause {
+        let Some(Node::SortBy(by)) = sort else {
+            return false;
+        };
+        let at = match by.node.as_ref() {
+            Some(Node::AConst(c)) => match &c.val {
+                Some(AConstValue::Integer(i)) => {
+                    usize::try_from(i.ival).ok().and_then(|i| i.checked_sub(1))
+                }
+                _ => None,
+            },
+            Some(Node::ColumnRef(c)) => match c.fields.as_slice() {
+                [Some(Node::String(name))] => {
+                    let mut at = names
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| **n == Some(name.sval.as_str()));
+                    match (at.next(), at.next()) {
+                        (Some((i, _)), None) => Some(i),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        match at.and_then(|i| covered.get_mut(i)) {
+            Some(slot) => *slot = true,
+            None => return false,
+        }
+    }
+    covered.iter().all(|&c| c)
+}
+
+/// [`select_at_most_one_row`] of `select`, judged against `ctx`'s tree.
+fn select_at_most_one_row_of(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     let mut found = None;
     let env = CteEnv::default();
-    for raw in &view.tree.stmts {
+    for raw in &ctx.tree.stmts {
         if let Some(root) = raw.stmt.as_ref() {
             find_select(
-                &ctx,
+                ctx,
                 root.to_ref(),
                 None,
                 &env,
@@ -294,8 +458,8 @@ pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &Se
     // CTE name in this tree a reference the proof gives up on (the node may
     // be inside one, shadowing a table of the same name).
     found.unwrap_or_else(|| {
-        let env = CteEnv::blocked(&dedup::cte_names(&view.tree));
-        select_at_most_one_row_in(&ctx, select, &FromScope::opaque(None), &env)
+        let env = CteEnv::blocked(&dedup::cte_names(ctx.tree));
+        select_at_most_one_row_in(ctx, select, &FromScope::opaque(None), &env)
     })
 }
 
@@ -353,9 +517,6 @@ pub(super) fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> boo
 /// The statement's own `WITH` clause provides its single-row CTEs, judged in
 /// declaration order (see [`select_at_most_one_row`]).
 pub fn statement_at_most_one_row(catalog: &PgCatalog, view: &QueryView) -> bool {
-    if !view.analyzed.spreads.is_empty() {
-        return false;
-    }
     let ctx = Ctx {
         sql: &view.sql,
         tree: &view.tree,
@@ -366,6 +527,53 @@ pub fn statement_at_most_one_row(catalog: &PgCatalog, view: &QueryView) -> bool 
         return false;
     };
     statement_at_most_one_row_in(&ctx, statement.to_ref(), &CteEnv::default(), None)
+}
+
+/// Whether `statement` — a statement node such as a `WITH` query's body, a
+/// node of `view.tree` at any nesting depth — provably yields at most one
+/// row by [`statement_at_most_one_row`]'s proof. It is judged without the
+/// query levels and `WITH` queries around it: a reference to an outer column
+/// or to any CTE of the tree proves nothing.
+pub fn statement_node_at_most_one_row(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    statement: NodeRef<'_>,
+) -> bool {
+    if !view.analyzed.spreads.is_empty() {
+        return false;
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    let env = CteEnv::blocked(&dedup::cte_names(&view.tree));
+    statement_at_most_one_row_in(&ctx, statement, &env, None)
+}
+
+/// Whether relation `relid` provably holds at most one row, so a statement
+/// writing it writes at most one: a plain table without rewrite rules (a
+/// rule may write elsewhere) whose complete unique key a validated CHECK
+/// fixes to one value, `id boolean PRIMARY KEY CHECK (id)` (see
+/// [`dedup::singleton_table`]).
+pub fn relation_holds_at_most_one_row(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    relid: crate::oid::PgClassOid,
+) -> bool {
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    catalog
+        .pg_class
+        .get(&relid)
+        .is_some_and(|class| class.relkind == RelKind::Table)
+        && !catalog.lint_relation_has_rules(relid)
+        && dedup::singleton_table(&ctx, relid)
 }
 
 // ── CTEs ────────────────────────────────────────────────────────────────────
@@ -529,7 +737,7 @@ fn with_clause(node: NodeRef<'_>) -> Option<&WithClause> {
 /// The columns a CTE body's `RETURNING` clause or target list yields.
 fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<CteColumn> {
     match body {
-        NodeRef::SelectStmt(select) => select_output_columns(ctx, select, env),
+        NodeRef::SelectStmt(select) => select_output_columns(ctx, select, env, None),
         NodeRef::InsertStmt(insert) => returning_columns(
             ctx,
             insert.relation.as_deref(),
@@ -558,18 +766,21 @@ fn cte_output_columns(ctx: &Ctx<'_>, body: NodeRef<'_>, env: &CteEnv) -> Vec<Cte
 /// The columns a `SELECT` body yields — a plain target list, a `VALUES` list
 /// or a set operation's arms — with each name, type and whether its
 /// collation compares bytewise. Used for a CTE's and a `FROM` subquery's
-/// output columns.
+/// output columns. `parent` is the namespace around the body (for a
+/// `LATERAL` subquery, the items to its left), which a column its own
+/// `FROM` doesn't hold is read from.
 pub(super) fn select_output_columns(
     ctx: &Ctx<'_>,
     select: &SelectStmt,
     env: &CteEnv,
+    parent: Option<&FromScope<'_>>,
 ) -> Vec<CteColumn> {
     if select.op != SetOperation::SetopNone {
         let (Some(left), Some(right)) = (select.larg.as_deref(), select.rarg.as_deref()) else {
             return Vec::new();
         };
-        let mut columns = select_output_columns(ctx, left, env);
-        let other = select_output_columns(ctx, right, env);
+        let mut columns = select_output_columns(ctx, left, env, parent);
+        let other = select_output_columns(ctx, right, env, parent);
         if columns.len() != other.len() {
             return Vec::new();
         }
@@ -595,7 +806,7 @@ pub(super) fn select_output_columns(
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                let (typ, deterministic) = value_type(ctx, None, item.as_ref());
+                let (typ, deterministic) = value_type(ctx, None, None, item.as_ref());
                 CteColumn {
                     name: Some(format!("column{}", i + 1)),
                     typ,
@@ -611,7 +822,7 @@ pub(super) fn select_output_columns(
                 return Vec::new();
             }
             for (column, item) in out.iter_mut().zip(&list.items) {
-                let (typ, deterministic) = value_type(ctx, None, item.as_ref());
+                let (typ, deterministic) = value_type(ctx, None, None, item.as_ref());
                 if column.typ != typ || !column.deterministic || !deterministic {
                     column.typ = None;
                     column.deterministic = false;
@@ -630,7 +841,7 @@ pub(super) fn select_output_columns(
         let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        if target.val.is_none() {
+        if target.val.is_none() || composite_star(target.val.as_ref()) {
             return Vec::new();
         }
         let value = &target.val;
@@ -672,7 +883,7 @@ pub(super) fn select_output_columns(
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value.as_ref());
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), parent, value.as_ref());
         out.push(CteColumn {
             name: if target.name.is_empty() {
                 output_name(value.as_ref())
@@ -714,7 +925,7 @@ fn returning_columns(
         let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        if target.val.is_none() {
+        if target.val.is_none() || composite_star(target.val.as_ref()) {
             return Vec::new();
         }
         let value = &target.val;
@@ -769,7 +980,7 @@ fn returning_columns(
             }
             continue;
         }
-        let (typ, deterministic) = value_type(ctx, scope.as_ref(), value.as_ref());
+        let (typ, deterministic) = value_type(ctx, scope.as_ref(), None, value.as_ref());
         out.push(CteColumn {
             name: if target.name.is_empty() {
                 output_name(value.as_ref())
@@ -812,6 +1023,7 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
+    outer: Option<&FromScope<'_>>,
     value: Option<&ast::Node>,
 ) -> (Option<crate::oid::PgTypeOid>, bool) {
     match value {
@@ -826,7 +1038,26 @@ fn value_type(
                     .map_or((None, false), |(typ, deterministic)| {
                         (Some(typ), deterministic)
                     }),
-                dedup::Col::Opaque | dedup::Col::Other => (None, false),
+                dedup::Col::Opaque => (None, false),
+                // Not a column of the body's own FROM: the nearest level
+                // around it that holds the name decides — unless the body
+                // has a relation the qualifier names, which hides any
+                // farther one.
+                dedup::Col::Other => {
+                    let qualifier = match names.as_slice() {
+                        [_] => None,
+                        [qualifier, _] | [_, qualifier, _] => Some(*qualifier),
+                        _ => return (None, false),
+                    };
+                    if qualifier.is_some_and(|q| scope.rel_named(q).is_some()) {
+                        return (None, false);
+                    }
+                    outer
+                        .and_then(|outer| outer.resolve_value(ctx, column))
+                        .map_or((None, false), |(typ, deterministic)| {
+                            (Some(typ), deterministic)
+                        })
+                }
             }
         }
         Some(Node::ParamRef(param)) => {
@@ -881,23 +1112,59 @@ fn value_type(
                 typ.is_some_and(|typ| !dedup::collatable_type(ctx, typ)),
             )
         }
+        // A `CASE` is its results' common type: known when every result
+        // that isn't a bare NULL has the same known type (all-literal
+        // results resolve to `text`, as one literal does), and deterministic
+        // when every one's collation is (its collation is derived from
+        // theirs).
+        Some(Node::CaseExpr(case)) => {
+            let results = case
+                .args
+                .iter()
+                .map(|when| match when {
+                    Some(Node::CaseWhen(when)) => Some(when.result.as_ref()),
+                    _ => None,
+                })
+                .chain(std::iter::once(Some(case.defresult.as_ref())));
+            let mut known: Option<(crate::oid::PgTypeOid, bool)> = None;
+            for result in results {
+                let Some(result) = result else {
+                    return (None, false);
+                };
+                // A missing ELSE is NULL, and NULL takes the others' type.
+                if result.is_none_or(|result| matches!(result, Node::AConst(c) if c.isnull)) {
+                    continue;
+                }
+                let (Some(typ), deterministic) = value_type(ctx, scope, outer, result) else {
+                    return (None, false);
+                };
+                known = match known {
+                    None => Some((typ, deterministic)),
+                    Some((other, other_deterministic)) if other == typ => {
+                        Some((typ, deterministic && other_deterministic))
+                    }
+                    Some(_) => return (None, false),
+                };
+            }
+            known.map_or((None, false), |(typ, deterministic)| {
+                (Some(typ), deterministic)
+            })
+        }
         _ => (None, false),
     }
 }
 
+/// Whether a target is `(composite).*`, which expands to the composite's
+/// fields: a list of its columns by position can't be made.
+fn composite_star(value: Option<&ast::Node>) -> bool {
+    matches!(value, Some(Node::AIndirection(indirection))
+        if matches!(indirection.indirection.last(), Some(Some(Node::AStar(_)))))
+}
+
 /// The column name PG gives a target that has none written, when it is
-/// certain: a bare column reference's last field. `FigureColname` derives
-/// other names from the expression (a cast from its argument, a function call
-/// from the function, `CASE` as `case`), which this doesn't reproduce, so
-/// anything else is unknown.
+/// certain (see [`crate::resolve::certain_colname`]).
 fn output_name(value: Option<&ast::Node>) -> Option<String> {
-    let Node::ColumnRef(column) = value? else {
-        return None;
-    };
-    let Fields::Names(names) = dedup::column_ref_fields(column) else {
-        return None;
-    };
-    names.last().map(|name| (*name).to_owned())
+    crate::resolve::certain_colname(value)
 }
 
 #[cfg(test)]
@@ -920,6 +1187,9 @@ enum SelectCheck {
     OneRow,
     /// [`proof::error_free_select_allow_count`] (the lint fix's proof).
     ErrorFree,
+    /// [`dedup::order_ties`] is `Unique`, with the enclosing levels' columns
+    /// as values.
+    OrderUnique,
 }
 
 /// Search `node`'s subtree for `target`, giving each nested query level the
@@ -952,6 +1222,10 @@ fn find_select(
                     }
                     SelectCheck::ErrorFree => {
                         proof::error_free_select_allow_count(ctx, select, &scope)
+                    }
+                    SelectCheck::OrderUnique => {
+                        dedup::order_ties(ctx, &dedup::cte_names(ctx.tree), select, Some(&scope))
+                            == dedup::OrderTies::Unique
                     }
                 });
                 return;
@@ -1446,8 +1720,15 @@ pub(super) fn select_at_most_one_row_in(
     if has_full_join(&select.from_clause) {
         return false;
     }
+    // A spread's row stands for any number of rows.
     if !select.values_lists.is_empty() {
-        return select.from_clause.is_empty() && select.values_lists.len() == 1;
+        return select.from_clause.is_empty()
+            && select.values_lists.len() == 1
+            && !select
+                .values_lists
+                .iter()
+                .flatten()
+                .any(|row| contains_spread_param(ctx, row.to_ref()));
     }
     if select.from_clause.is_empty() {
         return true;
@@ -1591,6 +1872,107 @@ fn distinct_on_key_reads_input(select: &SelectStmt, key: Option<&ast::Node>) -> 
     })
 }
 
+/// The output columns, by attnum, a `SELECT DISTINCT ON` keys: at most one
+/// of its rows has any one value of them. That holds when every key is a
+/// plain input column ([`distinct_on_key_reads_input`]) the target list
+/// also outputs as that same bare column, so the output column is the key's
+/// value; `DISTINCT ON` keeps one row per key under the keys' default
+/// equality, which no `ORDER BY … USING` replaces. A set-returning call at
+/// the level (by any routine of its name, in any schema: a view body's names
+/// were resolved under another `search_path`) is refused, as is a `*`
+/// target, whose columns this can't count.
+pub(super) fn distinct_on_output_key(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<Vec<i16>> {
+    if select.op != SetOperation::SetopNone
+        || select.distinct_clause.is_empty()
+        || dedup::is_plain_distinct(select)
+        || select.target_list.iter().any(|target| {
+            !matches!(target, Some(Node::ResTarget(target))
+                if target.val.as_ref().is_some_and(|value| !is_star(value)))
+        })
+        || select.sort_clause.iter().any(|item| {
+            !matches!(item, Some(Node::SortBy(by)) if by.sortby_dir != ast::SortByDir::SortbyUsing)
+        })
+        || may_return_set_in_any_schema(ctx, select)
+    {
+        return None;
+    }
+    let mut key = Vec::with_capacity(select.distinct_clause.len());
+    for item in &select.distinct_clause {
+        let Some(Node::ColumnRef(column)) = item else {
+            return None;
+        };
+        let Fields::Names(names) = dedup::column_ref_fields(column) else {
+            return None;
+        };
+        if !distinct_on_key_reads_input(select, item.as_ref()) {
+            return None;
+        }
+        let position = select.target_list.iter().position(|target| {
+            matches!(target, Some(Node::ResTarget(target))
+                if matches!(target.val.as_ref(), Some(Node::ColumnRef(output))
+                    if matches!(dedup::column_ref_fields(output),
+                        Fields::Names(output) if output == names)))
+        })?;
+        key.push(i16::try_from(position + 1).ok()?);
+    }
+    Some(key)
+}
+
+/// Whether `value` is a `*` or `qualifier.*` target.
+fn is_star(value: &Node) -> bool {
+    matches!(value, Node::ColumnRef(column)
+        if matches!(dedup::column_ref_fields(column), Fields::Star(_)))
+}
+
+/// [`has_set_returning`], counting every routine of a call's name in any
+/// schema: a stored view body was resolved under the `search_path` of the
+/// session that created it.
+fn may_return_set_in_any_schema(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    if has_set_returning(ctx, select) {
+        return true;
+    }
+    let mut stack: Vec<NodeRef<'_>> = Vec::new();
+    stack.extend(refs(&select.target_list));
+    stack.extend(refs(&select.from_clause));
+    stack.extend(refs(&select.group_clause));
+    stack.extend(refs(&select.window_clause));
+    stack.extend(refs(&select.sort_clause));
+    stack.extend(refs(&select.distinct_clause));
+    for node in [
+        &select.where_clause,
+        &select.having_clause,
+        &select.limit_count,
+        &select.limit_offset,
+    ] {
+        if let Some(node) = node.as_ref() {
+            stack.push(node.to_ref());
+        }
+    }
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeRef::SubLink(_) | NodeRef::RangeSubselect(_) | NodeRef::CommonTableExpr(_) => {
+                continue;
+            }
+            NodeRef::FuncCall(call) => {
+                let Some((_, name)) = function_name(&call.funcname) else {
+                    return true;
+                };
+                if ctx
+                    .catalog
+                    .pg_proc
+                    .values()
+                    .any(|proc| proc.proname == name && proc.proretset)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    false
+}
+
 /// The relation and attnum a grouping / `DISTINCT ON` item is a plain
 /// column of, resolved in this level's scope.
 fn plain_column(scope: &Scope<'_>, item: Option<&ast::Node>) -> Option<(usize, i16)> {
@@ -1654,6 +2036,8 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: Option<&ast::Node>) -> bool {
             | NodeRef::RangeVar(_)
             | NodeRef::RangeFunction(_)
             | NodeRef::RangeTableSample(_) => return false,
+            // A spread's placeholder stands for each of its items in turn.
+            NodeRef::ParamRef(param) if is_spread_param(ctx, param.number) => return false,
             // A window function numbers the rows it sees, so it differs
             // from one row to the next even over constants.
             NodeRef::FuncCall(call) if call.over.is_some() => return false,
@@ -1683,6 +2067,31 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: Option<&ast::Node>) -> bool {
         stack.extend(node.children());
     }
     true
+}
+
+/// Whether `$number` is one of a spread's placeholders. The query this
+/// proof reads has each `$..spread` written as one row of placeholders —
+/// in a `VALUES` list for a rows spread, as an `IN` list for a list spread
+/// (the only places a spread may be) — numbered after the regular
+/// parameters. At run time that row is any number of rows (none included)
+/// and that list any number of values, so such a placeholder is no single
+/// value, and a `VALUES` row holding one no single row.
+///
+/// [`crate::resolve::AnalyzedQuery::params`] lists the regular parameters
+/// only, so a spread's placeholder is any number past them.
+pub(super) fn is_spread_param(ctx: &Ctx<'_>, number: i32) -> bool {
+    !ctx.analyzed.spreads.is_empty()
+        && usize::try_from(number).map_or(true, |number| number > ctx.analyzed.params.len())
+}
+
+/// Whether a spread's placeholder ([`is_spread_param`]) appears under `node`.
+fn contains_spread_param(ctx: &Ctx<'_>, node: NodeRef<'_>) -> bool {
+    match node {
+        NodeRef::ParamRef(param) => is_spread_param(ctx, param.number),
+        _ => node
+            .children()
+            .any(|child| contains_spread_param(ctx, child)),
+    }
 }
 
 /// The [`NodeRef`]s of a list of AST nodes, skipping NULL cells.
@@ -2245,7 +2654,7 @@ fn merge_at_most_one_row(ctx: &Ctx<'_>, merge: &MergeStmt, env: &CteEnv) -> bool
             // its columns. (The FROM-subquery typing may fill these in on
             // its own; doing it here keeps the MERGE proof independent.)
             let source_env = visible_ctes(ctx, env, select.with_clause.as_deref(), None).after;
-            let columns = select_output_columns(ctx, select, &source_env);
+            let columns = select_output_columns(ctx, select, &source_env, None);
             if columns.len() == scope.rels[1].columns.len() {
                 scope.rels[1].cte_columns = columns
                     .iter()
@@ -3277,14 +3686,20 @@ mod tests {
         assert!(!aggregate_is_one_row(
             "SELECT (SELECT count(u.id) FROM (SELECT role FROM m) s) FROM u"
         ));
-        // A subquery output name that isn't certain refuses placement.
-        assert!(!aggregate_is_one_row(
+        // PG names `role || ''` `?column?` (FigureColname), so the
+        // aggregate reads the subquery's column.
+        assert!(aggregate_is_one_row(
             "SELECT (SELECT count(\"?column?\") FROM (SELECT role || '' FROM m) s) FROM u"
+        ));
+        // A subquery output name that isn't certain (PG names a scalar
+        // sublink after the sublink's own target) refuses placement.
+        assert!(!aggregate_is_one_row(
+            "SELECT (SELECT count(role) FROM (SELECT (SELECT role) FROM m) s) FROM u"
         ));
     }
 
     #[test]
-    fn a_cast_or_call_output_name_is_not_trusted() {
+    fn a_cast_or_call_output_name_follows_figure_colname() {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(
             "CREATE TABLE src (v int);
@@ -3319,10 +3734,10 @@ mod tests {
             "WITH c AS (SELECT v::int FROM src) \
              SELECT ARRAY(SELECT count(\"?column?\") FROM c) FROM outer_rows"
         ));
-        // A function call's name is not trusted either, even when PG names
-        // the column after the function: the relation's columns stay
-        // uncertain, so the count can't be placed on this level.
-        assert!(!aggregate_is_one_row(
+        // PG names a function call's column after the function: `"lower"`
+        // is the CTE's column, so the count is the inner level's aggregate
+        // and collapses it to one row.
+        assert!(aggregate_is_one_row(
             "WITH c AS (SELECT lower(v::text) FROM src) \
              SELECT ARRAY(SELECT count(\"lower\") FROM c) FROM outer_rows"
         ));
@@ -4350,7 +4765,6 @@ mod tests {
         db.apply_sql(
             "CREATE TABLE dup_keys (id integer PRIMARY KEY, v text);
              CREATE TABLE dup_nulls (k integer UNIQUE, v text);
-             CREATE TABLE dup_deferred (k integer UNIQUE DEFERRABLE, v text);
              CREATE TABLE dup_partial (k integer, v text);
              CREATE UNIQUE INDEX ON dup_partial (k) WHERE v IS NOT NULL;
              CREATE TABLE dup_trigger (k integer PRIMARY KEY);
@@ -4398,9 +4812,8 @@ mod tests {
             // NULLs never conflict under a unique index.
             "INSERT INTO dup_nulls (k, v) VALUES (NULL, 'a'), (NULL, 'b') \
              ON CONFLICT DO NOTHING RETURNING k",
-            // A deferrable key is checked at commit, not by `DO NOTHING`.
-            "INSERT INTO dup_deferred (k, v) VALUES (1, 'a'), (1, 'b') \
-             ON CONFLICT DO NOTHING RETURNING k",
+            // (A deferrable key can't arbitrate `DO NOTHING`: the executor
+            // refuses it, so such a statement never runs.)
             // A partial index does not cover both rows.
             "INSERT INTO dup_partial (k, v) VALUES (1, 'a'), (1, 'b') \
              ON CONFLICT DO NOTHING RETURNING k",
@@ -5048,6 +5461,12 @@ mod tests {
             "SELECT DISTINCT ON (org_id) org_id, o.id FROM owners o \
              WHERE o.org_id = $1 ORDER BY org_id, o.id",
         ));
+        // `t.owner_id + 0` is named `?column?`: `org_id` is the input column.
+        assert!(select_one(
+            &db,
+            "SELECT DISTINCT ON (org_id) t.owner_id + 0 FROM owners o \
+             JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
+        ));
         // A determined relation's column is one value even without a fact
         // about it.
         assert!(select_one(
@@ -5074,8 +5493,9 @@ mod tests {
             // `t.owner_id`, not the input `org_id` the WHERE fixes.
             "SELECT DISTINCT ON (org_id) t.owner_id AS org_id FROM owners o \
              JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
-            // A target whose output name isn't known may be the one meant.
-            "SELECT DISTINCT ON (org_id) t.owner_id + 0 FROM owners o \
+            // A target whose output name isn't known may be the one meant
+            // (PG names this one `org_id`, after the sublink's target).
+            "SELECT DISTINCT ON (org_id) (SELECT t.owner_id AS org_id) FROM owners o \
              JOIN tools t ON t.owner_id = o.id WHERE o.org_id = $1",
         ] {
             assert!(!select_one(&db, sql), "{sql}");
@@ -5372,6 +5792,386 @@ mod tests {
             &db,
             "SELECT x.id FROM lateral_rows t \
              CROSS JOIN LATERAL (SELECT t.id AS id LIMIT 1) x WHERE t.id = 1 GROUP BY x.id",
+        ));
+    }
+
+    /// The schema of the single-row proofs real projects needed.
+    fn projects_catalog() -> PgCatalog {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE jobs (
+                id bigint PRIMARY KEY,
+                ws bigint,
+                state text NOT NULL,
+                retired_at timestamptz
+             );
+             CREATE TABLE posts (id bigint PRIMARY KEY, title text NOT NULL);
+             CREATE TABLE inserted (id bigint PRIMARY KEY, x text);
+             CREATE TABLE runs (
+                id bigint PRIMARY KEY,
+                ws bigint NOT NULL,
+                state text NOT NULL,
+                retired_at timestamptz
+             );
+             CREATE UNIQUE INDEX ON runs (ws)
+                WHERE state IN ('queued', 'running', 'done') AND retired_at IS NULL;
+             CREATE TABLE slots (id bigint PRIMARY KEY, n int NOT NULL, k bigint NOT NULL);
+             CREATE UNIQUE INDEX ON slots (k) WHERE n IN (1, 2);
+             CREATE TABLE users (
+                id bigint PRIMARY KEY,
+                email text NOT NULL,
+                login text NOT NULL,
+                principal text UNIQUE
+             );
+             CREATE UNIQUE INDEX ON users (lower(email));
+             CREATE INDEX ON users (upper(login));
+             CREATE COLLATION ci (
+                provider = icu, locale = 'und-u-ks-level2', deterministic = false
+             );
+             CREATE TABLE ci_users (id bigint PRIMARY KEY, email text COLLATE ci NOT NULL);
+             CREATE UNIQUE INDEX ON ci_users (lower(email));
+             CREATE SCHEMA other;
+             CREATE FUNCTION public.norm(v text) RETURNS text IMMUTABLE LANGUAGE sql
+                AS $$ SELECT lower(v) $$;
+             CREATE FUNCTION other.norm(v text) RETURNS text IMMUTABLE LANGUAGE sql
+                AS $$ SELECT v $$;
+             CREATE TABLE handles (id bigint PRIMARY KEY, handle text NOT NULL);
+             CREATE UNIQUE INDEX ON handles (norm(handle));
+             CREATE TABLE builds (
+                id bigint PRIMARY KEY,
+                project_id bigint NOT NULL,
+                arch text NOT NULL,
+                created_at timestamptz NOT NULL
+             );
+             CREATE VIEW cur AS
+                SELECT DISTINCT ON (project_id, arch) id, project_id, arch FROM builds
+                ORDER BY project_id, arch, created_at DESC;
+             CREATE VIEW cur_hidden AS
+                SELECT DISTINCT ON (project_id, arch) id, project_id FROM builds
+                ORDER BY project_id, arch, created_at DESC;
+             CREATE VIEW cur_set AS
+                SELECT DISTINCT ON (project_id, arch) id, project_id, arch,
+                       generate_series(1, 2) AS n
+                FROM builds ORDER BY project_id, arch, created_at DESC;
+             CREATE VIEW all_builds AS SELECT id, project_id, arch FROM builds;
+             CREATE TABLE cnaes (codigo integer PRIMARY KEY, nome text);
+             CREATE TYPE kind AS ENUM ('a', 'b');
+             CREATE TABLE kinds (k kind PRIMARY KEY, label text);
+             CREATE TABLE empresas (id bigint PRIMARY KEY, cnae text, kind text);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn an_in_over_a_one_row_subquery_is_an_equality() {
+        let db = projects_catalog();
+        assert!(statement_one(
+            &db,
+            "UPDATE jobs SET state = 'x' \
+             WHERE id IN (SELECT id FROM jobs WHERE state = 'a' LIMIT 1) RETURNING id",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id IN (SELECT id FROM jobs ORDER BY id LIMIT 1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id = ANY (SELECT max(id) FROM jobs)",
+        ));
+        // Several rows match several keys.
+        assert!(!statement_one(
+            &db,
+            "UPDATE jobs SET state = 'x' \
+             WHERE id IN (SELECT id FROM jobs WHERE state = 'a') RETURNING id",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id IN (SELECT id FROM jobs LIMIT 2)",
+        ));
+        // A subquery reading the row it is tested against is one row per
+        // row: every row can match its own.
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs \
+             WHERE id IN (SELECT o.id FROM jobs o WHERE o.ws = jobs.ws LIMIT 1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id NOT IN (SELECT id FROM jobs LIMIT 1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE ws IN (SELECT ws FROM jobs LIMIT 1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id <> ANY (SELECT id FROM jobs LIMIT 1)",
+        ));
+    }
+
+    #[test]
+    fn a_spread_is_no_single_value_or_row() {
+        let db = projects_catalog();
+        // An aggregate without GROUP BY is one row however many rows a
+        // spread expands to.
+        assert!(statement_one(
+            &db,
+            "WITH v(title) AS (VALUES $..titles {title}) SELECT count(*) AS n FROM v",
+        ));
+        assert!(statement_one(
+            &db,
+            "SELECT count(*) FROM posts WHERE title IN $..ts",
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH a AS (INSERT INTO inserted (id, x) VALUES $..rows {id, x} RETURNING id) \
+             SELECT (SELECT count(*) FROM a) AS n",
+        ));
+        // A regular parameter beside a spread is still one value.
+        assert!(statement_one(
+            &db,
+            "SELECT title FROM posts WHERE id = $id AND title IN $..ts",
+        ));
+        // A key IN a spread is one row per item.
+        assert!(!statement_one(
+            &db,
+            "SELECT title FROM posts WHERE id IN $..ids",
+        ));
+        // A spread's row is any number of rows.
+        assert!(!statement_one(
+            &db,
+            "INSERT INTO inserted (id, x) VALUES $..rows {id, x} RETURNING id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "WITH v(title) AS (VALUES $..titles {title}) SELECT title FROM v",
+        ));
+        assert!(!statement_one(
+            &db,
+            "SELECT p.title FROM posts p \
+             JOIN (VALUES $..ids {id}) v(id) ON v.id::bigint = p.id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "SELECT DISTINCT title FROM posts WHERE title IN $..ts GROUP BY title",
+        ));
+    }
+
+    #[test]
+    fn a_sublink_inside_a_scalar_subquery_keeps_it_a_value() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT id FROM jobs WHERE EXISTS (SELECT 1 FROM posts) LIMIT 1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT id FROM jobs WHERE id IN (SELECT id FROM posts) LIMIT 1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT id FROM jobs WHERE id NOT IN (SELECT id FROM posts) LIMIT 1)",
+        ));
+        // A nested query naming its own relation's column first.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT j.id FROM jobs j \
+                         WHERE EXISTS (SELECT 1 FROM posts p WHERE p.id = j.id) LIMIT 1)",
+        ));
+        // The nested query reads the outer row: one value per row.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT j.id FROM jobs j \
+                         WHERE EXISTS (SELECT 1 FROM posts p WHERE p.id = jobs.ws) LIMIT 1)",
+        ));
+        // A plain FROM subquery can't see its sibling `jobs`: `jobs.id` there
+        // is the outer row's.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT x.id FROM jobs, (SELECT jobs.id AS id FROM posts) x LIMIT 1)",
+        ));
+    }
+
+    #[test]
+    fn an_equality_implies_an_in_partial_predicate() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state = 'done' AND retired_at IS NULL",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND 'queued' = state AND retired_at IS NULL",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM runs \
+             WHERE ws = $1 AND state IN ('done', 'queued') AND retired_at IS NULL",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM slots WHERE k = $1 AND n = 2",
+        ));
+        // A value outside the predicate's list, a list that isn't a subset,
+        // or a missing conjunct proves nothing.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state = 'gone' AND retired_at IS NULL",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs \
+             WHERE ws = $1 AND state IN ('done', 'gone') AND retired_at IS NULL",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state = 'done'",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state <> 'done' AND retired_at IS NULL",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM slots WHERE k = $1 AND n = 3",
+        ));
+    }
+
+    #[test]
+    fn a_unique_expression_index_keys_its_call() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM users WHERE lower(email) = lower($1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT u.id FROM users u WHERE $1 = pg_catalog.lower(u.email)",
+        ));
+        assert!(statement_one(
+            &db,
+            "UPDATE users SET login = $2 WHERE lower(email) = $1 RETURNING id",
+        ));
+        // Another call, another column, or no unique index.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE upper(email) = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE lower(login) = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE upper(login) = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE email = lower($1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE lower(email || '') = $1",
+        ));
+        // A nondeterministic collation is never trusted, as for a column key.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM ci_users WHERE lower(email) = $1",
+        ));
+        // An index made under `search_path = other, public` stores
+        // `other.norm`, while the query's `norm` is `public.norm`: the stored
+        // name can't tell which one it was (on PG, `norm(handle) = 'a'`
+        // matches both 'a' and 'A' there).
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM handles WHERE norm(handle) = $1",
+        ));
+    }
+
+    #[test]
+    fn a_distinct_on_view_or_subquery_is_keyed_by_its_keys() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM cur WHERE project_id = $1 AND arch = $2",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT c.i FROM cur c(i, p, a) WHERE c.p = $1 AND c.a = $2",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT b.id FROM (SELECT DISTINCT ON (project_id, arch) id, project_id, arch \
+                               FROM builds ORDER BY project_id, arch, created_at DESC) b \
+             WHERE b.project_id = $1 AND b.arch = $2",
+        ));
+        // One key column, a key the view doesn't output, a view that may
+        // repeat a key's row, a view without DISTINCT ON.
+        assert!(!select_one(&db, "SELECT id FROM cur WHERE project_id = $1",));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM cur_hidden WHERE project_id = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM cur_set WHERE project_id = $1 AND arch = $2",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM all_builds WHERE project_id = $1 AND arch = $2",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT b.id FROM (SELECT DISTINCT ON (project_id) id, project_id, arch \
+                               FROM builds ORDER BY project_id, created_at DESC) b \
+             WHERE b.arch = $1",
+        ));
+    }
+
+    #[test]
+    fn a_cast_or_lateral_column_determines_a_key() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT e.id, x.nome FROM empresas e \
+             LEFT JOIN cnaes x ON x.codigo = e.cnae::integer WHERE e.id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT e.id, k.label FROM empresas e \
+             LEFT JOIN kinds k ON k.k = e.kind::text::kind WHERE e.id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT nome FROM cnaes WHERE codigo = $1::text::int",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT u.id FROM empresas e \
+             CROSS JOIN LATERAL ( \
+                SELECT CASE WHEN e.cnae IS NULL THEN 'a' ELSE 'b' END AS principal \
+             ) h \
+             LEFT JOIN users u ON u.principal = h.principal WHERE e.id = $1",
+        ));
+        // The cast reads an undetermined row.
+        assert!(!select_one(
+            &db,
+            "SELECT e.id, x.nome FROM empresas e \
+             LEFT JOIN cnaes x ON x.codigo = e.cnae::integer",
+        ));
+        // A lateral subquery of several rows.
+        assert!(!select_one(
+            &db,
+            "SELECT u.id FROM empresas e \
+             CROSS JOIN LATERAL (SELECT principal FROM users WHERE login = e.cnae) h \
+             LEFT JOIN users u ON u.principal = h.principal WHERE e.id = $1",
         ));
     }
 }

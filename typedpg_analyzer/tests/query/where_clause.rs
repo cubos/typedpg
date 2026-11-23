@@ -218,6 +218,24 @@ fn where_not() {
     assert_params(&s, vec![p(int4())]);
 }
 
+/// `NOT (NOT e)` is `e`: `NOT (age NOT IN (SELECT …))` is `age IN (SELECT
+/// …)`, which no NULL age passes.
+#[test]
+fn where_double_negation_is_the_condition() {
+    let db = setup();
+    for sql in [
+        "SELECT age FROM users WHERE NOT (age NOT IN (SELECT 1))",
+        "SELECT age FROM users WHERE NOT (NOT (age > 0))",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_cols(&s, vec![c("age", int4())]);
+    }
+    let s = db
+        .analyze("SELECT age FROM users WHERE NOT (NOT (age IS NULL))")
+        .unwrap();
+    assert_cols(&s, vec![cn("age", int4())]);
+}
+
 // ── IN / LIKE / comparison ───────────────────────────────────────────────────
 
 #[test]

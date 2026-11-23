@@ -1897,6 +1897,13 @@ pub(crate) fn allowed_values(
             }));
         }
     }
+    // An expression saying nothing of `c` allows it anything: not the
+    // candidates of its type's own space (an enum's labels, `true` and
+    // `false`), which the type already says and the constraint must not be
+    // credited with.
+    if preds.is_empty() {
+        return Some(crate::refine::Refinement::NONE);
+    }
     let values = space
         .candidates(&preds)
         .filter(|_| exact)

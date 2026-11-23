@@ -454,6 +454,45 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         row_error: None,
     };
     check_rewrite(snapshot, table_oid, &rw)?;
+    // transform_MERGE_to_join: NOT MATCHED [BY TARGET] and NOT MATCHED BY
+    // SOURCE actions join the target and the source with a FULL JOIN on
+    // the ON condition, which no qual reduces — and which the planner
+    // fails to build when no merge or hash join can use its clauses
+    // (`populate_joinrel_with_paths`, see `full_join`).
+    let has = |kind: ast::MergeMatchKind| {
+        merge.merge_when_clauses.iter().any(
+            |w| matches!(w.as_ref(), Some(ast::Node::MergeWhenClause(w)) if w.match_kind == kind),
+        )
+    };
+    if expr::plan_time_checks()
+        && has(ast::MergeMatchKind::MergeWhenNotMatchedBySource)
+        && has(ast::MergeMatchKind::MergeWhenNotMatchedByTarget)
+        && super::full_join::on_clause_unplannable(
+            merge.join_condition.as_ref(),
+            expr::Ctx::new(&both, &null_ctx, snapshot),
+            &on_log,
+            &target_scope
+                .sources
+                .iter()
+                .map(|s| s.alias.clone())
+                .collect(),
+            &source_scope
+                .sources
+                .iter()
+                .map(|s| s.alias.clone())
+                .collect(),
+        )
+        && !(super::full_join::item_may_be_dummy(
+            merge.relation.clone().map(ast::Node::RangeVar).as_ref(),
+            snapshot,
+        ) && super::full_join::item_may_be_dummy(merge.source_relation.as_ref(), snapshot))
+        && let Some(e) = expr::plan_time_error(
+            crate::error::node_location(merge.join_condition.as_ref()),
+            super::select::full_join_unplannable_error(),
+        )
+    {
+        return Err(e);
+    }
     Ok((columns, None))
 }
 
