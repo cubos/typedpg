@@ -215,6 +215,14 @@ impl Soundness {
                     probe,
                     LintProbe::Assert { .. } | LintProbe::AtMostOneRow { .. }
                 );
+                if compares_rows && picks_rows_below(original_sql) {
+                    p.result = Some(LintProbeResult::Inconclusive(
+                        "a LIMIT / DISTINCT ON below the top level picks rows arbitrarily: \
+                         even the row counts may differ between plans"
+                            .to_owned(),
+                    ));
+                    return p;
+                }
                 if compares_rows && (nondeterministic(original_sql) || nondeterministic(sql)) {
                     p.result = Some(LintProbeResult::Inconclusive(
                         "a volatile call makes the results differ between runs".to_owned(),
@@ -403,6 +411,47 @@ impl Soundness {
     }
 }
 
+/// Whether a query level below the statement's own (a subquery, a CTE, a
+/// set operation's arm) has a LIMIT, OFFSET or DISTINCT ON: the rows it
+/// picks feed the rest, so even the statement's row count may change with
+/// the plan.
+pub(super) fn picks_rows_below(sql: &str) -> bool {
+    use typedpg_pg_query::NodeRef;
+    let Ok(parsed) = typedpg_pg_query::parse(sql) else {
+        return true;
+    };
+    let top = match parsed.tree.stmts.first().and_then(|s| s.stmt.as_ref()) {
+        Some(typedpg_pg_query::ast::Node::SelectStmt(s)) => Some(&**s as *const _),
+        _ => None,
+    };
+    // An EXISTS is TRUE or not whichever rows its LIMIT keeps.
+    let exists: Vec<*const typedpg_pg_query::ast::SelectStmt> = parsed
+        .tree
+        .nodes()
+        .filter_map(|(n, _)| match n {
+            NodeRef::SubLink(l)
+                if l.sub_link_type == typedpg_pg_query::ast::SubLinkType::ExistsSublink =>
+            {
+                match l.subselect.as_ref() {
+                    Some(typedpg_pg_query::ast::Node::SelectStmt(s)) => Some(&**s as *const _),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    parsed.tree.nodes().any(|(n, _)| match n {
+        NodeRef::SelectStmt(s) => {
+            !top.is_some_and(|t| std::ptr::eq(t, s))
+                && !exists.iter().any(|e| std::ptr::eq(*e, s))
+                && (s.limit_count.is_some()
+                    || s.limit_offset.is_some()
+                    || s.distinct_clause.iter().any(Option::is_some))
+        }
+        _ => false,
+    })
+}
+
 enum Verdict {
     Held,
     Skip(String),
@@ -439,9 +488,34 @@ fn compare(
     rows: &Rows,
 ) -> Verdict {
     let fix = probe.is_fix();
+    // An error a row raises (a value out of range, a duplicate key, a
+    // MERGE row matched twice): which row a plan evaluates first, or at
+    // all, is its own choice, so a plan that differs reaches another one,
+    // or none.
+    let row_error = |e: &str| {
+        let code = sqlstate(e);
+        code.starts_with("21") || code.starts_with("22") || code.starts_with("23")
+    };
     match (written, sent) {
         (Outcome::Truncated, _) | (_, Outcome::Truncated) => {
             return Verdict::Skip("too many rows".to_owned());
+        }
+        (Outcome::Failed(e), _) | (_, Outcome::Failed(e)) if sqlstate(e) == "57014" => {
+            return Verdict::Skip(format!("a statement times out: {e}"));
+        }
+        // A plan the planner can't find for the original (a FULL JOIN on a
+        // condition no merge or hash join takes), which it may find, or
+        // fail elsewhere, once the fix changed the query.
+        (Outcome::Failed(a), _) if a.starts_with("FULL JOIN is only supported") => {
+            return Verdict::Skip(format!("the original can't be planned: {a}"));
+        }
+        (Outcome::Failed(a), Outcome::Failed(b)) if row_error(a) && row_error(b) => {
+            return Verdict::Skip(format!("both fail on a row: {a} / {b}"));
+        }
+        (Outcome::Failed(a), _) if fix && row_error(a) => {
+            return Verdict::Skip(format!(
+                "the original fails on a row the fixed query's plan doesn't reach: {a}"
+            ));
         }
         (Outcome::Failed(a), Outcome::Failed(b)) => {
             return if !fix || sqlstate(a) == sqlstate(b) {

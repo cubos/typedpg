@@ -1117,6 +1117,22 @@ fn plain_row_fields(n: Option<&ast::Node>) -> Option<&[Option<ast::Node>]> {
     (!r.args.iter().any(|n| star(n.as_ref()))).then_some(r.args.as_slice())
 }
 
+/// `e` of `NOT (NOT e)`.
+fn double_negated(b: &ast::BoolExpr) -> Option<Option<&ast::Node>> {
+    match b.args.as_slice() {
+        [Some(ast::Node::BoolExpr(inner))]
+            if b.boolop == ast::BoolExprType::NotExpr
+                && inner.boolop == ast::BoolExprType::NotExpr =>
+        {
+            match inner.args.as_slice() {
+                [e] => Some(e.as_ref()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn is_row(n: Option<&ast::Node>) -> bool {
     matches!(n, Some(ast::Node::RowExpr(_)))
 }
@@ -1152,6 +1168,12 @@ fn nonnullable_node(
                 .fold(Facts::default(), |acc, a| acc.union(walk(a.as_ref(), true))),
             ast::BoolExprType::AndExpr | ast::BoolExprType::OrExpr => {
                 intersection(b.args.iter().map(Option::as_ref), |a| walk(a, top_level))
+            }
+            // `NOT (NOT e)` is `e` (`negate_clause`, as the planner folds the
+            // expressions, before `reduce_outer_joins`): `NOT (x NOT IN
+            // (SELECT …))` is `x IN (SELECT …)`, strict in `x` at the top.
+            ast::BoolExprType::NotExpr if double_negated(b).is_some() => {
+                walk(double_negated(b).flatten(), top_level)
             }
             // NOT is strict. At the top level `NOT e` TRUE also means `e`
             // FALSE, so not TRUE: `NOT (x IS NULL)` proves `x`.
@@ -1461,6 +1483,9 @@ pub(crate) fn nonnullable_unless_false(
         // A comparison with constants not FALSE: what it says holds of its
         // column unless that is NULL (`kind = 'a'` not FALSE: `kind` is
         // NULL or `'a'`).
+        // An `IN` list or `= ANY` array holding a NULL is never FALSE (NULL
+        // where no other item matches): not FALSE, it says nothing.
+        Some(ast::Node::AExpr(e)) if null_item(e, scope, snapshot) => Facts::default(),
         Some(ast::Node::ColumnRef(_) | ast::Node::AExpr(_)) => {
             match value_pred(node, scope, log, snapshot) {
                 Some((col, p)) => Facts::pred(col, p),
@@ -1475,6 +1500,29 @@ pub(crate) fn nonnullable_unless_false(
         }));
     }
     facts
+}
+
+/// Whether `IN` list or `op ANY` / `op ALL` array `e` holds a NULL item
+/// (which [`column_pred`] leaves out of an `IN` / `ANY`: it never makes the
+/// test TRUE, only keeps it from being FALSE).
+fn null_item(e: &ast::AExpr, scope: &Scope, snapshot: &PgCatalog) -> bool {
+    use ast::AExprKind as K;
+    match e.kind {
+        K::AexprIn => matches!(e.rexpr.as_ref(), Some(ast::Node::List(l))
+            if l.items.iter().any(|i| matches!(i, Some(ast::Node::AConst(c)) if c.isnull))),
+        K::AexprOpAny | K::AexprOpAll => {
+            let Some((_, t)) = e
+                .lexpr
+                .as_ref()
+                .and_then(|l| compared_column(l, scope, snapshot))
+            else {
+                return false;
+            };
+            array_constants(e.rexpr.as_ref(), t, false, snapshot).is_none()
+                && array_constants(e.rexpr.as_ref(), t, true, snapshot).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn unless_true_node(
@@ -1544,6 +1592,9 @@ fn unless_true_node(
             ast::BoolExprType::NotExpr => match b.args.as_slice() {
                 [e] => {
                     let f = nonnullable_unless_false(e.as_ref(), scope, log, snapshot);
+                    if matches!(e, Some(ast::Node::AExpr(x)) if null_item(x, scope, snapshot)) {
+                        return f;
+                    }
                     // `NOT e` not TRUE: `e` not FALSE, so what `e` says
                     // holds of its column unless that is NULL.
                     match value_pred(e.as_ref(), scope, log, snapshot) {

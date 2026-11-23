@@ -3495,13 +3495,20 @@ pub(crate) fn pushed_lock_error(
                 .collect()
         })
         .unwrap_or_default();
+    // A qual above an outer join may reduce it (`reduce_outer_joins`): a
+    // relation on its nullable side that one of them names may be no
+    // nullable side at all once planned, so only one no qual above names
+    // is refused (whether the qual is strict is the planner's to decide;
+    // the analyzer only rejects what fails every execution).
     fn item(
         n: Option<&ast::Node>,
         nullable: bool,
+        above: &[&ast::Node],
         ctes: &[String],
         snapshot: &PgCatalog,
     ) -> Option<crate::scope::LockBlock> {
         use crate::scope::LockBlock;
+        let refused = |alias: &str| nullable && !above.iter().any(|q| qual_may_name(q, alias));
         match n? {
             ast::Node::RangeVar(rv) => {
                 if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
@@ -3509,21 +3516,35 @@ pub(crate) fn pushed_lock_error(
                 }
                 let schema = (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str());
                 let class = snapshot.resolve_table(schema, &rv.relname)?;
-                if nullable {
+                let alias = rv
+                    .alias
+                    .as_ref()
+                    .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
+                if refused(alias) {
                     return Some(LockBlock::NullableSide);
+                }
+                if nullable {
+                    return None;
                 }
                 view_lock_error(class, snapshot)
             }
             ast::Node::RangeSubselect(rs) => {
-                if nullable {
-                    return Some(LockBlock::NullableSide);
-                }
+                let alias = rs.alias.as_ref().map_or("", |a| a.aliasname.as_str());
                 match rs.subquery.as_ref()? {
+                    ast::Node::SelectStmt(s) if nullable => (refused(alias)
+                        && pushed_lock_marks_rows(s, snapshot))
+                    .then_some(LockBlock::NullableSide)
+                    .or_else(|| match pushed_lock_error(s, snapshot) {
+                        Some(LockBlock::NullableSide) => None,
+                        other => other,
+                    }),
                     ast::Node::SelectStmt(s) => pushed_lock_error(s, snapshot),
-                    _ => None,
+                    _ => refused(alias).then_some(LockBlock::NullableSide),
                 }
             }
-            ast::Node::RangeTableSample(ts) => item(ts.relation.as_ref(), nullable, ctes, snapshot),
+            ast::Node::RangeTableSample(ts) => {
+                item(ts.relation.as_ref(), nullable, above, ctes, snapshot)
+            }
             ast::Node::JoinExpr(j) => {
                 let (l, r) = match j.jointype {
                     JoinType::JoinLeft => (nullable, true),
@@ -3531,16 +3552,85 @@ pub(crate) fn pushed_lock_error(
                     JoinType::JoinFull => (true, true),
                     _ => (nullable, nullable),
                 };
-                item(j.larg.as_ref(), l, ctes, snapshot)
-                    .or_else(|| item(j.rarg.as_ref(), r, ctes, snapshot))
+                // The join's own ON is above the joins below it, not above
+                // its own sides.
+                let mut below: Vec<&ast::Node> = above.to_vec();
+                below.extend(j.quals.as_ref());
+                let side = |n: Option<&ast::Node>| match n {
+                    Some(ast::Node::JoinExpr(_)) => below.as_slice(),
+                    _ => above,
+                };
+                item(j.larg.as_ref(), l, side(j.larg.as_ref()), ctes, snapshot)
+                    .or_else(|| item(j.rarg.as_ref(), r, side(j.rarg.as_ref()), ctes, snapshot))
             }
             // Functions, VALUES, JSON_TABLE… are unaffected by FOR UPDATE.
             _ => None,
         }
     }
+    let above: Vec<&ast::Node> = sel.where_clause.iter().collect();
     sel.from_clause
         .iter()
-        .find_map(|n| item(n.as_ref(), false, &ctes, snapshot))
+        .find_map(|n| item(n.as_ref(), false, &above, &ctes, snapshot))
+}
+
+/// Whether qual `q` may read a column of FROM entry `alias`: it names
+/// `alias`, or reads an unqualified column (which could be its).
+pub(crate) fn qual_may_name(q: &ast::Node, alias: &str) -> bool {
+    use typedpg_pg_query::NodeRef;
+    q.nodes().any(|(n, _)| match n {
+        NodeRef::ColumnRef(c) => {
+            let fields = crate::expr::extract_string_fields(&c.fields);
+            fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
+        }
+        _ => false,
+    })
+}
+
+/// Whether a locking clause pushed into FROM subquery `sel` marks a row
+/// in the outer query: the subquery is planned on its own (a LIMIT or
+/// OFFSET keeps it from being pulled up, and its own range-table entry
+/// carries the mark), or once pulled up a relation of its own carries the
+/// pushed-down mark. A subquery over VALUES or functions alone marks
+/// nothing: on the nullable side of an outer join, `make_outerjoininfo`
+/// finds no row mark there.
+pub(crate) fn pushed_lock_marks_rows(sel: &ast::SelectStmt, snapshot: &PgCatalog) -> bool {
+    fn item(n: Option<&ast::Node>, ctes: &[String], snapshot: &PgCatalog) -> bool {
+        match n {
+            Some(ast::Node::RangeVar(rv)) => {
+                !(rv.schemaname.is_empty() && ctes.contains(&rv.relname))
+                    && snapshot
+                        .resolve_table(
+                            (!rv.schemaname.is_empty()).then_some(rv.schemaname.as_str()),
+                            &rv.relname,
+                        )
+                        .is_some()
+            }
+            Some(ast::Node::RangeSubselect(rs)) => match rs.subquery.as_ref() {
+                Some(ast::Node::SelectStmt(s)) => pushed_lock_marks_rows(s, snapshot),
+                _ => true,
+            },
+            Some(ast::Node::RangeTableSample(ts)) => item(ts.relation.as_ref(), ctes, snapshot),
+            Some(ast::Node::JoinExpr(j)) => {
+                item(j.larg.as_ref(), ctes, snapshot) || item(j.rarg.as_ref(), ctes, snapshot)
+            }
+            _ => false,
+        }
+    }
+    if sel.limit_count.is_some() || sel.limit_offset.is_some() || sel.larg.is_some() {
+        return true;
+    }
+    let ctes: Vec<String> = sel
+        .with_clause
+        .iter()
+        .flat_map(|w| w.ctes.iter())
+        .filter_map(|c| match c.as_ref()? {
+            ast::Node::CommonTableExpr(c) => Some(c.ctename.clone()),
+            _ => None,
+        })
+        .collect();
+    sel.from_clause
+        .iter()
+        .any(|n| item(n.as_ref(), &ctes, snapshot))
 }
 
 /// [`pushed_lock_error`] for a view's stored query (`None` for a table).

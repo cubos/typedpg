@@ -114,6 +114,16 @@ fn locking_clause_targets() {
         "SELECT * FROM (SELECT DISTINCT a FROM t) s, t t2 FOR UPDATE OF t2",
         "SELECT (SELECT count(*) FROM u) FROM t FOR UPDATE",
         "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF t",
+        // A subquery over VALUES (or a function) alone, pulled up into the
+        // nullable side, leaves no row mark there.
+        "SELECT * FROM t LEFT JOIN (VALUES (1, 'x')) v(x, y) ON v.x = t.id FOR UPDATE",
+        "SELECT * FROM t FULL JOIN (SELECT n FROM generate_series(1, 2) g(n)) s ON s.n = t.id \
+         FOR UPDATE OF s",
+        "SELECT * FROM (VALUES (1)) v(x) LEFT JOIN (VALUES (2)) w(x) ON w.x = v.x FOR UPDATE",
+        // The WHERE reduces the join (`NOT (… NOT IN …)` is `IN`).
+        "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.t_id IN (1, 2) FOR UPDATE",
+        "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id \
+         WHERE NOT (u.t_id NOT IN (SELECT id FROM t)) FOR UPDATE",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
@@ -122,6 +132,10 @@ fn locking_clause_targets() {
     for sql in [
         "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE",
         "SELECT * FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF u",
+        // Planned on its own (a LIMIT keeps it from being pulled up), the
+        // subquery's own entry carries the mark.
+        "SELECT * FROM t LEFT JOIN (SELECT x FROM (VALUES (1)) v(x) LIMIT 1) q ON q.x = t.id \
+         FOR UPDATE",
     ] {
         let err = assert_err_prefix(
             &db,
@@ -248,6 +262,35 @@ fn locking_clause_through_views_and_subqueries() {
             "{sql}: {err:?}"
         );
     }
+    // A qual above the outer join may reduce it to an inner one
+    // (`reduce_outer_joins`): the view's or subquery's own WHERE, or once
+    // pulled up, a qual of the level locking it.
+    db.apply_sql(
+        "CREATE VIEW vw AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.x <> '';",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vw FOR UPDATE",
+        "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id WHERE u.x = 'a') q \
+         FOR UPDATE",
+        "SELECT * FROM t t2 JOIN (SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id) q \
+         ON q.x = t2.b FOR UPDATE",
+        "SELECT * FROM (SELECT u.x FROM t RIGHT JOIN u ON u.t_id = t.id WHERE t.b || 'x' <= 'a' \
+         LIMIT 3) q FOR UPDATE",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // The join's own ON reduces nothing.
+    let err = assert_err_prefix(
+        &db,
+        "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id AND u.x = 'a') q \
+         FOR UPDATE",
+        "FOR UPDATE cannot be applied to the nullable side of an outer join",
+    );
+    assert!(
+        matches!(err, AnalyzeError::FeatureNotSupported(_)),
+        "{err:?}"
+    );
     for sql in [
         "SELECT * FROM vp FOR UPDATE",
         "SELECT * FROM va, t FOR UPDATE OF t",
@@ -352,6 +395,12 @@ fn distinct_on_must_match_leading_order_by() {
         "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b, a, id",
         "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a",
         "SELECT DISTINCT ON (1) a, b FROM t ORDER BY a",
+        // An item sorting a target sorted already is dropped (in either
+        // direction), however it names it.
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a, b, id, 1",
+        "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a, b, id, 2 DESC",
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b, a DESC NULLS FIRST",
+        "SELECT DISTINCT ON (t.a) a AS x, b FROM t ORDER BY t.a, b, x",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }

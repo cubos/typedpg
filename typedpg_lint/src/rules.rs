@@ -532,6 +532,14 @@ pub(super) fn scan_until(
 
 /// Whether `text` is a keyword that starts a clause after a select list, a
 /// condition or a `RETURNING` list.
+/// The start of expression `node` as written: its first token, or the
+/// parenthesis before it that a part of it closes (`((x)::int)::int > 2`
+/// starts at the first `(`, where [`leftmost_start`] gives `x`).
+pub(super) fn expression_start(ctx: &Ctx<'_>, node: &Node) -> Option<usize> {
+    let start = leftmost_start(node)?;
+    Some(node_span(ctx, node.to_ref()).map_or(start, |span| span.start.min(start)))
+}
+
 /// The span of boolean expression `node`: from its first token to the
 /// clause keyword or closing parenthesis that ends it — or, unless
 /// `whole`, to the `AND` (outside a `BETWEEN … AND`) or `OR` after it at
@@ -542,7 +550,7 @@ pub(super) fn condition_span(
     node: &Node,
     whole: bool,
 ) -> Option<std::ops::Range<usize>> {
-    let start = leftmost_start(node)?;
+    let start = expression_start(ctx, node)?;
     let or = matches!(node, N::BoolExpr(b) if b.boolop == BoolExprType::OrExpr);
     let mut between = false;
     let (end, _) = scan_until(ctx, start, |text| {
@@ -554,7 +562,7 @@ pub(super) fn condition_span(
             between = false;
             return false;
         }
-        starts_clause(text)
+        ends_condition(text)
             || (!whole
                 && (text.eq_ignore_ascii_case("AND") || (!or && text.eq_ignore_ascii_case("OR"))))
     });
@@ -630,6 +638,13 @@ pub(super) fn starts_clause(text: &str) -> bool {
     .iter()
     .any(|keyword| text.eq_ignore_ascii_case(keyword))
         || text == ";"
+}
+
+/// Whether a token at a condition's own depth ends it: a clause keyword,
+/// or a comma — no condition holds one outside parentheses, and a join's
+/// `ON` may be followed by the next FROM item (`… ON a.x = 1, LATERAL …`).
+pub(super) fn ends_condition(text: &str) -> bool {
+    starts_clause(text) || text == ","
 }
 
 pub(super) fn is_terminator(text: &str) -> bool {

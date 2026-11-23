@@ -21,6 +21,10 @@
 #   scripts/run-lint-oracle.sh lint_oracle_corpus  # the corpus run only
 #   scripts/run-lint-oracle.sh deployed_oracle_corpus  # breaks_deployed_queries
 #   LINT_ORACLE_ITERS=20000 LINT_ORACLE_SEED=7 scripts/run-lint-oracle.sh lint_oracle_corpus
+#   LINT_ORACLE_ONLY=catalogs LINT_ORACLE_GEN_CASES=2000 LINT_ORACLE_SEED=7 \
+#       scripts/run-lint-oracle.sh lint_oracle_corpus   # random catalogs alone
+#   LINT_ORACLE_ONLY=catalogs LINT_ORACLE_GEN_CASE=42 LINT_ORACLE_SEED=7 \
+#       scripts/run-lint-oracle.sh lint_oracle_corpus   # one case again
 #
 # Extra args are nextest filters / flags, as for scripts/run-pg-sanity.sh.
 

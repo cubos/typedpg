@@ -175,7 +175,22 @@ pub(crate) fn analyze_set_operation(
     // tree's type (no coercion between the arms) for the tree to be pulled
     // up by `pull_up_simple_union_all`.
     let mut types_match = true;
+    let mut left_lits = left_lits;
+    let mut right_lits = right_lits;
     for (i, (mut l, mut r)) in left_cols.into_iter().zip(right_cols).enumerate() {
+        // An arm sorting or grouping by its literal output made it `text`
+        // already (`addTargetToSortList` / `addTargetToGroupList` coerce an
+        // `unknown` entry they add): `(SELECT DISTINCT 'y') UNION SELECT
+        // 'a'::varchar` is `text`.
+        for (arm, lits, col) in [
+            (left, &mut left_lits, &mut l),
+            (right, &mut right_lits, &mut r),
+        ] {
+            if lits[i].is_some() && arm_sorts_output(arm, i) {
+                lits[i] = None;
+                col.type_oid = oid::TEXT;
+            }
+        }
         if left_lits[i].is_some() {
             l.type_oid = oid::UNKNOWN;
         }
@@ -493,6 +508,36 @@ fn arm_unknown_literal(arm: &ast::SelectStmt, i: usize) -> Option<&str> {
         },
         _ => None,
     }
+}
+
+/// Whether arm `arm` (a plain SELECT) puts its output `i` in a sort or
+/// group list: a plain DISTINCT does every output, a DISTINCT ON, ORDER BY
+/// or GROUP BY item the ones it names by position or output name.
+fn arm_sorts_output(arm: &ast::SelectStmt, i: usize) -> bool {
+    if arm.distinct_clause.iter().any(Option::is_none) && !arm.distinct_clause.is_empty() {
+        return true;
+    }
+    let name = match arm.target_list.get(i) {
+        Some(Some(ast::Node::ResTarget(rt))) if !rt.name.is_empty() => Some(rt.name.as_str()),
+        _ => None,
+    };
+    let names_it = |n: Option<&ast::Node>| match n {
+        Some(ast::Node::AConst(c)) => matches!(&c.val,
+            Some(typedpg_pg_query::ast::AConstValue::Integer(v)) if v.ival as usize == i + 1),
+        Some(ast::Node::ColumnRef(cr)) => {
+            match expr::extract_string_fields(&cr.fields).as_slice() {
+                [only] => name == Some(only.as_str()),
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    arm.distinct_clause.iter().any(|d| names_it(d.as_ref()))
+        || arm.group_clause.iter().any(|g| names_it(g.as_ref()))
+        || arm.sort_clause.iter().any(|s| match s {
+            Some(ast::Node::SortBy(sb)) => names_it(sb.node.as_ref()),
+            _ => false,
+        })
 }
 
 /// transformSetOperationTree: no member of a set-operation tree may carry

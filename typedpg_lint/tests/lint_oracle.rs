@@ -14,9 +14,22 @@
 //!   built to make the rules report: CHECK constraints, enums, domains,
 //!   nullable and NOT NULL columns, foreign keys, unique keys, outer joins;
 //! - `$LINT_ORACLE_FUZZ_ITERS` (default 3000) queries of the analyzer
-//!   fuzzer's generators (`typedpg_analyzer/tests/fuzz/`), over its schema.
+//!   fuzzer's generators (`typedpg_analyzer/tests/fuzz/`), over its schema;
+//! - `$LINT_ORACLE_GEN_CASES` (default 75) random catalogs of
+//!   `oracle_support/generator.rs`, `$LINT_ORACLE_GEN_QUERIES` (default 40)
+//!   queries over each: keys of every kind, partitioned and inherited
+//!   tables, views, row security; LATERAL, set operations, grouping sets,
+//!   window functions, data-modifying CTEs, ON CONFLICT, MERGE….
+//!   `LINT_ORACLE_GEN_CASE=<n>[,<m>…]` runs those cases alone (the findings
+//!   name them),
+//!   `LINT_ORACLE_ONLY=catalogs` these cases alone.
 //!
-//! `$LINT_ORACLE_SEED` seeds both generators.
+//! `$LINT_ORACLE_SEED` seeds the generators. The generated queries (and the
+//! generated schemas) also go through the analyzer's own comparison with
+//! PostgreSQL, as its fuzzer's do: an analyzer divergence there is a
+//! finding too, but for its documented choices (`deliberate_divergence`).
+//! The ones both reject go to `invalid-generated.txt`, the generator's own
+//! mistakes.
 //!
 //! Every SELECT is linted as called with `fetch_all` (so
 //! `fetch_all_single_row` reports), and a statement with `RETURNING` also
@@ -42,11 +55,18 @@ use typedpg_lint::{Call, CallMethod, Language, LintOptions, lint_query_called};
 #[path = "oracle_support/fuzz.rs"]
 mod fuzz;
 
+/// The generator of random catalogs and queries over them.
+#[path = "oracle_support/generator.rs"]
+mod generator;
+
 /// One schema and the queries linted against it.
 struct Case {
     origin: String,
     ddl: Vec<String>,
     queries: Vec<String>,
+    /// Generated: the analyzer's outcome on each query (and on the schema)
+    /// is compared with PostgreSQL's too, as the analyzer's fuzzer does.
+    checked: bool,
 }
 
 #[derive(Default)]
@@ -55,27 +75,46 @@ struct Totals {
     rejected: u64,
     panics: BTreeMap<String, String>,
     broken: BTreeMap<String, String>,
+    /// The analyzer disagreeing with PostgreSQL on a generated query (or
+    /// rejecting a generated schema's statement).
+    divergences: BTreeMap<String, String>,
+    /// Generated queries both the analyzer and PostgreSQL reject: the
+    /// generator's own mistakes, written out to tune it.
+    invalid: Vec<String>,
     stats: BTreeMap<(String, String), u64>,
 }
 
 #[test]
 #[ignore = "needs a PostgreSQL (scripts/run-lint-oracle.sh)"]
 fn lint_oracle_corpus() {
-    let mut cases = docs_cases();
-    let docs = cases.len();
-    if let Some(dir) = std::env::var_os("LINT_ORACLE_CORPUS") {
-        cases.extend(recorded_cases(std::path::Path::new(&dir)));
-    }
-    let recorded = cases.len() - docs;
-    let iters: usize = std::env::var("LINT_ORACLE_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3000);
+    // `LINT_ORACLE_ONLY=catalogs` runs the catalog generator's cases alone;
+    // `LINT_ORACLE_GEN_CASE=<n>[,<m>…]` only those (to reproduce them).
+    let only_catalogs = std::env::var("LINT_ORACLE_ONLY").is_ok_and(|v| v == "catalogs");
+    let env = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
     let seed: u64 = std::env::var("LINT_ORACLE_SEED")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0x5eed);
+    let mut cases = Vec::new();
+    if !only_catalogs {
+        cases = docs_cases();
+    }
+    let docs = cases.len();
+    if !only_catalogs && let Some(dir) = std::env::var_os("LINT_ORACLE_CORPUS") {
+        cases.extend(recorded_cases(std::path::Path::new(&dir)));
+    }
+    let recorded = cases.len() - docs;
     // Generated queries, in chunks of 50 per catalog.
+    let iters = if only_catalogs {
+        0
+    } else {
+        env("LINT_ORACLE_ITERS", 3000)
+    };
     let mut rng = Rng(seed);
     let generated: Vec<String> = (0..iters).map(|_| generate(&mut rng)).collect();
     for (i, chunk) in generated.chunks(50).enumerate() {
@@ -83,14 +122,16 @@ fn lint_oracle_corpus() {
             origin: format!("generated #{i}"),
             ddl: vec![GENERATED_SCHEMA.to_owned()],
             queries: chunk.to_vec(),
+            checked: true,
         });
     }
     // The analyzer fuzzer's statements, narrowing and constraint queries,
     // over its schema.
-    let fuzz_iters: usize = std::env::var("LINT_ORACLE_FUZZ_ITERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3000);
+    let fuzz_iters = if only_catalogs {
+        0
+    } else {
+        env("LINT_ORACLE_FUZZ_ITERS", 3000)
+    };
     {
         use fuzz::SeedableRng;
         let mut rng = fuzz::StdRng::seed_from_u64(seed);
@@ -106,8 +147,32 @@ fn lint_oracle_corpus() {
                 origin: format!("fuzzer #{i}"),
                 ddl: vec![fuzz::SETUP_SQL.to_owned()],
                 queries: chunk.to_vec(),
+                checked: false,
             });
         }
+    }
+    // Random catalogs (`oracle_support/generator.rs`): `$LINT_ORACLE_GEN_CASES`
+    // schemas, `$LINT_ORACLE_GEN_QUERIES` queries over each.
+    let per_case = env("LINT_ORACLE_GEN_QUERIES", 40);
+    let gen_cases: Vec<u64> = match std::env::var("LINT_ORACLE_GEN_CASE") {
+        Ok(list) => list
+            .split(',')
+            .map(|n| {
+                n.trim()
+                    .parse()
+                    .expect("LINT_ORACLE_GEN_CASE lists case numbers")
+            })
+            .collect(),
+        Err(_) => (0..env("LINT_ORACLE_GEN_CASES", 75) as u64).collect(),
+    };
+    for index in gen_cases {
+        let generated = generator::case(seed, index, per_case);
+        cases.push(Case {
+            origin: format!("catalog seed {seed} case {index}"),
+            ddl: generated.ddl,
+            queries: generated.queries,
+            checked: true,
+        });
     }
     let total_queries: usize = cases.iter().map(|c| c.queries.len()).sum();
     eprintln!(
@@ -169,13 +234,26 @@ fn lint_oracle_corpus() {
         )
         .unwrap();
     }
+    for (i, (key, message)) in totals.divergences.iter().enumerate() {
+        std::fs::write(
+            format!("{out_dir}/divergence-{i:03}.txt"),
+            format!("{key}\n\n{message}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        format!("{out_dir}/invalid-generated.txt"),
+        totals.invalid.join("\n"),
+    )
+    .unwrap();
     eprintln!(
         "lint oracle: {} queries linted ({} the analyzer rejects), {} distinct broken claims, \
-         {} distinct panics; written to {out_dir}",
+         {} distinct panics, {} analyzer divergences on generated queries; written to {out_dir}",
         totals.queries,
         totals.rejected,
         totals.broken.len(),
-        totals.panics.len()
+        totals.panics.len(),
+        totals.divergences.len()
     );
     let mut by_rule: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for ((rule, what), n) in &totals.stats {
@@ -187,21 +265,45 @@ fn lint_oracle_corpus() {
     for key in totals.broken.keys() {
         eprintln!("  BROKEN {key}");
     }
+    for key in totals.divergences.keys() {
+        eprintln!("  DIVERGENCE {key}");
+    }
     assert!(
-        totals.broken.is_empty(),
-        "the lint oracle found {} broken claims (see {out_dir})",
-        totals.broken.len()
+        totals.broken.is_empty() && totals.divergences.is_empty(),
+        "the lint oracle found {} broken claims and {} analyzer divergences (see {out_dir})",
+        totals.broken.len(),
+        totals.divergences.len()
     );
 }
 
 fn run_case(case: &Case, totals: &Mutex<Totals>) {
     let built = catch_unwind(AssertUnwindSafe(|| {
         let mut catalog = PgCatalog::new().unwrap();
+        let mut rejected = Vec::new();
         for ddl in &case.ddl {
-            let _ = catalog.apply_sql(ddl);
+            if let Err(e) = catalog.apply_sql(ddl)
+                && case.checked
+            {
+                rejected.push(format!("{e}\nstatement:\n{ddl}"));
+            }
         }
-        catalog
+        (catalog, rejected)
     }));
+    let built = match built {
+        Ok((catalog, rejected)) => {
+            // A generated schema is valid: the analyzer rejecting one of
+            // its statements is a divergence (or a generator bug).
+            let mut t = totals.lock().unwrap();
+            for message in rejected {
+                t.divergences.insert(
+                    format!("schema of {}: {}", case.origin, first_line(&message)),
+                    format!("{message}\nschema:\n{};", case.ddl.join(";\n")),
+                );
+            }
+            Ok(catalog)
+        }
+        Err(panic) => Err(panic),
+    };
     let catalog = match built {
         Ok(catalog) => catalog,
         Err(panic) => {
@@ -225,6 +327,33 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
         language: Language::Rust,
     }];
     for query in &case.queries {
+        if case.checked {
+            // The analyzer's outcome against PostgreSQL's: acceptance,
+            // error, columns, nullability over the seeded rows.
+            let checked = catch_unwind(AssertUnwindSafe(|| catalog.analyze_checked(query)));
+            let mut t = totals.lock().unwrap();
+            match checked {
+                Ok((_, Some(divergence))) if deliberate_divergence(&divergence) => {}
+                Ok((_, Some(divergence))) => {
+                    let key = format!("{}: {}", case.origin, first_line(&divergence.message));
+                    t.divergences.entry(key).or_insert(format!(
+                        "{}\nschema:\n{};",
+                        divergence.message,
+                        case.ddl.join(";\n")
+                    ));
+                }
+                Ok((Err(e), None)) => t.invalid.push(format!("{e}\n{query}\n")),
+                Ok(_) => {}
+                Err(panic) => {
+                    let message = panic_message(&panic);
+                    t.panics.insert(
+                        format!("{}: {}", case.origin, first_line(&message)),
+                        format!("{message}\nquery:\n{query}"),
+                    );
+                    return;
+                }
+            }
+        }
         let upper = query.to_ascii_uppercase();
         let mut calls: Vec<&[Call]> = vec![&fetch_all];
         if upper.contains("RETURNING") {
@@ -250,7 +379,9 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
                     for message in broken {
                         let key = first_line(&message).to_owned();
                         let key = format!("{key} [{}]", case.origin);
-                        t.broken.entry(key).or_insert(message);
+                        t.broken.entry(key).or_insert_with(|| {
+                            format!("{message}\nschema:\n{};", case.ddl.join(";\n"))
+                        });
                     }
                 }
                 Err(panic) => {
@@ -264,6 +395,46 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
                 }
             }
         }
+    }
+}
+
+/// A divergence that is the analyzer's documented choice, or noise, not a
+/// bug (as the analyzer's fuzzer judges, `deliberate_divergence` in
+/// `typedpg_analyzer/tests/fuzz/main.rs`):
+///
+/// - a literal NULL written into a NOT NULL column (or domain) is rejected
+///   in UPDATE and MERGE too, although PG fails only the executions that
+///   touch a row (CLAUDE.md, "Errors that every execution raises");
+/// - that NULL next to another error (an ambiguous column, a FULL JOIN
+///   PG can't plan): two errors, and PG reports the other;
+/// - the execute fallback (all-NULL parameters) failing on another
+///   constraint than the analyzer reports: a statement writing several
+///   NULLs or values out of a partition's bounds breaks several
+///   constraints at once, and which one PG reports first is its order of
+///   checks (CLAUDE.md, "multiple simultaneous errors").
+fn deliberate_divergence(div: &typedpg_analyzer::Divergence) -> bool {
+    use typedpg_analyzer::DivergenceKind;
+    let line = |prefix: &str| {
+        div.message
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix(prefix).map(str::to_owned))
+    };
+    match div.kind {
+        DivergenceKind::AnalyzeAcceptedExecuted => line("analyzer error: ").is_some_and(|e| {
+            e.starts_with("null value in column ")
+                || (e.starts_with("domain ") && e.contains("does not allow null values"))
+        }),
+        DivergenceKind::ErrorPrefix => {
+            // Another error next to the NULL the analyzer rejects for
+            // its own reason (above): PG reports the other one.
+            line("analyzer:").is_some_and(|e| {
+                let e = e.trim_start();
+                e.starts_with("null value in column ")
+                    || (e.starts_with("domain ") && e.contains("does not allow null values"))
+            }) || (div.message.contains("(execute fallback)")
+                && line("PG (with SQLSTATE):").is_some_and(|e| e.contains("(SQLSTATE 23")))
+        }
+        _ => false,
     }
 }
 
@@ -330,6 +501,7 @@ fn docs_cases() -> Vec<Case> {
                 origin: format!("docs/lint/{}", path.file_name().unwrap().to_string_lossy()),
                 ddl: vec![ddl.join(";\n")],
                 queries,
+                checked: false,
             });
         }
     }
@@ -381,6 +553,7 @@ fn recorded_cases(dir: &std::path::Path) -> Vec<Case> {
                 origin: format!("recorded schema {id}"),
                 ddl: schemas.get(&id)?.clone(),
                 queries: queries.into_iter().collect(),
+                checked: false,
             })
         })
         .collect()
@@ -899,11 +1072,13 @@ fn generate(rng: &mut Rng) -> String {
             };
             let mut sql = format!("UPDATE {} SET {} = {}", t.name, c.name, value(rng, c.ty));
             if rng.chance(20) {
-                sql.push_str(&format!(", {0} = {0}", c.name));
+                // Another column assigned itself (the same one twice is an error).
+                let other = cols.iter().find(|o| o.name != c.name).unwrap_or(&c);
+                sql.push_str(&format!(", {0} = {0}", other.name));
             }
             sql.push_str(&format!(" WHERE {}", predicate(rng, &from, 1)));
             if rng.chance(50) {
-                sql.push_str(" RETURNING id");
+                sql.push_str(&format!(" RETURNING {}", t.cols[0].name));
             }
             sql
         }

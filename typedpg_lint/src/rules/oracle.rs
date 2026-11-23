@@ -374,7 +374,9 @@ fn claims(ctx: &Ctx<'_>, record: &Record) -> Vec<LintProbe> {
             }
         }
         Rule::ConstantCondition => {
-            let value = message.contains("always true");
+            // The conclusion, not the reason before it ("`x` is always true
+            // where this is evaluated, so this condition is never true").
+            let value = message.contains("condition is always true");
             condition_assert(ctx, span, value, rule)
         }
         Rule::RedundantNullCheck => redundant_null_check(ctx, record),

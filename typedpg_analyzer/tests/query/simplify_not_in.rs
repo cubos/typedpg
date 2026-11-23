@@ -799,6 +799,27 @@ fn the_oracle_does_not_compare_volatile_results() {
     );
 }
 
+#[cfg(feature = "pg_sanity")]
+#[test]
+fn the_oracle_counts_the_rows_a_limit_picks_arbitrarily() {
+    // Which row a LIMIT without ORDER BY keeps is the plan's choice (a
+    // DISTINCT dropped over a key reads another one first): only the
+    // count is compared.
+    let db = setup();
+    let written = "SELECT DISTINCT id FROM customers LIMIT 1";
+    assert!(
+        db.pg_sanity_check_rewrite(written, "SELECT id FROM customers ORDER BY id DESC LIMIT 1")
+            .is_none()
+    );
+    let divergence = db
+        .pg_sanity_check_rewrite(written, "SELECT id FROM customers LIMIT 2")
+        .expect("the oracle sees the other count");
+    assert!(
+        divergence.message.contains("returns 2 rows"),
+        "{divergence}"
+    );
+}
+
 #[test]
 fn a_user_implicit_cast_before_the_equality_is_not_trusted() {
     // `int = text` resolves to the built-in `int = int` through the user's

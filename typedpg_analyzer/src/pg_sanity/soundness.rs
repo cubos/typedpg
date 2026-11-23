@@ -473,6 +473,10 @@ impl Soundness {
         // that differ then prove nothing (the simplified query failing
         // where the written one runs still does).
         let volatile = nondeterministic(original.0) || nondeterministic(simplified.0);
+        // Rows a nested LIMIT picks change even the row count with the plan.
+        if lint::picks_rows_below(original.0) {
+            return None;
+        }
         self.install(client);
         let Some(values) = self.param_values(client, ours, original.1, finite_params) else {
             self.stats.equivalence_no_param_sample += 1;

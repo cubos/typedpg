@@ -2842,6 +2842,43 @@ pub(crate) fn subquery_lock_blocker(
     })
 }
 
+/// The WHERE and every join's ON of query level `sel`.
+fn level_quals(sel: &ast::SelectStmt) -> Vec<&ast::Node> {
+    fn joins<'a>(n: Option<&'a ast::Node>, out: &mut Vec<&'a ast::Node>) {
+        if let Some(ast::Node::JoinExpr(j)) = n {
+            out.extend(j.quals.as_ref());
+            joins(j.larg.as_ref(), out);
+            joins(j.rarg.as_ref(), out);
+        }
+    }
+    let mut out: Vec<&ast::Node> = sel.where_clause.iter().collect();
+    for item in &sel.from_clause {
+        joins(item.as_ref(), &mut out);
+    }
+    out
+}
+
+/// The query of FROM subquery `alias` in `from` (joins searched).
+fn from_subselect<'a>(from: &'a [Option<ast::Node>], alias: &str) -> Option<&'a ast::SelectStmt> {
+    fn find<'a>(n: Option<&'a ast::Node>, alias: &str) -> Option<&'a ast::SelectStmt> {
+        match n? {
+            ast::Node::RangeSubselect(rs)
+                if rs.alias.as_ref().is_some_and(|a| a.aliasname == alias) =>
+            {
+                match rs.subquery.as_ref()? {
+                    ast::Node::SelectStmt(s) => Some(s),
+                    _ => None,
+                }
+            }
+            ast::Node::JoinExpr(j) => {
+                find(j.larg.as_ref(), alias).or_else(|| find(j.rarg.as_ref(), alias))
+            }
+            _ => None,
+        }
+    }
+    from.iter().find_map(|n| find(n.as_ref(), alias))
+}
+
 /// Validate a SELECT's locking clauses like PG: `CheckSelectLocking` (the
 /// query may not use DISTINCT / GROUP BY / HAVING / aggregates / window
 /// functions / target-list SRFs), then `transformLockingClause` — each
@@ -2947,11 +2984,13 @@ fn check_locking_clause(
             }
         }
         for source in &locked {
-            if matches!(
-                source.kind,
-                SourceKind::Relation | SourceKind::Subquery { .. }
-            ) && null_ctx.is_nullable(&source.alias, "", true)
-            {
+            let marks_rows = match source.kind {
+                SourceKind::Relation => true,
+                SourceKind::Subquery { .. } => from_subselect(&sel.from_clause, &source.alias)
+                    .is_none_or(|s| super::from::pushed_lock_marks_rows(s, snapshot)),
+                _ => false,
+            };
+            if marks_rows && null_ctx.is_nullable(&source.alias, "", true) {
                 return Err(unsupported(format!(
                     "{clause} cannot be applied to the nullable side of an outer join"
                 )));
@@ -2966,6 +3005,12 @@ fn check_locking_clause(
                         "{clause} is not allowed with {blocker}"
                     )));
                 }
+                // Pulled up, the view or subquery's outer joins are this
+                // level's: a qual here naming it may reduce them.
+                Some(crate::scope::LockBlock::NullableSide)
+                    if level_quals(sel)
+                        .iter()
+                        .any(|q| super::from::qual_may_name(q, &source.alias)) => {}
                 Some(crate::scope::LockBlock::NullableSide) => {
                     return Err(unsupported(format!(
                         "{clause} cannot be applied to the nullable side of an outer join"
@@ -3144,7 +3189,7 @@ fn sort_expr_type(
 }
 
 /// Which target entry an ORDER BY / DISTINCT ON item denotes.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum SortKey {
     /// An entry of the select list (by position, output name, or equal
     /// expression).
@@ -3228,6 +3273,10 @@ fn check_distinct_on_matches_order_by(
     };
     let mut skipped = false;
     let mut covered: Vec<&SortKey> = Vec::new();
+    // `addTargetToSortList` drops an item sorting a target the list already
+    // sorts (by the same operator or its commutator: ASC after DESC too),
+    // so `ORDER BY a, b, 1` with `1` being `a` checks as `ORDER BY a, b`.
+    let mut sorted: Vec<SortKey> = Vec::new();
     for sort_node in &sel.sort_clause {
         let Some(ast::Node::SortBy(sb)) = sort_node.as_ref() else {
             continue;
@@ -3237,6 +3286,12 @@ fn check_distinct_on_matches_order_by(
             continue;
         }
         let key = sort_target_key(inner.as_ref(), &sel.target_list, columns, scope, snapshot);
+        if sb.sortby_dir != ast::SortByDir::SortbyUsing {
+            if sorted.contains(&key) {
+                continue;
+            }
+            sorted.push(key.clone());
+        }
         if let Some(d) = distinct.iter().find(|d| **d == key) {
             if skipped {
                 return Err(err());

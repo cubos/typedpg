@@ -159,6 +159,34 @@ mod tests {
         }
     }
 
+    /// An `IN` list or `= ANY` array holding a NULL is never FALSE: its
+    /// `NOT` is never TRUE when no other item matches, so the branch after
+    /// it is taken — not unreachable (as a CHECK keeping the column off the
+    /// other items made it look).
+    #[test]
+    fn not_in_a_list_holding_null_leaves_the_rest_reachable() {
+        let mut db = typedpg_analyzer::PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE t (id integer, kind text NOT NULL CHECK (kind IN ('b', 'x')), amount numeric);",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT CASE WHEN NOT (kind IN ('y', NULL)) THEN 1 ELSE 2 END FROM t",
+            "SELECT CASE WHEN NOT (amount IS NOT NULL AND kind IN ('y', NULL)) THEN 1 ELSE 2 END \
+             FROM t",
+            "SELECT CASE WHEN NOT (kind = ANY (ARRAY['y', NULL])) THEN 1 ELSE 2 END FROM t",
+            "SELECT CASE WHEN kind IN ('y', NULL) IS NOT FALSE THEN 1 ELSE 2 END FROM t",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // Without the NULL, `NOT (kind IN ('y'))` is always TRUE.
+        let sql = "SELECT CASE WHEN NOT (kind IN ('y')) THEN 1 ELSE 2 END FROM t";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        assert_eq!(&sql[findings[0].span.clone()], "ELSE 2");
+    }
+
     #[test]
     fn branches_never_taken_are_reported() {
         let db = catalog();
