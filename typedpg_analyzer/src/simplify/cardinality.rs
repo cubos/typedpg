@@ -293,9 +293,6 @@ pub fn redundant_group_keys(
 /// reference to one proves nothing — and a `MERGE` needs its target
 /// determined by the `ON` condition and its source at most one row.
 pub fn select_at_most_one_row(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> bool {
-    if !view.analyzed.spreads.is_empty() {
-        return false;
-    }
     let ctx = Ctx {
         sql: &view.sql,
         tree: &view.tree,
@@ -383,9 +380,6 @@ pub(super) fn select_is_error_free_in(ctx: &Ctx<'_>, select: &SelectStmt) -> boo
 /// The statement's own `WITH` clause provides its single-row CTEs, judged in
 /// declaration order (see [`select_at_most_one_row`]).
 pub fn statement_at_most_one_row(catalog: &PgCatalog, view: &QueryView) -> bool {
-    if !view.analyzed.spreads.is_empty() {
-        return false;
-    }
     let ctx = Ctx {
         sql: &view.sql,
         tree: &view.tree,
@@ -957,6 +951,44 @@ fn value_type(
                 typ,
                 typ.is_some_and(|typ| !dedup::collatable_type(ctx, typ)),
             )
+        }
+        // A `CASE` is its results' common type: known when every result
+        // that isn't a bare NULL has the same known type (all-literal
+        // results resolve to `text`, as one literal does), and deterministic
+        // when every one's collation is (its collation is derived from
+        // theirs).
+        Some(Node::CaseExpr(case)) => {
+            let results = case
+                .args
+                .iter()
+                .map(|when| match when {
+                    Some(Node::CaseWhen(when)) => Some(when.result.as_ref()),
+                    _ => None,
+                })
+                .chain(std::iter::once(Some(case.defresult.as_ref())));
+            let mut known: Option<(crate::oid::PgTypeOid, bool)> = None;
+            for result in results {
+                let Some(result) = result else {
+                    return (None, false);
+                };
+                // A missing ELSE is NULL, and NULL takes the others' type.
+                if result.is_none_or(|result| matches!(result, Node::AConst(c) if c.isnull)) {
+                    continue;
+                }
+                let (Some(typ), deterministic) = value_type(ctx, scope, result) else {
+                    return (None, false);
+                };
+                known = match known {
+                    None => Some((typ, deterministic)),
+                    Some((other, other_deterministic)) if other == typ => {
+                        Some((typ, deterministic && other_deterministic))
+                    }
+                    Some(_) => return (None, false),
+                };
+            }
+            known.map_or((None, false), |(typ, deterministic)| {
+                (Some(typ), deterministic)
+            })
         }
         _ => (None, false),
     }
@@ -1530,8 +1562,15 @@ pub(super) fn select_at_most_one_row_in(
     if has_full_join(&select.from_clause) {
         return false;
     }
+    // A spread's row stands for any number of rows.
     if !select.values_lists.is_empty() {
-        return select.from_clause.is_empty() && select.values_lists.len() == 1;
+        return select.from_clause.is_empty()
+            && select.values_lists.len() == 1
+            && !select
+                .values_lists
+                .iter()
+                .flatten()
+                .any(|row| contains_spread_param(ctx, row.to_ref()));
     }
     if select.from_clause.is_empty() {
         return true;
@@ -1675,6 +1714,107 @@ fn distinct_on_key_reads_input(select: &SelectStmt, key: Option<&ast::Node>) -> 
     })
 }
 
+/// The output columns, by attnum, a `SELECT DISTINCT ON` keys: at most one
+/// of its rows has any one value of them. That holds when every key is a
+/// plain input column ([`distinct_on_key_reads_input`]) the target list
+/// also outputs as that same bare column, so the output column is the key's
+/// value; `DISTINCT ON` keeps one row per key under the keys' default
+/// equality, which no `ORDER BY … USING` replaces. A set-returning call at
+/// the level (by any routine of its name, in any schema: a view body's names
+/// were resolved under another `search_path`) is refused, as is a `*`
+/// target, whose columns this can't count.
+pub(super) fn distinct_on_output_key(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<Vec<i16>> {
+    if select.op != SetOperation::SetopNone
+        || select.distinct_clause.is_empty()
+        || dedup::is_plain_distinct(select)
+        || select.target_list.iter().any(|target| {
+            !matches!(target, Some(Node::ResTarget(target))
+                if target.val.as_ref().is_some_and(|value| !is_star(value)))
+        })
+        || select.sort_clause.iter().any(|item| {
+            !matches!(item, Some(Node::SortBy(by)) if by.sortby_dir != ast::SortByDir::SortbyUsing)
+        })
+        || may_return_set_in_any_schema(ctx, select)
+    {
+        return None;
+    }
+    let mut key = Vec::with_capacity(select.distinct_clause.len());
+    for item in &select.distinct_clause {
+        let Some(Node::ColumnRef(column)) = item else {
+            return None;
+        };
+        let Fields::Names(names) = dedup::column_ref_fields(column) else {
+            return None;
+        };
+        if !distinct_on_key_reads_input(select, item.as_ref()) {
+            return None;
+        }
+        let position = select.target_list.iter().position(|target| {
+            matches!(target, Some(Node::ResTarget(target))
+                if matches!(target.val.as_ref(), Some(Node::ColumnRef(output))
+                    if matches!(dedup::column_ref_fields(output),
+                        Fields::Names(output) if output == names)))
+        })?;
+        key.push(i16::try_from(position + 1).ok()?);
+    }
+    Some(key)
+}
+
+/// Whether `value` is a `*` or `qualifier.*` target.
+fn is_star(value: &Node) -> bool {
+    matches!(value, Node::ColumnRef(column)
+        if matches!(dedup::column_ref_fields(column), Fields::Star(_)))
+}
+
+/// [`has_set_returning`], counting every routine of a call's name in any
+/// schema: a stored view body was resolved under the `search_path` of the
+/// session that created it.
+fn may_return_set_in_any_schema(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    if has_set_returning(ctx, select) {
+        return true;
+    }
+    let mut stack: Vec<NodeRef<'_>> = Vec::new();
+    stack.extend(refs(&select.target_list));
+    stack.extend(refs(&select.from_clause));
+    stack.extend(refs(&select.group_clause));
+    stack.extend(refs(&select.window_clause));
+    stack.extend(refs(&select.sort_clause));
+    stack.extend(refs(&select.distinct_clause));
+    for node in [
+        &select.where_clause,
+        &select.having_clause,
+        &select.limit_count,
+        &select.limit_offset,
+    ] {
+        if let Some(node) = node.as_ref() {
+            stack.push(node.to_ref());
+        }
+    }
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeRef::SubLink(_) | NodeRef::RangeSubselect(_) | NodeRef::CommonTableExpr(_) => {
+                continue;
+            }
+            NodeRef::FuncCall(call) => {
+                let Some((_, name)) = function_name(&call.funcname) else {
+                    return true;
+                };
+                if ctx
+                    .catalog
+                    .pg_proc
+                    .values()
+                    .any(|proc| proc.proname == name && proc.proretset)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    false
+}
+
 /// The relation and attnum a grouping / `DISTINCT ON` item is a plain
 /// column of, resolved in this level's scope.
 fn plain_column(scope: &Scope<'_>, item: Option<&ast::Node>) -> Option<(usize, i16)> {
@@ -1738,6 +1878,8 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: Option<&ast::Node>) -> bool {
             | NodeRef::RangeVar(_)
             | NodeRef::RangeFunction(_)
             | NodeRef::RangeTableSample(_) => return false,
+            // A spread's placeholder stands for each of its items in turn.
+            NodeRef::ParamRef(param) if is_spread_param(ctx, param.number) => return false,
             // A window function numbers the rows it sees, so it differs
             // from one row to the next even over constants.
             NodeRef::FuncCall(call) if call.over.is_some() => return false,
@@ -1767,6 +1909,31 @@ fn fixed_per_evaluation(ctx: &Ctx<'_>, value: Option<&ast::Node>) -> bool {
         stack.extend(node.children());
     }
     true
+}
+
+/// Whether `$number` is one of a spread's placeholders. The query this
+/// proof reads has each `$..spread` written as one row of placeholders —
+/// in a `VALUES` list for a rows spread, as an `IN` list for a list spread
+/// (the only places a spread may be) — numbered after the regular
+/// parameters. At run time that row is any number of rows (none included)
+/// and that list any number of values, so such a placeholder is no single
+/// value, and a `VALUES` row holding one no single row.
+///
+/// [`crate::resolve::AnalyzedQuery::params`] lists the regular parameters
+/// only, so a spread's placeholder is any number past them.
+pub(super) fn is_spread_param(ctx: &Ctx<'_>, number: i32) -> bool {
+    !ctx.analyzed.spreads.is_empty()
+        && usize::try_from(number).map_or(true, |number| number > ctx.analyzed.params.len())
+}
+
+/// Whether a spread's placeholder ([`is_spread_param`]) appears under `node`.
+fn contains_spread_param(ctx: &Ctx<'_>, node: NodeRef<'_>) -> bool {
+    match node {
+        NodeRef::ParamRef(param) => is_spread_param(ctx, param.number),
+        _ => node
+            .children()
+            .any(|child| contains_spread_param(ctx, child)),
+    }
 }
 
 /// The [`NodeRef`]s of a list of AST nodes, skipping NULL cells.
@@ -5456,6 +5623,386 @@ mod tests {
             &db,
             "SELECT x.id FROM lateral_rows t \
              CROSS JOIN LATERAL (SELECT t.id AS id LIMIT 1) x WHERE t.id = 1 GROUP BY x.id",
+        ));
+    }
+
+    /// The schema of the single-row proofs real projects needed.
+    fn projects_catalog() -> PgCatalog {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE jobs (
+                id bigint PRIMARY KEY,
+                ws bigint,
+                state text NOT NULL,
+                retired_at timestamptz
+             );
+             CREATE TABLE posts (id bigint PRIMARY KEY, title text NOT NULL);
+             CREATE TABLE inserted (id bigint PRIMARY KEY, x text);
+             CREATE TABLE runs (
+                id bigint PRIMARY KEY,
+                ws bigint NOT NULL,
+                state text NOT NULL,
+                retired_at timestamptz
+             );
+             CREATE UNIQUE INDEX ON runs (ws)
+                WHERE state IN ('queued', 'running', 'done') AND retired_at IS NULL;
+             CREATE TABLE slots (id bigint PRIMARY KEY, n int NOT NULL, k bigint NOT NULL);
+             CREATE UNIQUE INDEX ON slots (k) WHERE n IN (1, 2);
+             CREATE TABLE users (
+                id bigint PRIMARY KEY,
+                email text NOT NULL,
+                login text NOT NULL,
+                principal text UNIQUE
+             );
+             CREATE UNIQUE INDEX ON users (lower(email));
+             CREATE INDEX ON users (upper(login));
+             CREATE COLLATION ci (
+                provider = icu, locale = 'und-u-ks-level2', deterministic = false
+             );
+             CREATE TABLE ci_users (id bigint PRIMARY KEY, email text COLLATE ci NOT NULL);
+             CREATE UNIQUE INDEX ON ci_users (lower(email));
+             CREATE SCHEMA other;
+             CREATE FUNCTION public.norm(v text) RETURNS text IMMUTABLE LANGUAGE sql
+                AS $$ SELECT lower(v) $$;
+             CREATE FUNCTION other.norm(v text) RETURNS text IMMUTABLE LANGUAGE sql
+                AS $$ SELECT v $$;
+             CREATE TABLE handles (id bigint PRIMARY KEY, handle text NOT NULL);
+             CREATE UNIQUE INDEX ON handles (norm(handle));
+             CREATE TABLE builds (
+                id bigint PRIMARY KEY,
+                project_id bigint NOT NULL,
+                arch text NOT NULL,
+                created_at timestamptz NOT NULL
+             );
+             CREATE VIEW cur AS
+                SELECT DISTINCT ON (project_id, arch) id, project_id, arch FROM builds
+                ORDER BY project_id, arch, created_at DESC;
+             CREATE VIEW cur_hidden AS
+                SELECT DISTINCT ON (project_id, arch) id, project_id FROM builds
+                ORDER BY project_id, arch, created_at DESC;
+             CREATE VIEW cur_set AS
+                SELECT DISTINCT ON (project_id, arch) id, project_id, arch,
+                       generate_series(1, 2) AS n
+                FROM builds ORDER BY project_id, arch, created_at DESC;
+             CREATE VIEW all_builds AS SELECT id, project_id, arch FROM builds;
+             CREATE TABLE cnaes (codigo integer PRIMARY KEY, nome text);
+             CREATE TYPE kind AS ENUM ('a', 'b');
+             CREATE TABLE kinds (k kind PRIMARY KEY, label text);
+             CREATE TABLE empresas (id bigint PRIMARY KEY, cnae text, kind text);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn an_in_over_a_one_row_subquery_is_an_equality() {
+        let db = projects_catalog();
+        assert!(statement_one(
+            &db,
+            "UPDATE jobs SET state = 'x' \
+             WHERE id IN (SELECT id FROM jobs WHERE state = 'a' LIMIT 1) RETURNING id",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id IN (SELECT id FROM jobs ORDER BY id LIMIT 1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id = ANY (SELECT max(id) FROM jobs)",
+        ));
+        // Several rows match several keys.
+        assert!(!statement_one(
+            &db,
+            "UPDATE jobs SET state = 'x' \
+             WHERE id IN (SELECT id FROM jobs WHERE state = 'a') RETURNING id",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id IN (SELECT id FROM jobs LIMIT 2)",
+        ));
+        // A subquery reading the row it is tested against is one row per
+        // row: every row can match its own.
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs \
+             WHERE id IN (SELECT o.id FROM jobs o WHERE o.ws = jobs.ws LIMIT 1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id NOT IN (SELECT id FROM jobs LIMIT 1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE ws IN (SELECT ws FROM jobs LIMIT 1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT state FROM jobs WHERE id <> ANY (SELECT id FROM jobs LIMIT 1)",
+        ));
+    }
+
+    #[test]
+    fn a_spread_is_no_single_value_or_row() {
+        let db = projects_catalog();
+        // An aggregate without GROUP BY is one row however many rows a
+        // spread expands to.
+        assert!(statement_one(
+            &db,
+            "WITH v(title) AS (VALUES $..titles {title}) SELECT count(*) AS n FROM v",
+        ));
+        assert!(statement_one(
+            &db,
+            "SELECT count(*) FROM posts WHERE title IN $..ts",
+        ));
+        assert!(statement_one(
+            &db,
+            "WITH a AS (INSERT INTO inserted (id, x) VALUES $..rows {id, x} RETURNING id) \
+             SELECT (SELECT count(*) FROM a) AS n",
+        ));
+        // A regular parameter beside a spread is still one value.
+        assert!(statement_one(
+            &db,
+            "SELECT title FROM posts WHERE id = $id AND title IN $..ts",
+        ));
+        // A key IN a spread is one row per item.
+        assert!(!statement_one(
+            &db,
+            "SELECT title FROM posts WHERE id IN $..ids",
+        ));
+        // A spread's row is any number of rows.
+        assert!(!statement_one(
+            &db,
+            "INSERT INTO inserted (id, x) VALUES $..rows {id, x} RETURNING id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "WITH v(title) AS (VALUES $..titles {title}) SELECT title FROM v",
+        ));
+        assert!(!statement_one(
+            &db,
+            "SELECT p.title FROM posts p \
+             JOIN (VALUES $..ids {id}) v(id) ON v.id::bigint = p.id",
+        ));
+        assert!(!statement_one(
+            &db,
+            "SELECT DISTINCT title FROM posts WHERE title IN $..ts GROUP BY title",
+        ));
+    }
+
+    #[test]
+    fn a_sublink_inside_a_scalar_subquery_keeps_it_a_value() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT id FROM jobs WHERE EXISTS (SELECT 1 FROM posts) LIMIT 1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT id FROM jobs WHERE id IN (SELECT id FROM posts) LIMIT 1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT id FROM jobs WHERE id NOT IN (SELECT id FROM posts) LIMIT 1)",
+        ));
+        // A nested query naming its own relation's column first.
+        assert!(select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT j.id FROM jobs j \
+                         WHERE EXISTS (SELECT 1 FROM posts p WHERE p.id = j.id) LIMIT 1)",
+        ));
+        // The nested query reads the outer row: one value per row.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT j.id FROM jobs j \
+                         WHERE EXISTS (SELECT 1 FROM posts p WHERE p.id = jobs.ws) LIMIT 1)",
+        ));
+        // A plain FROM subquery can't see its sibling `jobs`: `jobs.id` there
+        // is the outer row's.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM jobs \
+             WHERE id = (SELECT x.id FROM jobs, (SELECT jobs.id AS id FROM posts) x LIMIT 1)",
+        ));
+    }
+
+    #[test]
+    fn an_equality_implies_an_in_partial_predicate() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state = 'done' AND retired_at IS NULL",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND 'queued' = state AND retired_at IS NULL",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM runs \
+             WHERE ws = $1 AND state IN ('done', 'queued') AND retired_at IS NULL",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM slots WHERE k = $1 AND n = 2",
+        ));
+        // A value outside the predicate's list, a list that isn't a subset,
+        // or a missing conjunct proves nothing.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state = 'gone' AND retired_at IS NULL",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs \
+             WHERE ws = $1 AND state IN ('done', 'gone') AND retired_at IS NULL",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state = 'done'",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM runs WHERE ws = $1 AND state <> 'done' AND retired_at IS NULL",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM slots WHERE k = $1 AND n = 3",
+        ));
+    }
+
+    #[test]
+    fn a_unique_expression_index_keys_its_call() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM users WHERE lower(email) = lower($1)",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT u.id FROM users u WHERE $1 = pg_catalog.lower(u.email)",
+        ));
+        assert!(statement_one(
+            &db,
+            "UPDATE users SET login = $2 WHERE lower(email) = $1 RETURNING id",
+        ));
+        // Another call, another column, or no unique index.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE upper(email) = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE lower(login) = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE upper(login) = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE email = lower($1)",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM users WHERE lower(email || '') = $1",
+        ));
+        // A nondeterministic collation is never trusted, as for a column key.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM ci_users WHERE lower(email) = $1",
+        ));
+        // An index made under `search_path = other, public` stores
+        // `other.norm`, while the query's `norm` is `public.norm`: the stored
+        // name can't tell which one it was (on PG, `norm(handle) = 'a'`
+        // matches both 'a' and 'A' there).
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM handles WHERE norm(handle) = $1",
+        ));
+    }
+
+    #[test]
+    fn a_distinct_on_view_or_subquery_is_keyed_by_its_keys() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT id FROM cur WHERE project_id = $1 AND arch = $2",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT c.i FROM cur c(i, p, a) WHERE c.p = $1 AND c.a = $2",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT b.id FROM (SELECT DISTINCT ON (project_id, arch) id, project_id, arch \
+                               FROM builds ORDER BY project_id, arch, created_at DESC) b \
+             WHERE b.project_id = $1 AND b.arch = $2",
+        ));
+        // One key column, a key the view doesn't output, a view that may
+        // repeat a key's row, a view without DISTINCT ON.
+        assert!(!select_one(&db, "SELECT id FROM cur WHERE project_id = $1",));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM cur_hidden WHERE project_id = $1",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM cur_set WHERE project_id = $1 AND arch = $2",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM all_builds WHERE project_id = $1 AND arch = $2",
+        ));
+        assert!(!select_one(
+            &db,
+            "SELECT b.id FROM (SELECT DISTINCT ON (project_id) id, project_id, arch \
+                               FROM builds ORDER BY project_id, created_at DESC) b \
+             WHERE b.arch = $1",
+        ));
+    }
+
+    #[test]
+    fn a_cast_or_lateral_column_determines_a_key() {
+        let db = projects_catalog();
+        assert!(select_one(
+            &db,
+            "SELECT e.id, x.nome FROM empresas e \
+             LEFT JOIN cnaes x ON x.codigo = e.cnae::integer WHERE e.id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT e.id, k.label FROM empresas e \
+             LEFT JOIN kinds k ON k.k = e.kind::text::kind WHERE e.id = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT nome FROM cnaes WHERE codigo = $1::text::int",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT u.id FROM empresas e \
+             CROSS JOIN LATERAL ( \
+                SELECT CASE WHEN e.cnae IS NULL THEN 'a' ELSE 'b' END AS principal \
+             ) h \
+             LEFT JOIN users u ON u.principal = h.principal WHERE e.id = $1",
+        ));
+        // The cast reads an undetermined row.
+        assert!(!select_one(
+            &db,
+            "SELECT e.id, x.nome FROM empresas e \
+             LEFT JOIN cnaes x ON x.codigo = e.cnae::integer",
+        ));
+        // A lateral subquery of several rows.
+        assert!(!select_one(
+            &db,
+            "SELECT u.id FROM empresas e \
+             CROSS JOIN LATERAL (SELECT principal FROM users WHERE login = e.cnae) h \
+             LEFT JOIN users u ON u.principal = h.principal WHERE e.id = $1",
         ));
     }
 }

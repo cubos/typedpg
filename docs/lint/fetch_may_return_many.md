@@ -54,8 +54,9 @@ row:
 | `fetch_optional()`, `fetch_optional_as()`, `fetch_value_optional()` | `fetchOptional()`, `fetchValueOptional()` |
 
 Each call is reported at its method name, so a query called from several
-places is reported at each one. A query with a `$..spread` parameter, such
-as `WHERE id IN $..ids`, is never proven to return one row.
+places is reported at each one. A `$..spread` stands for any number of
+values or rows: `WHERE id IN $..ids` and `INSERT … VALUES $..rows` are
+never proven to return one row, while an aggregate over them still is.
 
 ## Not reported
 
@@ -63,7 +64,16 @@ A query proven to return at most one row:
 
 - every column of a primary key, `UNIQUE` constraint or unique index pinned
   by `=` to a constant, a parameter or a column of an already-determined row
-  (also across join `ON` conditions): `WHERE email = $email`;
+  (also across join `ON` conditions): `WHERE email = $email`. The value may
+  be any non-volatile expression of those, a cast included
+  (`ON c.code = e.code::integer`), or a scalar subquery that doesn't read
+  the row; `id IN (SELECT … LIMIT 1)` counts as `id = (SELECT …)`;
+- a partial unique index whose predicate the `WHERE` implies
+  (`… WHERE state IN ('queued', 'done')` by `state = 'done'`), and a unique
+  index on a function of columns matched by the same call
+  (`UNIQUE (lower(email))` by `WHERE lower(email) = lower($login)`);
+- the `DISTINCT ON` keys of a view or `FROM` subquery, each pinned to one
+  value: `SELECT … FROM current_builds WHERE project_id = $p AND arch = $a`;
 - an aggregate without `GROUP BY`, or `GROUP BY` keys pinned to one value:
   `SELECT count(*) AS n FROM posts WHERE user_id = $userId`;
 - `LIMIT 1` / `LIMIT 0` / `FETCH FIRST 1 ROW ONLY`:

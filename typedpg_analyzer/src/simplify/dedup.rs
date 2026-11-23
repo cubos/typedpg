@@ -445,6 +445,11 @@ pub(super) struct Rel {
     /// `FROM` function): its one row is per row of theirs, so it is a fixed
     /// row of the level only once they are.
     pub(super) reads_left: bool,
+    /// For a relation with no table of its own (`oid` is `None`): sets of
+    /// its output columns, by attnum, no two of its rows share under their
+    /// types' default equality — a `DISTINCT ON` subquery's or view's keys
+    /// (see [`super::cardinality::distinct_on_output_key`]).
+    pub(super) derived_keys: Vec<Vec<i16>>,
 }
 
 impl Rel {
@@ -632,6 +637,20 @@ pub(super) struct EqFact {
     /// The operator's declared operand type on the column's side.
     declared: Option<PgTypeOid>,
     other: u64,
+    /// For a fact on an expression rather than a column (`attnum` is then
+    /// `0`): the function called and the attnums of the plain columns of
+    /// `rel` it is called with, in order — what an expression index's key
+    /// column stores (see [`IndexCall`]).
+    call: Option<IndexCall>,
+}
+
+/// A call to the routine `proc` whose every argument is a plain column of
+/// one relation, by attnum: the one shape of an index expression the
+/// cardinality proof matches against a query's.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct IndexCall {
+    proc: crate::oid::PgProcOid,
+    args: Vec<i16>,
 }
 
 /// One side of an equality.
@@ -639,6 +658,8 @@ struct Operand {
     typ: PgTypeOid,
     column: Option<(usize, i16)>,
     rels: u64,
+    /// The operand is an [`IndexCall`] over relation `.0`'s columns.
+    call: Option<(usize, IndexCall)>,
 }
 
 impl<'a> Scope<'a> {
@@ -806,6 +827,7 @@ impl<'a> Scope<'a> {
             columns_known: false,
             cte_columns: Vec::new(),
             reads_left: false,
+            derived_keys: Vec::new(),
         });
     }
 
@@ -958,6 +980,7 @@ impl<'a> Scope<'a> {
                 columns_known,
                 cte_columns,
                 reads_left: false,
+                derived_keys: Vec::new(),
             });
             return Some(1 << (self.rels.len() - 1));
         }
@@ -1122,6 +1145,7 @@ impl<'a> Scope<'a> {
             columns_known,
             cte_columns,
             reads_left: !self.rels.is_empty(),
+            derived_keys: Vec::new(),
         });
         Some(1 << (self.rels.len() - 1))
     }
@@ -1273,6 +1297,9 @@ impl<'a> Scope<'a> {
             columns_known,
             cte_columns,
             reads_left: sub.lateral,
+            derived_keys: super::cardinality::distinct_on_output_key(ctx, select)
+                .into_iter()
+                .collect(),
         });
         Some(1 << (self.rels.len() - 1))
     }
@@ -1290,6 +1317,14 @@ impl<'a> Scope<'a> {
         // can't see through.
         let trusted_view =
             class.relkind == RelKind::View && is_trusted_system_view(ctx.catalog, class);
+        // Any other view is one relation to the cardinality proof only when
+        // its body's `DISTINCT ON` keys it (see [`Self::add_view`]).
+        if class.relkind == RelKind::View && !trusted_view {
+            return match self.mode {
+                KeyScope::Cardinality => self.add_view(ctx, rv, class.oid, nullable),
+                KeyScope::Strict => None,
+            };
+        }
         // The strict scope trusts only a plain table with nothing reading
         // rows the index doesn't cover: no inheritance children, no row
         // security. The cardinality proof may trust more (see [`KeyScope`]):
@@ -1350,6 +1385,84 @@ impl<'a> Scope<'a> {
             columns_known: true,
             cte_columns: Vec::new(),
             reads_left: false,
+            derived_keys: Vec::new(),
+        });
+        Some(1 << (self.rels.len() - 1))
+    }
+
+    /// Add a reference to a user view whose body is a `SELECT DISTINCT ON`
+    /// keyed by output columns (see
+    /// [`super::cardinality::distinct_on_output_key`]): a relation with no
+    /// table, its columns the view's own (by `pg_attribute`, renamed by an
+    /// alias column list), each typed with its collation, and that key as
+    /// its one derived key. PG expands the view as a subquery, so its rows
+    /// are the body's, at most one per key value. Any other view is a
+    /// relation the proof can't see through.
+    fn add_view(
+        &mut self,
+        ctx: &Ctx<'_>,
+        rv: &ast::RangeVar,
+        view: PgClassOid,
+        nullable: bool,
+    ) -> Option<u64> {
+        let Some(Node::SelectStmt(body)) = ctx.catalog.view_body(view)?.ast.as_ref() else {
+            return None;
+        };
+        let key = super::cardinality::distinct_on_output_key(ctx, body)?;
+        let mut attrs: Vec<_> = ctx
+            .catalog
+            .attributes_of(view)
+            .iter()
+            .filter(|a| a.attnum > 0)
+            .collect();
+        attrs.sort_by_key(|a| a.attnum);
+        // A view's columns are its body's targets, in order, and a view
+        // never drops one.
+        if attrs.len() != body.target_list.len()
+            || attrs
+                .iter()
+                .enumerate()
+                .any(|(i, a)| usize::try_from(a.attnum).ok() != Some(i + 1))
+        {
+            return None;
+        }
+        let mut columns: Vec<(String, i16)> = attrs
+            .iter()
+            .map(|a| (a.attname.clone(), a.attnum))
+            .collect();
+        let renames = rv.alias.as_ref().map_or(&[][..], |a| &a.colnames[..]);
+        if renames.len() > columns.len() {
+            return None;
+        }
+        for (column, rename) in columns.iter_mut().zip(renames) {
+            let Some(Node::String(name)) = rename else {
+                return None;
+            };
+            column.0 = name.sval.clone();
+        }
+        let cte_columns = attrs
+            .iter()
+            .map(|a| (Some(a.atttypid), deterministic(ctx.catalog, a.attcollation)))
+            .collect();
+        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+        let class = ctx.catalog.pg_class.get(&view)?;
+        self.rels.push(Rel {
+            oid: None,
+            refname: alias.clone().unwrap_or_else(|| rv.relname.clone()),
+            aliased: alias.is_some(),
+            schema: ctx
+                .catalog
+                .namespace_name(class.relnamespace)
+                .unwrap_or_default()
+                .to_owned(),
+            relname: rv.relname.clone(),
+            nullable,
+            single_row: false,
+            columns,
+            columns_known: true,
+            cte_columns,
+            reads_left: false,
+            derived_keys: vec![key],
         });
         Some(1 << (self.rels.len() - 1))
     }
@@ -1524,11 +1637,15 @@ impl<'a> Scope<'a> {
                     typ,
                     column: rel.map(|r| (r, attnum)),
                     rels: rel.map_or(0, |r| 1 << r),
+                    call: None,
                 })
             }
             Node::SubLink(sub) if scalar_sublinks => {
                 self.scalar_sublink_operand(ctx, sub, outer, env)
             }
+            // A spread's placeholder stands for each of its items in turn,
+            // no single value.
+            Node::ParamRef(p) if super::cardinality::is_spread_param(ctx, p.number) => None,
             Node::ParamRef(p) => {
                 let index = usize::try_from(p.number).ok()?.checked_sub(1)?;
                 let param = ctx.analyzed.params.get(index)?;
@@ -1537,6 +1654,7 @@ impl<'a> Scope<'a> {
                     typ: type_oid(ctx, &param.pg_type)?,
                     column: None,
                     rels: 0,
+                    call: None,
                 })
             }
             Node::AConst(c) if !c.isnull => Some(Operand {
@@ -1548,6 +1666,7 @@ impl<'a> Scope<'a> {
                 },
                 column: None,
                 rels: 0,
+                call: None,
             }),
             Node::TypeCast(cast) if scalar_sublinks => {
                 let type_name = cast.type_name.as_ref()?;
@@ -1570,6 +1689,7 @@ impl<'a> Scope<'a> {
                         typ,
                         column: None,
                         rels: arg.rels,
+                        call: None,
                     },
                 )
             }
@@ -1650,10 +1770,32 @@ impl<'a> Scope<'a> {
         {
             return None;
         }
+        // A call whose every argument is a plain column of one relation is
+        // also what an expression index over that relation may store.
+        let call = operands
+            .first()
+            .and_then(|first| first.column)
+            .and_then(|(rel, _)| {
+                let args = operands
+                    .iter()
+                    .map(|operand| match operand.column {
+                        Some((r, attnum)) if r == rel => Some(attnum),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<i16>>>()?;
+                Some((
+                    rel,
+                    IndexCall {
+                        proc: resolved.oid,
+                        args,
+                    },
+                ))
+            });
         deterministic_type(ctx, resolved.return_type_oid).then_some(Operand {
             typ: resolved.return_type_oid,
             column: None,
             rels: operands.iter().fold(0, |rels, operand| rels | operand.rels),
+            call,
         })
     }
 
@@ -1697,6 +1839,7 @@ impl<'a> Scope<'a> {
             typ: op.result_type_oid,
             column: None,
             rels: left.map_or(0, |operand| operand.rels) | right.rels,
+            call: None,
         })
     }
 
@@ -1721,6 +1864,39 @@ impl<'a> Scope<'a> {
         if sub.sub_link_type != ast::SubLinkType::ExprSublink {
             return None;
         }
+        self.sublink_value(ctx, sub, outer, visible, false)
+    }
+
+    /// The one value the subquery of `x IN (SELECT …)` / `x = ANY (SELECT
+    /// …)` compares `x` with, when the subquery yields at most one row per
+    /// evaluation ([`super::cardinality::select_at_most_one_row_in`], or its
+    /// own `LIMIT 0` / `1`) and is otherwise a value
+    /// [`Self::scalar_sublink_operand`] reads. With at most one row, the
+    /// membership test is the equality `x = value` (or matches nothing).
+    /// Only the cardinality proof asks (`visible` is its CTE environment).
+    fn in_sublink_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        sub: &ast::SubLink,
+        outer: Option<&FromScope<'_>>,
+        visible: &CteEnv,
+    ) -> Option<Operand> {
+        if sub.sub_link_type != ast::SubLinkType::AnySublink {
+            return None;
+        }
+        self.sublink_value(ctx, sub, outer, Some(visible), true)
+    }
+
+    /// [`Self::scalar_sublink_operand`]'s value of a sublink's subquery,
+    /// also proving the subquery at most one row when `one_row` is set.
+    fn sublink_value(
+        &self,
+        ctx: &Ctx<'_>,
+        sub: &ast::SubLink,
+        outer: Option<&FromScope<'_>>,
+        visible: Option<&CteEnv>,
+        one_row: bool,
+    ) -> Option<Operand> {
         let Some(Node::SelectStmt(select)) = sub.subselect.as_ref() else {
             return None;
         };
@@ -1750,6 +1926,14 @@ impl<'a> Scope<'a> {
         if !self.sublink_uncorrelated(&scope, sub) {
             return None;
         }
+        if one_row {
+            let own = FromScope::of_select(ctx, select, Some(nested));
+            if !(super::cardinality::select_at_most_one_row_in(ctx, select, &own, &env)
+                || super::cardinality::limit_bounds_one(select))
+            {
+                return None;
+            }
+        }
         let (typ, deterministic_collation) = match value {
             Node::ColumnRef(column) => {
                 let Fields::Names(names) = column_ref_fields(column) else {
@@ -1767,6 +1951,7 @@ impl<'a> Scope<'a> {
             typ,
             column: None,
             rels: 0,
+            call: None,
         })
     }
 
@@ -1817,10 +2002,20 @@ impl<'a> Scope<'a> {
     }
 
     /// Whether nothing in the sublink's subquery reads a column of this
-    /// level, and the subquery is a single plain `SELECT` whose references
-    /// all resolve in its own FROM (or an outer level above this one). A
-    /// nested CTE, sublink or FROM subquery opens another level whose
-    /// references this can't place, so it gives up; `false` when unsure.
+    /// level, and the subquery is a single plain `SELECT` (no `WITH`, no
+    /// `VALUES`, no set operation). `local` is the subquery's own scope.
+    ///
+    /// PG binds a column reference to the innermost level that has it. A
+    /// reference this level could hold ([`Self::may_reference`]) is safe
+    /// only where the subquery's own FROM items are all visible and `local`
+    /// resolves it: in the subquery's own expressions — its target list,
+    /// WHERE, GROUP BY, HAVING, ORDER BY, … — and in any query nested in
+    /// them (a nested level that also has the name binds it first, which is
+    /// no closer to this one). Inside the subquery's FROM clause a join's ON
+    /// condition sees only its own two sides and a FROM subquery or function
+    /// only the items to its left (or none), so there a name `local` lists
+    /// may still fall through to this level: any reference this level could
+    /// hold is refused. `false` when unsure.
     fn sublink_uncorrelated(&self, local: &Scope<'_>, sub: &ast::SubLink) -> bool {
         let Some(root) = sub.subselect.as_ref() else {
             return false;
@@ -1834,26 +2029,59 @@ impl<'a> Scope<'a> {
         {
             return false;
         }
-        let mut stack = vec![root.to_ref()];
-        while let Some(node) = stack.pop() {
-            match node {
-                // A nested query has its own FROM and may bind a name this
-                // level also has: the reference can't be placed from here.
-                NodeRef::SubLink(_) | NodeRef::RangeSubselect(_) | NodeRef::CommonTableExpr(_) => {
-                    return false;
-                }
-                NodeRef::ColumnRef(column) => {
-                    let Fields::Names(names) = column_ref_fields(column) else {
-                        return false;
-                    };
-                    if !matches!(local.resolve(&names), Col::Rel(..)) && self.may_reference(&names)
-                    {
+        // (node, whether every item of the subquery's own FROM is visible)
+        let mut stack: Vec<(NodeRef<'_>, bool)> = Vec::new();
+        for list in [
+            &select.target_list,
+            &select.group_clause,
+            &select.window_clause,
+            &select.sort_clause,
+            &select.distinct_clause,
+        ] {
+            stack.extend(list.iter().flatten().map(|node| (node.to_ref(), true)));
+        }
+        for node in [
+            &select.where_clause,
+            &select.having_clause,
+            &select.limit_count,
+            &select.limit_offset,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            stack.push((node.to_ref(), true));
+        }
+        stack.extend(
+            select
+                .from_clause
+                .iter()
+                .flatten()
+                .map(|node| (node.to_ref(), false)),
+        );
+        while let Some((node, visible)) = stack.pop() {
+            if let NodeRef::ColumnRef(column) = node {
+                let fields = column_ref_fields(column);
+                // A `*` expands the FROM items of the level it is written
+                // in, never an outer one; `q.*` reads the relation `q`.
+                let (names, star): (Vec<&str>, bool) = match &fields {
+                    Fields::Names(names) => (names.clone(), false),
+                    Fields::Star(None) => (Vec::new(), true),
+                    Fields::Star(Some(qualifier)) => (vec![qualifier.as_str()], true),
+                    Fields::Other => return false,
+                };
+                if !names.is_empty() && self.may_reference(&names) {
+                    let resolved_locally = visible
+                        && if star {
+                            local.rel_named(names[0]).is_some()
+                        } else {
+                            matches!(local.resolve(&names), Col::Rel(..))
+                        };
+                    if !resolved_locally {
                         return false;
                     }
                 }
-                _ => {}
             }
-            stack.extend(node.children());
+            stack.extend(node.children().map(|child| (child, visible)));
         }
         true
     }
@@ -1925,6 +2153,29 @@ impl<'a> Scope<'a> {
         cardinality: bool,
         env: Option<&CteEnv>,
     ) -> Vec<EqFact> {
+        // `x IN (SELECT v …)` / `x = ANY (SELECT v …)` over a subquery of at
+        // most one row is `x = v` (see [`Self::in_sublink_operand`]).
+        if let Some(Node::SubLink(sub)) = conjunct
+            && cardinality
+            && let Some(env) = env
+        {
+            let name = match string_list(&sub.oper_name).as_slice() {
+                // `IN` leaves the operator unnamed: it is `=`.
+                [] | ["="] => "=",
+                ["pg_catalog", "="] => "pg_catalog.=",
+                _ => return Vec::new(),
+            };
+            if matches!(sub.testexpr.as_ref(), Some(Node::RowExpr(_))) {
+                return Vec::new();
+            }
+            let (Some(l), Some(r)) = (
+                self.operand(ctx, sub.testexpr.as_ref(), outer, true, Some(env)),
+                self.in_sublink_operand(ctx, sub, outer, env),
+            ) else {
+                return Vec::new();
+            };
+            return self.facts_of(ctx, name, &l, &r, true);
+        }
         let Some(Node::AExpr(e)) = conjunct else {
             return Vec::new();
         };
@@ -2046,6 +2297,7 @@ impl<'a> Scope<'a> {
                         typ,
                         column: Some((r, attnum)),
                         rels: 1 << r,
+                        call: None,
                     })
                 }
                 _ => None,
@@ -2088,6 +2340,7 @@ impl<'a> Scope<'a> {
             return Vec::new();
         }
         let mut out = Vec::new();
+        let right_declared = || ctx.catalog.pg_operator.get(&op.oid).map(|o| o.oprright);
         if let Some((rel, attnum)) = l.column
             && r.rels & (1 << rel) == 0
         {
@@ -2097,18 +2350,44 @@ impl<'a> Scope<'a> {
                 op: op.oid,
                 declared: op.declared_left_type_oid,
                 other: r.rels,
+                call: None,
             });
         }
         if let Some((rel, attnum)) = r.column
             && l.rels & (1 << rel) == 0
         {
-            let declared = ctx.catalog.pg_operator.get(&op.oid).map(|o| o.oprright);
             out.push(EqFact {
                 rel,
                 attnum,
                 op: op.oid,
-                declared,
+                declared: right_declared(),
                 other: l.rels,
+                call: None,
+            });
+        }
+        // An expression index key: `f(t.a) = value`, attnum `0`.
+        if let Some((rel, call)) = &l.call
+            && r.rels & (1 << rel) == 0
+        {
+            out.push(EqFact {
+                rel: *rel,
+                attnum: 0,
+                op: op.oid,
+                declared: op.declared_left_type_oid,
+                other: r.rels,
+                call: Some(call.clone()),
+            });
+        }
+        if let Some((rel, call)) = &r.call
+            && l.rels & (1 << rel) == 0
+        {
+            out.push(EqFact {
+                rel: *rel,
+                attnum: 0,
+                op: op.oid,
+                declared: right_declared(),
+                other: l.rels,
+                call: Some(call.clone()),
             });
         }
         out
@@ -2177,18 +2456,45 @@ fn coercion_is_nonvolatile(ctx: &Ctx<'_>, source: PgTypeOid, target: PgTypeOid) 
     {
         return true;
     }
-    let cast = ctx
-        .catalog
-        .cast_by_pair
-        .get(&(source, target))
-        .and_then(|oid| ctx.catalog.pg_cast.get(oid));
-    match cast {
-        Some(cast) if cast.castmethod == crate::pg_catalog::CastMethod::Function => cast
-            .castfunc
+    use crate::coerce::{CoercionContext, CoercionPath, coercion_pathway};
+    match coercion_pathway(target, source, CoercionContext::Explicit, ctx.catalog) {
+        Some(CoercionPath::Relabel) => true,
+        Some(CoercionPath::Func) => ctx
+            .catalog
+            .cast_by_pair
+            .get(&(
+                ctx.catalog.unwrap_domain(source),
+                ctx.catalog.unwrap_domain(target),
+            ))
+            .and_then(|oid| ctx.catalog.pg_cast.get(oid))
+            .and_then(|cast| cast.castfunc)
             .and_then(|func| ctx.catalog.pg_proc.get(&func))
             .is_some_and(|proc| proc.provolatile != ProVolatile::Volatile),
-        _ => false,
+        // The source type's output function, then the target's input
+        // function. The catalog doesn't keep a type's I/O functions, so
+        // only types whose functions are PG's own are trusted: a built-in
+        // type's (none of PG's I/O functions is volatile) and an enum's
+        // (`enum_in` / `enum_out`, stable). A user base type may declare a
+        // volatile one, and a user composite, array or range type's reads
+        // its elements' through theirs.
+        Some(CoercionPath::CoerceViaIo) => {
+            io_functions_nonvolatile(ctx, source) && io_functions_nonvolatile(ctx, target)
+        }
+        Some(CoercionPath::ArrayCoerce) | None => false,
     }
+}
+
+/// Whether `typ`'s input and output functions are PG's own non-volatile
+/// ones: a built-in type's, or an enum's (see [`coercion_is_nonvolatile`]).
+/// A domain reads its base type's.
+fn io_functions_nonvolatile(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
+    let typ = ctx.catalog.unwrap_domain(typ);
+    typ.get() < FIRST_NORMAL_OBJECT_ID
+        || ctx
+            .catalog
+            .pg_type
+            .get(&typ)
+            .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Enum)
 }
 
 /// The conjuncts a set of equality facts was read from, for matching a
@@ -2225,8 +2531,16 @@ impl<'a> Scope<'a> {
         allowed: u64,
         sources: Option<&PredicateSources<'_>>,
     ) -> Option<u64> {
-        let oid = self.rels[b].oid?;
-        unique_keys(ctx, oid).iter().find_map(|key| {
+        let Some(oid) = self.rels[b].oid else {
+            return self.derived_key_equated(ctx, b, facts, allowed);
+        };
+        // Expression keys are matched only by the cardinality proof's call
+        // facts; the `DISTINCT` proof never records one.
+        let keys = match self.mode {
+            KeyScope::Cardinality => unique_keys_with_expressions(ctx, oid),
+            KeyScope::Strict => unique_keys(ctx, oid),
+        };
+        keys.iter().find_map(|key| {
             if key.predicate.is_some() {
                 let sources = sources?;
                 if !self.predicate_implied(ctx, b, key.predicate.as_ref(), sources) {
@@ -2241,9 +2555,55 @@ impl<'a> Scope<'a> {
                 let fact = facts.iter().find(|f| {
                     f.rel == b
                         && f.attnum == c.attnum
+                        && f.call == c.expr
                         && f.other & !allowed == 0
                         && operand_type_matches(ctx, c.typ, f.declared)
                         && in_btree_equality(ctx, &c.family, f.op)
+                })?;
+                det |= fact.other;
+            }
+            Some(det)
+        })
+    }
+
+    /// [`Self::key_equated_with`] for a relation with no table of its own:
+    /// one of its derived keys ([`Rel::derived_keys`]) whose every column
+    /// `facts` equate to values read from relations within `allowed`. A
+    /// derived key is distinct under each column type's default equality
+    /// (what `DISTINCT ON` compares with), so the fact's operator must be
+    /// that btree family's equality, on a deterministic collation, and one
+    /// that equates no two values the default equality tells apart (see
+    /// [`grouping_equality`]).
+    fn derived_key_equated(
+        &self,
+        ctx: &Ctx<'_>,
+        b: usize,
+        facts: &[EqFact],
+        allowed: u64,
+    ) -> Option<u64> {
+        if self.mode != KeyScope::Cardinality {
+            return None;
+        }
+        let rel = &self.rels[b];
+        rel.derived_keys.iter().find_map(|key| {
+            if key.is_empty() {
+                return None;
+            }
+            let mut det = 0u64;
+            for &attnum in key {
+                let (typ, deterministic_collation) = rel.column_info(ctx, attnum)?;
+                if !deterministic_collation {
+                    return None;
+                }
+                let family = default_btree_family(ctx.catalog, typ)?;
+                let fact = facts.iter().find(|f| {
+                    f.rel == b
+                        && f.attnum == attnum
+                        && f.call.is_none()
+                        && f.other & !allowed == 0
+                        && operand_type_matches(ctx, typ, f.declared)
+                        && in_btree_equality(ctx, &family, f.op)
+                        && grouping_equality(ctx, f.op)
                 })?;
                 det |= fact.other;
             }
@@ -2350,12 +2710,63 @@ impl<'a> Scope<'a> {
                 return true;
             }
         }
+        // `col IN (c1, …, cn)` holds wherever `col = ci` (or `col IN` a
+        // subset of the constants) does.
+        if let Some((attnum, allowed)) = membership(&predicate)
+            && self.membership_literals_compare_alike(ctx, b, attnum, &allowed)
+            && sources.conjuncts.iter().any(|source| {
+                let source = self.canonical_source(b, *source);
+                source
+                    .as_ref()
+                    .and_then(membership)
+                    .is_some_and(|(column, values)| {
+                        column == attnum
+                            && self.membership_literals_compare_alike(ctx, b, attnum, &values)
+                            && values
+                                .iter()
+                                .all(|value| allowed.iter().any(|other| other.equal(*value)))
+                    })
+            })
+        {
+            return true;
+        }
         sources.conjuncts.iter().any(|source| {
             let source = self.canonical_source(b, *source);
             source
                 .as_ref()
                 .is_some_and(|source| predicate.equal(source))
         })
+    }
+
+    /// Whether the constants of a [`membership`] test on relation `b`'s
+    /// column `attnum` are compared through the same equality whether they
+    /// are written `col = c` or `col IN (…, c, …)`: untyped string
+    /// literals, which take the column's type either way (PG's
+    /// `select_common_type` ignores them, and `oper` reads one as the other
+    /// operand's type), or integer literals on an integer column, where
+    /// whichever integer equality PG picks agrees.
+    fn membership_literals_compare_alike(
+        &self,
+        ctx: &Ctx<'_>,
+        b: usize,
+        attnum: i16,
+        values: &[&ast::Node],
+    ) -> bool {
+        let is = |kind: fn(&AConstValue) -> bool| {
+            values.iter().all(|value| {
+                matches!(value, Node::AConst(c) if !c.isnull && c.val.as_ref().is_some_and(kind))
+            })
+        };
+        if is(|value| matches!(value, AConstValue::String(_))) {
+            return true;
+        }
+        is(|value| matches!(value, AConstValue::Integer(_)))
+            && self.rels[b].oid.is_some_and(|relid| {
+                ctx.catalog.attributes_of(relid).iter().any(|attribute| {
+                    attribute.attnum == attnum
+                        && [oid::INT2, oid::INT4, oid::INT8].contains(&attribute.atttypid)
+                })
+            })
     }
 
     /// Whether relation `b`'s column `attnum` is a `boolean`.
@@ -2495,6 +2906,48 @@ fn boolean_conjunct_fixes(node: Option<&ast::Node>, attnum: i16, value: bool) ->
             canonical_var_attnum(expr.args[0].as_ref()) == Some(attnum)
         }
         _ => false,
+    }
+}
+
+/// A canonical membership test of one column in non-NULL constants, written
+/// with the unqualified `=`: `col = c` or `c = col` (one constant), or
+/// `col IN (c1, …)`. Its column's attnum and the constants. (`= ANY
+/// (ARRAY[…])` is left out: the array constructor resolves its elements'
+/// type on its own, which may pick another equality.)
+fn membership(node: &ast::Node) -> Option<(i16, Vec<&ast::Node>)> {
+    let Node::AExpr(expr) = node else {
+        return None;
+    };
+    if string_list(&expr.name).as_slice() != ["="] {
+        return None;
+    }
+    fn constant(node: Option<&ast::Node>) -> Option<&ast::Node> {
+        node.filter(|node| matches!(node, Node::AConst(c) if !c.isnull))
+    }
+    match expr.kind {
+        AExprKind::AexprOp => {
+            match (
+                canonical_var_attnum(expr.lexpr.as_ref()),
+                canonical_var_attnum(expr.rexpr.as_ref()),
+            ) {
+                (Some(attnum), None) => Some((attnum, vec![constant(expr.rexpr.as_ref())?])),
+                (None, Some(attnum)) => Some((attnum, vec![constant(expr.lexpr.as_ref())?])),
+                _ => None,
+            }
+        }
+        AExprKind::AexprIn => {
+            let attnum = canonical_var_attnum(expr.lexpr.as_ref())?;
+            let Some(Node::List(list)) = expr.rexpr.as_ref() else {
+                return None;
+            };
+            let values = list
+                .items
+                .iter()
+                .map(|item| constant(item.as_ref()))
+                .collect::<Option<Vec<_>>>()?;
+            (!values.is_empty()).then_some((attnum, values))
+        }
+        _ => None,
     }
 }
 
@@ -2658,6 +3111,7 @@ fn system_view_keys(
                     family,
                     default_family: true,
                     deterministic: deterministic(catalog, attr.attcollation),
+                    expr: None,
                 });
             }
             Some(UniqueKey {
@@ -2725,6 +3179,11 @@ struct KeyColumn {
     default_family: bool,
     /// The index's and the column's collations are deterministic.
     deterministic: bool,
+    /// An expression key column (`attnum` is then `0`): the call it stores.
+    /// Only [`Scope::key_equated_with`] asks for these (see
+    /// [`unique_keys_with_expressions`]); every other reader sees plain
+    /// columns only.
+    expr: Option<IndexCall>,
 }
 
 struct UniqueKey {
@@ -2742,6 +3201,18 @@ struct UniqueKey {
 /// enforces nothing yet — a partitioned parent's `ON ONLY` index until every
 /// partition has an attached index — so it is never a key.
 fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
+    unique_keys_in(ctx, relid, false)
+}
+
+/// [`unique_keys`], also with the unique indexes whose key columns include
+/// expressions of the one shape [`index_expression_call`] reads: a call to
+/// a routine over plain columns of the table. Only the cardinality proof
+/// matches those, against the [`IndexCall`] facts of a query's own calls.
+fn unique_keys_with_expressions(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
+    unique_keys_in(ctx, relid, true)
+}
+
+fn unique_keys_in(ctx: &Ctx<'_>, relid: PgClassOid, expressions: bool) -> Vec<UniqueKey> {
     let catalog = ctx.catalog;
     let attrs = catalog.attributes_of(relid);
     // A trusted system view has no index: its keys are PostgreSQL's own.
@@ -2776,8 +3247,44 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
             continue;
         }
         let mut columns = Vec::with_capacity(nkeys);
+        let mut exprs = index.indexprs.iter();
         for i in 0..nkeys {
             let attnum = index.indkey[i];
+            if attnum == 0 {
+                // An expression slot, consumed from `indexprs` in order.
+                let stored = exprs.next();
+                if !expressions {
+                    continue 'index;
+                }
+                let Some((call, typ, collations_deterministic)) = stored
+                    .and_then(|stored| index_expression_call(ctx, relid, stored.ast.as_ref()))
+                else {
+                    continue 'index;
+                };
+                let Some(opclass) = index
+                    .indclass
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .and_then(|o| catalog.pg_opclass.iter().find(|c| c.oid == o))
+                else {
+                    continue 'index;
+                };
+                if opclass.opcmethod != "btree" {
+                    continue 'index;
+                }
+                columns.push(KeyColumn {
+                    attnum: 0,
+                    typ,
+                    notnull: false,
+                    family: (opclass.opcfamily.clone(), opclass.opcfamilynamespace),
+                    default_family: false,
+                    deterministic: collations_deterministic
+                        && deterministic(catalog, index.indcollation.get(i).copied().flatten()),
+                    expr: Some(call),
+                });
+                continue;
+            }
             let Some(attr) = attrs.iter().find(|a| a.attnum == attnum && attnum > 0) else {
                 continue 'index;
             };
@@ -2806,6 +3313,7 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
                 default_family,
                 deterministic: deterministic(catalog, index.indcollation.get(i).copied().flatten())
                     && deterministic(catalog, attr.attcollation),
+                expr: None,
             });
         }
         out.push(UniqueKey {
@@ -2818,6 +3326,98 @@ fn unique_keys(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<UniqueKey> {
         });
     }
     out
+}
+
+/// The call an index expression stores, when it is the one shape a query's
+/// call can be matched against: `f(a, b, …)`, every argument a plain column
+/// of `relid`, with no named notation, `VARIADIC`, aggregate or window
+/// decoration. With the call, the result type and whether every argument
+/// column's collation is deterministic (the expression's collation is
+/// derived from theirs).
+///
+/// The stored expression keeps only the name it was written with, resolved
+/// when the index was made under that session's `search_path`. It is
+/// resolved again here for the columns' types, and an unqualified name is
+/// only trusted when every routine of that name lives in the schema of the
+/// one it resolves to: no `search_path` could then have bound it to another
+/// schema's routine, and within one schema the argument types decide. The
+/// routine must be immutable (PG requires it of an index expression) and
+/// return one value of a non-polymorphic type.
+fn index_expression_call(
+    ctx: &Ctx<'_>,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+) -> Option<(IndexCall, PgTypeOid, bool)> {
+    let Some(Node::FuncCall(call)) = expr else {
+        return None;
+    };
+    let (schema, name, notation) = call_syntax(call)?;
+    let attrs = ctx.catalog.attributes_of(relid);
+    let mut args = Vec::with_capacity(call.args.len());
+    let mut types = Vec::with_capacity(call.args.len());
+    let mut collations_deterministic = true;
+    for arg in &call.args {
+        let Some(Node::ColumnRef(column)) = arg else {
+            return None;
+        };
+        let Fields::Names(names) = column_ref_fields(column) else {
+            return None;
+        };
+        let [column] = names.as_slice() else {
+            return None;
+        };
+        let attr = attrs
+            .iter()
+            .find(|a| a.attnum > 0 && a.attname == *column)?;
+        args.push(attr.attnum);
+        types.push(attr.atttypid);
+        collations_deterministic &= deterministic(ctx.catalog, attr.attcollation);
+    }
+    if args.is_empty() {
+        return None;
+    }
+    let resolved = crate::functions::resolve_function(
+        ctx.catalog,
+        schema,
+        name,
+        &types,
+        &notation,
+        false,
+        None,
+    )
+    .ok()?;
+    if resolved.is_aggregate
+        || resolved.is_window
+        || resolved.is_set_returning
+        || resolved.provariadic.is_some()
+        || crate::polymorphic::is_polymorphic(resolved.return_type_oid)
+    {
+        return None;
+    }
+    let proc = ctx.catalog.pg_proc.get(&resolved.oid)?;
+    if proc.provolatile != ProVolatile::Immutable
+        || proc.prokind != ProKind::Function
+        || proc.proargtypes.len() != args.len()
+    {
+        return None;
+    }
+    if schema.is_none()
+        && ctx
+            .catalog
+            .pg_proc
+            .values()
+            .any(|other| other.proname == name && other.pronamespace != proc.pronamespace)
+    {
+        return None;
+    }
+    Some((
+        IndexCall {
+            proc: resolved.oid,
+            args,
+        },
+        resolved.return_type_oid,
+        collations_deterministic,
+    ))
 }
 
 /// Whether relation `relid` provably holds at most one row: a complete,
