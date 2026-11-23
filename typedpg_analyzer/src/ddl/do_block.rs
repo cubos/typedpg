@@ -1889,9 +1889,11 @@ pub(crate) fn trigger_body_outcome(
             variables: variables(compiled),
             atomic: true,
             arguments: true,
+            may_raise: false,
+            scope: Vec::new(),
         };
         for variable in &mut run.variables {
-            variable.value = None;
+            variable.value = Val::any();
         }
         match enter_body(Some(function)) {
             Some(_leave) => run.block(&mut scratch, action).err(),
