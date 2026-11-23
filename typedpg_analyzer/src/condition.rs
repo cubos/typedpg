@@ -651,6 +651,28 @@ fn schema_source(
     decides: impl Fn(&Refinement) -> Option<()>,
 ) -> Option<String> {
     let (relid, attr) = base_column(node, ctx)?;
+    // An enum's labels, which no constraint needs to say.
+    let base = ctx.snapshot.unwrap_domain(attr.atttypid);
+    if let Some(ty) = ctx
+        .snapshot
+        .pg_type
+        .get(&base)
+        .filter(|ty| ty.typtype == crate::pg_catalog::TypType::Enum)
+    {
+        let labels = Refinement {
+            values: Some(
+                ctx.snapshot
+                    .enum_labels_of(base)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            ..Refinement::NONE
+        };
+        if decides(&labels).is_some() {
+            return Some(format!("enum \"{}\"", ty.typname));
+        }
+    }
     for (name, r) in ctx
         .snapshot
         .column_check_refinements(relid, &attr.attname, false)
@@ -956,6 +978,165 @@ fn node_key(kind: &str, n: Option<&ast::Node>) -> String {
     key
 }
 
+/// A CHECK expression's schema: the catalog, the relation its columns are
+/// of and the nodes its resolution trusted.
+struct Side<'a> {
+    catalog: &'a PgCatalog,
+    relid: crate::oid::PgClassOid,
+    trust: &'a crate::nonnull::TrustedNodes,
+}
+
+/// Whether CHECK expression `old` not being FALSE makes `new` not FALSE
+/// either (see [`PgCatalog::check_part_implied_by`]).
+fn weakly_implies(
+    old: (Option<&ast::Node>, &Side<'_>),
+    new: (Option<&ast::Node>, &Side<'_>),
+) -> bool {
+    let constant = |n: Option<&ast::Node>| match n {
+        // A missing ELSE is NULL.
+        None => Some(None),
+        Some(ast::Node::AConst(c)) if c.isnull => Some(None),
+        Some(ast::Node::AConst(c)) => match &c.val {
+            Some(ast::AConstValue::Boolean(b)) => Some(Some(b.boolval)),
+            _ => None,
+        },
+        _ => None,
+    };
+    // `new` always passes; `old` never does.
+    if matches!(constant(new.0), Some(None | Some(true))) || constant(old.0) == Some(Some(false)) {
+        return true;
+    }
+    if node_key("", old.0) == node_key("", new.0) {
+        return true;
+    }
+    let (Some(old_case), Some(new_case)) = (case_arms(old.0, old.1), case_arms(new.0, new.1))
+    else {
+        return false;
+    };
+    if old_case.subject != new_case.subject || old_case.exact != new_case.exact {
+        return false;
+    }
+    fn branch<'n>(case: &CaseArms<'n>, value: &str) -> Option<&'n ast::Node> {
+        case.arms
+            .iter()
+            .find(|(v, _)| v == value)
+            .map_or(case.otherwise, |(_, body)| *body)
+    }
+    let values: BTreeSet<&str> = old_case
+        .arms
+        .iter()
+        .chain(&new_case.arms)
+        .map(|(v, _)| v.as_str())
+        .collect();
+    values.into_iter().all(|value| {
+        weakly_implies(
+            (branch(&old_case, value), old.1),
+            (branch(&new_case, value), new.1),
+        )
+    }) && weakly_implies((old_case.otherwise, old.1), (new_case.otherwise, new.1))
+}
+
+/// A `CASE` over one column, each `WHEN` a constant the column equals.
+struct CaseArms<'a> {
+    /// The column's name.
+    subject: String,
+    /// How its values print, the same for equal ones.
+    exact: Exact,
+    /// Each constant (as the column's type reads it) with its body, the
+    /// first `WHEN` of a constant only (a later one is never taken).
+    arms: Vec<(String, Option<&'a ast::Node>)>,
+    /// The `ELSE` (`None`: NULL).
+    otherwise: Option<&'a ast::Node>,
+}
+
+/// `n` read as [`CaseArms`]: a simple `CASE col WHEN c THEN …` or a
+/// searched `CASE WHEN col = c THEN …`, every comparison a built-in one of
+/// a column of `side`'s relation whose type's equal values print the same.
+fn case_arms<'a>(n: Option<&'a ast::Node>, side: &Side<'_>) -> Option<CaseArms<'a>> {
+    use crate::nonnull::{StrictNode, Trust};
+    let Some(ast::Node::CaseExpr(case)) = n else {
+        return None;
+    };
+    let column_name = |n: Option<&ast::Node>| match n {
+        Some(ast::Node::ColumnRef(c)) => crate::expr::extract_string_fields(&c.fields)
+            .last()
+            .cloned(),
+        _ => None,
+    };
+    let literal = |n: Option<&ast::Node>| match n {
+        Some(ast::Node::AConst(c)) if !c.isnull => match c.val.as_ref()? {
+            ast::AConstValue::Integer(i) => Some(i.ival.to_string()),
+            ast::AConstValue::String(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut subject: Option<String> = column_name(case.arg.as_ref());
+    if case.arg.is_some() && subject.is_none() {
+        return None;
+    }
+    let mut constants = Vec::new();
+    for when in &case.args {
+        let Some(ast::Node::CaseWhen(when)) = when else {
+            return None;
+        };
+        let (column, constant) = if case.arg.is_some() {
+            // A simple CASE's `test = value` is recorded at its WHEN.
+            if !side.trust.trusts(when.location, StrictNode::BuiltinCompare) {
+                return None;
+            }
+            (subject.clone(), literal(when.expr.as_ref()))
+        } else {
+            let Some(ast::Node::AExpr(cmp)) = when.expr.as_ref() else {
+                return None;
+            };
+            if cmp.kind != ast::AExprKind::AexprOp
+                || crate::expr::extract_string_fields(&cmp.name) != ["="]
+                || !side.trust.trusts(cmp.location, StrictNode::BuiltinCompare)
+            {
+                return None;
+            }
+            match (
+                column_name(cmp.lexpr.as_ref()),
+                column_name(cmp.rexpr.as_ref()),
+            ) {
+                (Some(column), None) => (Some(column), literal(cmp.rexpr.as_ref())),
+                (None, Some(column)) => (Some(column), literal(cmp.lexpr.as_ref())),
+                _ => return None,
+            }
+        };
+        let (Some(column), Some(constant)) = (column, constant) else {
+            return None;
+        };
+        match &subject {
+            Some(s) if *s != column => return None,
+            Some(_) => {}
+            None => subject = Some(column),
+        }
+        constants.push((constant, when.result.as_ref()));
+    }
+    let subject = subject?;
+    let attr = side
+        .catalog
+        .attributes_of(side.relid)
+        .iter()
+        .find(|a| a.attnum > 0 && a.attname == subject)?;
+    let exact = Exact::of(attr.atttypid, attr.attcollation, side.catalog)?;
+    let mut arms: Vec<(String, Option<&ast::Node>)> = Vec::new();
+    for (constant, body) in constants {
+        let value = exact.read(&constant)?;
+        if !arms.iter().any(|(v, _)| *v == value) {
+            arms.push((value, body));
+        }
+    }
+    Some(CaseArms {
+        subject,
+        exact,
+        arms,
+        otherwise: case.defresult.as_ref(),
+    })
+}
+
 impl PgCatalog {
     /// The constraints a value an INSERT or UPDATE stores into column
     /// `column` of relation `relid` must satisfy: its enforced CHECK
@@ -1189,6 +1370,95 @@ impl PgCatalog {
             }
         }
         PartOutcome::Unknown
+    }
+
+    /// Whether the CHECK conjunct `key` of relation `relid` — the
+    /// [`CheckPart::key`] of a relation constraint's part — lets through
+    /// every row an enforced CHECK constraint of relation `old_relid` of
+    /// `old` lets through (`NOT VALID` ones included: they bind the rows
+    /// written), so it restricts nothing more than that schema did: a
+    /// CHECK passes a row it is NULL for, so this is PostgreSQL's weak
+    /// implication (`predicate_implied_by(…, weak = true)`).
+    ///
+    /// Proven: an old conjunct equal to it; a constant `true` or NULL; and
+    /// a `CASE` over one column whose `WHEN`s are constants it equals (a
+    /// simple `CASE col WHEN 'a' THEN …`, or a searched one of `WHEN col =
+    /// 'a'`), compared value by value with an old `CASE` over the same
+    /// column: for each value either names, and for the values neither
+    /// does (the `ELSE`s, which NULL reaches too), the old branch it takes
+    /// must imply the new one — the same, recursively, or an old `false`.
+    /// Adding a branch whose body is `true` to a `CASE … ELSE false END`,
+    /// or replacing a body by `true`, widens it. The comparisons must be
+    /// built-in ones of a type whose equal values print the same (no
+    /// nondeterministic collation), so two different constants are two
+    /// different values.
+    pub fn check_part_implied_by(
+        &self,
+        relid: crate::oid::PgClassOid,
+        key: &str,
+        old: &PgCatalog,
+        old_relid: crate::oid::PgClassOid,
+    ) -> bool {
+        let Some((new_conjunct, new_trust)) =
+            self.relation_conjunct(relid, |n| node_key("relation:", n) == key)
+        else {
+            return false;
+        };
+        let new = Side {
+            catalog: self,
+            relid,
+            trust: new_trust,
+        };
+        old.pg_constraint
+            .values()
+            .filter(|c| {
+                c.conrelid == old_relid
+                    && c.contype == crate::pg_catalog::ConType::Check
+                    && c.conenforced
+            })
+            .filter_map(|c| old.check_defs.get(&c.oid))
+            .any(|def| {
+                let (crate::ddl::tables::check_inherit::StoredExpr::Written(expr), Some(trust)) =
+                    (&def.expr, &def.trusted)
+                else {
+                    return false;
+                };
+                let old_side = Side {
+                    catalog: old,
+                    relid: old_relid,
+                    trust,
+                };
+                crate::nonnull::checks::check_conjuncts((**expr).as_ref())
+                    .into_iter()
+                    .any(|o| weakly_implies((o, &old_side), (new_conjunct, &new)))
+            })
+    }
+
+    /// The first top-level conjunct of an enforced CHECK constraint of
+    /// `relid` that `matches`, with the constraint's trusted nodes.
+    fn relation_conjunct(
+        &self,
+        relid: crate::oid::PgClassOid,
+        matches: impl Fn(Option<&ast::Node>) -> bool,
+    ) -> Option<(Option<&ast::Node>, &crate::nonnull::TrustedNodes)> {
+        use crate::ddl::tables::check_inherit::StoredExpr;
+        self.pg_constraint
+            .values()
+            .filter(|c| {
+                c.conrelid == relid
+                    && c.contype == crate::pg_catalog::ConType::Check
+                    && c.conenforced
+            })
+            .filter_map(|c| self.check_defs.get(&c.oid))
+            .find_map(|def| {
+                let (StoredExpr::Written(expr), Some(trust)) = (&def.expr, &def.trusted) else {
+                    return None;
+                };
+                crate::nonnull::checks::check_conjuncts((**expr).as_ref())
+                    .into_iter()
+                    .find(|n| matches(*n))
+                    .map(|n| (n, trust))
+            })
     }
 
     /// [`Self::check_part_outcome`] of conjunct `n`, whose column

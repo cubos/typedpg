@@ -99,7 +99,13 @@ Against the new schema, a deployed query:
   aside) or may now be `NULL` (also array elements and record fields);
 - returns a different column list (`SELECT *` gaining a column);
 - may return a value the code doesn't know: a new enum label, a `CHECK`
-  admitting more values or a wider range (also in arrays and composites);
+  admitting more values or a wider range (also in arrays and composites).
+  A new value is reported where the code's type narrows to the old ones:
+  in TypeScript, the generated literal union (`"active" | "blocked"`),
+  which the runtime passes any text through unchecked; in Rust, a type
+  `[types]` maps — an enum decoding into its Rust enum fails on the new
+  label ("a label the deployed code's crate::Status does not have:
+  decoding it fails"), a mapped domain may reject a new value;
 - has a parameter (or `$..spread` field) that changes type, no longer
   accepts `NULL`, or no longer accepts an enum label;
 - `INSERT`s or `COPY`s without a column now `NOT NULL` with no default (an
@@ -142,6 +148,17 @@ command takes it over (then only the view's own columns are checked).
 - A narrower column the value written certainly fits; a `CHECK` renamed, or
   dropped and re-added with the same expression; a `CHECK` that is true or
   `NULL` for the constants every row writes.
+- A new `CHECK` the deployed schema's `CHECK`s imply, letting through every
+  row they did: `kind IN ('a', 'b')` widened to `kind IN ('a', 'b', 'c')`,
+  or a `CASE` over one column widened by a branch —
+  `CASE type WHEN 'a' THEN payload ? 'x' ELSE false END` to the same with
+  `WHEN 'b' THEN true` — or with a branch's body made `true`. The `CASE`s are
+  compared value by value (simple or searched `WHEN type = 'a'`, constants
+  of a type whose equal values print the same): each branch the old one
+  takes must imply the new one's, equal or an old `false`.
+- In Rust, a new enum label or `CHECK` value of a column the code decodes
+  into a `String` (an enum or domain `[types]` doesn't map, a `text`): any
+  value decodes.
 - A new `UNIQUE`, primary key or exclusion constraint (depends on data); a
   timestamp, time or interval precision change (rounds); a length or
   precision change of a column only read.

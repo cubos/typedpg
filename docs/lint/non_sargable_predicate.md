@@ -91,7 +91,11 @@ top-level `AND` part of a `WHERE` or `JOIN … ON` (`SELECT`, `UPDATE`,
 - a function with it as an argument: `lower(sku)`,
   `date_trunc('day', created_at)`;
 - arithmetic or `||` with it and no other column: `id + 1`;
-- an implicit conversion forced by the other side: `int4` column `= 1.5`.
+- an implicit conversion forced by the other side: `int4` column `= 1.5`;
+- a binary-compatible relabeling the index's operator family doesn't
+  compare: a `citext` column (`citext_ops`) compared with a `text` value,
+  `c = 'a'::text` or `c::text = $1`, is compared as `text` (EXPLAIN shows a
+  Filter).
 
 And the index would otherwise apply:
 
@@ -102,8 +106,13 @@ And the index would otherwise apply:
 
 ## Not reported
 
-- A cast to the column's own or a binary-compatible type:
-  `sku::text = $sku` on `varchar`.
+- A cast to the column's own or a binary-compatible type the index's
+  operator family compares: `sku::text = $sku` on `varchar` (`text_ops`).
+- A column of a domain, compared as its base type: `c = 'a'::text` on a
+  domain over `text`.
+- A polymorphic operator, which takes the column as it is: an enum's `=`
+  (`anyenum`, served by `enum_ops`: `arch = 'x86_64'`, `arch IN (…)`,
+  `arch = ANY($1)`), an array's (`anyarray`).
 - A cross-type comparison the index supports: `id = 5::bigint` on `int4`.
 - No btree index leads with the column: `lower(name) = $name`.
 - The table has any expression index, which might match.

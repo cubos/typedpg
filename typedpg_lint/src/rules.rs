@@ -36,6 +36,7 @@ mod scalar_subquery_may_return_many;
 mod self_assignment;
 mod simplifiable_case;
 mod timestamp_timezone_mix;
+mod unbounded_write;
 mod unreachable_case_branch;
 mod unstable_order;
 mod unused_cte;
@@ -47,7 +48,7 @@ const COMPARISONS: &[&str] = &["=", "<>", "!=", "<", ">", "<=", ">="];
 pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
     match rule {
         Rule::NullComparison => null_comparison(ctx),
-        Rule::UnboundedWrite => unbounded_write(ctx),
+        Rule::UnboundedWrite => unbounded_write::findings(ctx),
         Rule::NotInNullable => not_in_nullable(ctx),
         Rule::RedundantNullCheck => redundant_null_check::findings(ctx),
         Rule::LimitWithoutOrder => limit_without_order::findings(ctx),
@@ -802,56 +803,6 @@ fn not_in(ctx: &Ctx<'_>, sub: &SubLink, negated: bool, out: &mut Vec<RawFinding>
         message,
         help: Some(
             "use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL".to_owned(),
-        ),
-        fix: Vec::new(),
-    });
-}
-
-// ── unbounded_write ────────────────────────────────────────────────────────
-
-fn unbounded_write(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    let mut out = Vec::new();
-    for (node, _) in ctx.tree.nodes() {
-        match node {
-            NodeRef::UpdateStmt(stmt) if stmt.where_clause.is_none() => {
-                write_finding(ctx, "UPDATE", "changes", stmt.relation.as_deref(), &mut out);
-            }
-            NodeRef::DeleteStmt(stmt) if stmt.where_clause.is_none() => {
-                write_finding(ctx, "DELETE", "removes", stmt.relation.as_deref(), &mut out);
-            }
-            _ => {}
-        }
-    }
-    out
-}
-
-fn write_finding(
-    ctx: &Ctx<'_>,
-    keyword: &str,
-    verb: &str,
-    relation: Option<&RangeVar>,
-    out: &mut Vec<RawFinding>,
-) {
-    let Some(relation) = relation else {
-        return;
-    };
-    let Some(relation_start) = location(relation.location) else {
-        return;
-    };
-    let start = ctx
-        .tokens
-        .iter()
-        .filter(|token| token.end <= relation_start)
-        .rfind(|token| ctx.sql[token.start..token.end].eq_ignore_ascii_case(keyword))
-        .map_or(relation_start, |token| token.start);
-    let end = relation_end(ctx, relation).unwrap_or(relation_start + relation.relname.len());
-    let table = table_name(relation);
-    out.push(RawFinding {
-        span: start..end.max(start + keyword.len()),
-        message: format!("{keyword} without WHERE {verb} every row of {table}"),
-        help: Some(
-            "add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
-                .to_owned(),
         ),
         fix: Vec::new(),
     });

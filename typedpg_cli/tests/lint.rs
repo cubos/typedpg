@@ -710,17 +710,26 @@ fn lint_crate(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
 
 #[test]
 fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
-    let dir = deployed_crate(
-        &[
-            "SELECT email FROM users WHERE id = $id",
-            "SELECT name, status FROM users",
-            "SELECT * FROM users",
-            "UPDATE users SET age = $age WHERE id = 1",
-        ],
-        "ALTER TABLE users DROP COLUMN email;\n\
+    let queries = [
+        "SELECT email FROM users WHERE id = $id",
+        "SELECT name, status FROM users",
+        "SELECT * FROM users",
+        "UPDATE users SET age = $age WHERE id = 1",
+    ];
+    let migration = "ALTER TABLE users DROP COLUMN email;\n\
          ALTER TABLE users ALTER COLUMN name DROP NOT NULL;\n\
          ALTER TYPE status ADD VALUE 'deleted';\n\
-         ALTER TABLE users ALTER COLUMN age TYPE bigint;\n",
+         ALTER TABLE users ALTER COLUMN age TYPE bigint;\n";
+    let calls: Vec<String> = queries
+        .iter()
+        .map(|query| format!("sql!(pool, {query:?})"))
+        .collect();
+    // The deployed code decodes `status` into a Rust enum of its labels.
+    let dir = deployed_crate_with(
+        "\n[package.metadata.typedpg.types]\nstatus = \"crate::Status\"\n",
+        "",
+        &calls,
+        migration,
         // The branch removed every query: the deployed code still runs them.
         &[],
     );
@@ -735,7 +744,8 @@ fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
         "this migration breaks the deployed query at src/lib.rs:4 (HEAD): it no longer runs: \
          column \"email\" does not exist",
         "result column \"name\" may now be NULL",
-        "result column \"status\" may now be 'deleted', a value the deployed code does not know",
+        "result column \"status\" may now be 'deleted', a label the deployed code's \
+         crate::Status does not have: decoding it fails",
         "this migration breaks the deployed query at src/lib.rs:6 (HEAD): result column \"email\" \
          is gone",
         "migrations/0002_change.sql:4:1",
@@ -748,6 +758,17 @@ fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
     // Without the flag, the rule has nothing to compare with.
     let (_, stdout, _) = lint_crate(dir.path(), &[]);
     assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+
+    // Unmapped, `status` decodes into a `String`, which takes the new label:
+    // the two queries reading it are not broken by the ALTER TYPE.
+    let unmapped = deployed_crate(&queries, migration, &[]);
+    let (_, stdout, _) = lint_crate(unmapped.path(), &["--previous-deployment", "HEAD"]);
+    assert_eq!(
+        stdout.matches("warning[breaks_deployed_queries]").count(),
+        6,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("'deleted'"), "{stdout}");
 
     // The flag's old name still works, and reports the same.
     let (code, alias_stdout, stderr) =

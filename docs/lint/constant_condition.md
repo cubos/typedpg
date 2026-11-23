@@ -67,7 +67,11 @@ In a `WHERE` (of `SELECT`, `UPDATE`, `DELETE`), `ON`, `HAVING` or
 - an expression of constants: `1 = 1`, `'a' <> 'b'`, `true`, `false`;
 - a comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`) or `IN` list decided by a
   `CHECK` constraint, a domain or an enum, or by an earlier condition in the
-  same `AND` or an enclosing `WHERE`;
+  same `AND` or an enclosing `WHERE`. The message names the one that alone
+  decides it — `(enum "mech")` for `m = 'oauth'` on a one-label enum,
+  `(CHECK constraint "…")`, `(domain "…")` — and says "where this is
+  evaluated" when none does alone; a `CHECK` that says nothing of the column
+  is never named;
 - `x = x` on a column that is never `NULL` (always true);
 - `EXISTS` over a subquery that always returns a row, such as
   `EXISTS (SELECT count(*) FROM users)`.
@@ -83,7 +87,7 @@ reported.
 - `x = x` on a nullable column: it filters out the `NULL`s.
 - Columns of a table that has a `NOT VALID` `CHECK` constraint.
 - A column with a nondeterministic collation.
-- An enum compared with one of its own labels.
+- An enum compared with one of its labels, when the column can hold another.
 - The bare `ON true` of a join, e.g. `LEFT JOIN LATERAL (…) s ON true`.
 - Comparisons with a `NULL` literal ([`null_comparison`](null_comparison.md))
   and `IS [NOT] NULL` ([`redundant_null_check`](redundant_null_check.md)).

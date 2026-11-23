@@ -421,6 +421,30 @@ pub fn statement_node_at_most_one_row(
     statement_at_most_one_row_in(&ctx, statement, &env, None)
 }
 
+/// Whether relation `relid` provably holds at most one row, so a statement
+/// writing it writes at most one: a plain table without rewrite rules (a
+/// rule may write elsewhere) whose complete unique key a validated CHECK
+/// fixes to one value, `id boolean PRIMARY KEY CHECK (id)` (see
+/// [`dedup::singleton_table`]).
+pub fn relation_holds_at_most_one_row(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    relid: crate::oid::PgClassOid,
+) -> bool {
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    catalog
+        .pg_class
+        .get(&relid)
+        .is_some_and(|class| class.relkind == RelKind::Table)
+        && !catalog.lint_relation_has_rules(relid)
+        && dedup::singleton_table(&ctx, relid)
+}
+
 // ── CTEs ────────────────────────────────────────────────────────────────────
 
 /// The CTEs a statement's `WITH` clause makes visible: the environment

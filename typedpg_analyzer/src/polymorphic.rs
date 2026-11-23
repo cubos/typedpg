@@ -64,6 +64,19 @@ pub(crate) fn is_polymorphic(oid: PgTypeOid) -> bool {
     )
 }
 
+/// Whether `oid` is one of the `anycompatible*` pseudo-types, whose
+/// arguments are converted to a common type.
+pub(crate) fn is_anycompatible(oid: PgTypeOid) -> bool {
+    matches!(
+        oid,
+        ANYCOMPATIBLE
+            | ANYCOMPATIBLEARRAY
+            | ANYCOMPATIBLENONARRAY
+            | ANYCOMPATIBLERANGE
+            | ANYCOMPATIBLEMULTIRANGE
+    )
+}
+
 /// coerce_type returns a value cast to `"any"`, `anyelement`,
 /// `anynonarray`, `anycompatible` or `anycompatiblenonarray` untouched —
 /// an `unknown` one or a domain included; the other polymorphic targets

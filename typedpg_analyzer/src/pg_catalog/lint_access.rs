@@ -104,6 +104,29 @@ impl PgCatalog {
             })
     }
 
+    /// Whether an `UPDATE` trigger of `relid`, or of a table inheriting
+    /// from it (a partition), sees the rows an `UPDATE` naming `columns` in
+    /// its SET list rewrites, whatever its state or `WHEN` condition: a
+    /// `FOR EACH ROW` one, or a statement-level one with a transition table,
+    /// without an `UPDATE OF` list or with one listing any of `columns`.
+    pub fn lint_update_trigger_sees_rows(&self, relid: PgClassOid, columns: &[&str]) -> bool {
+        std::iter::once(relid)
+            .chain(crate::resolve::inheritance_descendants(self, relid))
+            .any(|rel| {
+                self.triggers.get(&rel).is_some_and(|triggers| {
+                    triggers.iter().any(|trigger| {
+                        trigger.events & crate::ddl::triggers::TRIGGER_TYPE_UPDATE != 0
+                            && (trigger.row || !trigger.transition_tables.is_empty())
+                            && (trigger.columns.is_empty()
+                                || trigger
+                                    .columns
+                                    .iter()
+                                    .any(|c| columns.contains(&c.as_str())))
+                    })
+                })
+            })
+    }
+
     /// The typmod a column's declared type carries, through domains and
     /// arrays, exactly as the analyzer resolves it.
     pub fn lint_effective_typmod(&self, oid: PgTypeOid, typmod: Option<i32>) -> Option<i32> {

@@ -27,7 +27,9 @@ mod migrations;
 pub mod report;
 mod rules;
 
-pub use deployed::{DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries};
+pub use deployed::{
+    Decoding, DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries,
+};
 pub use ignore::IgnoreSet;
 pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,

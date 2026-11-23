@@ -26,8 +26,8 @@ use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
 use typedpg_lint::{
-    Call as LintCall, CallFinding, CallMethod, DeployedKind, DeployedQuery, Deployment, Finding,
-    IgnoreSet, Language, LintOptions, MigrationFile, MigrationLint, NewSchema, Rule,
+    Call as LintCall, CallFinding, CallMethod, Decoding, DeployedKind, DeployedQuery, Deployment,
+    Finding, IgnoreSet, Language, LintOptions, MigrationFile, MigrationLint, NewSchema, Rule,
     breaks_deployed_queries, lint_migrations, lint_query_called_as,
 };
 
@@ -237,12 +237,20 @@ fn build(
         match deployed(reference, manifest, &options) {
             Ok(deployed) => {
                 for db in &databases {
-                    let (Some(Ok(catalog)), Some(new), Some(old_catalog), Some(queries)) = (
+                    let (
+                        Some(Ok(catalog)),
+                        Some(new),
+                        Some(old_catalog),
+                        Some(queries),
+                        Some(types),
+                    ) = (
                         catalogs.get(db),
                         new_migrations.get(db),
                         deployed.catalogs.get(db),
                         deployed.queries.get(db),
-                    ) else {
+                        deployed.types.get(db),
+                    )
+                    else {
                         continue;
                     };
                     let Some(first_new) = new.first_new else {
@@ -254,6 +262,7 @@ fn build(
                             reference,
                             catalog: old_catalog,
                             queries,
+                            decoding: Decoding::Rust { types },
                         },
                         &NewSchema {
                             files: &new.files,
@@ -780,6 +789,8 @@ fn collect_rust_files(dir: &Path, paths: &mut Vec<PathBuf>) {
 struct Deployed {
     catalogs: HashMap<Option<String>, PgCatalog>,
     queries: HashMap<Option<String>, Vec<DeployedQuery>>,
+    /// Its `[types]` map, per database: what its queries decode into.
+    types: HashMap<Option<String>, HashMap<QualifiedName, String>>,
 }
 
 /// The queries and schemas of the crate as git ref `reference` has it,
@@ -817,6 +828,11 @@ fn deployed(reference: &str, manifest: &Path, options: &LintOptions) -> Result<D
             &mut scratch,
         );
         if let Ok((catalog, _)) = built {
+            let types = config
+                .resolve(db.as_deref())
+                .map(|resolved| resolved.types)
+                .unwrap_or_default();
+            deployed.types.insert(db.clone(), types);
             deployed.catalogs.insert(db, catalog);
         }
     }

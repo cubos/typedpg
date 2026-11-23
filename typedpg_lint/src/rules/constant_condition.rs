@@ -742,6 +742,48 @@ mod tests {
         )
     }
 
+    /// What decides the comparison is cited, not a CHECK of the table that
+    /// says nothing of the column: an enum's labels are its type's.
+    #[test]
+    fn the_enum_deciding_a_comparison_is_cited() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TYPE mech AS ENUM ('oauth');
+             CREATE TYPE two AS ENUM ('a', 'b');
+             CREATE TABLE acc (
+                 id int PRIMARY KEY,
+                 fp text CHECK (fp ~ '^[0-9a-f]{16}$'),
+                 m mech NOT NULL,
+                 t two NOT NULL CHECK (t = 'a'),
+                 n int CHECK (id > 0),
+                 flag boolean NOT NULL CHECK (id > 0)
+             );",
+        )
+        .unwrap();
+        for (sql, message) in [
+            (
+                "SELECT id FROM acc WHERE m = 'oauth'",
+                "`m` is always 'oauth' (enum \"mech\"), so this condition is always true",
+            ),
+            (
+                "SELECT id FROM acc WHERE t = 'b'",
+                "`t` is always 'a' (CHECK constraint \"acc_t_check\"), so this condition is \
+                 never true",
+            ),
+        ] {
+            let (_, got) = one(&db, sql);
+            assert_eq!(got, message, "{sql}");
+        }
+        for sql in [
+            "SELECT id FROM acc WHERE n > 3000000000",
+            "SELECT id FROM acc WHERE flag IN (true, false)",
+        ] {
+            for finding in lint_rule(&db, sql, RULE) {
+                assert!(!finding.message.contains("CHECK"), "{sql}: {finding:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_value_the_column_cannot_have_is_never_true() {
         let db = refined();

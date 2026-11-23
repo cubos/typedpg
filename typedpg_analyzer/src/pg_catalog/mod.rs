@@ -1437,6 +1437,24 @@ impl PgCatalog {
             .map_or("btree", String::as_str)
     }
 
+    /// Whether the operator family of operator class `opclass` holds an
+    /// operator of its access method whose left operand is of type `ty`
+    /// (`pg_amop.amoplefttype`). `None` when `opclass` is unknown.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn opclass_family_has_left_type(
+        &self,
+        opclass: crate::oid::PgOpclassOid,
+        ty: PgTypeOid,
+    ) -> Option<bool> {
+        let class = self.pg_opclass.iter().find(|c| c.oid == opclass)?;
+        Some(self.pg_amop.iter().any(|amop| {
+            amop.amopmethod == class.opcmethod
+                && amop.amopfamily == class.opcfamily
+                && amop.amopfamilynamespace == class.opcfamilynamespace
+                && amop.amoplefttype == ty
+        }))
+    }
+
     /// Whether `index` backs a PRIMARY KEY / UNIQUE / EXCLUDE constraint.
     #[cfg(any(test, feature = "internal"))]
     pub fn index_backs_constraint(&self, index: PgClassOid) -> bool {
@@ -3728,7 +3746,10 @@ impl QueryView {
     /// argument type, the common type of a `CASE`, `COALESCE`, `GREATEST` /
     /// `LEAST` or a `UNION` column, an `INSERT` / `UPDATE` column's type, or
     /// a written cast. `None` when it is not converted (an untyped literal
-    /// or parameter typed by its context included), when the analyzer saw
+    /// or parameter typed by its context included, and a value a
+    /// polymorphic parameter takes as it is: an enum's `anyenum` `=`; an
+    /// `anycompatible` one, whose common type may convert it, records no
+    /// conversion either), when the analyzer saw
     /// no such site, or when it inferred the site two ways.
     pub fn value_conversion(
         &self,
