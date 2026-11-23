@@ -8,6 +8,7 @@ use std::path::Path;
 use tokio_postgres::Client;
 use typedpg::migrate::{self, MigrationSource};
 use typedpg_core::config::MigrationsConfig;
+use typedpg_core::migrations::{HASH_VERSION, hash, hash_with_version};
 
 /// A connection to a fresh, empty database, and that database's name.
 async fn fresh_db() -> (Client, String) {
@@ -802,7 +803,7 @@ async fn accept_records_the_edited_file_without_running_it() {
     assert_eq!(row.get::<_, String>(1), edited.migrations()[0].sql);
     let stored_hash: String = row.get(2);
     assert_eq!(stored_hash.len(), 32, "not an MD5 hex digest");
-    assert_eq!(row.get::<_, i32>(3), 1);
+    assert_eq!(row.get::<_, i32>(3), HASH_VERSION);
 }
 
 /// A tracking table from before the hash columns: a run adds them, fills
@@ -852,7 +853,7 @@ async fn run_upgrades_a_table_from_before_the_hash_columns() {
         row.get::<_, Option<String>>(0).is_some(),
         "the old row was not hashed"
     );
-    assert_eq!(row.get::<_, i32>(1), 1);
+    assert_eq!(row.get::<_, i32>(1), HASH_VERSION);
 
     let statuses = migrate::status(&client, &source, &config).await.unwrap();
     assert!(!statuses[0].drifted);
@@ -901,6 +902,174 @@ async fn status_on_an_old_table_writes_nothing_and_sees_drift() {
         !column_exists(&client, "public._migrations", "hash_version").await,
         "status wrote the hash_version column"
     );
+}
+
+const LF_FUNCTION: &str =
+    "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
+
+/// A tracking table as typedpg 0.6 to 0.8 wrote it (`hash_version` 1, the
+/// hashes that release computed): `0001_f`, an LF function whose body and
+/// string hold line breaks; `0002_b`, applied as `id INT`; `0003_c`, a row
+/// without its text (its version-1 hash only).
+async fn version_1_table(client: &Client) {
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public._migrations (
+                 name         TEXT PRIMARY KEY,
+                 applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 sql_source   TEXT,
+                 hash         TEXT,
+                 hash_version INTEGER
+             );
+             {LF_FUNCTION}
+             CREATE TABLE b (id INT);
+             CREATE TABLE c (id INT);"
+        ))
+        .await
+        .unwrap();
+    let rows: [(&str, Option<&str>, String); 3] = [
+        (
+            "0001_f",
+            Some(LF_FUNCTION),
+            // What typedpg 0.8's `hash` returned for this text.
+            "36008b21f609949ea9d09c40c9aad1d0".to_string(),
+        ),
+        (
+            "0002_b",
+            Some("CREATE TABLE b (id INT);"),
+            hash_with_version("CREATE TABLE b (id INT);", 1).unwrap(),
+        ),
+        (
+            "0003_c",
+            None,
+            hash_with_version("CREATE TABLE c (id INT);\n", 1).unwrap(),
+        ),
+    ];
+    for (name, sql, stored) in rows {
+        client
+            .execute(
+                "INSERT INTO public._migrations (name, sql_source, hash, hash_version) \
+                 VALUES ($1, $2, $3, 1)",
+                &[&name, &sql, &stored],
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Upgrading typedpg reports no false drift on a table the previous hash
+/// version wrote, even for a checkout whose line endings changed (git
+/// `autocrlf`), and still reports a real edit under either version.
+#[tokio::test]
+async fn hashes_of_the_previous_version_report_no_false_drift() {
+    let (mut client, _db) = fresh_db().await;
+    version_1_table(&client).await;
+    let config = MigrationsConfig::default();
+    let crlf = |sql: &str| sql.replace('\n', "\r\n");
+    let function = crlf(LF_FUNCTION);
+    let checkout = |b: &str| {
+        let b = crlf(b);
+        MigrationSource::from_embedded([
+            ("0001_f", function.as_str(), None),
+            ("0002_b", b.as_str(), None),
+            ("0003_c", "CREATE TABLE c (id INT);\n", None),
+            ("0004_d", "CREATE TABLE d (id INT);", None),
+        ])
+        .unwrap()
+    };
+
+    // `status` reads the old rows without writing: the CRLF checkout is no
+    // drift, the edit of `0002_b` is.
+    let edited = checkout("CREATE TABLE b (id BIGINT);");
+    let drifted: Vec<_> = migrate::status(&client, &edited, &config)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| (s.name.clone(), s.drifted))
+        .collect();
+    assert_eq!(
+        drifted,
+        [
+            ("0001_f".to_string(), false),
+            ("0002_b".to_string(), true),
+            ("0003_c".to_string(), false),
+            ("0004_d".to_string(), false),
+        ]
+    );
+    let err = migrate::run(&mut client, &edited, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("migration '0002_b' has been modified since it was applied"),
+        "unexpected error: {err}"
+    );
+    assert!(!err.contains("0001_f"), "false drift: {err}");
+    assert!(!table_exists(&client, "d").await);
+
+    // The file restored (with CRLF line endings): the run goes ahead, and
+    // the rows with their text now carry the current version's hash.
+    let restored = checkout("CREATE TABLE b (id INT);");
+    let applied = migrate::run(&mut client, &restored, &config).await.unwrap();
+    assert_eq!(applied, ["0004_d"]);
+    let rows = client
+        .query(
+            "SELECT name, hash, hash_version FROM public._migrations ORDER BY name",
+            &[],
+        )
+        .await
+        .unwrap();
+    let stored: Vec<(String, String, i32)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        stored,
+        [
+            ("0001_f".to_string(), hash(LF_FUNCTION), HASH_VERSION),
+            (
+                "0002_b".to_string(),
+                hash("CREATE TABLE b (id INT);"),
+                HASH_VERSION
+            ),
+            // No text to re-hash: it keeps its version-1 hash.
+            (
+                "0003_c".to_string(),
+                hash_with_version("CREATE TABLE c (id INT);\n", 1).unwrap(),
+                1
+            ),
+            (
+                "0004_d".to_string(),
+                hash("CREATE TABLE d (id INT);"),
+                HASH_VERSION
+            ),
+        ]
+    );
+    assert!(
+        migrate::status(&client, &restored, &config)
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| !s.drifted)
+    );
+
+    // After the upgrade, real drift is still drift: an edit inside the
+    // function's body, and an edit of the row only version 1 can check.
+    let edited_function = crlf(&LF_FUNCTION.replace("'a", "'z"));
+    let body_edit = MigrationSource::from_embedded([
+        ("0001_f", edited_function.as_str(), None),
+        ("0002_b", "CREATE TABLE b (id INT);", None),
+        ("0003_c", "CREATE TABLE c (id BIGINT);\n", None),
+        ("0004_d", "CREATE TABLE d (id INT);", None),
+    ])
+    .unwrap();
+    let drifted: Vec<_> = migrate::status(&client, &body_edit, &config)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.drifted)
+        .collect();
+    assert_eq!(drifted, [true, false, true, false]);
 }
 
 /// `accept` only accepts a known, applied migration.

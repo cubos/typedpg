@@ -1001,9 +1001,10 @@ npx typedpg migrate up --db warehouse  # with several databases
 Editing an applied migration's statements is drift: with `failOnDrift` (the
 default) the run aborts before applying anything new and prints a unified diff
 of the applied text against the file; with `failOnDrift: false` it only warns.
-Comments, whitespace and the case of unquoted words do not count. An
-intentional edit that does not need to run again is recorded with
-`acceptMigration` (or `typedpg migrate accept <name>`) without running it.
+Comments, whitespace, line endings (a CRLF checkout) and the case of unquoted
+words do not count. An intentional edit that does not need to run again is
+recorded with `acceptMigration` (or `typedpg migrate accept <name>`) without
+running it.
 
 At startup, from the generated module (`"migrations": { "embed": true }`)
 or from a directory:

@@ -10,7 +10,8 @@
 //! - [`compare_versions`] / [`compare_migration_names`] — migration order.
 //! - [`parse_migration_name`] — the `NNNN_description` rule.
 //! - [`split_statements`] — a migration as the statements the runner sends.
-//! - [`normalize`] / [`hash`] — the text drift detection compares.
+//! - [`normalize`] / [`hash`] — the text drift detection compares, and
+//!   [`hash_with_version`] the hash an older release stored.
 //! - [`drift_message`] — the error (or warning) drift produces.
 //! - [`locate_position`] — a server error's line and column in the file.
 //! - [`machine`] — the whole runner as a sans-I/O state machine, driven by
@@ -29,7 +30,7 @@ pub mod machine;
 
 pub use drift::drift_message;
 pub use name::{MigrationNameError, parse_migration_name};
-pub use normalize::{HASH_VERSION, hash, normalize};
+pub use normalize::{HASH_VERSION, hash, hash_with_version, normalize};
 pub use position::locate_position;
 pub use split::split_statements;
 

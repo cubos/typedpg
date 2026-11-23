@@ -322,5 +322,29 @@
     "b": "SELECT u&'a' FROM t;",
     "same": true,
     "why": "the `U&` prefix folds like a word"
+  },
+  {
+    "a": "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n",
+    "b": "CREATE FUNCTION f() RETURNS text AS $$\r\nBEGIN\r\n  RETURN 'a\r\nb';\r\nEND\r\n$$ LANGUAGE plpgsql;\r\n",
+    "same": true,
+    "why": "a CRLF checkout (git autocrlf) of an LF file is no edit, inside a dollar-quoted body and a string too"
+  },
+  {
+    "a": "SELECT 'a\nb', E'c\nd', \"e\nf\";",
+    "b": "SELECT 'a\rb', E'c\r\nd', \"e\rf\";",
+    "same": true,
+    "why": "LF, CRLF and a lone CR are the same line break in every literal"
+  },
+  {
+    "a": "SELECT 'a\nb';",
+    "b": "SELECT 'a\n\nb';",
+    "same": false,
+    "why": "an added line inside a string is still an edit"
+  },
+  {
+    "a": "SELECT\u000b1\u000bFROM\u000ct;",
+    "b": "SELECT 1 FROM t;",
+    "same": true,
+    "why": "a vertical tab and a form feed are whitespace to PostgreSQL's lexer"
   }
 ]

@@ -50,7 +50,9 @@
 
 use std::ops::Range;
 
-use super::{HASH_VERSION, drift_message, hash, locate_position, split_statements};
+use super::{
+    HASH_VERSION, drift_message, hash, hash_with_version, locate_position, split_statements,
+};
 use crate::config::validate_table_name;
 
 /// What a run does.
@@ -262,15 +264,25 @@ struct AppliedRow {
 
 impl AppliedRow {
     /// Whether the stored hash differs from the file's, computed with the
-    /// current algorithm. A row without a hash (no `sql_source` stored, from
-    /// before that column existed) is not checked, and neither is one whose
-    /// hash predates the current algorithm — `Up` re-hashes it first.
+    /// algorithm the row's `hash_version` names. A row without a hash (no
+    /// `sql_source` stored, from before that column existed) is not checked,
+    /// and neither is one of a version this release does not know. `Up`
+    /// re-hashes older rows from their `sql_source` first; one without it
+    /// keeps its version and is compared with that algorithm.
     fn drifted(&self, sql: &str) -> bool {
-        self.hash_version == Some(HASH_VERSION)
-            && self
-                .hash
-                .as_deref()
-                .is_some_and(|stored| stored != hash(sql))
+        stored_hash_differs(self.hash.as_deref(), self.hash_version, sql)
+    }
+}
+
+/// Whether `stored`, a hash of `version`, differs from the file `sql`'s
+/// under the same algorithm; `false` when there is nothing to compare.
+fn stored_hash_differs(stored: Option<&str>, version: Option<i32>, sql: &str) -> bool {
+    match (
+        stored,
+        version.and_then(|version| hash_with_version(sql, version)),
+    ) {
+        (Some(stored), Some(file)) => stored != file,
+        _ => false,
     }
 }
 
@@ -279,6 +291,7 @@ impl AppliedRow {
 struct StatusInfo {
     applied_at: Option<String>,
     hash: Option<String>,
+    hash_version: Option<i32>,
 }
 
 /// What to do after the lock and tracking table are ready.
@@ -855,11 +868,8 @@ impl Migrator {
                         name,
                         StatusInfo {
                             applied_at,
-                            hash: if version == Some(HASH_VERSION) {
-                                stored_hash
-                            } else {
-                                None
-                            },
+                            hash: stored_hash,
+                            hash_version: version,
                         },
                     ));
                 }
@@ -890,6 +900,7 @@ impl Migrator {
                             .find(|(applied, _)| *applied == name)
                     {
                         info.hash = Some(hash(&sql));
+                        info.hash_version = Some(HASH_VERSION);
                     }
                 }
                 self.build_status(0)
@@ -1327,9 +1338,9 @@ impl Migrator {
                 .iter()
                 .find(|(applied, _)| *applied == name)
                 .map(|(_, info)| info);
-            let drifted = info
-                .and_then(|info| info.hash.as_deref())
-                .is_some_and(|stored| stored != hash(&sql));
+            let drifted = info.is_some_and(|info| {
+                stored_hash_differs(info.hash.as_deref(), info.hash_version, &sql)
+            });
             self.status_rows.push(StatusRow {
                 name: name.clone(),
                 applied: info.is_some(),
@@ -2590,6 +2601,157 @@ mod tests {
             &steps[steps.len() - 2],
             Step::Warn(message) if message == "warning: migration '0001_a' has been modified since it was applied"
         ));
+    }
+
+    const LF_FUNCTION: &str = "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
+    const CRLF_FUNCTION: &str = "CREATE FUNCTION f() RETURNS text AS $$\r\nBEGIN\r\n  RETURN 'a\r\nb';\r\nEND\r\n$$ LANGUAGE plpgsql;\r\n";
+    /// `LF_FUNCTION`'s hash as typedpg 0.6 to 0.8 stored it (version 1).
+    const LF_FUNCTION_V1_HASH: &str = "36008b21f609949ea9d09c40c9aad1d0";
+
+    /// An `up` over the given applied rows (`name`, `hash`, `hash_version`),
+    /// none of them left for the backfill (no stored text).
+    fn up_over(
+        file: &str,
+        applied: Vec<Vec<Option<String>>>,
+    ) -> (Vec<Step>, Result<Outcome, Failure>) {
+        drive(
+            input(Action::Up, vec![migration("0001_a", file, None)], config()),
+            move |step| match step {
+                Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_applied_select(sql) => rows(applied.clone()),
+                Step::Query { sql, .. } if is_stored_sql(sql) => rows(vec![vec![None]]),
+                Step::Query { sql, .. } if is_unlock(sql) => locked(),
+                other => panic!("unexpected step: {other:?}"),
+            },
+        )
+    }
+
+    /// A version-1 row the backfill cannot re-hash (no stored text) keeps
+    /// being compared with version 1's algorithm: the hash the previous
+    /// release stored is no drift, and an edit still is.
+    #[test]
+    fn a_version_1_row_without_its_text_is_compared_with_version_1() {
+        let row = |hash: &str| {
+            vec![vec![
+                Some("0001_a".to_string()),
+                Some(hash.to_string()),
+                Some("1".to_string()),
+            ]]
+        };
+        let (_, result) = up_over(LF_FUNCTION, row(LF_FUNCTION_V1_HASH));
+        assert_eq!(result, Ok(Outcome::Applied(vec![])));
+
+        let edited = LF_FUNCTION.replace("'a", "'z");
+        let (steps, result) = up_over(&edited, row(LF_FUNCTION_V1_HASH));
+        assert!(
+            matches!(&result, Err(Failure::Message(m)) if m.starts_with("migration '0001_a' has been modified")),
+            "{result:?}"
+        );
+        assert!(!queries(&steps).any(is_insert));
+
+        // A version this release does not know is not compared.
+        let (_, result) = up_over(&edited, {
+            let mut rows = row(LF_FUNCTION_V1_HASH);
+            rows[0][2] = Some((HASH_VERSION + 1).to_string());
+            rows
+        });
+        assert_eq!(result, Ok(Outcome::Applied(vec![])));
+    }
+
+    /// The backfill re-hashes a version-1 row from its stored text with the
+    /// current algorithm, so a CRLF checkout of the LF file it applied is
+    /// no drift once upgraded.
+    #[test]
+    fn backfill_upgrades_version_1_rows_to_the_current_hash() {
+        let (steps, result) = drive(
+            input(
+                Action::Up,
+                vec![migration("0001_a", CRLF_FUNCTION, None)],
+                config(),
+            ),
+            |step| match step {
+                Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { sql, params } if is_backfill_select(sql) => {
+                    assert_eq!(params, &[Some(HASH_VERSION.to_string())]);
+                    rows(vec![vec![
+                        Some("0001_a".to_string()),
+                        Some(LF_FUNCTION.to_string()),
+                    ]])
+                }
+                Step::Query { sql, .. } if is_backfill_update(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![vec![
+                    Some("0001_a".to_string()),
+                    Some(hash(LF_FUNCTION)),
+                    Some(HASH_VERSION.to_string()),
+                ]]),
+                Step::Query { sql, .. } if is_unlock(sql) => locked(),
+                other => panic!("unexpected step: {other:?}"),
+            },
+        );
+        assert_eq!(result, Ok(Outcome::Applied(vec![])));
+        let update = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Query { sql, params } if is_backfill_update(sql) => Some(params.clone()),
+                _ => None,
+            })
+            .expect("no backfill update");
+        assert_eq!(update[0], Some(hash(CRLF_FUNCTION)));
+        assert_eq!(update[1], Some(HASH_VERSION.to_string()));
+    }
+
+    /// `status` over version-1 rows: one with its text is re-hashed in
+    /// memory (a CRLF checkout is no drift), one without is compared with
+    /// version 1 (the released hash is no drift, an edit is).
+    #[test]
+    fn status_reads_version_1_rows() {
+        let status = |file: &str, stale: Vec<Vec<Option<String>>>| {
+            drive(
+                input(
+                    Action::Status,
+                    vec![migration("0001_a", file, None)],
+                    config(),
+                ),
+                move |step| match step {
+                    Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![vec![
+                        Some("true".to_string()),
+                        Some("true".to_string()),
+                        Some("true".to_string()),
+                        Some("true".to_string()),
+                    ]]),
+                    Step::Query { sql, .. } if is_status_rows(sql) => rows(vec![vec![
+                        Some("0001_a".to_string()),
+                        Some("2026-01-02T03:04:05.000000Z".to_string()),
+                        Some(LF_FUNCTION_V1_HASH.to_string()),
+                        Some("1".to_string()),
+                    ]]),
+                    Step::Query { sql, .. } if is_status_stale(sql) => rows(stale.clone()),
+                    Step::Warn(_) => done(),
+                    other => panic!("unexpected step: {other:?}"),
+                },
+            )
+            .1
+        };
+        let drifted = |result: Result<Outcome, Failure>| match result {
+            Ok(Outcome::Status(statuses)) => statuses[0].drifted,
+            other => panic!("expected statuses, got {other:?}"),
+        };
+        let with_text = vec![vec![
+            Some("0001_a".to_string()),
+            Some(LF_FUNCTION.to_string()),
+        ]];
+        assert!(!drifted(status(CRLF_FUNCTION, with_text.clone())));
+        assert!(drifted(status(
+            &CRLF_FUNCTION.replace("'a", "'z"),
+            with_text
+        )));
+        assert!(!drifted(status(LF_FUNCTION, vec![])));
+        assert!(drifted(status(&LF_FUNCTION.replace("'a", "'z"), vec![])));
     }
 
     /// `accept` rejects an unknown file without reading the table, and an

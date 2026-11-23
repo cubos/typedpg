@@ -97,7 +97,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
             }
             _ => {}
         }
-        if !b.is_ascii_whitespace() {
+        if !is_space(b) {
             state.has_token = true;
         }
         i += 1;
@@ -155,6 +155,12 @@ impl StatementState {
             }
         }
     }
+}
+
+/// Whitespace as PostgreSQL's lexer skips it (scan.l's `space`, which
+/// `scanner_isspace` mirrors): Rust's `is_ascii_whitespace` leaves out `\v`.
+pub(crate) fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
 }
 
 pub(crate) fn is_ident_start(b: u8) -> bool {
@@ -301,6 +307,13 @@ mod tests {
             ["SELECT 1;"]
         );
         assert!(split("  -- only a comment\n").is_empty());
+    }
+
+    // scan.l's `space` is `[ \t\n\r\f\v]`: a vertical tab after the last
+    // statement is no statement of its own.
+    #[test]
+    fn a_vertical_tab_is_whitespace() {
+        assert_eq!(split_statements("SELECT 1;\x0b\x0c\n"), ["SELECT 1;"]);
     }
 
     #[test]

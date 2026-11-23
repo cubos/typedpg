@@ -318,31 +318,16 @@ fn translate(span: SourceSpan, lex_output: &LexOutput) -> SourceSpan {
 const TAB_WIDTH: usize = 4;
 
 /// The columns `c` takes in a terminal: none for a combining mark, two for
-/// a wide character (CJK, emoji), [`TAB_WIDTH`] for a tab, else one.
+/// a wide character (CJK, emoji), [`TAB_WIDTH`] for a tab, else one —
+/// PostgreSQL's own widths (`ucs_wcwidth`), a control character counting
+/// as one.
 fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    match cp {
-        0x09 => TAB_WIDTH,
-        // Combining marks and zero-width characters.
-        0x0300..=0x036F | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F | 0xFE20..=0xFE2F => {
-            0
-        }
-        // East Asian Wide / Fullwidth, and the emoji blocks.
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE4F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x1F300..=0x1F64F
-        | 0x1F900..=0x1F9FF
-        | 0x20000..=0x3FFFD => 2,
-        _ => 1,
+    if c == '\t' {
+        return TAB_WIDTH;
+    }
+    match typedpg_core::display_width::pg_wcwidth(c) {
+        width if width < 0 => 1,
+        width => width.unsigned_abs() as usize,
     }
 }
 

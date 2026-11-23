@@ -140,8 +140,8 @@ test("a drifted migration fails with the diff and how to accept it", async () =>
     if (sql.includes("advisory")) return [["t"]];
     if (sql.startsWith("SELECT name::pg_catalog.text, hash::pg_catalog.text")) {
       // A stored hash that is not the file's, under the current
-      // normalization (`hash_version` is 1).
-      return [["0001_a", "not-the-file's-hash", "1"]];
+      // normalization (`hash_version` is 2).
+      return [["0001_a", "not-the-file's-hash", "2"]];
     }
     if (sql.startsWith("SELECT sql_source::pg_catalog.text FROM")) return [[stored]];
     return [];
@@ -156,6 +156,50 @@ test("a drifted migration fails with the diff and how to accept it", async () =>
   });
   assert.ok(!driver.log.includes("BEGIN"), "a migration ran despite the drift");
   assert.equal(driver.log.at(-1), "unlock");
+});
+
+const LF_FUNCTION = "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
+const CRLF_FUNCTION = LF_FUNCTION.replaceAll("\n", "\r\n");
+// LF_FUNCTION's hash as typedpg 0.6 to 0.8 stored it (`hash_version` 1).
+const LF_FUNCTION_V1_HASH = "36008b21f609949ea9d09c40c9aad1d0";
+
+test("rows of the previous hash version report no false drift", async () => {
+  // A version-1 row with its text: the backfill re-hashes it with the
+  // current algorithm, so a CRLF checkout of the LF file is no drift.
+  const updates: (string | null)[][] = [];
+  const upgraded = new ScriptedDriver((sql, params) => {
+    if (sql.includes("advisory")) return [["t"]];
+    if (sql.includes("hash_version IS DISTINCT FROM")) return [["0001_f", LF_FUNCTION]];
+    if (sql.startsWith("UPDATE") && sql.includes("SET hash")) {
+      updates.push(params);
+      return [];
+    }
+    if (sql.startsWith("SELECT name::pg_catalog.text, hash::pg_catalog.text")) {
+      return [["0001_f", updates[0]![0]!, updates[0]![1]!]];
+    }
+    return [];
+  });
+  assert.deepEqual(await migrate(upgraded, embedMigrations([["0001_f", CRLF_FUNCTION, null]])), []);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0]![1], "2");
+
+  // A version-1 row without its text keeps its hash, compared with version
+  // 1's algorithm: the hash the previous release stored is no drift, an
+  // edit is.
+  const unhashed = () =>
+    new ScriptedDriver((sql) => {
+      if (sql.includes("advisory")) return [["t"]];
+      if (sql.startsWith("SELECT name::pg_catalog.text, hash::pg_catalog.text")) {
+        return [["0001_f", LF_FUNCTION_V1_HASH, "1"]];
+      }
+      if (sql.startsWith("SELECT sql_source::pg_catalog.text FROM")) return [[null]];
+      return [];
+    });
+  assert.deepEqual(await migrate(unhashed(), embedMigrations([["0001_f", LF_FUNCTION, null]])), []);
+  await assert.rejects(
+    migrate(unhashed(), embedMigrations([["0001_f", LF_FUNCTION.replace("'a", "'z"), null]])),
+    /migration '0001_f' has been modified since it was applied/,
+  );
 });
 
 test("a database error in a migration is rethrown with its line and as the cause", async () => {
