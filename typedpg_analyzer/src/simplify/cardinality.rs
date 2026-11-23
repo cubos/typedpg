@@ -5836,7 +5836,9 @@ mod tests {
              CREATE FUNCTION other.norm(v text) RETURNS text IMMUTABLE LANGUAGE sql
                 AS $$ SELECT v $$;
              CREATE TABLE handles (id bigint PRIMARY KEY, handle text NOT NULL);
-             CREATE UNIQUE INDEX ON handles (norm(handle));
+             SET search_path = other, public;
+             CREATE UNIQUE INDEX ON public.handles (norm(handle));
+             RESET search_path;
              CREATE TABLE builds (
                 id bigint PRIMARY KEY,
                 project_id bigint NOT NULL,
@@ -6085,13 +6087,16 @@ mod tests {
             &db,
             "SELECT id FROM ci_users WHERE lower(email) = $1",
         ));
-        // An index made under `search_path = other, public` stores
-        // `other.norm`, while the query's `norm` is `public.norm`: the stored
-        // name can't tell which one it was (on PG, `norm(handle) = 'a'`
-        // matches both 'a' and 'A' there).
+        // An index made under `search_path = other, public` keys
+        // `other.norm`, while the query's `norm` is `public.norm` (on PG,
+        // `norm(handle) = 'a'` matches both 'a' and 'A' there).
         assert!(!select_one(
             &db,
             "SELECT id FROM handles WHERE norm(handle) = $1",
+        ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM handles WHERE other.norm(handle) = $1",
         ));
     }
 

@@ -1582,7 +1582,14 @@ fn validate_on_conflict_target(
                 .min(idx.indkey.len())];
             let cols: std::collections::BTreeSet<i16> =
                 key.iter().copied().filter(|&a| a != 0).collect();
-            let idx_exprs: Vec<Option<&ast::Node>> = idx.indexprs.iter().map(decode).collect();
+            // Compared as written: the index's expressions as ruleutils
+            // prints them under the current search path.
+            let rendered: Vec<Option<ast::Node>> = idx
+                .indexprs
+                .iter()
+                .map(|e| crate::ddl::stored_exprs::render(snapshot, decode(e)))
+                .collect();
+            let idx_exprs: Vec<Option<&ast::Node>> = rendered.iter().map(Option::as_ref).collect();
             let mut exprs: Vec<String> = idx_exprs.iter().map(|n| node_fingerprint(*n)).collect();
             exprs.sort();
             exprs.dedup();
@@ -1595,8 +1602,11 @@ fn validate_on_conflict_target(
             {
                 return false;
             }
-            let pred = idx.indpred.as_ref().and_then(decode);
-            predtest::predicate_implied_by(pred, where_clause.as_ref(), &types)
+            let pred = idx
+                .indpred
+                .as_ref()
+                .and_then(|p| crate::ddl::stored_exprs::render(snapshot, decode(p)));
+            predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref(), &types)
         })
         .map(|idx| idx.indexrelid)
         .collect();

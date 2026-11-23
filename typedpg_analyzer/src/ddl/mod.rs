@@ -512,7 +512,11 @@ pub(super) fn note_user_code(db: &mut PgCatalog) {
 /// checks (`fk_bypass`).
 fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
     fk_bypass::note(db, stmt);
-    dispatch_statement(db, stmt)
+    dispatch_statement(db, stmt)?;
+    // The stored expressions it wrote are bound to the objects their names
+    // find under the search path it ran with.
+    stored_exprs::bind_stored_expressions(db);
+    Ok(())
 }
 
 /// Apply a single parsed statement, by kind.

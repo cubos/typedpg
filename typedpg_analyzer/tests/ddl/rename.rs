@@ -523,3 +523,201 @@ fn renaming_a_table_over_an_array_type_moves_the_array_aside() {
         Some(b)
     );
 }
+
+/// Objects in schema `s`, which the search path names only where a test
+/// sets it.
+const BOUND_SETUP: &str = "CREATE SCHEMA s;
+     CREATE FUNCTION s.spos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+     CREATE FUNCTION s.inc(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+     CREATE FUNCTION s.ieq(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
+     CREATE OPERATOR s.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = s.ieq);
+     CREATE TYPE s.e AS ENUM ('x', 'y');
+     CREATE COLLATION s.co FROM \"C\";
+     CREATE SEQUENCE s.sq;
+     CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';";
+
+/// Apply `sql`, which must fail with an error starting with `message`.
+fn expect_failure(db: &mut PgCatalog, sql: &str, message: &str) {
+    let err = db.apply_sql(sql).expect_err(sql);
+    assert!(
+        err.to_string().starts_with(message),
+        "{sql}\n  expected: {message}\n       got: {err}"
+    );
+}
+
+#[test]
+fn stored_expressions_keep_the_objects_their_search_path_found() {
+    // PG stores an expression's routines, operators, types, collations and
+    // regclass constants as the OIDs the creation search path found: with
+    // `s` off the path later, a CHECK, an index, a default, a generation
+    // or partition key expression, a domain's CHECK and DEFAULT, a trigger
+    // WHEN and a policy still run them, and ALTER COLUMN TYPE rebuilds
+    // them (naming them `s.spos`, `OPERATOR(s.===)`, `s.e`, `s.co`).
+    let mut db = build_db(&[
+        ("0001.sql", BOUND_SETUP),
+        (
+            "0002.sql",
+            "SET search_path = s, public;
+             CREATE TABLE public.t (a int CHECK (spos(a)), b text CHECK (b::e IS NOT NULL),
+                 c text CHECK (c COLLATE co > 'a'), x int, y int CHECK (x === y),
+                 n int DEFAULT nextval('sq'), m int DEFAULT nextval('sq'::regclass),
+                 w int, g bool GENERATED ALWAYS AS (spos(w)) STORED);
+             CREATE INDEX ON public.t (inc(a)) WHERE spos(x);
+             CREATE TABLE public.pk (a int) PARTITION BY RANGE (inc(a));
+             CREATE DOMAIN public.d AS int CHECK (spos(VALUE)) DEFAULT inc(1);
+             CREATE TABLE public.r (q int);
+             CREATE TRIGGER tr BEFORE INSERT ON public.r FOR EACH ROW
+                 WHEN (spos(new.q)) EXECUTE FUNCTION public.tf();
+             CREATE POLICY p ON public.r USING (spos(q) AND q === q);",
+        ),
+    ]);
+    db.apply_sql(
+        "RESET search_path;
+         ALTER TABLE t ALTER a TYPE smallint;
+         ALTER TABLE t ALTER b TYPE varchar;
+         ALTER TABLE t ALTER c TYPE varchar;
+         ALTER TABLE t ALTER x TYPE int;
+         ALTER TABLE t ALTER n TYPE bigint;
+         ALTER TABLE t ALTER g TYPE text;
+         CREATE TABLE c () INHERITS (t);
+         CREATE TABLE l (LIKE t INCLUDING ALL);
+         CREATE TABLE pk1 PARTITION OF pk FOR VALUES FROM (0) TO (10);
+         CREATE TABLE td (v d);",
+    )
+    .unwrap();
+    db.apply_sql(
+        "INSERT INTO t (a, b, c, x, y) VALUES (1, 'x', 'b', 1, 1);
+         INSERT INTO pk VALUES (1);
+         INSERT INTO td DEFAULT VALUES;
+         INSERT INTO r VALUES (1);",
+    )
+    .unwrap();
+}
+
+#[test]
+fn an_object_created_earlier_on_the_search_path_does_not_capture_a_stored_name() {
+    // A function or type created later in a schema that comes first on the
+    // search path takes the name over for new statements, not for the
+    // expressions bound to `public`'s: their rebuild names `public.f`, and
+    // the error it can raise says so.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+         CREATE TYPE k AS ENUM ('x');
+         CREATE TABLE t (a int CHECK (f(a)), b text CHECK (b::k IS NOT NULL));
+         CREATE SCHEMA s2;
+         CREATE FUNCTION s2.f(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT false';
+         CREATE TYPE s2.k AS ENUM ('z');",
+    )]);
+    db.apply_sql(
+        "SET search_path = s2, public;
+         ALTER TABLE public.t ALTER a TYPE int;
+         ALTER TABLE public.t ALTER b TYPE varchar;
+         INSERT INTO public.t VALUES (1, 'x');",
+    )
+    .unwrap();
+    expect_failure(
+        &mut db,
+        "ALTER TABLE public.t ALTER a TYPE text;",
+        "function public.f(text) does not exist",
+    );
+    expect_failure(
+        &mut db,
+        "DROP FUNCTION public.f(int);",
+        "cannot drop function public.f(integer) because other objects depend on it",
+    );
+    db.apply_sql("DROP FUNCTION s2.f(int); DROP TYPE s2.k;")
+        .unwrap();
+}
+
+#[test]
+fn a_rebuilt_expression_names_its_objects_as_the_search_path_shows_them() {
+    // ruleutils qualifies a routine or an operator only when an unqualified
+    // lookup under the current search path wouldn't find it: the error a
+    // rebuild raises names it that way.
+    let mut db = build_db(&[
+        ("0001.sql", BOUND_SETUP),
+        (
+            "0002.sql",
+            "SET search_path = s, public;
+             CREATE TABLE public.t (a int CHECK (spos(a)), x int, y int CHECK (x === y));",
+        ),
+    ]);
+    for (sql, message) in [
+        (
+            "ALTER TABLE public.t ALTER a TYPE text;",
+            "function spos(text) does not exist",
+        ),
+        (
+            "ALTER TABLE public.t ALTER x TYPE text;",
+            "operator does not exist: text === integer",
+        ),
+    ] {
+        expect_failure(&mut db, sql, message);
+    }
+    db.apply_sql("RESET search_path;").unwrap();
+    for (sql, message) in [
+        (
+            "ALTER TABLE t ALTER a TYPE text;",
+            "function s.spos(text) does not exist",
+        ),
+        (
+            "ALTER TABLE t ALTER x TYPE text;",
+            "operator does not exist: text s.=== integer",
+        ),
+    ] {
+        expect_failure(&mut db, sql, message);
+    }
+}
+
+#[test]
+fn a_bound_expression_follows_its_objects_renamed_and_moved() {
+    // The binding is to the object: renamed, moved to another schema or in
+    // a renamed schema, it is still the one a rebuild names.
+    let mut db = build_db(&[
+        ("0001.sql", BOUND_SETUP),
+        (
+            "0002.sql",
+            "SET search_path = s, public;
+             CREATE TABLE public.t (a int CHECK (spos(a)), b int DEFAULT nextval('sq'));
+             CREATE INDEX ON public.t (inc(a));",
+        ),
+    ]);
+    db.apply_sql(
+        "RESET search_path;
+         ALTER FUNCTION s.spos(int) RENAME TO spos2;
+         ALTER FUNCTION s.inc(int) SET SCHEMA public;
+         ALTER SEQUENCE s.sq RENAME TO sq2;
+         ALTER SCHEMA s RENAME TO s3;
+         ALTER TABLE t ALTER a TYPE int;
+         ALTER TABLE t ALTER b TYPE bigint;
+         INSERT INTO t (a) VALUES (1);",
+    )
+    .unwrap();
+    expect_failure(
+        &mut db,
+        "ALTER TABLE t ALTER a TYPE text;",
+        "function inc(text) does not exist",
+    );
+}
+
+#[test]
+fn on_conflict_infers_an_index_bound_to_another_schema() {
+    // ON CONFLICT compares the index's expressions as they print under the
+    // current search path.
+    let mut db = build_db(&[
+        ("0001.sql", BOUND_SETUP),
+        (
+            "0002.sql",
+            "SET search_path = s, public;
+             CREATE TABLE public.u (a int);
+             CREATE UNIQUE INDEX ON public.u (inc(a)) WHERE spos(a);",
+        ),
+    ]);
+    db.apply_sql(
+        "INSERT INTO public.u VALUES (1) ON CONFLICT (inc(a)) WHERE spos(a) DO NOTHING;
+         RESET search_path;
+         INSERT INTO u VALUES (1) ON CONFLICT (s.inc(a)) WHERE s.spos(a) DO NOTHING;",
+    )
+    .unwrap();
+}

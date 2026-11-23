@@ -3552,11 +3552,12 @@ fn unique_keys_in(ctx: &Ctx<'_>, relid: PgClassOid, expressions: bool) -> Vec<Un
 /// column's collation is deterministic (the expression's collation is
 /// derived from theirs).
 ///
-/// The stored expression keeps only the name it was written with, resolved
-/// when the index was made under that session's `search_path`. It is
-/// resolved again here for the columns' types, and an unqualified name is
-/// only trusted when every routine of that name lives in the schema of the
-/// one it resolves to: no `search_path` could then have bound it to another
+/// The stored expression names a routine outside `pg_catalog` with the
+/// schema it was found in when the index was made (see
+/// [`crate::ddl::stored_exprs::bind_stored_expressions`]). It is resolved
+/// again here for the columns' types, and an unqualified name is only
+/// trusted when every routine of that name lives in the schema of the one
+/// it resolves to: no `search_path` could then have bound it to another
 /// schema's routine, and within one schema the argument types decide. The
 /// routine must be immutable (PG requires it of an index expression) and
 /// return one value of a non-polymorphic type.

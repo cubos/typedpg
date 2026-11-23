@@ -172,7 +172,8 @@ pub(crate) fn over_own_row(
             fields.drain(..idx);
         }
     });
-    tree.stmts.pop().and_then(|s| s.stmt)
+    // And its objects named as the current search path prints them.
+    render(interp, tree.stmts.pop().and_then(|s| s.stmt).as_ref())
 }
 
 /// ALTER TABLE ... RENAME COLUMN `old` TO `new` of relation `relid`: the
@@ -408,7 +409,7 @@ pub(crate) enum Renamed<'a> {
 }
 
 /// Where a stored expression lives.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Slot {
     Check(crate::oid::PgConstraintOid),
     Default(PgClassOid, i16),
@@ -418,6 +419,8 @@ enum Slot {
     DomainCheck(PgTypeOid, usize),
     DomainDefault(PgTypeOid),
     TriggerWhen(PgClassOid, usize),
+    /// A policy's USING (`false`) or WITH CHECK (`true`) expression.
+    Policy(PgClassOid, String, bool),
 }
 
 /// What a stored expression is analyzed over.
@@ -434,9 +437,23 @@ enum Over {
     Nothing,
 }
 
-/// Every stored expression, with what it is analyzed over.
-fn stored_expressions(interp: &PgCatalog) -> Vec<(Slot, Over, Option<ast::Node>)> {
+/// Every stored expression, with what it is analyzed over — the policies'
+/// too when `policies` (their renames are [`crate::ddl::policies`]').
+fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Option<ast::Node>)> {
     let mut out = Vec::new();
+    if policies {
+        for ((relid, name), (using, with_check)) in &interp.column_deps.policy_quals {
+            for (clause, is_check) in [(using, false), (with_check, true)] {
+                if let Some(clause) = clause {
+                    out.push((
+                        Slot::Policy(*relid, name.clone(), is_check),
+                        Over::Row(*relid),
+                        clause.expr.clone(),
+                    ));
+                }
+            }
+        }
+    }
     for (&oid, def) in interp.check_defs.iter() {
         if let StoredExpr::Written(expr) = &def.expr
             && let Some(con) = interp.pg_constraint.get(&oid)
@@ -727,7 +744,7 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
         // Any name may be an object of the schema's.
         Renamed::Schema { .. } => None,
     };
-    let rewritten: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp)
+    let rewritten: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, false)
         .into_iter()
         .filter(|(_, _, expr)| names.as_ref().is_none_or(|n| mentions(expr.as_ref(), n)))
         .filter_map(|(slot, over, mut expr)| {
@@ -738,68 +755,460 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
         })
         .collect();
     for (slot, expr) in rewritten {
-        match slot {
-            Slot::Check(oid) => {
-                if let Some(mut def) = interp.check_defs.get(&oid).cloned() {
-                    def.expr = StoredExpr::Written(Box::new(expr));
-                    interp.check_defs.insert(oid, def);
-                }
+        write_slot(interp, slot, expr);
+    }
+}
+
+/// Store `expr` as the expression of `slot`.
+fn write_slot(interp: &mut PgCatalog, slot: Slot, expr: Option<ast::Node>) {
+    match slot {
+        Slot::Check(oid) => {
+            if let Some(mut def) = interp.check_defs.get(&oid).cloned() {
+                def.expr = StoredExpr::Written(Box::new(expr));
+                interp.check_defs.insert(oid, def);
             }
-            Slot::Default(relid, attnum) => {
-                interp
-                    .attr_default_exprs
-                    .insert((relid, attnum), StoredExpr::Written(Box::new(expr)));
+        }
+        Slot::Default(relid, attnum) => {
+            interp
+                .attr_default_exprs
+                .insert((relid, attnum), StoredExpr::Written(Box::new(expr)));
+        }
+        Slot::IndexExpr(index, i) => {
+            // The index's columns keep the names the expressions gave
+            // them (`inc` for `inc(a)`) until it is rebuilt.
+            if !interp.index_attnames.contains_key(&index) {
+                let names = crate::ddl::indexes::index_attnames(interp, index);
+                interp.index_attnames.insert(index, names);
             }
-            Slot::IndexExpr(index, i) => {
-                // The index's columns keep the names the expressions gave
-                // them (`inc` for `inc(a)`) until it is rebuilt.
-                if !interp.index_attnames.contains_key(&index) {
-                    let names = crate::ddl::indexes::index_attnames(interp, index);
-                    interp.index_attnames.insert(index, names);
-                }
-                if let Some(mut row) = interp.pg_index.get(&index).cloned()
-                    && let Some(e) = row.indexprs.get_mut(i)
-                {
-                    e.ast = expr;
-                    interp.pg_index.insert(index, row);
-                }
+            if let Some(mut row) = interp.pg_index.get(&index).cloned()
+                && let Some(e) = row.indexprs.get_mut(i)
+            {
+                e.ast = expr;
+                interp.pg_index.insert(index, row);
             }
-            Slot::IndexPred(index) => {
-                if let Some(mut row) = interp.pg_index.get(&index).cloned()
-                    && let Some(pred) = row.indpred.as_mut()
-                {
-                    pred.ast = expr;
-                    interp.pg_index.insert(index, row);
-                }
+        }
+        Slot::IndexPred(index) => {
+            if let Some(mut row) = interp.pg_index.get(&index).cloned()
+                && let Some(pred) = row.indpred.as_mut()
+            {
+                pred.ast = expr;
+                interp.pg_index.insert(index, row);
             }
-            Slot::PartitionKey(relid, i) => {
-                if let Some(mut exprs) = interp.partition_key_exprs.get(&relid).cloned()
-                    && let Some(e) = exprs.get_mut(i)
-                {
-                    e.ast = expr;
-                    interp.partition_key_exprs.insert(relid, exprs);
-                }
+        }
+        Slot::PartitionKey(relid, i) => {
+            if let Some(mut exprs) = interp.partition_key_exprs.get(&relid).cloned()
+                && let Some(e) = exprs.get_mut(i)
+            {
+                e.ast = expr;
+                interp.partition_key_exprs.insert(relid, exprs);
             }
-            Slot::DomainCheck(domain, i) => {
-                if let Some(mut constraints) = interp.domain_constraints.get(&domain).cloned()
-                    && let Some(c) = constraints.get_mut(i)
-                {
-                    c.expr = Some(StoredExpr::Written(Box::new(expr)));
-                    interp.domain_constraints.insert(domain, constraints);
-                }
+        }
+        Slot::DomainCheck(domain, i) => {
+            if let Some(mut constraints) = interp.domain_constraints.get(&domain).cloned()
+                && let Some(c) = constraints.get_mut(i)
+            {
+                c.expr = Some(StoredExpr::Written(Box::new(expr)));
+                interp.domain_constraints.insert(domain, constraints);
             }
-            Slot::DomainDefault(domain) => {
-                interp
-                    .domain_default_exprs
-                    .insert(domain, StoredExpr::Written(Box::new(expr)));
+        }
+        Slot::DomainDefault(domain) => {
+            interp
+                .domain_default_exprs
+                .insert(domain, StoredExpr::Written(Box::new(expr)));
+        }
+        Slot::TriggerWhen(relid, i) => {
+            if let Some(t) = interp.triggers.get_mut(&relid).and_then(|ts| ts.get_mut(i)) {
+                t.when = expr;
             }
-            Slot::TriggerWhen(relid, i) => {
-                if let Some(t) = interp.triggers.get_mut(&relid).and_then(|ts| ts.get_mut(i)) {
-                    t.when = expr;
-                }
+        }
+        Slot::Policy(relid, name, is_check) => {
+            if let Some((using, with_check)) =
+                interp.column_deps.policy_quals.get_mut(&(relid, name))
+                && let Some(clause) = if is_check { with_check } else { using }.as_mut()
+            {
+                clause.expr = expr;
             }
         }
     }
+}
+
+// ─── Binding to the objects found at creation ──────────────────────────────
+//
+// PG stores an expression analyzed: its routines, operators, types,
+// collations and `regclass` constants are OIDs, found under the search path
+// in effect when it was written. When it re-parses one (ALTER COLUMN TYPE
+// rebuilds a CHECK or an index from `pg_get_constraintdef` /
+// `pg_get_indexdef`), ruleutils prints each of those objects unqualified if
+// an unqualified lookup under the *current* search path finds that same
+// object, schema-qualified otherwise (generate_function_name,
+// generate_operator_name, format_type_be, generate_collation_name,
+// regclassout).
+//
+// The analyzer keeps the parse tree. Right after each statement, every
+// name in a stored expression that resolves to an object outside
+// `pg_catalog` is bound to it by qualifying it with the object's schema
+// ([`bind_stored_expressions`]): a later search path then can't make the
+// name miss the object, nor an object created later in an earlier schema
+// capture it, and a copy of the expression (a child's CHECK, a LIKE copy,
+// a partition's index) carries the binding. [`follow_rename`] keeps the
+// names right when the object is renamed or moved. Wherever the analyzer
+// reads a stored expression again, [`render`] prints it as ruleutils
+// would: a qualification the current search path doesn't need is dropped.
+// `pg_catalog` objects are never qualified: that schema is searched first
+// along every search path that doesn't name it.
+
+/// `pg_catalog`'s or a temporary schema (whose objects are this session's
+/// own, under whatever name it has): names in it are left as written.
+fn left_as_written(interp: &PgCatalog, ns: crate::oid::PgNamespaceOid) -> bool {
+    interp
+        .namespace_name(ns)
+        .is_none_or(|n| n == "pg_catalog" || n.starts_with("pg_temp"))
+}
+
+/// The names of the routines, types, collations, operators and relations
+/// outside `pg_catalog`: an unqualified name among them may need binding.
+fn user_object_names(interp: &PgCatalog) -> std::collections::HashSet<String> {
+    let catalog = interp.namespace_oid("pg_catalog");
+    let mut names = std::collections::HashSet::new();
+    let user = |ns: crate::oid::PgNamespaceOid| Some(ns) != catalog;
+    names.extend(
+        interp
+            .pg_proc
+            .values()
+            .filter(|p| user(p.pronamespace))
+            .map(|p| p.proname.clone()),
+    );
+    names.extend(
+        interp
+            .pg_type
+            .values()
+            .filter(|t| user(t.typnamespace))
+            .map(|t| t.typname.clone()),
+    );
+    names.extend(
+        interp
+            .pg_collation
+            .values()
+            .filter(|c| user(c.collnamespace))
+            .map(|c| c.collname.clone()),
+    );
+    names.extend(
+        interp
+            .pg_operator
+            .values()
+            .filter(|o| user(o.oprnamespace))
+            .map(|o| o.oprname.clone()),
+    );
+    names.extend(
+        interp
+            .pg_class
+            .values()
+            .filter(|c| user(c.relnamespace))
+            .map(|c| c.relname.clone()),
+    );
+    names
+}
+
+/// Whether `expr` has an unqualified name among `names` (or a string
+/// constant equal to one, which may be a `regclass`).
+fn has_unbound_name(expr: Option<&ast::Node>, names: &std::collections::HashSet<String>) -> bool {
+    use typedpg_pg_query::NodeRef;
+    let single = |list: &[Option<ast::Node>]| match list {
+        [Some(ast::Node::String(s))] => names.contains(&s.sval),
+        _ => false,
+    };
+    expr.is_some_and(|e| {
+        e.nodes().any(|(n, ..)| match n {
+            NodeRef::FuncCall(fc) => single(&fc.funcname),
+            NodeRef::TypeName(tn) => single(&tn.names),
+            NodeRef::CollateClause(cc) => single(&cc.collname),
+            NodeRef::AExpr(ae) => single(&ae.name),
+            NodeRef::AConst(c) => matches!(&c.val,
+                Some(ast::AConstValue::String(s)) if names.contains(&s.sval)),
+            _ => false,
+        })
+    })
+}
+
+/// A sequence function taking its sequence as a `regclass` first argument.
+fn takes_regclass(name: &str) -> bool {
+    matches!(name, "nextval" | "currval" | "setval")
+}
+
+/// The string of a `regclass` constant `c`, naming relation `name`
+/// unqualified, bound: qualified with the schema of the relation the
+/// current search path finds.
+fn bind_regclass_literal(interp: &PgCatalog, c: &mut ast::AConst) {
+    let Some(ast::AConstValue::String(s)) = c.val.as_mut() else {
+        return;
+    };
+    let Ok(names) = crate::reg_input::qualified_name_list(&s.sval) else {
+        return;
+    };
+    let [name] = names.as_slice() else {
+        return;
+    };
+    if let Some(class) = interp.resolve_table(None, name)
+        && !left_as_written(interp, class.relnamespace)
+        && let Some(ns) = interp.namespace_name(class.relnamespace)
+    {
+        s.sval = crate::qualified_name::QualifiedName::new(ns, &class.relname).to_string();
+    }
+}
+
+/// Qualify the names of `expr` that `refs` resolved to objects outside
+/// `pg_catalog` with their schemas.
+fn bind_slots(
+    interp: &PgCatalog,
+    expr: &mut Option<ast::Node>,
+    refs: &crate::ddl::policies::PolicyRefs,
+) {
+    use typedpg_pg_query::NodeMut;
+    let schema = |ns: crate::oid::PgNamespaceOid| -> Option<String> {
+        (!left_as_written(interp, ns))
+            .then(|| interp.namespace_name(ns).map(str::to_owned))
+            .flatten()
+    };
+    edit_nodes(expr, &mut |n| match n {
+        NodeMut::FuncCall(fc) => {
+            let Some(proc) = refs
+                .functions
+                .get(&fc.location)
+                .and_then(|p| interp.pg_proc.get(p))
+            else {
+                return;
+            };
+            if fc.funcname.len() == 1
+                && let Some(ns) = schema(proc.pronamespace)
+            {
+                requalify(&mut fc.funcname, Some(&ns), None);
+            }
+            if takes_regclass(&proc.proname)
+                && left_as_written(interp, proc.pronamespace)
+                && let Some(Some(ast::Node::AConst(c))) = fc.args.first_mut()
+            {
+                bind_regclass_literal(interp, c);
+            }
+        }
+        NodeMut::TypeName(tn) => {
+            if tn.names.len() == 1
+                && !tn.pct_type
+                && let Some(ns) = refs
+                    .types
+                    .get(&tn.location)
+                    .and_then(|t| interp.pg_type.get(t))
+                    .and_then(|t| schema(t.typnamespace))
+            {
+                requalify(&mut tn.names, Some(&ns), None);
+            }
+        }
+        NodeMut::TypeCast(tc) => {
+            let regclass = tc
+                .type_name
+                .as_ref()
+                .and_then(|tn| refs.types.get(&tn.location))
+                .and_then(|t| interp.pg_type.get(t))
+                .is_some_and(|t| {
+                    t.typname == "regclass" && left_as_written(interp, t.typnamespace)
+                });
+            if regclass && let Some(ast::Node::AConst(c)) = tc.arg.as_mut() {
+                bind_regclass_literal(interp, c);
+            }
+        }
+        NodeMut::CollateClause(cc) => {
+            if cc.collname.len() == 1
+                && let Some(ns) = refs
+                    .collations
+                    .get(&cc.location)
+                    .and_then(|c| interp.pg_collation.get(c))
+                    .and_then(|c| schema(c.collnamespace))
+            {
+                requalify(&mut cc.collname, Some(&ns), None);
+            }
+        }
+        NodeMut::AExpr(ae) => {
+            if ae.kind == ast::AExprKind::AexprOp
+                && ae.name.len() == 1
+                && let Some(ns) = refs
+                    .operators
+                    .get(&ae.location)
+                    .and_then(|o| interp.pg_operator.get(o))
+                    .and_then(|o| schema(o.oprnamespace))
+            {
+                requalify(&mut ae.name, Some(&ns), None);
+            }
+        }
+        _ => {}
+    });
+}
+
+/// After a statement: bind the stored expressions it wrote (see above).
+/// One already bound has no unqualified name of an object outside
+/// `pg_catalog` left, and is skipped.
+pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) {
+    let names = user_object_names(interp);
+    if names.is_empty() {
+        return;
+    }
+    let bound: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, true)
+        .into_iter()
+        .filter(|(_, _, expr)| has_unbound_name(expr.as_ref(), &names))
+        .filter_map(|(slot, over, mut expr)| {
+            let refs = bindings_of(interp, over, expr.as_ref());
+            let before = expr.clone();
+            bind_slots(interp, &mut expr, &refs);
+            (expr != before).then_some((slot, expr))
+        })
+        .collect();
+    for (slot, expr) in bound {
+        write_slot(interp, slot, expr);
+    }
+}
+
+/// Whether ruleutils would print routine `name` of schema `ns` unqualified
+/// (generate_function_name): an unqualified call with the routine's
+/// argument types resolves to it — for each routine of that name there.
+fn function_visible(interp: &PgCatalog, ns: crate::oid::PgNamespaceOid, name: &str) -> bool {
+    let procs: Vec<&crate::pg_catalog::PgProc> = interp
+        .pg_proc
+        .values()
+        .filter(|p| p.pronamespace == ns && p.proname == name)
+        .collect();
+    !procs.is_empty()
+        && procs.iter().all(|p| {
+            crate::functions::resolve_function(
+                interp,
+                None,
+                name,
+                &p.proargtypes,
+                &crate::functions::CallNotation::default(),
+                false,
+                None,
+            )
+            .is_ok_and(|f| f.oid == p.oid)
+        })
+}
+
+/// Whether ruleutils would print operator `name` of schema `ns` without
+/// `OPERATOR(schema.op)` (generate_operator_name): an unqualified operator
+/// with its operand types resolves to it — for each operator of that name
+/// there.
+fn operator_visible(interp: &PgCatalog, ns: crate::oid::PgNamespaceOid, name: &str) -> bool {
+    let ops: Vec<&crate::pg_catalog::PgOperator> = interp
+        .pg_operator
+        .values()
+        .filter(|o| o.oprnamespace == ns && o.oprname == name)
+        .collect();
+    !ops.is_empty()
+        && ops.iter().all(|o| {
+            matches!(interp.find_operator_detailed(name, o.oprleft, o.oprright),
+                crate::lookup::OperatorMatch::Found(r) if r.oid == o.oid)
+        })
+}
+
+/// The namespace a qualified name's schema part names, unless it is one
+/// whose names are left as written.
+fn qualifier(
+    interp: &PgCatalog,
+    names: &[Option<ast::Node>],
+) -> Option<(crate::oid::PgNamespaceOid, String)> {
+    let [Some(ast::Node::String(s)), Some(ast::Node::String(n))] = names else {
+        return None;
+    };
+    let ns = interp.namespace_oid(&s.sval)?;
+    (!left_as_written(interp, ns)).then(|| (ns, n.sval.clone()))
+}
+
+/// `regclassout`: the string of `regclass` constant `c` qualified only if
+/// the relation is not visible.
+fn render_regclass_literal(interp: &PgCatalog, c: &mut ast::AConst) {
+    let Some(ast::AConstValue::String(s)) = c.val.as_mut() else {
+        return;
+    };
+    let Ok(names) = crate::reg_input::qualified_name_list(&s.sval) else {
+        return;
+    };
+    let [schema, name] = names.as_slice() else {
+        return;
+    };
+    let Some(ns) = interp.namespace_oid(schema) else {
+        return;
+    };
+    if left_as_written(interp, ns) {
+        return;
+    }
+    let bound = interp.class_by_qname.get(&(ns, name.clone()));
+    if bound.is_some() && interp.resolve_table(None, name).map(|c| &c.oid) == bound {
+        s.sval = typedpg_core::quote_identifier(name);
+    }
+}
+
+/// `expr`, a stored expression, as ruleutils prints it under the current
+/// search path: a schema qualification is dropped wherever an unqualified
+/// lookup finds the same object.
+pub(crate) fn render(interp: &PgCatalog, expr: Option<&ast::Node>) -> Option<ast::Node> {
+    use typedpg_pg_query::NodeMut;
+    let mut out = expr.cloned();
+    // The lookups below are the renderer's, not the statement's.
+    let _barrier = crate::error::DiagContextGuard::barrier();
+    crate::ddl::depend::collect(|| {
+        edit_nodes(&mut out, &mut |n| match n {
+            NodeMut::FuncCall(fc) => {
+                if let Some((ns, name)) = qualifier(interp, &fc.funcname)
+                    && function_visible(interp, ns, &name)
+                {
+                    fc.funcname.remove(0);
+                }
+                let sequence_function = match fc.funcname.as_slice() {
+                    [Some(ast::Node::String(n))] => takes_regclass(&n.sval),
+                    [Some(ast::Node::String(s)), Some(ast::Node::String(n))] => {
+                        s.sval == "pg_catalog" && takes_regclass(&n.sval)
+                    }
+                    _ => false,
+                };
+                if sequence_function && let Some(Some(ast::Node::AConst(c))) = fc.args.first_mut() {
+                    render_regclass_literal(interp, c);
+                }
+            }
+            NodeMut::TypeName(tn) => {
+                if !tn.pct_type
+                    && let Some((ns, name)) = qualifier(interp, &tn.names)
+                    && interp
+                        .resolve_type_by_name(None, &name)
+                        .is_some_and(|t| t.typnamespace == ns)
+                {
+                    tn.names.remove(0);
+                }
+            }
+            NodeMut::TypeCast(tc) => {
+                let regclass = tc.type_name.as_ref().is_some_and(|tn| {
+                    matches!(tn.names.last(), Some(Some(ast::Node::String(s))) if s.sval == "regclass")
+                });
+                if regclass && let Some(ast::Node::AConst(c)) = tc.arg.as_mut() {
+                    render_regclass_literal(interp, c);
+                }
+            }
+            NodeMut::CollateClause(cc) => {
+                if let Some((ns, name)) = qualifier(interp, &cc.collname)
+                    && interp
+                        .resolve_collation(None, &name)
+                        .is_some_and(|c| c.collnamespace == ns)
+                {
+                    cc.collname.remove(0);
+                }
+            }
+            NodeMut::AExpr(ae) => {
+                if ae.kind == ast::AExprKind::AexprOp
+                    && let Some((ns, name)) = qualifier(interp, &ae.name)
+                    && operator_visible(interp, ns, &name)
+                {
+                    ae.name.remove(0);
+                }
+            }
+            _ => {}
+        });
+    });
+    out
 }
 
 #[cfg(test)]
