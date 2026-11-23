@@ -222,6 +222,48 @@ impl SearchPathGuc {
     }
 }
 
+/// The custom settings (placeholder variables, `prefix.name`: no server
+/// parameter of their own, unless an extension's library defines one) the
+/// migrations' session set, with their session values and pending `SET
+/// LOCAL` ones. One the session never set is taken as unset — the server's
+/// configuration may define some the analyzer can't see.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CustomSettings {
+    session: std::collections::BTreeMap<String, String>,
+    local: std::collections::BTreeMap<String, Option<String>>,
+}
+
+impl CustomSettings {
+    /// Whether `name` is a custom setting's (a dotted name,
+    /// valid_custom_variable_name).
+    pub(crate) fn is_custom(name: &str) -> bool {
+        name.contains('.')
+    }
+
+    /// Its value now: `None` when unset.
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        match self.local.get(&name) {
+            Some(local) => local.as_deref(),
+            None => self.session.get(&name).map(String::as_str),
+        }
+    }
+
+    /// `SET [LOCAL]` (`Some`), or `RESET` / `SET ... TO DEFAULT` (`None`).
+    fn set(&mut self, name: &str, value: Option<String>, is_local: bool) {
+        let name = name.to_ascii_lowercase();
+        if is_local {
+            self.local.insert(name, value);
+        } else {
+            self.local.remove(&name);
+            match value {
+                Some(value) => self.session.insert(name, value),
+                None => self.session.remove(&name),
+            };
+        }
+    }
+}
+
 /// A boolean setting with its session value and a pending `SET LOCAL` one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BoolGuc {
@@ -425,6 +467,7 @@ impl PgCatalog {
         self.allow_system_table_mods.local = None;
         self.row_security_guc.local = None;
         self.timezone_utc.local = None;
+        self.custom_settings.local.clear();
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
             self.refresh_search_path();
@@ -463,6 +506,24 @@ impl PgCatalog {
         self.search_path_guc.local = Some(names);
         self.refresh_search_path();
         saved
+    }
+
+    /// The end of an extension script's or a routine's `SET search_path`
+    /// scope: its path is reverted, but not a plain `SET` that ran in it,
+    /// which replaced it (AtEOXact_GUC keeps a `GUC_SET` value).
+    /// An `ALTER DATABASE ... SET` the script ran stays too: it is no
+    /// setting of the session.
+    pub(crate) fn restore_scoped_search_path(&mut self, saved: SearchPathGuc) {
+        let database = self.search_path_guc.database.take();
+        let plain_set = self.search_path_guc.local.is_none();
+        let session = self.search_path_guc.session.take();
+        self.search_path_guc = saved;
+        self.search_path_guc.database = database;
+        if plain_set {
+            self.search_path_guc.local = None;
+            self.search_path_guc.session = session;
+        }
+        self.refresh_search_path();
     }
 
     pub(crate) fn restore_search_path(&mut self, saved: SearchPathGuc) {
@@ -547,6 +608,7 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         interp.check_function_bodies = BoolGuc::new(true);
         interp.allow_system_table_mods = BoolGuc::new(false);
         interp.timezone_utc = BoolGuc::new(true);
+        interp.custom_settings = CustomSettings::default();
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
@@ -570,6 +632,29 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         || stmt.name.eq_ignore_ascii_case("plan_cache_mode")
     {
         interp.planner_settings_changed = true;
+    }
+    if CustomSettings::is_custom(&stmt.name) {
+        match kind {
+            VariableSetKind::VarSetValue => {
+                let value = match stmt.args.as_slice() {
+                    [arg] => const_arg_string(arg.as_ref()),
+                    _ => None,
+                };
+                match value {
+                    Some(value) => {
+                        interp
+                            .custom_settings
+                            .set(&stmt.name, Some(value), stmt.is_local)
+                    }
+                    None => interp.roles.uncertain.settings = true,
+                }
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                interp.custom_settings.set(&stmt.name, None, stmt.is_local);
+            }
+            _ => interp.roles.uncertain.settings = true,
+        }
+        return Ok(());
     }
     // `SET TIME ZONE ...` sets `timezone`; LOCAL / DEFAULT resets it.
     if stmt.name.eq_ignore_ascii_case("timezone") {
@@ -748,6 +833,10 @@ pub(crate) fn select_side_effects(
             continue;
         };
         super::cluster::large_object_calls(interp, fc);
+        if postgis_add_to_search_path(interp, fc) {
+            continue;
+        }
+        super::do_block::select_call(interp, fc)?;
         if let Some((setting, value, is_local)) = constant_identity_set_config(fc) {
             set_identity(interp, &setting, Some(&value), is_local)?;
             continue;
@@ -769,6 +858,9 @@ pub(crate) fn select_side_effects(
                 .collect();
             super::guc::constant_call_error(interp, proname, &args)?;
         }
+        if let Some((setting, value, is_local)) = constant_custom_set_config(fc) {
+            interp.custom_settings.set(&setting, Some(value), is_local);
+        }
         if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
         }
@@ -787,6 +879,70 @@ pub(crate) fn select_side_effects(
         }
     }
     Ok(())
+}
+
+/// PostGIS topology's `topology.AddToSearchPath(schema)`, which its
+/// installation script calls with `'topology'`: a PL/pgSQL function reading
+/// the server's settings, modeled as it behaves (postgis_topology 3.7.0).
+/// The search path it starts from is the database's (`ALTER DATABASE ...
+/// SET`), else the configuration file's — taken as not setting one — else
+/// the built-in `"$user", public`. Unless that text already contains the
+/// quoted schema name, the schema is appended and the database set to the
+/// result; either way the session's path becomes it (a plain `SET`, which
+/// outlasts the function's own `SET search_path` and the extension
+/// script's). `false` when `fc` is no such call over a constant.
+fn postgis_add_to_search_path(interp: &mut PgCatalog, fc: &FuncCall) -> bool {
+    let name: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    let (schema, proname) = match name.as_slice() {
+        [schema, proname] => (Some(*schema), *proname),
+        [proname] => (None, *proname),
+        _ => return false,
+    };
+    if proname != "addtosearchpath" {
+        return false;
+    }
+    let [arg] = fc.args.as_slice() else {
+        return false;
+    };
+    let arg = match arg.as_ref() {
+        Some(ast::Node::TypeCast(tc)) => tc.arg.as_ref(),
+        other => other,
+    };
+    let Some(target) = const_arg_string(arg) else {
+        return false;
+    };
+    // The extension's own script calls it before its members are recorded.
+    let installing = interp.installing_extension.as_deref() == Some("postgis_topology");
+    let from_topology = interp
+        .find_functions(schema, proname)
+        .into_iter()
+        .filter(|p| p.proargtypes.len() == 1)
+        .any(|p| installing || interp.extension_of_proc(p.oid) == Some("postgis_topology"));
+    if !from_topology {
+        return false;
+    }
+    let render = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| typedpg_core::quote_identifier(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut current = match &interp.search_path_guc.database {
+        Some(names) => render(names),
+        // pg_settings.boot_val.
+        None => "\"$user\", public".to_owned(),
+    };
+    if !current.contains(&typedpg_core::quote_identifier(&target)) {
+        current = format!("{current}, {}", typedpg_core::quote_identifier(&target));
+        interp.search_path_guc.database = Some(split_identifier_string(&current));
+    }
+    interp.set_search_path(Some(split_identifier_string(&current)), false);
+    true
 }
 
 /// A `SET TIME ZONE` / `SET timezone` value: a number of hours, an
@@ -947,6 +1103,46 @@ fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(Strin
         _ => return None,
     };
     Some((value.sval, is_local))
+}
+
+/// `set_config(name, value, is_local)` of a custom setting, all constants.
+fn constant_custom_set_config(fc: &FuncCall) -> Option<(String, String, bool)> {
+    let name: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    if !matches!(
+        name.as_slice(),
+        ["set_config"] | ["pg_catalog", "set_config"]
+    ) {
+        return None;
+    }
+    let [setting, value, is_local] = fc.args.as_slice() else {
+        return None;
+    };
+    let as_const = |n: Option<&typedpg_pg_query::ast::Node>| match n {
+        Some(ast::Node::AConst(c)) => c.val.clone(),
+        Some(ast::Node::TypeCast(tc)) => match tc.arg.as_ref() {
+            Some(ast::Node::AConst(c)) => c.val.clone(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(ast::AConstValue::String(setting)) = as_const(setting.as_ref()) else {
+        return None;
+    };
+    if !CustomSettings::is_custom(&setting.sval) {
+        return None;
+    }
+    let Some(ast::AConstValue::String(value)) = as_const(value.as_ref()) else {
+        return None;
+    };
+    let is_local = match as_const(is_local.as_ref())? {
+        ast::AConstValue::Boolean(b) => b.boolval,
+        _ => return None,
+    };
+    Some((setting.sval, value.sval, is_local))
 }
 
 /// PG's `SplitIdentifierString(value, ',')` (`varlena.c`): split a GUC list

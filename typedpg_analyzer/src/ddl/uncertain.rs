@@ -96,6 +96,9 @@ pub(crate) struct Uncertain {
     /// Triggers may have been enabled or disabled (`tgenabled`), but for
     /// the foreign keys' own.
     pub(crate) triggers: bool,
+    /// Custom settings (`prefix.name`) may hold values the analyzer doesn't
+    /// know: a `set_config` or `SET` of one may have run.
+    pub(crate) settings: bool,
     /// Anything may differ: a statement of unknown kind may have run.
     pub(crate) catalog: bool,
 }
@@ -137,6 +140,7 @@ impl Uncertain {
         self.default_acls |= other.default_acls;
         self.routines |= other.routines;
         self.triggers |= other.triggers;
+        self.settings |= other.settings;
         self.catalog |= other.catalog;
     }
 

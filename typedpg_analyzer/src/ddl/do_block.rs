@@ -41,6 +41,13 @@
 //! own interpreter, a query reading the arguments analyzed with them as
 //! parameters. Bodies in other languages, or run under `SECURITY DEFINER`
 //! or `SET` clauses, are not followed.
+//!
+//! A migration's `SELECT f(...)` (or a body's `PERFORM f(...)`) of a
+//! PL/pgSQL function runs its body too ([`select_call`]), its arguments the
+//! values the call passes as far as they are known, under its `SET
+//! search_path` (the one `SET` clause followed); a call of one inside an
+//! expression the analyzer evaluates gives the value its `RETURN` certainly
+//! returns, the body run on a copy of the catalog ([`function_value`]).
 
 use std::collections::BTreeMap;
 
@@ -110,6 +117,8 @@ struct Run {
     /// The varnos in scope, innermost last: the blocks' declarations and
     /// the loops' targets entered.
     scope: Vec<i32>,
+    /// The value a function's `RETURN expr` certainly returned.
+    returned: Option<Val>,
 }
 
 thread_local! {
@@ -317,6 +326,7 @@ fn run_do_block(
         arguments: false,
         may_raise: false,
         scope: Vec::new(),
+        returned: None,
     };
     // The block's RETURN ends the block, not its caller.
     Ok(match run.block(interp, action)? {
@@ -919,7 +929,12 @@ impl Run {
             }
             Stmt::Assign(s) => self.assign(interp, stmt, s),
             Stmt::Raise(s) => self.raise(s),
-            Stmt::Return(_) => Ok(Flow::Return),
+            Stmt::Return(s) => {
+                if let Some(query) = expr_query(s.expr.as_ref()) {
+                    self.returned = Some(symbolic::eval(&Live(self, interp), query));
+                }
+                Ok(Flow::Return)
+            }
             Stmt::If(s) => self.if_statement(interp, stmt, s),
             Stmt::Exit(s) => {
                 let flow = if s.is_exit {
@@ -1806,14 +1821,25 @@ fn run_plpgsql_body(
     create_sql: &str,
     atomic: bool,
 ) -> Result<Flow, DdlError> {
+    run_plpgsql_routine(interp, create_sql, atomic, &[]).map(|(flow, _)| flow)
+}
+
+/// [`run_plpgsql_body`] of a routine whose first arguments have the values
+/// `args` (the rest unknown), with the value its `RETURN` certainly gave.
+fn run_plpgsql_routine(
+    interp: &mut PgCatalog,
+    create_sql: &str,
+    atomic: bool,
+    args: &[Val],
+) -> Result<(Flow, Option<Val>), DdlError> {
     let Ok(parsed) = typedpg_pg_query::parse_plpgsql_with_catalog(create_sql, &*interp) else {
-        return unknowable(interp);
+        return unknowable(interp).map(|flow| (flow, None));
     };
     let Some(function) = parsed.first() else {
-        return unknowable(interp);
+        return unknowable(interp).map(|flow| (flow, None));
     };
     let Some(action) = &function.action else {
-        return unknowable(interp);
+        return unknowable(interp).map(|flow| (flow, None));
     };
     let mut run = Run {
         variables: variables(function),
@@ -1821,17 +1847,181 @@ fn run_plpgsql_body(
         arguments: true,
         may_raise: false,
         scope: Vec::new(),
+        returned: None,
     };
-    for &varno in &function.fn_argvarnos {
+    for (i, &varno) in function.fn_argvarnos.iter().enumerate() {
         if let Some(v) = usize::try_from(varno)
             .ok()
             .and_then(|i| run.variables.get_mut(i))
         {
-            v.value = Val::any();
+            v.value = args.get(i).cloned().unwrap_or_else(Val::any);
         }
     }
     let flow = run.block(interp, action)?;
-    Ok(if run.may_raise { Flow::Unknown } else { flow })
+    let flow = if run.may_raise { Flow::Unknown } else { flow };
+    Ok((flow, run.returned))
+}
+
+/// A PL/pgSQL function the migrations created that `call` names, which the
+/// analyzer can run: one candidate of its name and argument count, without
+/// `SECURITY DEFINER` and with no `SET` clause but `search_path`'s. With
+/// its `CREATE FUNCTION` statement and the path its `SET` clause gives.
+fn plpgsql_function(
+    interp: &PgCatalog,
+    call: &ast::FuncCall,
+) -> Option<(PgProc, String, Option<Vec<String>>)> {
+    if call.agg_star
+        || call.agg_distinct
+        || call.over.is_some()
+        || call.func_variadic
+        || call
+            .args
+            .iter()
+            .any(|a| matches!(a, Some(ast::Node::NamedArgExpr(_))))
+    {
+        return None;
+    }
+    let names: Vec<&str> = call
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    let (schema, name) = match names.as_slice() {
+        [schema, name] => (Some(*schema), *name),
+        [name] => (None, *name),
+        _ => return None,
+    };
+    let mut candidates = interp
+        .find_functions(schema, name)
+        .into_iter()
+        .filter(|p| p.prokind == ProKind::Function && p.proargtypes.len() == call.args.len());
+    let proc = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let routine = interp.routine_bodies.get(&proc.oid)?;
+    if routine.security_definer {
+        return None;
+    }
+    let RoutineSource::Plpgsql { create_sql } = &routine.source else {
+        return None;
+    };
+    let search_path = if interp.procs_with_config.contains(&proc.oid) {
+        Some(search_path_clause(create_sql)?)
+    } else {
+        None
+    };
+    Some((proc.clone(), create_sql.clone(), search_path))
+}
+
+/// The path a routine's only `SET` clause, `SET search_path = ...`, gives;
+/// `None` for any other clause.
+fn search_path_clause(create_sql: &str) -> Option<Vec<String>> {
+    let parsed = typedpg_pg_query::parse(create_sql).ok()?;
+    let Some(ast::Node::CreateFunctionStmt(create)) = parsed.tree.stmts.first()?.stmt.as_ref()
+    else {
+        return None;
+    };
+    let mut path = None;
+    for option in &create.options {
+        let Some(ast::Node::DefElem(de)) = option.as_ref() else {
+            continue;
+        };
+        if de.defname != "set" {
+            continue;
+        }
+        let Some(ast::Node::VariableSetStmt(set)) = de.arg.as_ref() else {
+            return None;
+        };
+        if !set.name.eq_ignore_ascii_case("search_path")
+            || set.kind != ast::VariableSetKind::VarSetValue
+        {
+            return None;
+        }
+        path = Some(super::session::search_path_args(set)?);
+    }
+    path
+}
+
+/// The arguments of a call, as far as the analyzer knows them.
+fn call_arguments(interp: &PgCatalog, call: &ast::FuncCall) -> Vec<Val> {
+    struct Constants<'a>(&'a PgCatalog);
+    impl symbolic::Scope for Constants<'_> {
+        fn variable(&self, _: &str) -> Option<Val> {
+            None
+        }
+        fn field(&self, _: &str, _: &str) -> Option<Val> {
+            None
+        }
+        fn catalog(&self) -> Option<&PgCatalog> {
+            Some(self.0)
+        }
+    }
+    call.args
+        .iter()
+        .map(|a| {
+            a.as_ref()
+                .map_or_else(Val::any, |a| symbolic::eval_node(&Constants(interp), a))
+        })
+        .collect()
+}
+
+/// A migration's `SELECT f(...)` — or a body's `PERFORM f(...)` — of a
+/// PL/pgSQL function the migrations created (see [`plpgsql_function`]):
+/// its body runs as a procedure's does ([`call`]), atomically, under its
+/// `SET search_path`, its arguments the values the call passes, as far as
+/// the analyzer knows them (pgmq's `SELECT pgmq.create('orders')` creates
+/// the queue's tables).
+pub(crate) fn select_call(interp: &mut PgCatalog, call: &ast::FuncCall) -> Result<(), DdlError> {
+    let Some((proc, create_sql, search_path)) = plpgsql_function(interp, call) else {
+        return Ok(());
+    };
+    let args = call_arguments(interp, call);
+    let pending = (!running_body()).then(Pending::enter);
+    let saved = search_path.map(|path| interp.replace_search_path(path));
+    let result = match enter_body(Some(proc.oid)) {
+        Some(_leave) => {
+            let _barrier = crate::error::DiagContextGuard::barrier();
+            run_plpgsql_routine(interp, &create_sql, true, &args).map(drop)
+        }
+        None => unknowable(interp).map(drop),
+    };
+    if let Some(saved) = saved {
+        interp.restore_scoped_search_path(saved);
+    }
+    if let Some(pending) = pending {
+        let found = pending.finish();
+        record(interp, &found);
+    }
+    result
+}
+
+/// The value `call` of a PL/pgSQL function the migrations created returns
+/// (see [`plpgsql_function`]), its arguments `args`, when running its body
+/// on a copy of the catalog certainly returns one (pgmq's
+/// `format_table_name`). What the body does to the catalog is not kept.
+pub(crate) fn function_value(
+    interp: &PgCatalog,
+    call: &ast::FuncCall,
+    args: &[Val],
+) -> Option<Val> {
+    let (proc, create_sql, search_path) = plpgsql_function(interp, call)?;
+    let mut scratch = interp.clone();
+    let pending = Pending::enter();
+    if let Some(path) = search_path {
+        scratch.replace_search_path(path);
+    }
+    let returned = match enter_body(Some(proc.oid)) {
+        Some(_leave) => {
+            let _barrier = crate::error::DiagContextGuard::barrier();
+            run_plpgsql_routine(&mut scratch, &create_sql, true, args)
+                .ok()
+                .and_then(|(_, returned)| returned)
+        }
+        None => None,
+    };
+    drop(pending.finish());
+    returned
 }
 
 /// What may fail in trigger function `function`'s body (a `LANGUAGE
@@ -1891,6 +2081,7 @@ pub(crate) fn trigger_body_outcome(
             arguments: true,
             may_raise: false,
             scope: Vec::new(),
+            returned: None,
         };
         for variable in &mut run.variables {
             variable.value = Val::any();

@@ -9,7 +9,8 @@ use super::{ExtensionDef, ExtensionVersion};
 
 // ─── Registry ───────────────────────────────────────────────────────────────
 //
-// All PostgreSQL contrib extensions, alphabetical order.
+// All PostgreSQL contrib extensions, alphabetical order, then the
+// third-party ones (PostGIS, pg_cron, pgmq, pg_jsonschema, pgvector).
 // SQL files are in typedpg_analyzer/src/extensions/ and fetched via
 // update_extensions.sh from the PostgreSQL release typedpg targets: the
 // versions and default versions here are that release's, as its parser
@@ -972,6 +973,113 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
     // ═══════════════════════════════════════════════════════════════════════
     // Third-party extensions
     // ═══════════════════════════════════════════════════════════════════════
+    // ── pg_cron (pg_catalog; needs shared_preload_libraries on a server) ───
+    ExtensionDef {
+        name: "pg_cron",
+        default_version: "1.6",
+        versions: &[
+            ExtensionVersion {
+                version: "1.0",
+                from: None,
+                sql: include_str!("../../extensions/pg_cron--1.0.sql"),
+            },
+            ExtensionVersion {
+                version: "1.1",
+                from: Some("1.0"),
+                sql: include_str!("../../extensions/pg_cron--1.0--1.1.sql"),
+            },
+            ExtensionVersion {
+                version: "1.2",
+                from: Some("1.1"),
+                sql: include_str!("../../extensions/pg_cron--1.1--1.2.sql"),
+            },
+            ExtensionVersion {
+                version: "1.3",
+                from: Some("1.2"),
+                sql: include_str!("../../extensions/pg_cron--1.2--1.3.sql"),
+            },
+            ExtensionVersion {
+                version: "1.4",
+                from: Some("1.3"),
+                sql: include_str!("../../extensions/pg_cron--1.3--1.4.sql"),
+            },
+            ExtensionVersion {
+                version: "1.4-1",
+                from: Some("1.4"),
+                sql: include_str!("../../extensions/pg_cron--1.4--1.4-1.sql"),
+            },
+            ExtensionVersion {
+                version: "1.5",
+                from: Some("1.4-1"),
+                sql: include_str!("../../extensions/pg_cron--1.4-1--1.5.sql"),
+            },
+            ExtensionVersion {
+                version: "1.6",
+                from: Some("1.5"),
+                sql: include_str!("../../extensions/pg_cron--1.5--1.6.sql"),
+            },
+        ],
+    },
+    // ── pg_jsonschema ─────────────────────────────────────────────────
+    ExtensionDef {
+        name: "pg_jsonschema",
+        default_version: "0.3.4",
+        versions: &[ExtensionVersion {
+            version: "0.3.4",
+            from: None,
+            sql: include_str!("../../extensions/pg_jsonschema--0.3.4.sql"),
+        }],
+    },
+    // ── pgmq (its release installs 1.13.2 only) ─────────────────────────
+    ExtensionDef {
+        name: "pgmq",
+        default_version: "1.13.2",
+        versions: &[ExtensionVersion {
+            version: "1.13.2",
+            from: None,
+            sql: include_str!("../../extensions/pgmq--1.13.2.sql"),
+        }],
+    },
+    // ── postgis ───────────────────────────────────────────────────────
+    ExtensionDef {
+        name: "postgis",
+        default_version: "3.7.0",
+        versions: &[ExtensionVersion {
+            version: "3.7.0",
+            from: None,
+            sql: include_str!("../../extensions/postgis--3.7.0.sql"),
+        }],
+    },
+    // ── postgis_raster ────────────────────────────────────────────────
+    ExtensionDef {
+        name: "postgis_raster",
+        default_version: "3.7.0",
+        versions: &[ExtensionVersion {
+            version: "3.7.0",
+            from: None,
+            sql: include_str!("../../extensions/postgis_raster--3.7.0.sql"),
+        }],
+    },
+    // ── postgis_sfcgal ────────────────────────────────────────────────
+    ExtensionDef {
+        name: "postgis_sfcgal",
+        default_version: "3.7.0",
+        versions: &[ExtensionVersion {
+            version: "3.7.0",
+            from: None,
+            sql: include_str!("../../extensions/postgis_sfcgal--3.7.0.sql"),
+        }],
+    },
+    // ── postgis_topology ──────────────────────────────────────────────
+    ExtensionDef {
+        name: "postgis_topology",
+        default_version: "3.7.0",
+        versions: &[ExtensionVersion {
+            version: "3.7.0",
+            from: None,
+            sql: include_str!("../../extensions/postgis_topology--3.7.0.sql"),
+        }],
+    },
     // ── vector (pgvector) ──────────────────────────────────────────────
     ExtensionDef {
         name: "vector",

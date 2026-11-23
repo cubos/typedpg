@@ -77,9 +77,13 @@ pub fn create_extension(
 
     let target_version = extract_option(&stmt.options, "new_version")
         .unwrap_or_else(|| ext.default_version.to_owned());
-    // CreateExtensionInternal: a control file's fixed `schema` wins — giving
-    // another one is an error — else the SCHEMA given, which must exist, or
-    // the creation schema.
+    // CreateExtensionInternal: a SCHEMA given must exist, whatever the
+    // control file says. A control file's fixed `schema` wins — giving
+    // another one is an error — else the SCHEMA given, or the creation
+    // schema.
+    if let Some(given) = extract_option(&stmt.options, "schema") {
+        super::util::existing_namespace(interp, &given)?;
+    }
     let target_schema = match fixed_schema(name) {
         Some(schema) => {
             if let Some(given) = extract_option(&stmt.options, "schema")
@@ -96,10 +100,16 @@ pub fn create_extension(
             None => super::util::creation_schema(interp)?,
         },
     };
-    let target_nsoid = super::util::existing_namespace(interp, &target_schema)?;
-
     // Find the install path: base version, then upgrades to target.
     let path = find_install_path(ext, &target_version)?;
+
+    // A control file's schema is created when missing (by the current
+    // role, as a generated CREATE SCHEMA command).
+    let target_nsoid = if fixed_schema(name).is_some() {
+        ensure_namespace(interp, &target_schema)?
+    } else {
+        super::util::existing_namespace(interp, &target_schema)?
+    };
 
     // get_required_extension: required extensions must be installed, or
     // are installed first with CASCADE.
@@ -275,6 +285,7 @@ fn record_extension_membership(
 /// foreign-data wrappers become members too
 /// (recordDependencyOnCurrentExtension).
 struct OtherMembers {
+    namespaces: std::collections::HashSet<crate::oid::PgNamespaceOid>,
     languages: std::collections::HashSet<crate::oid::PgLanguageOid>,
     operators: std::collections::HashSet<crate::oid::PgOperatorOid>,
     relations: std::collections::HashSet<PgClassOid>,
@@ -286,6 +297,7 @@ struct OtherMembers {
 impl OtherMembers {
     fn snapshot(interp: &PgCatalog) -> Self {
         Self {
+            namespaces: interp.pg_namespace.keys().copied().collect(),
             languages: interp.pg_language.keys().copied().collect(),
             operators: interp.pg_operator.keys().copied().collect(),
             relations: interp.pg_class.keys().copied().collect(),
@@ -307,6 +319,15 @@ impl OtherMembers {
                 .keys()
                 .filter(|k| !self.languages.contains(k))
                 .map(|&l| ObjectAddress::language(l)),
+        );
+        // A schema the script creates (pg_cron's `cron`); not the temporary
+        // one, nor the control file's, created before the script runs.
+        members.extend(
+            interp
+                .pg_namespace
+                .keys()
+                .filter(|k| !self.namespaces.contains(k) && interp.temp_namespace != Some(**k))
+                .map(|&n| ObjectAddress::namespace(n)),
         );
         // A relation's indexes are its own, not members; a composite type's
         // relation neither (heap_create_with_catalog: its type is the
@@ -349,12 +370,40 @@ impl OtherMembers {
     }
 }
 
+/// The `proj4text` of the `spatial_ref_sys` row PostGIS's installation
+/// script inserts for `srid` (its rows are written one per line, `(srid,
+/// 'auth', auth_srid, 'srtext', 'proj4text')`). Read from the script only
+/// when asked.
+pub(crate) fn postgis_proj4text(srid: i64) -> Option<&'static str> {
+    let script = REGISTRY
+        .iter()
+        .find(|e| e.name == "postgis")?
+        .versions
+        .iter()
+        .find(|v| v.from.is_none())?
+        .sql;
+    let prefix = format!("({srid}, '");
+    let line = script.lines().find(|l| l.starts_with(&prefix))?;
+    let start = line.rfind(", '")? + 3;
+    line[start..].rsplit_once('\'').map(|(text, _)| text)
+}
+
 /// Bundled extensions that aren't PostgreSQL's own (the registry's
 /// third-party section).
 #[cfg(any(test, feature = "pg_sanity"))]
-const THIRD_PARTY: &[&str] = &["vector"];
+const THIRD_PARTY: &[&str] = &[
+    "pg_cron",
+    "pg_jsonschema",
+    "pgmq",
+    "postgis",
+    "postgis_raster",
+    "postgis_sfcgal",
+    "postgis_topology",
+    "vector",
+];
 
-/// Whether `name` is a bundled extension the `postgres` image doesn't ship:
+/// Whether `name` is a bundled extension the `postgres` image doesn't ship
+/// (`scripts/extensions-image` builds one that ships the third-party ones):
 /// a third-party one, or one requiring a procedural language the registry
 /// doesn't bundle (plperl, plperlu, plpython3u are built separately, and
 /// the image has none of them). The `pg_sanity` mirror stops comparing
@@ -369,13 +418,28 @@ pub(crate) fn outside_postgres_image(name: &str) -> bool {
 /// move the extension. Every bundled extension's control file says `true`
 /// but these.
 fn relocatable(name: &str) -> bool {
-    !matches!(name, "plpgsql" | "xml2")
+    !matches!(
+        name,
+        "plpgsql"
+            | "xml2"
+            | "pg_cron"
+            | "pg_jsonschema"
+            | "pgmq"
+            | "postgis"
+            | "postgis_raster"
+            | "postgis_topology"
+    )
 }
 
 /// The control files' `schema`: extensions that must be installed in one
 /// schema (plpgsql.control: `schema = pg_catalog`).
 fn fixed_schema(name: &str) -> Option<&'static str> {
-    (name == "plpgsql").then_some("pg_catalog")
+    match name {
+        "plpgsql" | "pg_cron" => Some("pg_catalog"),
+        "pgmq" => Some("pgmq"),
+        "postgis_topology" => Some("topology"),
+        _ => None,
+    }
 }
 
 /// The control files' `requires`: extensions that must be installed first.
@@ -389,6 +453,7 @@ pub(crate) fn requires(name: &str) -> &'static [&'static str] {
         "hstore_plpython3u" => &["hstore", "plpython3u"],
         "jsonb_plpython3u" => &["plpython3u"],
         "ltree_plpython3u" => &["ltree", "plpython3u"],
+        "postgis_raster" | "postgis_sfcgal" | "postgis_topology" => &["postgis"],
         _ => &[],
     }
 }
@@ -397,37 +462,24 @@ pub(crate) fn requires(name: &str) -> &'static [&'static str] {
 
 /// Find the script chain to install an extension at a target version.
 /// Returns: base install script + any upgrades needed to reach target.
+///
+/// CreateExtensionInternal: the target version's own installation script
+/// when there is one, else the shortest update path from a version that has
+/// one (find_install_path).
 fn find_install_path<'a>(ext: &'a ExtensionDef, target: &str) -> Result<Vec<&'a str>, DdlError> {
-    // Find the base version (from == None).
-    let base = ext
-        .versions
-        .iter()
-        .find(|v| v.from.is_none())
-        .ok_or_else(|| {
-            DdlError::ExtensionError(format!(
-                "extension '{}' has no base install version",
-                ext.name
-            ))
-        })?;
-
-    let mut path = vec![base.sql];
-    let mut current = base.version;
-
-    if current == target {
-        return Ok(path);
+    let bases = || ext.versions.iter().filter(|v| v.from.is_none());
+    if let Some(direct) = bases().find(|v| v.version == target) {
+        return Ok(vec![direct.sql]);
     }
-
-    // Walk upgrade chain.
-    for _ in 0..100 {
-        if let Some(upgrade) = ext.versions.iter().find(|v| v.from == Some(current)) {
-            path.push(upgrade.sql);
-            current = upgrade.version;
-            if current == target {
-                return Ok(path);
-            }
-        } else {
-            break;
-        }
+    let shortest = bases()
+        .filter_map(|base| {
+            let mut path = vec![base.sql];
+            path.extend(find_upgrade_path(ext, base.version, target).ok()?);
+            Some(path)
+        })
+        .min_by_key(Vec::len);
+    if let Some(path) = shortest {
+        return Ok(path);
     }
 
     Err(DdlError::ExtensionError(format!(
@@ -515,7 +567,7 @@ fn apply_with_schema(
         }
     }
 
-    interp.restore_search_path(original);
+    interp.restore_scoped_search_path(original);
     result
 }
 
@@ -1154,6 +1206,13 @@ mod tests {
                 "jsonb_plperlu",
                 "jsonb_plpython3u",
                 "ltree_plpython3u",
+                "pg_cron",
+                "pg_jsonschema",
+                "pgmq",
+                "postgis",
+                "postgis_raster",
+                "postgis_sfcgal",
+                "postgis_topology",
                 "vector",
             ]
         );

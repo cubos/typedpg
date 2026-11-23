@@ -193,6 +193,44 @@ pub(crate) struct PgSanityServer {
     /// The catalog oracle reported this catalog once already: what follows
     /// inherits the divergence.
     catalog_diverged: bool,
+    /// Held while the mirror runs in a database named by the test (see
+    /// [`Self::spawn_in`]); dropped after the database is.
+    _db_lock: Option<NamedDatabaseLock>,
+    /// The database's `search_path` setting the query session follows (see
+    /// [`Self::sync_query_search_path`]).
+    database_search_path: Option<String>,
+}
+
+/// One catalog at a time in a database a test names (see
+/// [`PgSanityServer::spawn_in`]), across every test process sharing the
+/// cluster: a file lock, as [`SharedCatalogLock`].
+struct NamedDatabaseLock(std::fs::File);
+
+impl NamedDatabaseLock {
+    fn acquire(admin_conn_str: &str, name: &str) -> NamedDatabaseLock {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (admin_conn_str, name).hash(&mut hasher);
+        let path = std::env::temp_dir().join(format!(
+            "typedpg-pg-sanity-database-{:016x}.lock",
+            hasher.finish()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("pg_sanity: opening {} failed: {e}", path.display()));
+        file.lock()
+            .unwrap_or_else(|e| panic!("pg_sanity: locking {} failed: {e}", path.display()));
+        NamedDatabaseLock(file)
+    }
+}
+
+impl Drop for NamedDatabaseLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Serializes the migrations writing a shared (cluster-wide) catalog
@@ -305,10 +343,11 @@ fn writes_shared_catalog(sql: &str) -> bool {
 
 impl PgSanityServer {
     /// Read `POSTGRES_URL`, create a per-instance scratch database with a
-    /// random name, and return a client connected to it.
-    /// `db_name`: the scratch database's name, when the catalog already
-    /// chose it.
-    pub(crate) fn spawn(db_name: Option<String>) -> Result<Self, String> {
+    /// random name — or database `name` when given (see
+    /// `PgCatalog::pg_sanity_database`: whatever a previous run left of it
+    /// goes first, and every catalog using that name waits for the one
+    /// using it now) — and return a client connected to it.
+    pub(crate) fn spawn_in(name: Option<&str>) -> Result<Self, String> {
         let admin_conn_str = std::env::var("POSTGRES_URL").map_err(|_| {
             "pg_sanity: POSTGRES_URL is not set. Run tests via `scripts/run-pg-sanity.sh`, \
              which spins up a Docker PostgreSQL and exports the URL."
@@ -319,7 +358,8 @@ impl PgSanityServer {
         // wall-clock nanos gives us enough entropy that concurrent test
         // binaries don't collide; underscore-prefix keeps it valid as an
         // unquoted SQL identifier.
-        let db_name = db_name.unwrap_or_else(scratch_db_name);
+        let db_name = name.map_or_else(scratch_db_name, str::to_owned);
+        let db_lock = name.map(|name| NamedDatabaseLock::acquire(&admin_conn_str, name));
 
         // Connect to the admin database (whatever `POSTGRES_URL` points at)
         // and CREATE DATABASE. Drop the admin client immediately — we keep
@@ -330,6 +370,13 @@ impl PgSanityServer {
                     "pg_sanity: connect to admin DB failed (POSTGRES_URL={admin_conn_str:?}): {e}"
                 )
             })?;
+            if db_lock.is_some() {
+                admin
+                    .batch_execute(&format!(
+                        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                    ))
+                    .map_err(|e| format!("pg_sanity: DROP DATABASE \"{db_name}\" failed: {e}"))?;
+            }
             admin
                 .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
                 .map_err(|e| format!("pg_sanity: CREATE DATABASE \"{db_name}\" failed: {e}"))?;
@@ -360,6 +407,8 @@ impl PgSanityServer {
             mirror_only: std::env::var("PG_SANITY_MIRROR_ONLY").is_ok_and(|v| v == "1"),
             history: Vec::new(),
             catalog_diverged: false,
+            _db_lock: db_lock,
+            database_search_path: None,
         })
     }
 
@@ -437,6 +486,9 @@ impl PgSanityServer {
             });
         }
         drop(lock);
+        if pg_result.is_ok() {
+            self.sync_query_search_path();
+        }
         self.history.push(match &pg_result {
             Ok(()) => format!("{sql}\n-- (succeeded)"),
             Err(e) => format!("{sql}\n-- (failed: {})", render_pg_error(e)),
@@ -446,6 +498,45 @@ impl PgSanityServer {
         self.type_name_cache.clear();
         self.soundness.schema_changed();
         pg_result
+    }
+
+    /// The application's queries run in new sessions, which start with the
+    /// database's `search_path` (`ALTER DATABASE ... SET`, which a
+    /// migration — or an extension's script — may have changed since the
+    /// query session connected): give the query session the one a new
+    /// session would have now.
+    fn sync_query_search_path(&mut self) {
+        let setting: Option<String> = self
+            .client
+            .query_opt(
+                "SELECT o.option_value \
+                 FROM pg_catalog.pg_db_role_setting s, \
+                      pg_catalog.pg_options_to_table(s.setconfig) o \
+                 WHERE o.option_name = 'search_path' AND s.setrole = 0 \
+                   AND s.setdatabase = (SELECT oid FROM pg_catalog.pg_database \
+                                        WHERE datname = pg_catalog.current_database())",
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("pg_sanity: reading the database's settings failed: {e}"))
+            .map(|row| row.get(0));
+        if setting == self.database_search_path {
+            return;
+        }
+        let path = match &setting {
+            Some(path) => path.clone(),
+            None => self
+                .query_client
+                .query_one(
+                    "SELECT boot_val FROM pg_catalog.pg_settings WHERE name = 'search_path'",
+                    &[],
+                )
+                .unwrap_or_else(|e| panic!("pg_sanity: reading search_path's default failed: {e}"))
+                .get(0),
+        };
+        self.query_client
+            .batch_execute(&format!("SET search_path TO {path}"))
+            .unwrap_or_else(|e| panic!("pg_sanity: SET search_path TO {path} failed: {e}"));
+        self.database_search_path = setting;
     }
 
     /// [`Self::compare_apply_matches`] for a migration that creates, alters
@@ -2883,9 +2974,17 @@ impl Drop for PgSanityServer {
         // intentionally swallowed (a panic in Drop would mask the original
         // test failure); the script-level cleanup tears the whole cluster
         // down anyway.
-        let _ = self
-            .client
-            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{}\"", self.db_name));
+        // A database a test named may have sessions of the server's own
+        // (pg_cron's launcher connects to cron.database_name).
+        let force = if self._db_lock.is_some() {
+            " WITH (FORCE)"
+        } else {
+            ""
+        };
+        let _ = self.client.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS \"{}\"{force}",
+            self.db_name
+        ));
 
         // Roles are cluster-wide: drop the ones the migrations created so
         // concurrent test processes don't collide. Errors are swallowed (a

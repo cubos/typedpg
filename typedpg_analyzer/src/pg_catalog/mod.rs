@@ -319,6 +319,9 @@ pub struct PgCatalog {
     /// servers, and the pg_sanity mirror's), until a `SET TIME ZONE` /
     /// `SET timezone` / `set_config('TimeZone', ...)` says otherwise.
     pub(crate) timezone_utc: crate::ddl::session::BoolGuc,
+    /// The custom (placeholder, `prefix.name`) settings the migrations'
+    /// session set, for `current_setting` in a body the analyzer runs.
+    pub(crate) custom_settings: crate::ddl::session::CustomSettings,
     /// The migration set `constraint_exclusion` or `plan_cache_mode`: the
     /// planner may then prove more relations empty, or plan an EXECUTE
     /// generically, than the defaults the plan-time checks assume.
@@ -658,6 +661,11 @@ pub struct PgCatalog {
     #[cfg(feature = "pg_sanity")]
     pg_sanity_skip: bool,
 
+    /// Set by [`Self::pg_sanity_database`]: the database the mirror runs
+    /// in, instead of a scratch one of its own.
+    #[cfg(feature = "pg_sanity")]
+    pg_sanity_database: Option<String>,
+
     /// Every migration applied so far, in order, for the corpus recorder
     /// (see [`crate::corpus`]).
     #[cfg(feature = "record_corpus")]
@@ -968,6 +976,7 @@ impl PgCatalog {
             row_security_guc: crate::ddl::session::BoolGuc::new(true),
             database_row_security: None,
             timezone_utc: crate::ddl::session::BoolGuc::new(true),
+            custom_settings: Default::default(),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
@@ -1059,6 +1068,8 @@ impl PgCatalog {
             pg_sanity_tainted: false,
             #[cfg(feature = "pg_sanity")]
             pg_sanity_skip: false,
+            #[cfg(feature = "pg_sanity")]
+            pg_sanity_database: None,
             #[cfg(feature = "record_corpus")]
             corpus_ddl: Vec::new(),
             #[cfg(feature = "record_corpus")]
@@ -2201,6 +2212,27 @@ impl PgCatalog {
                 .is_none_or(|c| c.convalidated)
     }
 
+    /// Run the `pg_sanity` mirror in database `name` — created afresh,
+    /// dropped afterwards, used by one catalog at a time across the test
+    /// processes — instead of a scratch database of its own: for an
+    /// extension that installs in one database only (pg_cron, in
+    /// `cron.database_name`). Call it before the first migration. A no-op
+    /// without the `pg_sanity` feature.
+    pub fn pg_sanity_database(&mut self, name: &str) {
+        #[cfg(feature = "pg_sanity")]
+        {
+            assert!(
+                self.pg_sanity
+                    .as_ref()
+                    .is_none_or(|cell| cell.get().is_none()),
+                "pg_sanity_database must be called before the mirror starts"
+            );
+            self.pg_sanity_database = Some(name.to_owned());
+        }
+        #[cfg(not(feature = "pg_sanity"))]
+        let _ = name;
+    }
+
     pub fn skip_pg_sanity(&mut self) {
         #[cfg(feature = "pg_sanity")]
         {
@@ -2299,8 +2331,10 @@ impl PgCatalog {
     ) -> Option<R> {
         let cell = self.pg_sanity.as_ref()?;
         let mutex = cell.get_or_init(|| {
-            let server = crate::pg_sanity::PgSanityServer::spawn(
-                self.session_identity.database().map(str::to_owned),
+            let server = crate::pg_sanity::PgSanityServer::spawn_in(
+                self.pg_sanity_database
+                    .as_deref()
+                    .or(self.session_identity.database()),
             )
             .unwrap_or_else(|e| panic!("pg_sanity: {e}"));
             std::sync::Mutex::new(server)

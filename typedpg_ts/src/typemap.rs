@@ -850,6 +850,11 @@ mod tests {
             assert_eq!(m.map(&ext("vector", "vector")).codec, Codec::Vector);
             assert_eq!(m.map(&ext("vector", "halfvec")).output, "number[]");
             assert_eq!(m.map(&ext("vector", "sparsevec")).output, "string");
+            // PostGIS's text output: hex EWKB, read and sent as is.
+            for name in ["geometry", "geography", "box2d"] {
+                let ty = m.map(&ext("postgis", name));
+                assert_eq!((ty.output.as_str(), ty.codec), ("string", Codec::Text));
+            }
             assert_eq!(
                 m.map(&ext("hstore", "hstore")).output,
                 "Record<string, string | null>"

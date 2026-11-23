@@ -946,6 +946,7 @@ as it describes a statement before binding it.
 | range, multirange | `Range<T>`, `Range<T>[]` (`range(1, 10)`, `emptyRange` build them) |
 | `vector`, `halfvec` (pgvector) | `number[]` |
 | `hstore` | `Record<string, string \| null>` |
+| `geometry`, `geography` (PostGIS) | `string`, its text form: hex EWKB (`0101000020E6…`), which parameters take too, as WKT or EWKT (`SRID=4326;POINT(1 2)`) do |
 | anything else | `string`, its text form |
 
 A value the query proves holds one of a few values reads as their literal

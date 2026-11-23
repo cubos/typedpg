@@ -942,6 +942,20 @@ impl PgCatalog {
         None
     }
 
+    /// The extension function `proc_oid` is a member of, if any.
+    pub(crate) fn extension_of_proc(&self, proc_oid: crate::oid::PgProcOid) -> Option<&str> {
+        self.pg_depend.iter().find_map(|d| {
+            (matches!(d.deptype, DepType::Extension)
+                && d.classid == crate::pg_catalog::PG_PROC_RELID
+                && d.objid.get() == proc_oid.get()
+                && d.refclassid == PG_EXTENSION_RELID)
+                .then(|| crate::oid::PgExtensionOid::new(d.refobjid.get()))
+                .flatten()
+                .and_then(|oid| self.pg_extension.get(&oid))
+                .map(|e| e.extname.as_str())
+        })
+    }
+
     /// Iterate all `pg_depend` rows in the catalog. Reserved for the
     /// CASCADE walker in `ddl/drop.rs`.
     pub(crate) fn iter_pg_depend(&self) -> impl Iterator<Item = &PgDepend> + '_ {

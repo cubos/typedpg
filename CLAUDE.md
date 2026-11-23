@@ -211,7 +211,9 @@ The `sql!` macro is wired end-to-end with static analysis (no Docker needed at c
 
 The `pg_sanity` feature mirrors every `apply_sql` / `analyze` onto a real
 PostgreSQL and asserts they agree (see `typedpg_analyzer/src/pg_sanity.rs`,
-run via `scripts/run-pg-sanity.sh`). A differential fuzzer
+run via `scripts/run-pg-sanity.sh`; `PG_IMAGE=typedpg-extensions:pg19`, built by
+`scripts/build-extensions-image.sh`, adds the bundled third-party extensions —
+PostGIS, pgvector, pg_cron, pgmq, pg_jsonschema). A differential fuzzer
 (`typedpg_analyzer/tests/fuzz/main.rs`, `#[ignore]`d) generates queries to surface
 new disagreements automatically.
 
@@ -224,7 +226,8 @@ mapped to names; what is compared and what is deliberately normalized is
 listed there. `tests/catalog_oracle` feeds it migration corpora
 (`CATALOG_CORPUS`) and random DDL, and minimizes a divergence.
 
-**Uncertain state.** A `DO` block or procedure whose effect depends on what
+**Uncertain state.** A `DO` block, procedure or PL/pgSQL function a migration's
+`SELECT` calls, whose effect depends on what
 the analyzer can't know (a loop over a table's rows, an `EXECUTE` of a
 computed string) records what it *may* have changed instead of running it
 (`typedpg_analyzer/src/ddl/uncertain.rs`, `ddl/symbolic.rs`): privileges and

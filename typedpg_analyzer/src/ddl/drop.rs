@@ -1472,6 +1472,30 @@ pub(crate) fn drop_extension_oid(
             }
         }
     }
+    // A member schema (one the scripts created) goes last, with what is in
+    // it: anything else there depends on it, as on any member.
+    let member_schemas: Vec<PgNamespaceOid> = owned
+        .iter()
+        .filter(|(classid, _)| *classid == PG_NAMESPACE_RELID)
+        .filter_map(|(_, objid)| PgNamespaceOid::new(objid.get()))
+        .collect();
+    if !cascade {
+        for &nsoid in &member_schemas {
+            let outside = schema_objects(interp, nsoid).into_iter().find(|a| {
+                !is_member(a.classid, a.objid.get())
+                    && super::depend::owning_extension(interp, *a).is_none()
+            });
+            if let Some(object) = outside {
+                let schema = interp.namespace_name(nsoid).unwrap_or_default().to_owned();
+                return Err(DdlError::DependencyError(format!(
+                    "cannot drop {desc} because other objects depend on it ({} depends on \
+                     schema {})",
+                    super::depend::describe(interp, object),
+                    typedpg_core::quote_identifier(&schema)
+                )));
+            }
+        }
+    }
     // A member wrapper's servers (and their user mappings and foreign
     // tables), which the analyzer keeps by name.
     for &(classid, objid) in &owned {
@@ -1538,8 +1562,18 @@ pub(crate) fn drop_extension_oid(
                     drop_relation_by_oid(interp, o);
                 }
             }
+            c if c == PG_NAMESPACE_RELID => {}
             _ => super::depend::delete_member(interp, classid, objid),
         }
+    }
+    for nsoid in member_schemas {
+        let Some(schema) = interp.namespace_name(nsoid).map(str::to_owned) else {
+            continue;
+        };
+        let node = ast::Node::String(typedpg_pg_query::ast::String { sval: schema }.into());
+        drop_schema(interp, Some(&node), true, true)?;
+        let objid = crate::oid::PgGenericOid::from_nonzero(nsoid.into_nonzero());
+        interp.remove_dependencies_of(PG_NAMESPACE_RELID, objid);
     }
 
     interp.remove_pg_extension(ext_oid);

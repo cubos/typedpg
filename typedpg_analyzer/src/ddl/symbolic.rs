@@ -341,6 +341,30 @@ fn eval_call(scope: &dyn Scope, call: &ast::FuncCall) -> Val {
                 None => Val::any(),
             }
         }
+        // A custom setting the session never set is NULL with `missing_ok`
+        // (an error without, which isn't followed).
+        (Some("current_setting"), [name, rest @ ..])
+            if rest.len() <= 1
+                && matches!(name.as_known(), Some(Some(n))
+                    if super::session::CustomSettings::is_custom(n)) =>
+        {
+            let (Some(interp), Some(Some(name))) = (scope.catalog(), name.as_known()) else {
+                return Val::any();
+            };
+            let uncertain = &interp.roles.uncertain;
+            if uncertain.settings || uncertain.catalog {
+                return Val::any();
+            }
+            match interp.custom_settings.get(name) {
+                Some(value) => Val::known(Some(value.to_owned())),
+                None => match rest.first().map(Val::as_known) {
+                    Some(Some(Some(missing_ok))) if missing_ok == "t" || missing_ok == "true" => {
+                        Val::known(None)
+                    }
+                    _ => Val::any(),
+                },
+            }
+        }
         (Some("current_schema"), []) => match scope.catalog() {
             Some(interp) => Val::known(super::util::creation_schema(interp).ok()),
             None => Val::any(),
@@ -370,7 +394,58 @@ fn eval_call(scope: &dyn Scope, call: &ast::FuncCall) -> Val {
             Some(None) => Val::known(None),
             None => Val::any(),
         },
+        // Case mapping is the collation's: followed for ASCII only.
+        (Some("lower"), [arg]) => arg.map_text(|v| {
+            v.map(|t| t.is_ascii().then(|| t.to_ascii_lowercase()))
+                .unwrap_or(None)
+        }),
+        (Some("length" | "char_length" | "character_length"), [arg]) => match arg.as_known() {
+            Some(Some(text)) => Val::known(Some(text.chars().count().to_string())),
+            Some(None) => Val::known(None),
+            None => Val::any(),
+        },
+        (Some("to_regclass"), [arg]) => match (scope.catalog(), arg.as_known()) {
+            (Some(interp), Some(Some(text))) if !interp.roles.uncertain.catalog => {
+                regclass(interp, text)
+            }
+            (_, Some(None)) => Val::known(None),
+            _ => Val::any(),
+        },
+        // A PL/pgSQL function the migrations created, run on a copy.
+        _ if function_name(&call.funcname).is_none() || scope.catalog().is_some() => scope
+            .catalog()
+            .and_then(|interp| super::do_block::function_value(interp, call, &args))
+            .unwrap_or_else(Val::any),
         _ => Val::any(),
+    }
+}
+
+/// `to_regclass(text)` of a constant: the relation's name, or NULL when it
+/// doesn't exist (a malformed name is an error, not followed).
+fn regclass(interp: &PgCatalog, text: &str) -> Val {
+    let Ok(name) = typedpg_core::QualifiedName::parse_in_schema(text, "") else {
+        return Val::any();
+    };
+    let found = if name.schema.is_empty() {
+        interp.resolve_table(None, &name.name).is_some()
+            || interp.search_path.iter().any(|&ns| {
+                interp
+                    .pg_class
+                    .values()
+                    .any(|c| c.relnamespace == ns && c.relname == name.name)
+            })
+    } else {
+        interp.namespace_oid(&name.schema).is_some_and(|ns| {
+            interp
+                .pg_class
+                .values()
+                .any(|c| c.relnamespace == ns && c.relname == name.name)
+        })
+    };
+    if found {
+        Val::known(Some(text.to_owned()))
+    } else {
+        Val::known(None)
     }
 }
 
@@ -648,6 +723,29 @@ fn truth_node(scope: &dyn Scope, node: &Node) -> Option<bool> {
             };
             catalog_exists(scope, scope.catalog()?, select)
         }
+        // `(SELECT condition)`: a scalar subquery of one condition, read
+        // from nothing.
+        Node::SubLink(link) if link.sub_link_type == ast::SubLinkType::ExprSublink => {
+            let Some(Node::SelectStmt(select)) = link.subselect.as_ref() else {
+                return None;
+            };
+            if !select.from_clause.is_empty()
+                || select.where_clause.is_some()
+                || select.larg.is_some()
+                || !select.values_lists.is_empty()
+                || select.with_clause.is_some()
+                || select.limit_count.is_some()
+                || select.limit_offset.is_some()
+                || select.having_clause.is_some()
+                || !select.group_clause.is_empty()
+            {
+                return None;
+            }
+            let [Some(Node::ResTarget(target))] = select.target_list.as_slice() else {
+                return None;
+            };
+            truth_node(scope, target.val.as_ref()?)
+        }
         Node::NullTest(test) => {
             let value = eval_node(scope, test.arg.as_ref()?);
             let is_null = value.as_known()?.is_none();
@@ -663,9 +761,20 @@ fn truth_node(scope: &dyn Scope, node: &Node) -> Option<bool> {
             let (Some(left), Some(right)) = (left.as_known(), right.as_known()) else {
                 return None;
             };
+            let integers = || -> Option<(i64, i64)> {
+                Some((
+                    left.as_deref()?.trim().parse().ok()?,
+                    right.as_deref()?.trim().parse().ok()?,
+                ))
+            };
             match (e.kind, op) {
                 (ast::AExprKind::AexprOp, "=") => Some(left.as_ref()? == right.as_ref()?),
                 (ast::AExprKind::AexprOp, "<>" | "!=") => Some(left.as_ref()? != right.as_ref()?),
+                // Integers only: anything else compares by its type.
+                (ast::AExprKind::AexprOp, "<") => integers().map(|(l, r)| l < r),
+                (ast::AExprKind::AexprOp, "<=") => integers().map(|(l, r)| l <= r),
+                (ast::AExprKind::AexprOp, ">") => integers().map(|(l, r)| l > r),
+                (ast::AExprKind::AexprOp, ">=") => integers().map(|(l, r)| l >= r),
                 (ast::AExprKind::AexprDistinct, _) => Some(left != right),
                 (ast::AExprKind::AexprNotDistinct, _) => Some(left == right),
                 _ => None,
@@ -681,7 +790,8 @@ fn truth_node(scope: &dyn Scope, node: &Node) -> Option<bool> {
 
 /// `EXISTS (SELECT ... FROM view WHERE column = value AND ...)` over a
 /// catalog view whose rows the analyzer's catalog holds: `pg_roles` /
-/// `pg_authid` (`rolname`), `pg_user` (`usename`), `pg_publication`
+/// `pg_authid` (`rolname`), `pg_user` (`usename`), `pg_extension`
+/// (`extname`), `pg_publication`
 /// (`pubname`, `puballtables`) and `pg_publication_tables` of a publication
 /// that doesn't exist. `None` for anything else, or when what it reads may
 /// differ from the catalog (see [`super::uncertain`]).
@@ -791,6 +901,12 @@ fn catalog_exists(scope: &dyn Scope, interp: &PgCatalog, select: &ast::SelectStm
             } else {
                 interp.roles.exists(name)
             })
+        }
+        "pg_extension" => {
+            if !flags.is_empty() || !only(&["extname"]) {
+                return None;
+            }
+            Some(interp.extension_by_name.contains_key(value_of("extname")?))
         }
         "pg_publication" => {
             if !only(&["pubname", "puballtables"]) {
@@ -936,13 +1052,22 @@ pub(crate) fn classify_statement(stmt: &Node, uncertain: &mut Uncertain) {
         // A query changes rows, not the catalog — but for the settings a
         // `set_config` call changes (see `session::select_side_effects`).
         Node::SelectStmt(s) if s.into_clause.is_none() => {
-            if stmt.nodes().any(|(node, _)| match node {
-                typedpg_pg_query::NodeRef::FuncCall(f) => {
-                    function_name(&f.funcname) == Some("set_config")
+            for (node, _) in stmt.nodes() {
+                let typedpg_pg_query::NodeRef::FuncCall(f) = node else {
+                    continue;
+                };
+                if function_name(&f.funcname) != Some("set_config") {
+                    continue;
                 }
-                _ => false,
-            }) {
-                uncertain.catalog = true;
+                // One naming a custom setting changes only that one.
+                let custom = matches!(f.args.first(), Some(Some(Node::AConst(c)))
+                    if matches!(c.val.as_ref(), Some(ast::AConstValue::String(name))
+                        if super::session::CustomSettings::is_custom(&name.sval)));
+                if custom {
+                    uncertain.settings = true;
+                } else {
+                    uncertain.catalog = true;
+                }
             }
         }
         Node::InsertStmt(_)
@@ -958,6 +1083,9 @@ pub(crate) fn classify_statement(stmt: &Node, uncertain: &mut Uncertain) {
         | Node::TransactionStmt(_)
         | Node::ExplainStmt(_)
         | Node::CommentStmt(_) => {}
+        Node::VariableSetStmt(s) if super::session::CustomSettings::is_custom(&s.name) => {
+            uncertain.settings = true;
+        }
         Node::VariableSetStmt(s)
             if !matches!(
                 s.name.as_str(),

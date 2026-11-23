@@ -775,6 +775,12 @@ pub fn format_type_with_typmod(
             format!("({n})")
         }
         DecodedTypmod::Numeric { precision, scale } => format!("({precision},{scale})"),
+        DecodedTypmod::Spatial {
+            geometry_type,
+            z,
+            m,
+            srid,
+        } => crate::typmod::spatial_typmod_out(geometry_type, z, m, srid),
         DecodedTypmod::Other(n) => format!("({n})"),
     };
     // The datetime types carry the modifier before their zone suffix.

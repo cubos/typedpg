@@ -19,6 +19,14 @@
 # only pass filters / extra nextest flags, never the boilerplate.
 # `PG_SANITY_PACKAGE=typedpg_lint` runs the lint crate's suite instead, with
 # the lint oracle on (`scripts/run-lint-oracle.sh` does).
+#
+# `PG_IMAGE` picks the server (the official `postgres` image of the release
+# typedpg targets by default). The third-party extensions the analyzer
+# bundles (PostGIS, pgvector, pg_cron, pgmq, pg_jsonschema) are compared only
+# on a server that has them: `scripts/build-extensions-image.sh` builds one,
+# then `PG_IMAGE=typedpg-extensions:pg19 scripts/run-pg-sanity.sh` runs on it
+# (`third_party` selects their tests). Elsewhere a test stops comparing once
+# the server reports the extension as not available.
 
 set -euo pipefail
 

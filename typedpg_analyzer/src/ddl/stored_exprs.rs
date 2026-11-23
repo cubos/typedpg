@@ -1730,10 +1730,7 @@ mod tests {
         )
         .unwrap();
         let path = |db: &mut PgCatalog, names: &[&str]| {
-            db.search_path = names
-                .iter()
-                .map(|n| db.namespace_oid(n).unwrap())
-                .collect();
+            db.search_path = names.iter().map(|n| db.namespace_oid(n).unwrap()).collect();
         };
         path(&mut db, &["s", "public"]);
         assert_eq!(deparsed_call(&db), ["g"]);

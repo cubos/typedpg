@@ -814,7 +814,17 @@ Non-JSONB domains (e.g. `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)`) a
 
 ## PostgreSQL extensions
 
-`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, `vector` (pgvector), and the rest of the contrib bundle all work without extra setup.
+`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, and the rest of the contrib bundle all work without extra setup, and so do these third-party extensions, each at the version below and the update chain shown:
+
+| Extension | Version |
+|-----------|---------|
+| `vector` (pgvector) | 0.8.7 (from 0.8.2) |
+| `postgis`, `postgis_raster`, `postgis_topology`, `postgis_sfcgal` | 3.7.0 |
+| `pg_cron` | 1.6 (from 1.0) |
+| `pgmq` | 1.13.2 |
+| `pg_jsonschema` | 0.3.4 |
+
+An extension costs nothing until a migration installs it: PostGIS's 7.5 MB script is only parsed by a `CREATE EXTENSION postgis`.
 
 For pgvector specifically, the macro auto-routes `vector` / `halfvec` / `sparsevec` columns to the [`pgvector`](https://docs.rs/pgvector) crate:
 
@@ -860,6 +870,8 @@ For extension types without a built-in mapping (e.g. `citext`, `hstore`), point 
 "public.citext" = "String"
 "public.hstore" = "::std::collections::HashMap<String, Option<String>>"
 ```
+
+PostGIS's `geometry` and `geography` have no built-in mapping either: map them to a type implementing `tokio-postgres`'s `FromSql` / `ToSql` for them (the `geozero` and `postgis` crates have some), or convert in the query — `ST_AsText(geom)`, `ST_AsGeoJSON(geom)` or `geom::text` (hex EWKB) read as `String`. Their modifiers are checked as PostGIS checks them (`geometry(Point, 4326)`, `geography(Polygon)`), and functions such as `ST_DWithin(geog, ST_MakePoint($lon, $lat)::geography, $meters)` infer their parameters (`f64` here).
 
 ## Transactions
 

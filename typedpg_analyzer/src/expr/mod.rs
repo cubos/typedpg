@@ -994,6 +994,7 @@ pub(crate) fn derive_collation<'a>(
     // `InvalidOid` (an implicit one without a collation).
     let mut implicit: Option<Collation> = None;
     let mut conflict: Option<(Collation, Collation)> = None;
+    let mut saw_default = false;
     for t in inputs {
         match t.no_collation {
             Some(NoCollation::Conflict(a, b)) => {
@@ -1011,9 +1012,16 @@ pub(crate) fn derive_collation<'a>(
             }
             Some(NoCollation::Unset) | None => {}
         }
-        let Some(c) = t.collation else {
+        // `None` is the input's type's default: `name`'s is "C".
+        let Some(c) = t.collation.or_else(|| {
+            t.no_collation
+                .is_none()
+                .then(|| snapshot.get_type(t.type_oid).and_then(|ty| ty.typcollation))
+                .flatten()
+        }) else {
             continue;
         };
+        saw_default |= c == DEFAULT_COLLATION;
         if t.explicit_collation {
             match explicit {
                 Some(e) if e != c => {
@@ -1038,11 +1046,14 @@ pub(crate) fn derive_collation<'a>(
             }
         }
     }
-    let collatable = snapshot
-        .get_type(result_type)
-        .is_some_and(|t| t.typcollation.is_some());
-    if !collatable {
+    let type_default = snapshot.get_type(result_type).and_then(|t| t.typcollation);
+    if type_default.is_none() {
         return Ok(DerivedCollation::default());
+    }
+    // Only the default collation came in: the result has it, also when its
+    // type's default is another one (`text_expr::name`).
+    if implicit.is_none() && saw_default && type_default != Some(DEFAULT_COLLATION) {
+        implicit = Some(Some(DEFAULT_COLLATION));
     }
     Ok(match (explicit, conflict) {
         (Some(e), _) => DerivedCollation {

@@ -52,6 +52,8 @@ mod rename;
 mod schemas;
 #[path = "ddl/temporal.rs"]
 mod temporal;
+#[path = "ddl/third_party_extensions.rs"]
+mod third_party_extensions;
 #[path = "ddl/types.rs"]
 mod types;
 #[path = "ddl/uncertain.rs"]

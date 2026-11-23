@@ -1303,6 +1303,43 @@ fn view_columns_keep_their_expression_collation() {
 }
 
 #[test]
+fn casts_keep_their_operand_collation() {
+    // PG 19 (assign_collations_walker): a cast's result takes its operand's
+    // collation — `name`'s "C" through a cast to varchar, the default
+    // collation of a text expression through a cast to name — and only an
+    // operand without one takes the result type's (PostGIS's
+    // geometry_columns and raster_overviews views).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE VIEW v AS SELECT current_database()::varchar(256) AS a,
+                                 split_part('x.y', '.', 1)::name AS b,
+                                 relname::text AS c,
+                                 'x'::name AS d,
+                                 1::text::name AS e
+                          FROM pg_class;",
+    )]);
+    let info = db.analyze("SELECT a, b, c, d, e FROM v").unwrap();
+    let colls: Vec<Option<String>> = info
+        .columns
+        .iter()
+        .map(|c| match &c.pg_type {
+            Type::Basic { collation, .. } => collation.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        colls,
+        [
+            Some("C".to_owned()),
+            None,
+            Some("C".to_owned()),
+            Some("C".to_owned()),
+            None
+        ]
+    );
+}
+
+#[test]
 fn create_table_as_needs_a_derived_collation() {
     // PG 18 (42P22): a UNION ALL column whose arms carry different implicit
     // collations has none, which a table or view column can't store. A
