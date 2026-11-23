@@ -3,10 +3,8 @@
 use typedpg_pg_query::ast::{self, Node, RangeVar, TypeName};
 
 use crate::ddl::DdlError;
-use crate::oid::{PgCastOid, PgNamespaceOid, PgTypeOid};
-use crate::pg_catalog::{
-    CastContext, CastMethod, PgCast, PgCatalog, PgNamespace, oid as builtin_oid,
-};
+use crate::oid::{PgNamespaceOid, PgTypeOid};
+use crate::pg_catalog::{PgCatalog, PgNamespace};
 use crate::qualified_name::QualifiedName;
 
 /// Schema an unqualified new object is created in: PG's creation namespace,
@@ -860,24 +858,4 @@ pub(crate) fn is_system_column(name: &str) -> bool {
     crate::pg_catalog::SYSTEM_COLUMNS
         .iter()
         .any(|(n, ..)| *n == name)
-}
-
-/// Register the implicit `composite_oid → record` cast PG creates for every
-/// composite type. Used by the operator resolver so that `composite =
-/// composite` reaches the polymorphic `record = record` (record_eq) operator
-/// via cast lookup.
-pub fn register_composite_to_record_cast(
-    interp: &mut PgCatalog,
-    composite_oid: PgTypeOid,
-) -> Result<(), DdlError> {
-    let cast_oid = PgCastOid::from_nonzero(interp.alloc_oid()?);
-    interp.insert_pg_cast(PgCast {
-        oid: cast_oid,
-        castsource: composite_oid,
-        casttarget: builtin_oid::RECORD,
-        castcontext: CastContext::Implicit,
-        castmethod: CastMethod::Binary,
-        castfunc: None,
-    });
-    Ok(())
 }

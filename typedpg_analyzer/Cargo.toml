@@ -16,7 +16,10 @@ internal = []
 # server. Each `PgCatalog` creates its own scratch database inside the
 # shared cluster pointed to by `POSTGRES_URL` and tears it down on Drop.
 # Spin up the cluster + run tests via `scripts/run-pg-sanity.sh`.
-pg_sanity = ["dep:postgres", "dep:bytes"]
+pg_sanity = ["catalog_export", "dep:bytes"]
+# Read a live server's system catalogs into the catalog rows (`typedpg_seed`,
+# the `pg_sanity` catalog oracle).
+catalog_export = ["dep:postgres"]
 # Record every query `analyze` accepts, with the migrations its catalog
 # applied before it, to `$TYPEDPG_RECORD_CORPUS/` (JSON lines): the lint
 # oracle replays the analyzer's test suite as its corpus

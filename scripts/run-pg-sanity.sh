@@ -115,6 +115,11 @@ else
     export POSTGRES_URL="host=127.0.0.1 port=$PG_PORT user=$PG_USER password=$PG_PASS dbname=$PG_DB"
 fi
 echo "pg_sanity: POSTGRES_URL=$POSTGRES_URL"
+# The catalog oracle (typedpg_analyzer/src/pg_sanity/catalog_state.rs):
+# after every migration, the system catalogs must agree too. On unless the
+# caller set it (PG_SANITY_CATALOG=0 turns it off;
+# PG_SANITY_CATALOG_LOG=<file> logs instead of panicking).
+export PG_SANITY_CATALOG="${PG_SANITY_CATALOG:-1}"
 echo "pg_sanity: running tests..."
 
 # The nullability soundness oracle (typedpg_analyzer/src/pg_sanity/

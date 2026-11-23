@@ -327,11 +327,12 @@ fn key_must_be_validated_enforced_and_immediate() {
 }
 
 #[test]
-fn key_validated_without_checking_the_rows_is_not_trusted() {
-    // PG 18 rewrites an enforced NOT VALID key's row as validated, without
-    // checking the rows, when ENFORCED comes with a deferrability change;
-    // NOT DEFERRABLE again, it looks enforced, valid and immediate while
-    // orphans may remain.
+fn enforced_with_a_deferrability_change_leaves_a_not_valid_key_not_valid() {
+    // On PostgreSQL 19, ALTER CONSTRAINT naming the enforceability an
+    // enforced NOT VALID key already has changes nothing — neither its
+    // validity nor the deferrability named with it: the key stays NOT
+    // VALID (PG 18 rewrote its row as validated, without checking the
+    // rows).
     let tables = "CREATE TABLE cust (id bigint PRIMARY KEY, name text);
          CREATE TABLE ord (id bigint PRIMARY KEY, cid bigint NOT NULL);";
     let sql = "SELECT o.id FROM ord o JOIN cust c ON c.id = o.cid";
@@ -341,17 +342,23 @@ fn key_validated_without_checking_the_rows_is_not_trusted() {
         "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID;
          ALTER TABLE ord ALTER CONSTRAINT f ENFORCED DEFERRABLE;
          ALTER TABLE ord ALTER CONSTRAINT f NOT DEFERRABLE;",
-        // VALIDATE CONSTRAINT skips a key already marked valid.
-        "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID;
-         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED DEFERRABLE;
-         ALTER TABLE ord ALTER CONSTRAINT f NOT DEFERRABLE;
-         ALTER TABLE ord VALIDATE CONSTRAINT f;",
     ] {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(tables).unwrap();
         db.apply_sql(steps).unwrap();
         assert_kept(&db, &[sql]);
     }
+    // VALIDATE CONSTRAINT then checks the rows.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(tables).unwrap();
+    db.apply_sql(
+        "ALTER TABLE ord ADD CONSTRAINT f FOREIGN KEY (cid) REFERENCES cust NOT VALID;
+         ALTER TABLE ord ALTER CONSTRAINT f ENFORCED DEFERRABLE;
+         ALTER TABLE ord ALTER CONSTRAINT f NOT DEFERRABLE;
+         ALTER TABLE ord VALIDATE CONSTRAINT f;",
+    )
+    .unwrap();
+    assert_simplified(&db, &[(sql, "SELECT o.id FROM ord o")]);
     // A partitioned child: its partitions' clones too.
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql(

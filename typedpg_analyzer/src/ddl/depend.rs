@@ -2551,6 +2551,7 @@ pub(crate) fn delete_auto_extension_dependent(
                 if let Some(oid) = dropped {
                     interp.remove_dependencies_of(PG_TRIGGER_RELID, oid);
                 }
+                super::triggers::prune_trigger_constraints(interp, relid);
             }
         }
         interp.event_triggers.retain(|(_, f)| *f != proc);

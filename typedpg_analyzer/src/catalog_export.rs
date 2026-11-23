@@ -1,0 +1,1246 @@
+//! Reading a live PostgreSQL's system catalogs into the analyzer's catalog
+//! rows ([`PgCatalogSeed`]).
+//!
+//! `typedpg_seed` exports the whole catalog of a stock server into
+//! `seed.json` with [`export_catalog`]; the `pg_sanity` catalog oracle
+//! exports only the objects a run created ([`export_user_objects`]) and
+//! compares them with the analyzer's own (`pg_sanity::catalog_state`).
+//!
+//! Every query takes a `min_oid` bound: `0` exports everything, the first
+//! normal OID (16384) only what initdb did not create.
+
+use crate::oid::{
+    PgCastOid, PgClassOid, PgCollationOid, PgConstraintOid, PgEnumOid, PgExtensionOid,
+    PgGenericOid, PgLanguageOid, PgNamespaceOid, PgOpclassOid, PgOperatorOid, PgProcOid, PgTypeOid,
+};
+use crate::pg_catalog::{
+    AclCatalog, AggKind, ArgMode, AttGenerated, AttIdentity, CastContext, CastMethod, ConType,
+    DepType, PgAggregate, PgAm, PgAmop, PgAttribute, PgCast, PgCatalog, PgCatalogSeed, PgClass,
+    PgCollation, PgConstraint, PgConversion, PgDepend, PgEnum, PgExtension, PgIndex, PgInherits,
+    PgLanguage, PgNamespace, PgOpclass, PgOperator, PgOpfamily, PgProc, PgRange, PgSetting,
+    PgTsConfigMap, PgTsObject, PgType, ProKind, ProVolatile, RelKind, SeedAcl, SerializedAst,
+    TypAlign, TypCategory, TypStorage, TypType,
+};
+
+/// `FirstNormalObjectId`: the first OID handed to an object initdb did not
+/// create.
+pub const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
+
+/// Export the whole catalog of the server `client` is connected to.
+/// `pg_index` expressions are serialized against the exported catalog
+/// itself; `pg_rewrite` is left empty (`typedpg_seed` replays the views).
+pub fn export_catalog(client: &mut postgres::Client) -> Result<PgCatalogSeed, postgres::Error> {
+    let mut seed = export_tables(client, 0)?;
+    let scratch = PgCatalog::from_seed(seed.clone());
+    seed.pg_index = export_indexes(client, 0, Some(&scratch))?;
+    Ok(seed)
+}
+
+/// Export only the rows of the objects initdb did not create (OID >=
+/// [`FIRST_NORMAL_OBJECT_ID`]; a `pg_depend` row when either end is one).
+/// `pg_index` expressions and predicates are empty placeholders;
+/// `pg_settings`, `search_path` and `pg_rewrite` are left empty.
+pub fn export_user_objects(
+    client: &mut postgres::Client,
+) -> Result<PgCatalogSeed, postgres::Error> {
+    let mut seed = export_tables(client, FIRST_NORMAL_OBJECT_ID)?;
+    seed.search_path = String::new();
+    seed.pg_index = export_indexes(client, FIRST_NORMAL_OBJECT_ID, None)?;
+    Ok(seed)
+}
+
+/// Every table but `pg_index` (whose expressions need a catalog to resolve
+/// against) and `pg_rewrite`, restricted to rows at or above `min`.
+fn export_tables(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<PgCatalogSeed, postgres::Error> {
+    let pg_namespace = export_namespaces(client, min)?;
+    let pg_type = export_types(client, min)?;
+    let pg_enum = export_enums(client, min)?;
+    let pg_range = export_ranges(client, min)?;
+    let pg_class = export_classes(client, min)?;
+    let pg_attribute = export_attributes(client, min)?;
+    let pg_proc = export_procs(client, min)?;
+    let pg_aggregate = export_aggregates(client, min)?;
+    let pg_operator = export_operators(client, min)?;
+    let pg_cast = export_casts(client, min)?;
+    let pg_extension = export_extensions(client, min)?;
+    let pg_language = export_languages(client, min)?;
+    let pg_depend = export_depends(client, min)?;
+    let pg_inherits = export_inherits(client, min)?;
+    let pg_constraint = export_constraints(client, min)?;
+    let pg_collation = export_collations(client, min)?;
+    let search_path = export_search_path(client)?;
+    let sql_function_defs = export_sql_function_defs(client, min)?;
+    let (pg_am, pg_opfamily, pg_opclass, pg_amop) = export_access_methods(client, min)?;
+    let pg_settings = export_settings(client, min)?;
+    let pg_ts_objects = export_ts_objects(client, min)?;
+    let pg_ts_config_map = export_ts_config_map(client, min)?;
+    let pg_conversion = export_conversions(client, min)?;
+    let pg_acl = export_acls(client, min)?;
+
+    Ok(PgCatalogSeed {
+        pg_namespace,
+        pg_type,
+        pg_enum,
+        pg_range,
+        pg_class,
+        pg_attribute,
+        pg_proc,
+        pg_aggregate,
+        pg_operator,
+        pg_cast,
+        pg_extension,
+        pg_depend,
+        pg_inherits,
+        pg_constraint,
+        pg_index: Vec::new(),
+        // pg_rewrite (view bodies) is populated downstream by
+        // populate_view_defs, which re-runs each CREATE VIEW through the
+        // analyzer DDL pipeline against this seed.
+        pg_rewrite: Vec::new(),
+        pg_collation,
+        search_path,
+        sql_function_defs,
+        pg_am,
+        pg_opfamily,
+        pg_opclass,
+        pg_amop,
+        pg_settings,
+        pg_ts_objects,
+        pg_ts_config_map,
+        pg_conversion,
+        pg_language,
+        pg_acl,
+    })
+}
+
+fn export_search_path(client: &mut postgres::Client) -> Result<String, postgres::Error> {
+    Ok(client.query_one("SHOW search_path", &[])?.get(0))
+}
+
+fn export_namespaces(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgNamespace>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, nspname FROM pg_catalog.pg_namespace WHERE oid >= $1 ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            PgNamespace {
+                oid: PgNamespaceOid::new(oid).expect("namespace oid is non-zero"),
+                nspname: r.get(1),
+            }
+        })
+        .collect())
+}
+
+fn export_types(client: &mut postgres::Client, min: u32) -> Result<Vec<PgType>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
+                typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod, typcollation, \
+                typstorage, typlen, typbyval, typalign, typsubscript::oid, typisdefined \
+         FROM pg_catalog.pg_type WHERE oid >= $1 ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let typtype: i8 = r.get(3);
+            let typcategory: i8 = r.get(4);
+            let oid: u32 = r.get(0);
+            let typnamespace: u32 = r.get(2);
+            let typrelid: u32 = r.get(6);
+            let typelem: u32 = r.get(7);
+            let typarray: u32 = r.get(8);
+            let typbasetype: u32 = r.get(9);
+            let typtypmod_raw: i32 = r.get(11);
+            let typcollation: u32 = r.get(12);
+            PgType {
+                oid: PgTypeOid::new(oid).expect("pg_type.oid is non-zero"),
+                typname: r.get(1),
+                typnamespace: PgNamespaceOid::new(typnamespace).expect("typnamespace is non-zero"),
+                typtype: char_to_typtype(typtype as u8 as char),
+                typcategory: char_to_typcategory(typcategory as u8 as char),
+                typispreferred: r.get(5),
+                typrelid: PgClassOid::new(typrelid),
+                typelem: PgTypeOid::new(typelem),
+                typarray: PgTypeOid::new(typarray),
+                typbasetype: PgTypeOid::new(typbasetype),
+                typnotnull: r.get(10),
+                typtypmod: (typtypmod_raw >= 0).then_some(typtypmod_raw),
+                typcollation: PgCollationOid::new(typcollation),
+                typstorage: match r.get::<_, i8>(13) as u8 {
+                    b'e' => TypStorage::External,
+                    b'm' => TypStorage::Main,
+                    b'x' => TypStorage::Extended,
+                    _ => TypStorage::Plain,
+                },
+                typlen: r.get(14),
+                typbyval: r.get(15),
+                typalign: match r.get::<_, i8>(16) as u8 {
+                    b'c' => TypAlign::Char,
+                    b's' => TypAlign::Short,
+                    b'd' => TypAlign::Double,
+                    _ => TypAlign::Int,
+                },
+                typsubscript: PgProcOid::new(r.get(17)),
+                typisdefined: r.get(18),
+            }
+        })
+        .collect())
+}
+
+fn export_enums(client: &mut postgres::Client, min: u32) -> Result<Vec<PgEnum>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, enumtypid, enumsortorder, enumlabel \
+         FROM pg_catalog.pg_enum WHERE enumtypid >= $1 ORDER BY enumtypid, enumsortorder",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let enumtypid: u32 = r.get(1);
+            PgEnum {
+                oid: PgEnumOid::new(oid).expect("pg_enum.oid is non-zero"),
+                enumtypid: PgTypeOid::new(enumtypid).expect("enumtypid is non-zero"),
+                enumsortorder: r.get(2),
+                enumlabel: r.get(3),
+            }
+        })
+        .collect())
+}
+
+fn export_ranges(client: &mut postgres::Client, min: u32) -> Result<Vec<PgRange>, postgres::Error> {
+    let rows = client.query(
+        "SELECT rngtypid, rngsubtype, rngmultitypid, rngcollation, rngsubopc \
+         FROM pg_catalog.pg_range WHERE rngtypid >= $1 ORDER BY rngtypid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let rngtypid: u32 = r.get(0);
+            let rngsubtype: u32 = r.get(1);
+            let rngmultitypid: u32 = r.get(2);
+            let rngcollation: u32 = r.get(3);
+            let rngsubopc: u32 = r.get(4);
+            PgRange {
+                rngtypid: PgTypeOid::new(rngtypid).expect("rngtypid is non-zero"),
+                rngsubtype: PgTypeOid::new(rngsubtype).expect("rngsubtype is non-zero"),
+                rngmultitypid: PgTypeOid::new(rngmultitypid),
+                rngcollation: PgCollationOid::new(rngcollation),
+                rngsubopc: PgOpclassOid::new(rngsubopc),
+            }
+        })
+        .collect())
+}
+
+fn export_classes(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgClass>, postgres::Error> {
+    // No relkind filter — `RelKind` covers every variant PG emits, so the
+    // mirror is 1:1. Rows we don't recognize are silently dropped by
+    // `char_to_relkind`, but in practice that never fires.
+    let rows = client.query(
+        "SELECT oid, relname, relnamespace, relkind, reltype \
+         FROM pg_catalog.pg_class \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let relkind: i8 = r.get(3);
+            let relkind = char_to_relkind(relkind as u8 as char)?;
+            let oid: u32 = r.get(0);
+            let relnamespace: u32 = r.get(2);
+            let reltype: u32 = r.get(4);
+            Some(PgClass {
+                oid: PgClassOid::new(oid).expect("pg_class.oid is non-zero"),
+                relname: r.get(1),
+                relnamespace: PgNamespaceOid::new(relnamespace).expect("relnamespace is non-zero"),
+                relkind,
+                reltype: PgTypeOid::new(reltype),
+            })
+        })
+        .collect())
+}
+
+fn export_attributes(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgAttribute>, postgres::Error> {
+    // `attnum > 0` filters PG's system columns (`ctid`, `xmin`, …) which the
+    // analyzer never inspects. `NOT attisdropped` skips columns that
+    // ALTER TABLE DROP COLUMN tombstoned — PG keeps the row so attnum gaps
+    // stay stable. No relkind filter: we mirror every relation's columns.
+    let rows = client.query(
+        "SELECT a.attrelid, a.attname, a.atttypid, a.attnum, a.attnotnull, a.atthasdef, \
+                a.attgenerated, a.atttypmod, a.attidentity, a.attcollation, \
+                a.attislocal, a.attinhcount::int2 \
+         FROM pg_catalog.pg_attribute a \
+         WHERE a.attnum > 0 \
+           AND NOT a.attisdropped \
+           AND a.attrelid >= $1 \
+         ORDER BY a.attrelid, a.attnum",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let attgenerated: i8 = r.get(6);
+            let attidentity: i8 = r.get(8);
+            let attrelid: u32 = r.get(0);
+            let atttypid: u32 = r.get(2);
+            let atttypmod_raw: i32 = r.get(7);
+            let attcollation: u32 = r.get(9);
+            PgAttribute {
+                attrelid: PgClassOid::new(attrelid).expect("attrelid is non-zero"),
+                attname: r.get(1),
+                atttypid: PgTypeOid::new(atttypid).expect("atttypid is non-zero"),
+                attnum: r.get(3),
+                attnotnull: r.get(4),
+                atthasdef: r.get(5),
+                attgenerated: char_to_attgenerated(attgenerated as u8 as char),
+                atttypmod: (atttypmod_raw >= 0).then_some(atttypmod_raw),
+                attidentity: char_to_attidentity(attidentity as u8 as char),
+                attcollation: PgCollationOid::new(attcollation),
+                attislocal: r.get(10),
+                attinhcount: r.get(11),
+            }
+        })
+        .collect())
+}
+
+fn export_procs(client: &mut postgres::Client, min: u32) -> Result<Vec<PgProc>, postgres::Error> {
+    let rows = client.query(
+        "SELECT p.oid, p.proname, p.pronamespace, p.prokind, \
+                p.proargtypes::int4[]::int4[], p.prorettype, \
+                p.proretset, p.provariadic, p.proisstrict, p.pronargdefaults, \
+                p.proallargtypes::int4[], p.proargmodes, p.proargnames, \
+                p.provolatile, p.prolang, \
+                p.prosupport::oid, \
+                (SELECT coalesce(array_agg(t.typtype = 'p' AND t.typname LIKE 'any%' \
+                                           ORDER BY u.ord), '{}') \
+                   FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY u(o, ord) \
+                   JOIN pg_catalog.pg_type t ON t.oid = u.o) \
+         FROM pg_catalog.pg_proc p \
+         WHERE p.oid >= $1 \
+         ORDER BY p.oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let prokind: i8 = r.get(3);
+            let arg_types_raw: Vec<i32> = r.get(4);
+            let proargtypes: Vec<PgTypeOid> = arg_types_raw
+                .iter()
+                .filter_map(|&x| PgTypeOid::new(x as u32))
+                .collect();
+            let proallargtypes_raw: Option<Vec<i32>> = r.get(10);
+            let proallargtypes: Vec<PgTypeOid> = proallargtypes_raw
+                .map(|v| {
+                    v.into_iter()
+                        .filter_map(|x| PgTypeOid::new(x as u32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let arg_modes: Option<Vec<i8>> = r.get(11);
+            let proargmodes: Vec<ArgMode> = arg_modes
+                .map(|v| {
+                    v.into_iter()
+                        .map(|c| char_to_argmode(c as u8 as char))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let arg_names: Option<Vec<String>> = r.get(12);
+            let provolatile: i8 = r.get(13);
+            let oid: u32 = r.get(0);
+            let pronamespace: u32 = r.get(2);
+            let prorettype: u32 = r.get(5);
+            let provariadic: u32 = r.get(7);
+            let pronargdefaults: i16 = r.get(9);
+            let prolang: u32 = r.get(14);
+            let prosupport: u32 = r.get(15);
+            let polymorphic_args: Vec<bool> = r.get(16);
+            // The builtin defaults' types: a default of a non-polymorphic
+            // parameter was coerced to the parameter's type when the
+            // function was created, so its type is the declared one. A
+            // polymorphic parameter's default keeps its own type, which the
+            // catalog doesn't expose — refuse to guess for the seed (the
+            // catalog oracle, exporting user objects, doesn't compare it).
+            let first_default = proargtypes.len().saturating_sub(pronargdefaults as usize);
+            if min == 0 && polymorphic_args.iter().skip(first_default).any(|&p| p) {
+                panic!(
+                    "pg_proc {oid} ({}) has a default on a polymorphic parameter; \
+                     typedpg_seed can't export its type",
+                    r.get::<_, String>(1)
+                );
+            }
+            let proargdefaulttypes = proargtypes[first_default..].to_vec();
+            PgProc {
+                oid: PgProcOid::new(oid).expect("pg_proc.oid is non-zero"),
+                proname: r.get(1),
+                pronamespace: PgNamespaceOid::new(pronamespace).expect("pronamespace is non-zero"),
+                prokind: char_to_prokind(prokind as u8 as char),
+                proargtypes,
+                prorettype: PgTypeOid::new(prorettype).expect("prorettype is non-zero"),
+                proretset: r.get(6),
+                provariadic: PgTypeOid::new(provariadic),
+                proisstrict: r.get(8),
+                pronargdefaults,
+                proallargtypes,
+                proargmodes,
+                proargnames: arg_names.unwrap_or_default(),
+                provolatile: char_to_provolatile(provolatile as u8 as char),
+                proargdefaulttypes,
+                prolang: PgLanguageOid::new(prolang).expect("prolang is non-zero"),
+                prosupport: PgProcOid::new(prosupport),
+            }
+        })
+        .collect())
+}
+
+fn char_to_provolatile(c: char) -> ProVolatile {
+    match c {
+        'i' => ProVolatile::Immutable,
+        's' => ProVolatile::Stable,
+        _ => ProVolatile::Volatile,
+    }
+}
+
+fn export_aggregates(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgAggregate>, postgres::Error> {
+    // aggfnoid identifies the aggregate (FK pg_proc.oid). aggfinalfn (also
+    // FK pg_proc.oid, or 0 for none) drives the effective return type
+    // resolution: callers walk to that proc's prorettype, otherwise fall
+    // back to aggfnoid.prorettype. Don't pre-compute the type — PG doesn't
+    // and we shouldn't desync from it.
+    let rows = client.query(
+        "SELECT aggfnoid::int4 AS aggfnoid, \
+                aggfinalfn::int4 AS aggfinalfn, \
+                aggkind::text AS aggkind, \
+                aggnumdirectargs \
+         FROM pg_catalog.pg_aggregate \
+         WHERE aggfnoid >= $1 \
+         ORDER BY aggfnoid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let aggfnoid: i32 = r.get(0);
+            let aggfinalfn: i32 = r.get(1);
+            let aggkind: String = r.get(2);
+            PgAggregate {
+                aggfnoid: PgProcOid::new(aggfnoid as u32).expect("aggfnoid is non-zero"),
+                aggfinalfn: PgProcOid::new(aggfinalfn as u32),
+                aggkind: match aggkind.as_str() {
+                    "o" => AggKind::OrderedSet,
+                    "h" => AggKind::Hypothetical,
+                    _ => AggKind::Normal,
+                },
+                aggnumdirectargs: r.get(3),
+            }
+        })
+        .collect())
+}
+
+fn export_operators(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgOperator>, postgres::Error> {
+    // No filter — shell operators (oprresult = 0) round-trip too. Operator
+    // resolution skips them at lookup time.
+    let rows = client.query(
+        "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid, oprcom, \
+                oprnegate \
+         FROM pg_catalog.pg_operator \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let oprnamespace: u32 = r.get(2);
+            let oprleft: u32 = r.get(3);
+            let oprright: u32 = r.get(4);
+            let oprresult: u32 = r.get(5);
+            let oprcode: u32 = r.get(6);
+            let oprcom: u32 = r.get(7);
+            let oprnegate: u32 = r.get(8);
+            PgOperator {
+                oid: PgOperatorOid::new(oid).expect("pg_operator.oid is non-zero"),
+                oprname: r.get(1),
+                oprnamespace: PgNamespaceOid::new(oprnamespace).expect("oprnamespace is non-zero"),
+                oprleft: PgTypeOid::new(oprleft),
+                oprright: PgTypeOid::new(oprright).expect("oprright is non-zero"),
+                oprresult: PgTypeOid::new(oprresult),
+                oprcode: PgProcOid::new(oprcode),
+                oprcom: PgOperatorOid::new(oprcom),
+                oprnegate: PgOperatorOid::new(oprnegate),
+            }
+        })
+        .collect())
+}
+
+fn export_casts(client: &mut postgres::Client, min: u32) -> Result<Vec<PgCast>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, castsource, casttarget, castcontext, castmethod, castfunc \
+         FROM pg_catalog.pg_cast \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let ctx: i8 = r.get(3);
+            let method: i8 = r.get(4);
+            let oid: u32 = r.get(0);
+            let castsource: u32 = r.get(1);
+            let casttarget: u32 = r.get(2);
+            let castfunc: u32 = r.get(5);
+            PgCast {
+                oid: PgCastOid::new(oid).expect("pg_cast.oid is non-zero"),
+                castsource: PgTypeOid::new(castsource).expect("castsource is non-zero"),
+                casttarget: PgTypeOid::new(casttarget).expect("casttarget is non-zero"),
+                castcontext: char_to_castcontext(ctx as u8 as char),
+                castmethod: char_to_castmethod(method as u8 as char),
+                castfunc: PgProcOid::new(castfunc),
+            }
+        })
+        .collect())
+}
+
+fn export_languages(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgLanguage>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, lanname, lanispl, lanpltrusted, lanplcallfoid \
+         FROM pg_catalog.pg_language \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let handler: u32 = r.get(4);
+            PgLanguage {
+                oid: PgLanguageOid::new(oid).expect("pg_language.oid is non-zero"),
+                lanname: r.get(1),
+                lanispl: r.get(2),
+                lanpltrusted: r.get(3),
+                lanplcallfoid: PgProcOid::new(handler),
+            }
+        })
+        .collect())
+}
+
+fn export_extensions(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgExtension>, postgres::Error> {
+    let rows = client.query(
+        "SELECT oid, extname, extnamespace, extversion \
+         FROM pg_catalog.pg_extension \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let oid: u32 = r.get(0);
+            let extnamespace: u32 = r.get(2);
+            PgExtension {
+                oid: PgExtensionOid::new(oid).expect("pg_extension.oid is non-zero"),
+                extname: r.get(1),
+                extnamespace: PgNamespaceOid::new(extnamespace).expect("extnamespace is non-zero"),
+                extversion: r.get(3),
+            }
+        })
+        .collect())
+}
+
+fn export_constraints(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgConstraint>, postgres::Error> {
+    // No contype filter — `ConType::Other` is a catch-all so unknown chars
+    // round-trip without panicking.
+    let rows = client.query(
+        "SELECT oid, conname, conrelid, contype, conkey, confrelid, confkey, \
+                conislocal, coninhcount::int2, conenforced, convalidated, \
+                connoinherit, conperiod \
+         FROM pg_catalog.pg_constraint \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oid: u32 = r.get(0);
+            let conname: String = r.get(1);
+            let conrelid: u32 = r.get(2);
+            let contype: i8 = r.get(3);
+            let conkey: Option<Vec<i16>> = r.get(4);
+            let confrelid: u32 = r.get(5);
+            let confkey: Option<Vec<i16>> = r.get(6);
+            Some(PgConstraint {
+                oid: PgConstraintOid::new(oid)?,
+                conname,
+                conrelid: PgClassOid::new(conrelid)?,
+                contype: char_to_contype(contype as u8 as char),
+                conkey: conkey.unwrap_or_default(),
+                confrelid: PgClassOid::new(confrelid),
+                confkey: confkey.unwrap_or_default(),
+                conislocal: r.get(7),
+                coninhcount: r.get(8),
+                conenforced: r.get(9),
+                convalidated: r.get(10),
+                connoinherit: r.get(11),
+                conperiod: r.get(12),
+            })
+        })
+        .collect())
+}
+
+fn char_to_contype(c: char) -> ConType {
+    match c {
+        'p' => ConType::PrimaryKey,
+        'u' => ConType::Unique,
+        'f' => ConType::ForeignKey,
+        'c' => ConType::Check,
+        'x' => ConType::Exclusion,
+        'n' => ConType::NotNull,
+        't' => ConType::Trigger,
+        _ => ConType::Other,
+    }
+}
+
+/// Export every `pg_index` row whose `indrelid` is a relation we already
+/// snapshotted. For each row we also need to recover `indexprs` and
+/// `indpred` as analyzer ASTs — PG stores them as `pg_node_tree` (its own
+/// serialization, not the AST shape we use), so we reach back through
+/// `pg_get_indexdef(idx, slot, false)` and `pg_get_expr(indpred, indrelid)`
+/// to get the SQL text and feed it to the analyzer's `serialize_expression`
+/// / `serialize_predicate`. Indexes whose expressions don't round-trip
+/// (rare; usually catalog-internal collation/typename quirks) are skipped
+/// with a warning.
+///
+/// Without `snapshot`, nothing is serialized: each expression slot and the
+/// predicate are left as empty placeholders (their presence is kept).
+fn export_indexes(
+    client: &mut postgres::Client,
+    min: u32,
+    snapshot: Option<&PgCatalog>,
+) -> Result<Vec<PgIndex>, postgres::Error> {
+    let rows = client.query(
+        "SELECT i.indexrelid, i.indrelid, i.indnatts, i.indnkeyatts, \
+                i.indisunique, i.indisprimary, i.indisexclusion, \
+                i.indkey::int2[]::int4[] AS indkey, \
+                i.indcollation::oid[] AS indcollation, i.indclass::oid[] AS indclass, \
+                i.indexprs IS NOT NULL AS has_exprs, \
+                CASE WHEN i.indpred IS NOT NULL \
+                     THEN pg_get_expr(i.indpred, i.indrelid) \
+                     ELSE NULL END AS pred_sql \
+         FROM pg_catalog.pg_index i \
+         WHERE i.indexrelid >= $1 \
+         ORDER BY i.indexrelid",
+        &[&min],
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut skipped: Vec<u32> = Vec::new();
+    for r in rows.iter() {
+        let indexrelid: u32 = r.get(0);
+        let indrelid: u32 = r.get(1);
+        let indnatts: i16 = r.get(2);
+        let indnkeyatts: i16 = r.get(3);
+        let indisunique: bool = r.get(4);
+        let indisprimary: bool = r.get(5);
+        let indisexclusion: bool = r.get(6);
+        let indkey_raw: Vec<i32> = r.get(7);
+        let indcollation: Vec<u32> = r.get(8);
+        let indclass: Vec<u32> = r.get(9);
+        let has_exprs: bool = r.get(10);
+        let pred_sql: Option<String> = r.get(11);
+        let indkey: Vec<i16> = indkey_raw.into_iter().map(|n| n as i16).collect();
+
+        // Pull each expression slot's SQL via pg_get_indexdef(idx, slot, false).
+        // PG numbers slots from 1 up; slots whose indkey is 0 are expressions.
+        let mut indexprs = Vec::new();
+        let mut skip_row = false;
+        let placeholder = || SerializedAst {
+            ast: None,
+            bindings: Vec::new(),
+        };
+        if has_exprs && snapshot.is_none() {
+            indexprs.extend(indkey.iter().filter(|&&a| a == 0).map(|_| placeholder()));
+        } else if let Some(snapshot) = snapshot.filter(|_| has_exprs) {
+            for (slot_idx, &attnum) in indkey.iter().enumerate() {
+                if attnum != 0 {
+                    continue;
+                }
+                let slot_no = (slot_idx + 1) as i32;
+                let expr_sql: String = client
+                    .query_one(
+                        "SELECT pg_get_indexdef($1::oid, $2, false)",
+                        &[&indexrelid, &slot_no],
+                    )?
+                    .get(0);
+                match snapshot.serialize_expression(&expr_sql) {
+                    Ok(s) => indexprs.push(s),
+                    Err(e) => {
+                        eprintln!(
+                            "  skipping pg_index oid={indexrelid}: serialize_expression on `{expr_sql}` failed: {e}"
+                        );
+                        skip_row = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if skip_row {
+            skipped.push(indexrelid);
+            continue;
+        }
+
+        let indpred = if pred_sql.is_some() && snapshot.is_none() {
+            Some(placeholder())
+        } else if let (Some(sql), Some(snapshot)) = (pred_sql, snapshot) {
+            match snapshot.serialize_predicate(&sql) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!(
+                        "  skipping pg_index oid={indexrelid}: serialize_predicate on `{sql}` failed: {e}"
+                    );
+                    skipped.push(indexrelid);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let Some(indexrelid) = PgClassOid::new(indexrelid) else {
+            continue;
+        };
+        let Some(indrelid) = PgClassOid::new(indrelid) else {
+            continue;
+        };
+        out.push(PgIndex {
+            indexrelid,
+            indrelid,
+            indnatts,
+            indnkeyatts,
+            indisunique,
+            indisprimary,
+            indisexclusion,
+            indkey,
+            indexprs,
+            indpred,
+            indcollation: indcollation.into_iter().map(PgCollationOid::new).collect(),
+            indclass: indclass.into_iter().map(PgOpclassOid::new).collect(),
+        });
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "Skipped {} pg_index row(s) whose expressions/predicate didn't round-trip.",
+            skipped.len(),
+        );
+    }
+    Ok(out)
+}
+
+fn export_collations(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgCollation>, postgres::Error> {
+    // Collations vary by host OS — `en_US.UTF-8` may exist on one machine
+    // and not another. The seed snapshots whatever the container shipped
+    // with; users that build against a different libc will need to
+    // regenerate.
+    let rows = client.query(
+        "SELECT oid, collname, collnamespace, collencoding, collisdeterministic \
+         FROM pg_catalog.pg_collation \
+         WHERE oid >= $1 \
+         ORDER BY oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oid: u32 = r.get(0);
+            let collnamespace: u32 = r.get(2);
+            Some(PgCollation {
+                oid: PgCollationOid::new(oid)?,
+                collname: r.get(1),
+                collnamespace: PgNamespaceOid::new(collnamespace)?,
+                collencoding: r.get(3),
+                collisdeterministic: r.get(4),
+            })
+        })
+        .collect())
+}
+
+fn export_inherits(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgInherits>, postgres::Error> {
+    let rows = client.query(
+        "SELECT inhrelid, inhparent, inhseqno \
+         FROM pg_catalog.pg_inherits \
+         WHERE inhrelid >= $1 \
+         ORDER BY inhrelid, inhseqno",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let inhrelid: u32 = r.get(0);
+            let inhparent: u32 = r.get(1);
+            Some(PgInherits {
+                inhrelid: PgClassOid::new(inhrelid)?,
+                inhparent: PgClassOid::new(inhparent)?,
+                inhseqno: r.get(2),
+            })
+        })
+        .collect())
+}
+
+fn export_depends(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgDepend>, postgres::Error> {
+    // No deptype filter — every dependency edge round-trips. Mirrors
+    // `pg_depend` 1:1 so cascading drops behave identically to PG.
+    let rows = client.query(
+        "SELECT classid::int4, objid::int4, objsubid, refclassid::int4, refobjid::int4, \
+                refobjsubid, deptype \
+         FROM pg_catalog.pg_depend \
+         WHERE objid >= $1 OR refobjid >= $1 \
+         ORDER BY classid, objid, objsubid, refclassid, refobjid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let classid: i32 = r.get(0);
+            let objid: i32 = r.get(1);
+            let objsubid: i32 = r.get(2);
+            let refclassid: i32 = r.get(3);
+            let refobjid: i32 = r.get(4);
+            let refobjsubid: i32 = r.get(5);
+            let deptype: i8 = r.get(6);
+            Some(PgDepend {
+                classid: PgClassOid::new(classid as u32)?,
+                objid: PgGenericOid::new(objid as u32)?,
+                objsubid: objsubid as i16,
+                refclassid: PgClassOid::new(refclassid as u32)?,
+                refobjid: PgGenericOid::new(refobjid as u32)?,
+                refobjsubid: refobjsubid as i16,
+                deptype: char_to_deptype(deptype as u8 as char),
+            })
+        })
+        .collect())
+}
+
+/// Text search configurations, dictionaries, parsers and templates.
+fn export_ts_objects(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgTsObject>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT * FROM ( \
+               SELECT 'c', cfgname::text, cfgnamespace, oid FROM pg_catalog.pg_ts_config \
+               UNION ALL SELECT 'd', dictname::text, dictnamespace, oid \
+                   FROM pg_catalog.pg_ts_dict \
+               UNION ALL SELECT 'p', prsname::text, prsnamespace, oid \
+                   FROM pg_catalog.pg_ts_parser \
+               UNION ALL SELECT 't', tmplname::text, tmplnamespace, oid \
+                   FROM pg_catalog.pg_ts_template) o(kind, name, namespace, oid) \
+             WHERE oid >= $1 \
+             ORDER BY 1, 2",
+            &[&min],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgTsObject {
+                oid: PgGenericOid::new(r.get::<_, u32>(3))?,
+                kind: r.get(0),
+                name: r.get(1),
+                namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+            })
+        })
+        .collect())
+}
+
+/// The text search configurations' mappings (`pg_ts_config_map`).
+fn export_ts_config_map(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgTsConfigMap>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT mapcfg, maptokentype, mapseqno, mapdict FROM pg_catalog.pg_ts_config_map \
+             WHERE mapcfg >= $1 \
+             ORDER BY 1, 2, 3",
+            &[&min],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgTsConfigMap {
+                mapcfg: PgGenericOid::new(r.get::<_, u32>(0))?,
+                maptokentype: r.get(1),
+                mapseqno: r.get(2),
+                mapdict: PgGenericOid::new(r.get::<_, u32>(3))?,
+            })
+        })
+        .collect())
+}
+
+/// The encoding conversions (`pg_conversion`).
+fn export_conversions(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgConversion>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT oid, conname::text, connamespace FROM pg_catalog.pg_conversion \
+             WHERE oid >= $1 ORDER BY oid",
+            &[&min],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgConversion {
+                oid: PgGenericOid::new(r.get::<_, u32>(0))?,
+                name: r.get(1),
+                namespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+            })
+        })
+        .collect())
+}
+
+/// The non-NULL ACLs of the built-in objects (`pg_acl`): one row per object
+/// whose `relacl` / `attacl` / `proacl` / `nspacl` / `typacl` / `lanacl` is
+/// not NULL, with the `aclitem[]` in its text form.
+fn export_acls(client: &mut postgres::Client, min: u32) -> Result<Vec<SeedAcl>, postgres::Error> {
+    let rows = client.query(
+        "SELECT 'pg_class', oid::int4, 0::int2, relacl::text \
+           FROM pg_catalog.pg_class WHERE relacl IS NOT NULL AND oid >= $1 \
+         UNION ALL \
+         SELECT 'pg_attribute', attrelid::int4, attnum::int2, attacl::text \
+           FROM pg_catalog.pg_attribute WHERE attacl IS NOT NULL AND attrelid >= $1 \
+         UNION ALL \
+         SELECT 'pg_proc', oid::int4, 0::int2, proacl::text \
+           FROM pg_catalog.pg_proc WHERE proacl IS NOT NULL AND oid >= $1 \
+         UNION ALL \
+         SELECT 'pg_namespace', oid::int4, 0::int2, nspacl::text \
+           FROM pg_catalog.pg_namespace WHERE nspacl IS NOT NULL AND oid >= $1 \
+         UNION ALL \
+         SELECT 'pg_type', oid::int4, 0::int2, typacl::text \
+           FROM pg_catalog.pg_type WHERE typacl IS NOT NULL AND oid >= $1 \
+         UNION ALL \
+         SELECT 'pg_language', oid::int4, 0::int2, lanacl::text \
+           FROM pg_catalog.pg_language WHERE lanacl IS NOT NULL AND oid >= $1 \
+         ORDER BY 1, 2, 3",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let catalog = match r.get::<_, String>(0).as_str() {
+                "pg_class" => AclCatalog::Class,
+                "pg_attribute" => AclCatalog::Attribute,
+                "pg_proc" => AclCatalog::Proc,
+                "pg_namespace" => AclCatalog::Namespace,
+                "pg_type" => AclCatalog::Type,
+                "pg_language" => AclCatalog::Language,
+                _ => return None,
+            };
+            Some(SeedAcl {
+                catalog,
+                objid: PgGenericOid::new(r.get::<_, i32>(1) as u32)?,
+                objsubid: r.get(2),
+                acl: r.get(3),
+            })
+        })
+        .collect())
+}
+
+/// The configuration parameters (`pg_settings`) of a stock server.
+fn export_settings(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<PgSetting>, postgres::Error> {
+    Ok(client
+        .query(
+            "SELECT name, vartype, context, coalesce(unit, ''), coalesce(min_val, ''), \
+                    coalesce(max_val, ''), coalesce(enumvals, '{}') \
+             FROM pg_catalog.pg_settings WHERE $1::oid = 0 ORDER BY name",
+            &[&min],
+        )?
+        .iter()
+        .map(|r| PgSetting {
+            name: r.get(0),
+            vartype: r.get(1),
+            context: r.get(2),
+            unit: r.get(3),
+            min_val: r.get(4),
+            max_val: r.get(5),
+            enumvals: r.get(6),
+        })
+        .collect())
+}
+
+/// `pg_am`, `pg_opfamily`, `pg_opclass` and (search) `pg_amop` rows.
+type AccessMethodRows = (Vec<PgAm>, Vec<PgOpfamily>, Vec<PgOpclass>, Vec<PgAmop>);
+
+/// Access methods, operator families and operator classes (by access
+/// method name).
+fn export_access_methods(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<AccessMethodRows, postgres::Error> {
+    let am = client
+        .query(
+            "SELECT amname::text, amtype::text, amhandler::oid FROM pg_catalog.pg_am \
+             WHERE oid >= $1 ORDER BY oid",
+            &[&min],
+        )?
+        .iter()
+        .map(|r| PgAm {
+            amname: r.get(0),
+            amtype: r.get(1),
+            amhandler: PgProcOid::new(r.get::<_, u32>(2)),
+        })
+        .collect();
+    let opfamily = client
+        .query(
+            "SELECT f.opfname::text, f.opfnamespace, a.amname::text, f.oid \
+             FROM pg_catalog.pg_opfamily f JOIN pg_catalog.pg_am a ON a.oid = f.opfmethod \
+             WHERE f.oid >= $1 \
+             ORDER BY f.oid",
+            &[&min],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgOpfamily {
+                oid: PgGenericOid::new(r.get::<_, u32>(3))?,
+                opfname: r.get(0),
+                opfnamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
+                opfmethod: r.get(2),
+            })
+        })
+        .collect();
+    let opclass = client
+        .query(
+            "SELECT c.oid, c.opcname::text, c.opcnamespace, a.amname::text, c.opcintype, \
+                    c.opcdefault, \
+                    f.opfname::text, f.opfnamespace \
+             FROM pg_catalog.pg_opclass c JOIN pg_catalog.pg_am a ON a.oid = c.opcmethod \
+             JOIN pg_catalog.pg_opfamily f ON f.oid = c.opcfamily \
+             WHERE c.oid >= $1 \
+             ORDER BY c.oid",
+            &[&min],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgOpclass {
+                oid: PgOpclassOid::new(r.get::<_, u32>(0))?,
+                opcname: r.get(1),
+                opcnamespace: PgNamespaceOid::new(r.get::<_, u32>(2))?,
+                opcmethod: r.get(3),
+                opcintype: PgTypeOid::new(r.get::<_, u32>(4))?,
+                opcdefault: r.get(5),
+                opcfamily: r.get(6),
+                opcfamilynamespace: PgNamespaceOid::new(r.get::<_, u32>(7))?,
+            })
+        })
+        .collect();
+    let amop = client
+        .query(
+            "SELECT f.opfname::text, f.opfnamespace, a.amname::text, o.amoplefttype, \
+                    o.amoprighttype, o.amopstrategy, o.amopopr \
+             FROM pg_catalog.pg_amop o \
+             JOIN pg_catalog.pg_opfamily f ON f.oid = o.amopfamily \
+             JOIN pg_catalog.pg_am a ON a.oid = o.amopmethod \
+             WHERE o.amoppurpose = 's' AND o.oid >= $1 \
+             ORDER BY o.oid",
+            &[&min],
+        )?
+        .iter()
+        .filter_map(|r| {
+            Some(PgAmop {
+                amopfamily: r.get(0),
+                amopfamilynamespace: PgNamespaceOid::new(r.get::<_, u32>(1))?,
+                amopmethod: r.get(2),
+                amoplefttype: PgTypeOid::new(r.get::<_, u32>(3))?,
+                amoprighttype: PgTypeOid::new(r.get::<_, u32>(4))?,
+                amopstrategy: r.get(5),
+                amopopr: PgOperatorOid::new(r.get::<_, u32>(6))?,
+            })
+        })
+        .collect();
+    Ok((am, opfamily, opclass, amop))
+}
+
+/// `pg_get_functiondef` of each non-set-returning `LANGUAGE sql` function;
+/// the analyzer keeps the inlinable ones' bodies (`inline_function`).
+fn export_sql_function_defs(
+    client: &mut postgres::Client,
+    min: u32,
+) -> Result<Vec<(PgProcOid, String)>, postgres::Error> {
+    let rows = client.query(
+        "SELECT p.oid, pg_catalog.pg_get_functiondef(p.oid) \
+         FROM pg_catalog.pg_proc p \
+         WHERE p.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'sql') \
+           AND p.prokind = 'f' AND NOT p.proretset \
+           AND p.oid >= $1 \
+         ORDER BY p.oid",
+        &[&min],
+    )?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let oid = PgProcOid::new(r.get::<_, u32>(0))?;
+            let definition: String = r.get(1);
+            Some((oid, definition))
+        })
+        .collect())
+}
+
+// ─── Char → enum mapping ───────────────────────────────────────────────────────
+
+fn char_to_typtype(c: char) -> TypType {
+    match c {
+        'b' => TypType::Base,
+        'c' => TypType::Composite,
+        'd' => TypType::Domain,
+        'e' => TypType::Enum,
+        'p' => TypType::Pseudo,
+        'r' => TypType::Range,
+        'm' => TypType::Multirange,
+        _ => TypType::Base,
+    }
+}
+
+fn char_to_typcategory(c: char) -> TypCategory {
+    match c {
+        'A' => TypCategory::Array,
+        'B' => TypCategory::Boolean,
+        'C' => TypCategory::Composite,
+        'D' => TypCategory::DateTime,
+        'E' => TypCategory::Enum,
+        'G' => TypCategory::Geometric,
+        'I' => TypCategory::Network,
+        'N' => TypCategory::Numeric,
+        'P' => TypCategory::Pseudo,
+        'R' => TypCategory::Range,
+        'S' => TypCategory::String,
+        'T' => TypCategory::Timespan,
+        'U' => TypCategory::UserDefined,
+        'V' => TypCategory::BitString,
+        'X' => TypCategory::Unknown,
+        'Z' => TypCategory::Internal,
+        _ => TypCategory::UserDefined,
+    }
+}
+
+fn char_to_relkind(c: char) -> Option<RelKind> {
+    Some(match c {
+        'r' => RelKind::Table,
+        'i' => RelKind::Index,
+        'S' => RelKind::Sequence,
+        't' => RelKind::ToastTable,
+        'v' => RelKind::View,
+        'm' => RelKind::MaterializedView,
+        'c' => RelKind::CompositeType,
+        'f' => RelKind::ForeignTable,
+        'p' => RelKind::Partitioned,
+        'I' => RelKind::PartitionedIndex,
+        _ => return None,
+    })
+}
+
+fn char_to_prokind(c: char) -> ProKind {
+    match c {
+        'a' => ProKind::Aggregate,
+        'w' => ProKind::Window,
+        'p' => ProKind::Procedure,
+        _ => ProKind::Function,
+    }
+}
+
+fn char_to_argmode(c: char) -> ArgMode {
+    match c {
+        'o' => ArgMode::Out,
+        'b' => ArgMode::InOut,
+        'v' => ArgMode::Variadic,
+        't' => ArgMode::Table,
+        _ => ArgMode::In,
+    }
+}
+
+fn char_to_attgenerated(c: char) -> Option<AttGenerated> {
+    match c {
+        's' => Some(AttGenerated::Stored),
+        'v' => Some(AttGenerated::Virtual),
+        _ => None,
+    }
+}
+
+fn char_to_attidentity(c: char) -> Option<AttIdentity> {
+    match c {
+        'a' => Some(AttIdentity::Always),
+        'd' => Some(AttIdentity::ByDefault),
+        _ => None,
+    }
+}
+
+fn char_to_castcontext(c: char) -> CastContext {
+    match c {
+        'i' => CastContext::Implicit,
+        'a' => CastContext::Assignment,
+        _ => CastContext::Explicit,
+    }
+}
+
+fn char_to_castmethod(c: char) -> CastMethod {
+    match c {
+        'b' => CastMethod::Binary,
+        'i' => CastMethod::InOut,
+        _ => CastMethod::Function,
+    }
+}
+
+fn char_to_deptype(c: char) -> DepType {
+    match c {
+        'a' => DepType::Auto,
+        'i' => DepType::Internal,
+        'e' => DepType::Extension,
+        'x' => DepType::AutoExtension,
+        'p' => DepType::Pin,
+        _ => DepType::Normal,
+    }
+}

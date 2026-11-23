@@ -214,6 +214,15 @@ run via `scripts/run-pg-sanity.sh`). A differential fuzzer
 (`typedpg_analyzer/tests/fuzz/main.rs`, `#[ignore]`d) generates queries to surface
 new disagreements automatically.
 
+**Catalog state.** After every migration both sides accept, the mirror also
+compares the system catalogs (`pg_sanity/catalog_state.rs`, on by default in
+`scripts/run-pg-sanity.sh`; `PG_SANITY_CATALOG_LOG=<file>` logs instead of
+panicking): the server's user rows, exported like `seed.json`
+(`typedpg_analyzer::catalog_export`), must equal the analyzer's, OIDs
+mapped to names; what is compared and what is deliberately normalized is
+listed there. `tests/catalog_oracle` feeds it migration corpora
+(`CATALOG_CORPUS`) and random DDL, and minimizes a divergence.
+
 **Nullability soundness.** Describe says nothing about nullability, so the
 mirror also *executes* every accepted query, in a rolled-back transaction,
 over adversarial rows it seeds into every table (NULL in each nullable

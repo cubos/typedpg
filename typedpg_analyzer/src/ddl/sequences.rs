@@ -33,6 +33,9 @@ pub fn create_sequence(interp: &mut PgCatalog, stmt: &CreateSeqStmt) -> Result<(
 
     let owner = super::roles::current_role(interp);
     let seq_oid = insert_sequence_relation(interp, nsoid, name, owner)?;
+    if rv.relpersistence == "u" {
+        interp.relpersistence.insert(seq_oid, 'u');
+    }
     interp.sequence_params.insert(seq_oid, params);
     for opt in &stmt.options {
         apply_owned_by(interp, seq_oid, opt.as_ref())?;
@@ -58,6 +61,10 @@ pub(crate) fn insert_sequence_relation(
         relkind: RelKind::Sequence,
         reltype: None,
     });
+    // A sequence of the temporary schema is temporary.
+    if interp.temp_namespace == Some(nsoid) {
+        interp.relpersistence.insert(class_oid, 't');
+    }
     super::acl::relation_created(
         interp,
         class_oid,
@@ -99,6 +106,7 @@ pub(crate) fn create_owned_sequence(
     attnum: i16,
     deptype: DepType,
     options: &[Option<typedpg_pg_query::ast::Node>],
+    of_column_type: bool,
     owner: super::roles::RoleId,
 ) -> Result<(), DdlError> {
     let Some(class) = interp.pg_class.get(&relid).cloned() else {
@@ -152,12 +160,14 @@ pub(crate) fn create_owned_sequence(
         },
         _ => None,
     });
-    // A serial / identity sequence has its column's integer type; its
-    // options are checked like CREATE SEQUENCE's.
+    // A serial / identity sequence has its column's integer type (but a
+    // LIKE copy's: CREATE SEQUENCE's default); its options are checked like
+    // CREATE SEQUENCE's.
     let column_type = interp
         .attributes_of(relid)
         .iter()
         .find(|a| a.attnum == attnum)
+        .filter(|_| of_column_type)
         .map_or(oid::INT8, |a| a.atttypid);
     let sequence_options: Vec<Option<typedpg_pg_query::ast::Node>> = options
         .iter()
@@ -183,6 +193,17 @@ pub(crate) fn create_owned_sequence(
         ),
     };
     let seq_oid = insert_sequence_relation(interp, nsoid, name, owner)?;
+    // generateSerialExtraStmts: the sequence is as persistent as its table
+    // (a temporary table's sequence is in the temporary schema), unless
+    // LOGGED / UNLOGGED says otherwise.
+    let unlogged = options.iter().find_map(|o| match o.as_ref() {
+        Some(ast::Node::DefElem(de)) if de.defname == "logged" => Some(false),
+        Some(ast::Node::DefElem(de)) if de.defname == "unlogged" => Some(true),
+        _ => None,
+    });
+    if unlogged.unwrap_or(interp.relpersistence.get(&relid) == Some(&'u')) {
+        interp.relpersistence.insert(seq_oid, 'u');
+    }
     // An owned sequence belongs to its table's owner, not the current role
     // (`ATExecAddColumn` / `transformColumnDefinition` make it the table
     // owner's), and takes that role's sequence default privileges — both of

@@ -38,6 +38,8 @@
 mod analysis_diff;
 mod array_input;
 mod builtin_nullability;
+#[cfg(feature = "catalog_export")]
+pub mod catalog_export;
 mod clause;
 mod coerce;
 mod condition;

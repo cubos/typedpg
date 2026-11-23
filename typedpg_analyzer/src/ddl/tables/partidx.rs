@@ -251,7 +251,9 @@ fn create_clone(
             coninhcount: 1,
             conenforced: con.conenforced,
             convalidated: con.convalidated,
-            connoinherit: con.connoinherit,
+            // index_constraint_create: a constraint inherited from the
+            // parent's is not NO INHERIT.
+            connoinherit: false,
             conperiod: con.conperiod,
         });
     }

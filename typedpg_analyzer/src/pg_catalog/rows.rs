@@ -65,6 +65,18 @@ pub enum TypAlign {
     Double,
 }
 
+impl TypStorage {
+    /// The PG char (`p`, `e`, `m`, `x`).
+    pub fn as_char(self) -> u8 {
+        match self {
+            TypStorage::Plain => b'p',
+            TypStorage::External => b'e',
+            TypStorage::Main => b'm',
+            TypStorage::Extended => b'x',
+        }
+    }
+}
+
 impl TypAlign {
     /// The PG char (`c`, `s`, `i`, `d`).
     pub fn as_char(self) -> u8 {
@@ -458,7 +470,10 @@ pub enum ConType {
     /// `attnotnull` mirrors whether it has one.
     #[serde(rename = "n")]
     NotNull,
-    /// Catch-all for `t` (constraint trigger) and any future variants.
+    /// A constraint trigger's (CREATE CONSTRAINT TRIGGER).
+    #[serde(rename = "t")]
+    Trigger,
+    /// Catch-all for any future variants.
     #[serde(other)]
     Other,
 }

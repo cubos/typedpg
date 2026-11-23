@@ -269,36 +269,35 @@ pub(super) fn alter_constraint(
         alter_check_enforceability(interp, &con, alter.is_enforced, rec.recurse, false, &[])?;
         return Ok(());
     }
-    // ATExecAlterConstraintInternal: a change of enforceability, or else
-    // one of deferrability, rewrites the row (AlterConstrUpdateConstraintEntry)
-    // with every attribute the command names — a constraint made ENFORCED
-    // is validated, a NOT ENFORCED one is not valid — and so each clone's.
-    // Naming what the constraint already is changes nothing: ENFORCED on an
-    // enforced NOT VALID key leaves it NOT VALID.
+    // ATExecAlterConstraintInternal: a change of enforceability rewrites
+    // the row (AlterConstrUpdateConstraintEntry) with every attribute the
+    // command names — a constraint made ENFORCED is validated (its rows are
+    // checked), a NOT ENFORCED one is not valid — and so each clone's.
+    // Without ENFORCED / NOT ENFORCED, a change of deferrability does.
+    // Naming the enforceability the constraint already has changes nothing
+    // at all on PostgreSQL 19, not even the deferrability named with it:
+    // ENFORCED DEFERRABLE on an enforced NOT VALID key leaves it NOT VALID
+    // and as deferrable as it was.
     let details = interp.fk_details.get(&con.oid);
     let enforceability_changes = alter.alter_enforceability && alter.is_enforced != con.conenforced;
     let deferrability_changes = alter.alter_deferrability
         && details.is_none_or(|d| {
             (d.deferrable(), d.initdeferred()) != (alter.deferrable, alter.initdeferred)
         });
-    if enforceability_changes || deferrability_changes {
+    let rewrites = if alter.alter_enforceability {
+        enforceability_changes
+    } else {
+        deferrability_changes
+    };
+    if rewrites {
         let clones = std::cell::RefCell::new(Vec::new());
         foreign_keys::for_each_fk_clone(interp, con.oid, &|c| clones.borrow_mut().push(c.oid));
         for oid in std::iter::once(con.oid).chain(clones.into_inner()) {
             if alter.alter_enforceability
                 && let Some(c) = interp.pg_constraint.get_mut(&oid)
             {
-                // NOT ENFORCED → ENFORCED checks the rows (phase 3); a
-                // deferrability change only rewrites the row, marking an
-                // enforced NOT VALID key validated unchecked.
-                let unchecked = !enforceability_changes && !c.convalidated && alter.is_enforced;
                 c.conenforced = alter.is_enforced;
                 c.convalidated = alter.is_enforced;
-                if unchecked {
-                    interp.fk_validity_unproven.insert(oid);
-                } else if enforceability_changes {
-                    interp.fk_validity_unproven.remove(&oid);
-                }
             }
             if alter.alter_deferrability
                 && let Some(d) = interp.fk_details.get_mut(&oid)

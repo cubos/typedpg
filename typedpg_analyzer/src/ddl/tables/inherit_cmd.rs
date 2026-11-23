@@ -605,10 +605,22 @@ fn remove_inheritance(
         .iter()
         .position(|i| i.inhrelid == relid && i.inhparent == parent)
     else {
-        let (a, b) = if role == "partition" {
-            (relname_of(interp, relid), relname_of(interp, parent))
+        // RemoveInheritance names a partition when the parent is
+        // partitioned (is_partitioning), whatever the command.
+        let partitioning = role == "partition"
+            || interp.pg_class.get(&parent).map(|c| c.relkind) == Some(RelKind::Partitioned);
+        let (a, b, role) = if partitioning {
+            (
+                relname_of(interp, relid),
+                relname_of(interp, parent),
+                "partition",
+            )
         } else {
-            (relname_of(interp, parent), relname_of(interp, relid))
+            (
+                relname_of(interp, parent),
+                relname_of(interp, relid),
+                "parent",
+            )
         };
         return Err(DdlError::TableNotFound(format!(
             "relation \"{a}\" is not a {role} of relation \"{b}\""

@@ -35,7 +35,7 @@ fn def_qualified_name(de: &DefElem) -> Vec<String> {
 }
 
 /// `defGetBoolean`: no value means true.
-fn def_bool(de: &DefElem) -> bool {
+pub(crate) fn def_bool(de: &DefElem) -> bool {
     match de.arg.as_ref() {
         None => true,
         Some(ast::Node::Boolean(b)) => b.boolval,

@@ -51,6 +51,14 @@ pub(crate) enum OptionsOwner {
 }
 
 impl ForeignData {
+    /// Every wrapper, with its OID (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn wrappers(
+        &self,
+    ) -> impl Iterator<Item = (&String, crate::oid::PgGenericOid)> + '_ {
+        self.wrapper_oids.iter().map(|(name, &oid)| (name, oid))
+    }
+
     /// Wrapper `name`'s OID.
     pub(crate) fn wrapper_oid(&self, name: &str) -> Option<crate::oid::PgGenericOid> {
         self.wrapper_oids.get(name).copied()

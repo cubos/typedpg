@@ -108,8 +108,8 @@ pub fn encode(
             .collect()
     };
 
-    if is_pgvector_type(snapshot, type_oid) {
-        return encode_vector(&raw()?).map(Some);
+    if let Some(max) = pgvector_max_dimensions(snapshot, type_oid) {
+        return encode_vector(&raw()?, &t.typname, max).map(Some);
     }
 
     let in_pg_catalog = snapshot.namespace_name(t.typnamespace) == Some("pg_catalog");
@@ -161,7 +161,11 @@ pub fn decode(snapshot: &PgCatalog, type_oid: PgTypeOid, typmod: Option<i32>) ->
         return DecodedTypmod::None;
     };
 
-    if is_pgvector_type(snapshot, type_oid) {
+    if pgvector_max_dimensions(snapshot, type_oid).is_some()
+        && snapshot
+            .get_type(type_oid)
+            .is_some_and(|t| t.typname == "vector")
+    {
         return DecodedTypmod::VectorDim(t);
     }
 
@@ -318,20 +322,24 @@ fn encode_interval(raw: &[i32]) -> Result<Option<i32>, DdlError> {
     }
 }
 
-fn encode_vector(raw: &[i32]) -> Result<i32, DdlError> {
-    if raw.len() != 1 {
+/// pgvector's `vector_typmod_in` / `halfvec_typmod_in` /
+/// `sparsevec_typmod_in`: one dimension count, from 1 to the type's
+/// maximum, which is the typmod.
+fn encode_vector(raw: &[i32], typname: &str, max: i32) -> Result<i32, DdlError> {
+    let [n] = raw else {
+        return Err(DdlError::UnsupportedDdl("invalid type modifier".into()));
+    };
+    if *n < 1 {
         return Err(DdlError::UnsupportedDdl(format!(
-            "vector type takes exactly one dimension argument, got {}",
-            raw.len()
+            "dimensions for type {typname} must be at least 1"
         )));
     }
-    let n = raw[0];
-    if !(1..=MAX_VECTOR_DIM).contains(&n) {
+    if *n > max {
         return Err(DdlError::UnsupportedDdl(format!(
-            "vector dimension {n} must be between 1 and {MAX_VECTOR_DIM}"
+            "dimensions for type {typname} cannot exceed {max}"
         )));
     }
-    Ok(n)
+    Ok(*n)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -380,11 +388,19 @@ fn typmod_integer(s: &str) -> Result<i32, DdlError> {
 /// True when `oid` resolves to pgvector's `vector` type (any namespace,
 /// since pgvector typically lives in `public` but users can install it
 /// elsewhere).
-fn is_pgvector_type(snapshot: &PgCatalog, oid: PgTypeOid) -> bool {
-    snapshot
-        .get_type(oid)
-        .map(|t| t.typname == "vector")
-        .unwrap_or(false)
+/// The most dimensions a pgvector type takes (`VECTOR_MAX_DIM`,
+/// `HALFVEC_MAX_DIM`, `SPARSEVEC_MAX_DIM`), or `None` for another type.
+fn pgvector_max_dimensions(snapshot: &PgCatalog, oid: PgTypeOid) -> Option<i32> {
+    let t = snapshot.get_type(oid)?;
+    if !snapshot.types_with_typmodin.contains(&oid) {
+        return None;
+    }
+    match t.typname.as_str() {
+        "vector" => Some(MAX_VECTOR_DIM),
+        "halfvec" => Some(16_000),
+        "sparsevec" => Some(1_000_000_000),
+        _ => None,
+    }
 }
 
 // ─── Validation: literal vs column typmod ─────────────────────────────────

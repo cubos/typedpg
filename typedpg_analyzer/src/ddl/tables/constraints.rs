@@ -709,7 +709,19 @@ pub(super) fn emit_constraint_with_backing_index(
         coninhcount: 0,
         conenforced: true,
         convalidated: true,
-        connoinherit: false,
+        // index_constraint_create: a local index constraint is NO INHERIT
+        // (only a partition's, inherited from its parent's, is not);
+        // addFkConstraint: a local foreign key too, but on a partitioned
+        // table ("always inherit for partitioned tables, never for legacy
+        // inheritance").
+        connoinherit: match contype {
+            ConType::PrimaryKey | ConType::Unique | ConType::Exclusion => true,
+            ConType::ForeignKey => interp
+                .pg_class
+                .get(&relid)
+                .is_some_and(|c| c.relkind != RelKind::Partitioned),
+            _ => false,
+        },
         conperiod: period,
     });
     if matches!(
@@ -773,8 +785,11 @@ pub(super) fn emit_constraint_with_backing_index(
             // constraint too.
             indisexclusion: contype == ConType::Exclusion || period,
             indkey,
-            indexprs: Vec::new(),
-            indpred: None,
+            indexprs: index_def
+                .as_ref()
+                .map(|d| d.indexprs.clone())
+                .unwrap_or_default(),
+            indpred: index_def.as_ref().and_then(|d| d.indpred.clone()),
             indcollation,
             indclass,
         });
@@ -902,7 +917,11 @@ fn exclusion_keys(
             continue;
         };
         if elem.name.is_empty() {
-            attnums.push(0);
+            // An expression that is a plain column is the column.
+            attnums.push(
+                crate::ddl::indexes::expression_column(interp, relid, elem.expr.as_ref())
+                    .unwrap_or(0),
+            );
             // ChooseIndexColumnNames → FigureIndexColname.
             names.push(crate::ddl::indexes::figure_index_colname(
                 elem.expr.as_ref(),
@@ -1260,6 +1279,25 @@ pub(crate) fn drop_constraint(
         .cloned()
     {
         return super::check_inherit::drop_check(interp, &con, rec);
+    }
+    // A constraint trigger's row goes only with its trigger (its internal
+    // dependency, findDependentObjects).
+    if let Some(oid) = found_oid
+        .filter(|oid| interp.pg_constraint.get(oid).map(|c| c.contype) == Some(ConType::Trigger))
+    {
+        let relname = relname_of(interp, relid);
+        let trigger = interp
+            .triggers
+            .get(&relid)
+            .into_iter()
+            .flatten()
+            .find(|t| t.constraint == Some(oid))
+            .map_or_else(String::new, |t| t.name.clone());
+        return Err(DdlError::DependencyError(format!(
+            "cannot drop constraint {conname} on table {relname} because trigger {trigger} on \
+             table {relname} requires it (You can drop trigger {trigger} on table {relname} \
+             instead.)"
+        )));
     }
     let Some(oid) = found_oid else {
         if cmd.missing_ok {
@@ -2017,7 +2055,8 @@ fn add_index_constraint(
         coninhcount: 0,
         conenforced: true,
         convalidated: true,
-        connoinherit: false,
+        // index_constraint_create: a local index constraint is NO INHERIT.
+        connoinherit: true,
         conperiod: false,
     });
     Ok(())

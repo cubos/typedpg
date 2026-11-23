@@ -195,6 +195,7 @@ fn of_type_columns(
                 storage: None,
                 owned_sequence: None,
                 identity_options: Vec::new(),
+                sequence_of_column_type: true,
                 nn_local: false,
                 nn_name: None,
                 nn_no_inherit: false,
@@ -278,6 +279,9 @@ fn expand_like(
                             .map(crate::ddl::seqparams::SeqParams::as_options)
                     })
                     .unwrap_or_default(),
+                // transformTableLikeClause calls generateSerialExtraStmts
+                // without the column's type: the copy's sequence is bigint.
+                sequence_of_column_type: false,
                 nn_local: copy_not_null && attr.attnotnull,
                 // RelationGetNotNullConstraints(include_noinh = true): the
                 // source's constraint, with its name and NO INHERIT flag.
@@ -309,6 +313,10 @@ fn lookup_relation(
     rv: &typedpg_pg_query::ast::RangeVar,
 ) -> Result<PgClassOid, DdlError> {
     let (schema, name) = range_var_names(rv, interp);
+    // RangeVarGetRelid: a qualified name's schema must exist.
+    if !rv.schemaname.is_empty() {
+        crate::ddl::util::existing_namespace(interp, &schema)?;
+    }
     interp
         .namespace_oid(&schema)
         .and_then(|ns| interp.class_by_qname.get(&(ns, name.clone())).copied())
@@ -536,6 +544,7 @@ fn inherited_columns(
                 storage: Some(parent_storage),
                 owned_sequence: None,
                 identity_options: Vec::new(),
+                sequence_of_column_type: true,
                 nn_local: false,
                 nn_name: None,
                 nn_no_inherit: false,

@@ -46,6 +46,9 @@ pub(crate) struct Trigger {
     /// `tgqual`: the `WHEN` condition as written, or `None`. It runs for
     /// each row the trigger may see, before the trigger function is called.
     pub(crate) when: Option<typedpg_pg_query::ast::Node>,
+    /// A constraint trigger's `pg_constraint` row (`tgconstraint`), which
+    /// carries its name — RENAME TRIGGER leaves it.
+    pub(crate) constraint: Option<crate::oid::PgConstraintOid>,
     /// The routines the `WHEN` condition runs, resolved at CREATE TRIGGER
     /// (the condition's function calls), which a firing role needs EXECUTE
     /// on — they run as that role.
@@ -379,6 +382,10 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
         [schema, name] => (Some(*schema), *name),
         _ => return Ok(()),
     };
+    // LookupFuncName: a qualified name's schema must exist.
+    if let Some(schema) = schema {
+        super::util::existing_namespace(interp, schema)?;
+    }
     let Some((_, function)) =
         super::alter::find_proc(interp, schema, name, &|p| p.proargtypes.is_empty())
     else {
@@ -424,6 +431,7 @@ pub fn create_trigger(interp: &mut PgCatalog, stmt: &CreateTrigStmt) -> Result<(
         constrrel,
         parent: None,
         when: stmt.when_clause.as_ref().cloned(),
+        constraint: None,
         when_functions,
         transition_tables,
     };
@@ -702,7 +710,48 @@ fn install(
         Some(at) => interp.triggers[&relid][at].oid,
         None => crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?),
     };
-    let trigger = Trigger { oid, ..trigger };
+    // CreateTriggerFiringOn: a constraint trigger's pg_constraint row, under
+    // its name — which no constraint of the relation may have (the unique
+    // index on conrelid, contypid, conname).
+    let constraint = match existing {
+        Some(at) => interp.triggers[&relid][at].constraint,
+        None if trigger.constraint_deferrable.is_some() => {
+            if interp
+                .pg_constraint
+                .values()
+                .any(|c| c.conrelid == relid && c.conname == trigger.name)
+            {
+                return Err(DdlError::DuplicateObject(
+                    "duplicate key value violates unique constraint \
+                     \"pg_constraint_conrelid_contypid_conname_index\""
+                        .into(),
+                ));
+            }
+            let con = crate::oid::PgConstraintOid::from_nonzero(interp.alloc_oid()?);
+            interp.insert_pg_constraint(crate::pg_catalog::PgConstraint {
+                oid: con,
+                conname: trigger.name.clone(),
+                conrelid: relid,
+                contype: crate::pg_catalog::ConType::Trigger,
+                conkey: Vec::new(),
+                confrelid: None,
+                confkey: Vec::new(),
+                conislocal: true,
+                coninhcount: 0,
+                conenforced: true,
+                convalidated: true,
+                connoinherit: true,
+                conperiod: false,
+            });
+            Some(con)
+        }
+        None => None,
+    };
+    let trigger = Trigger {
+        oid,
+        constraint,
+        ..trigger
+    };
     let triggers = interp.triggers.entry(relid).or_default();
     match existing {
         Some(at) => triggers[at] = trigger,
@@ -783,6 +832,32 @@ pub(crate) fn drop_cloned_triggers(interp: &mut PgCatalog, part: PgClassOid) {
     if let Some(triggers) = interp.triggers.get_mut(&part) {
         triggers.retain(|t| t.parent.is_none() || t.constrrel.is_some());
     }
+    prune_trigger_constraints(interp, part);
+}
+
+/// Drop the `pg_constraint` rows of `relid`'s constraint triggers that are
+/// gone: a constraint trigger's row goes with it.
+pub(crate) fn prune_trigger_constraints(interp: &mut PgCatalog, relid: PgClassOid) {
+    let live: Vec<crate::oid::PgConstraintOid> = interp
+        .triggers
+        .get(&relid)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.constraint)
+        .collect();
+    let gone: Vec<crate::oid::PgConstraintOid> = interp
+        .pg_constraint
+        .values()
+        .filter(|c| {
+            c.conrelid == relid
+                && c.contype == crate::pg_catalog::ConType::Trigger
+                && !live.contains(&c.oid)
+        })
+        .map(|c| c.oid)
+        .collect();
+    for oid in gone {
+        interp.pg_constraint.remove(&oid);
+    }
 }
 
 /// Remove trigger `name` of `relid` and, recursively, its clones.
@@ -793,6 +868,7 @@ pub(crate) fn remove_with_clones(interp: &mut PgCatalog, relid: PgClassOid, name
         if let Some(oid) = dropped {
             interp.remove_dependencies_of(super::depend::PG_TRIGGER_RELID, oid);
         }
+        prune_trigger_constraints(interp, relid);
     }
     for part in partitions_of(interp, relid) {
         if interp

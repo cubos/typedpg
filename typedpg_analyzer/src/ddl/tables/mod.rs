@@ -11,10 +11,7 @@ use crate::pg_catalog::{
 };
 
 use super::DdlError;
-use super::util::{
-    ensure_range_var, format_type_for_message, lookup_type_name, range_var_names,
-    register_composite_to_record_cast,
-};
+use super::util::{ensure_range_var, format_type_for_message, lookup_type_name, range_var_names};
 use super::views;
 use crate::pg_catalog::PgCatalog;
 use crate::qualified_name::QualifiedName;
@@ -87,31 +84,119 @@ impl ConName {
     }
 }
 
+/// ComputePartitionAttrs: a key expression whose transformed form is a
+/// plain column — `(a)`, `((t).a)`, `(a::int)` of an int column, under
+/// COLLATE clauses — is that column ("User wrote "(column)" or "(column
+/// COLLATE something)". Treat it like simple attribute anyway"); the
+/// spec with such keys written as columns (the COLLATE as the key's).
+fn canonical_partition_spec(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    spec: &typedpg_pg_query::ast::PartitionSpec,
+) -> typedpg_pg_query::ast::PartitionSpec {
+    let mut spec = spec.clone();
+    for elem in &mut spec.part_params {
+        let Some(ast::Node::PartitionElem(pe)) = elem.as_mut() else {
+            continue;
+        };
+        if !pe.name.is_empty() {
+            continue;
+        }
+        let Some(attnum) = crate::ddl::indexes::expression_column(interp, relid, pe.expr.as_ref())
+            .filter(|&a| a > 0)
+        else {
+            continue;
+        };
+        let Some(name) = interp
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum == attnum)
+            .map(|a| a.attname.clone())
+        else {
+            continue;
+        };
+        // The outermost COLLATE clause is the key's collation, unless the
+        // key has its own.
+        if pe.collation.is_empty()
+            && let Some(ast::Node::CollateClause(c)) = pe.expr.take()
+        {
+            pe.collation = c.collname.clone();
+        }
+        pe.name = name;
+        pe.expr = None;
+    }
+    spec
+}
+
 /// A CHECK constraint's `conkey`: the columns its expression reads, in
-/// attnum order (StoreRelCheck / pull_varattnos). DROP COLUMN drops the
-/// constraints whose key contains the column.
+/// the order it reads them (StoreRelCheck's pull_var_clause, duplicates
+/// dropped). DROP COLUMN drops the constraints whose key contains the
+/// column.
 fn check_conkey(
     interp: &PgCatalog,
     relid: PgClassOid,
     expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> Vec<i16> {
-    let mut attnums: Vec<i16> = Vec::new();
+    check_columns(interp, relid, expr)
+        .into_iter()
+        .map(|(_, attnum)| attnum)
+        .collect()
+}
+
+/// The columns (user or system) a CHECK expression of `relid` reads, in
+/// the order it reads them, each once: a column reference, or a field
+/// selection on the relation's whole row (`(t).a`, which transformIndirection
+/// turns into the column's Var).
+fn check_columns(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&typedpg_pg_query::ast::Node>,
+) -> Vec<(String, i16)> {
+    let selections = super::util::relation_row_selections(interp, relid, expr);
+    // The references in source order (the walk's order is not): the
+    // transformed expression's Vars come in the same order.
+    let mut refs: Vec<(i32, &str)> = Vec::new();
     if let Some(inner) = expr {
         for (n, ..) in inner.nodes() {
-            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                && let Some(name) = cr
+            let typedpg_pg_query::NodeRef::ColumnRef(cr) = n else {
+                continue;
+            };
+            let name = match selections.iter().find(|(r, _)| std::ptr::eq(*r, cr)) {
+                Some((_, field)) => Some(*field),
+                None => cr
                     .fields
                     .last()
-                    .and_then(|n| super::util::node_string(n.as_ref()))
-                && let Some(attr) = interp.attribute_by_name(relid, name)
-                && !attnums.contains(&attr.attnum)
-            {
-                attnums.push(attr.attnum);
+                    .and_then(|n| super::util::node_string(n.as_ref())),
+            };
+            if let Some(name) = name {
+                refs.push((cr.location, name));
             }
         }
     }
-    attnums.sort_unstable();
-    attnums
+    refs.sort_by_key(|&(location, _)| location);
+    let mut columns: Vec<(String, i16)> = Vec::new();
+    for (_, name) in refs {
+        if let Some(attnum) = check_column_attnum(interp, relid, name)
+            && !columns.iter().any(|(_, a)| *a == attnum)
+        {
+            columns.push((name.to_owned(), attnum));
+        }
+    }
+    columns
+}
+
+/// The attnum of the column `name` a CHECK expression of `relid` reads: a
+/// column of the relation, or a system column (`tableoid`, `ctid`…).
+fn check_column_attnum(interp: &PgCatalog, relid: PgClassOid, name: &str) -> Option<i16> {
+    interp
+        .attribute_by_name(relid, name)
+        .map(|a| a.attnum)
+        .or_else(|| {
+            crate::pg_catalog::SYSTEM_COLUMNS
+                .iter()
+                .find(|(n, ..)| *n == name)
+                .map(|&(.., attnum)| attnum)
+        })
 }
 
 /// The name addition for a CHECK constraint (AddRelationNewConstraints):
@@ -122,23 +207,8 @@ fn check_name_addition(
     relid: PgClassOid,
     expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> String {
-    let mut columns: Vec<String> = Vec::new();
-    if let Some(inner) = expr {
-        for (n, ..) in inner.nodes() {
-            if let typedpg_pg_query::NodeRef::ColumnRef(cr) = n
-                && let Some(name) = cr
-                    .fields
-                    .last()
-                    .and_then(|n| super::util::node_string(n.as_ref()))
-                && interp.attribute_by_name(relid, name).is_some()
-                && !columns.iter().any(|c| c == name)
-            {
-                columns.push(name.to_owned());
-            }
-        }
-    }
-    match columns.as_slice() {
-        [one] => one.clone(),
+    match check_columns(interp, relid, expr).as_slice() {
+        [(one, _)] => one.clone(),
         _ => String::new(),
     }
 }
@@ -500,7 +570,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typsubscript: phys.typsubscript,
         typisdefined: true,
     });
-    register_composite_to_record_cast(interp, composite_oid)?;
 
     // Array type for the composite (makeArrayTypeName: `_<name>`, unless
     // that is taken).
@@ -605,6 +674,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 (i + 1) as i16,
                 deptype,
                 &col.identity_options,
+                col.sequence_of_column_type,
                 owner,
             )?;
         }
@@ -622,7 +692,11 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
 
     // transformPartitionSpec / ComputePartitionAttrs: the key columns and
     // expressions, and their operator classes.
-    if let Some(spec) = stmt.partspec.as_ref() {
+    let canonical_spec = stmt
+        .partspec
+        .as_ref()
+        .map(|spec| canonical_partition_spec(interp, class_oid, spec));
+    if let Some(spec) = canonical_spec.as_ref() {
         use typedpg_pg_query::ast::PartitionStrategy;
         let strategy = Some(spec.strategy);
         // DefineRelation: PARTITION_MAX_KEYS (= INDEX_MAX_KEYS).
@@ -1260,6 +1334,10 @@ struct ParsedColumn {
     owned_sequence: Option<crate::pg_catalog::DepType>,
     /// The identity's sequence options (`GENERATED ... AS IDENTITY (...)`).
     identity_options: Vec<Option<typedpg_pg_query::ast::Node>>,
+    /// The implicit sequence is of the column's type (generateSerialExtraStmts
+    /// given it); `false` for a LIKE copy's identity, whose CREATE SEQUENCE
+    /// names no type: it is a bigint one.
+    sequence_of_column_type: bool,
     /// The column has a local NOT NULL (explicit, PRIMARY KEY, serial,
     /// identity) — PG 18 records it as a local not-null constraint.
     nn_local: bool,
@@ -1841,10 +1919,15 @@ fn set_persistence(
             )));
         }
     }
-    if to_logged {
-        interp.relpersistence.remove(&relid);
-    } else {
-        interp.relpersistence.insert(relid, 'u');
+    // ATRewriteTables: the table's owned sequences (serial, identity, OWNED
+    // BY) change persistence with it.
+    let sequences = crate::ddl::sequences::owned_sequences(interp, relid, None);
+    for rel in std::iter::once(relid).chain(sequences) {
+        if to_logged {
+            interp.relpersistence.remove(&rel);
+        } else {
+            interp.relpersistence.insert(rel, 'u');
+        }
     }
     // ATRewriteTables: a new persistence is a rewrite.
     crate::ddl::indexes::table_rewritten(interp, relid);

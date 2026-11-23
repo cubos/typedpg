@@ -31,6 +31,8 @@
 //! Every accepted query is also executed over adversarial data to check
 //! the analyzer's nullability: see [`soundness`].
 
+mod catalog_extras;
+mod catalog_state;
 mod soundness;
 
 /// What the `breaks_deployed_queries` oracle (`typedpg_lint`) reuses of
@@ -185,6 +187,12 @@ pub(crate) struct PgSanityServer {
     /// tests build catalogs the mirror can't follow (clones sharing one
     /// server, migrations the runner's transaction wraps).
     mirror_only: bool,
+    /// Every migration sent to the server, with its outcome: the repro the
+    /// catalog oracle prints.
+    history: Vec<String>,
+    /// The catalog oracle reported this catalog once already: what follows
+    /// inherits the divergence.
+    catalog_diverged: bool,
 }
 
 /// Serializes the migrations writing a shared (cluster-wide) catalog
@@ -348,6 +356,8 @@ impl PgSanityServer {
             soundness: soundness::Soundness::new(),
             created_roles: Vec::new(),
             mirror_only: std::env::var("PG_SANITY_MIRROR_ONLY").is_ok_and(|v| v == "1"),
+            history: Vec::new(),
+            catalog_diverged: false,
         })
     }
 
@@ -425,6 +435,10 @@ impl PgSanityServer {
             });
         }
         drop(lock);
+        self.history.push(match &pg_result {
+            Ok(()) => format!("{sql}\n-- (succeeded)"),
+            Err(e) => format!("{sql}\n-- (failed: {})", render_pg_error(e)),
+        });
         // A type renamed or moved to another schema keeps its OID: the
         // names cached for the old catalog may be stale.
         self.type_name_cache.clear();
@@ -900,6 +914,145 @@ impl PgSanityServer {
         if let Some(message) = divergence {
             panic!("{message}");
         }
+    }
+
+    /// The catalog oracle (see [`catalog_state`]): after a migration both
+    /// sides accepted, the server's system catalogs and the analyzer's must
+    /// hold the same rows for every object the migrations created, but for
+    /// OIDs. On with `PG_SANITY_CATALOG=1` (panics on the first divergence)
+    /// or `PG_SANITY_CATALOG_LOG=<file>` (appends each catalog's first
+    /// divergence to the file and goes on). `PG_SANITY_CATALOG_IGNORE` —
+    /// substrings separated by `|` — drops the difference lines containing
+    /// one (a corpus run against a server whose extensions are other
+    /// versions than the analyzer's).
+    pub(crate) fn check_catalog_state(&mut self, db: &crate::pg_catalog::PgCatalog) {
+        let log = std::env::var_os("PG_SANITY_CATALOG_LOG");
+        let on = log.is_some() || std::env::var("PG_SANITY_CATALOG").is_ok_and(|v| v == "1");
+        if !on || self.mirror_only || self.catalog_diverged {
+            return;
+        }
+        let ignored = std::env::var("PG_SANITY_CATALOG_IGNORE").unwrap_or_default();
+        let ignored: Vec<&str> = ignored.split('|').filter(|s| !s.is_empty()).collect();
+        let differences: Vec<String> = self
+            .catalog_differences(db)
+            .into_iter()
+            .filter(|line| !ignored.iter().any(|s| line.contains(s)))
+            .collect();
+        if differences.is_empty() {
+            return;
+        }
+        self.catalog_diverged = true;
+        let message = format!(
+            "pg_sanity: the catalogs diverged after these migrations:\n{}\n\
+             --- differences:\n{}\n",
+            self.history.join("\n\n"),
+            differences.join("\n")
+        );
+        match log {
+            Some(path) => {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap_or_else(|e| panic!("pg_sanity: open {path:?}: {e}"));
+                let test = std::thread::current()
+                    .name()
+                    .unwrap_or("<unnamed>")
+                    .to_owned();
+                // One write per record: concurrent test processes append to
+                // the same file.
+                let record = format!("=== {test}\n{message}");
+                file.write_all(record.as_bytes())
+                    .unwrap_or_else(|e| panic!("pg_sanity: write {path:?}: {e}"));
+            }
+            None => panic!("{message}"),
+        }
+    }
+
+    /// The catalog oracle's comparison: every difference between the
+    /// server's user rows and the analyzer's, normalized.
+    fn catalog_differences(&mut self, db: &crate::pg_catalog::PgCatalog) -> Vec<String> {
+        let fail = |e: postgres::Error| -> ! {
+            panic!("pg_sanity: catalog export failed: {}", render_pg_error(&e))
+        };
+        let mut pg = crate::catalog_export::export_user_objects(&mut self.client)
+            .unwrap_or_else(|e| fail(e));
+        // Another session's temporary schema (the query session's helper
+        // functions) is no migration's.
+        let hidden: std::collections::HashSet<u32> = self
+            .client
+            .query(
+                "SELECT n.oid FROM pg_catalog.pg_namespace n \
+                 WHERE n.nspname ~ '^pg_(toast_)?temp_[0-9]+$' \
+                   AND regexp_replace(n.nspname, '^pg_(toast_)?temp_', '') \
+                       IS DISTINCT FROM ( \
+                         SELECT regexp_replace(m.nspname, '^pg_temp_', '') \
+                         FROM pg_catalog.pg_namespace m \
+                         WHERE m.oid = pg_catalog.pg_my_temp_schema())",
+                &[],
+            )
+            .unwrap_or_else(|e| fail(e))
+            .iter()
+            .map(|r| r.get::<_, u32>(0))
+            .collect();
+        catalog_state::hide_namespaces(&mut pg, &hidden);
+        let mut pg_aux = catalog_state::Aux {
+            extras: catalog_extras::from_server(&mut self.client).unwrap_or_else(|e| fail(e)),
+            ..Default::default()
+        };
+        for row in self
+            .client
+            .query(
+                "SELECT 2601::oid, oid, 'access method ' || amname FROM pg_catalog.pg_am \
+                   WHERE oid >= 16384 \
+                 UNION ALL \
+                 SELECT 2328::oid, oid, 'foreign-data wrapper ' || fdwname \
+                   FROM pg_catalog.pg_foreign_data_wrapper WHERE oid >= 16384 \
+                 UNION ALL \
+                 SELECT 2612::oid, oid, lanname::text FROM pg_catalog.pg_language",
+                &[],
+            )
+            .unwrap_or_else(|e| fail(e))
+        {
+            pg_aux
+                .names
+                .insert((row.get::<_, u32>(0), row.get::<_, u32>(1)), row.get(2));
+        }
+
+        let mut ours = db.to_seed();
+        // A partition's index: PG records its parent index in
+        // pg_inherits, the analyzer in `index_parents`.
+        for (&child, &parent) in db.index_parents.iter() {
+            ours.pg_inherits.push(crate::pg_catalog::PgInherits {
+                inhrelid: child,
+                inhparent: parent,
+                inhseqno: 1,
+            });
+        }
+        let session_user: String = self
+            .client
+            .query_one("SELECT session_user::text", &[])
+            .unwrap_or_else(|e| fail(e))
+            .get(0);
+        let mut our_aux = catalog_state::Aux {
+            extras: catalog_extras::from_model(db, &|role| pg_role_name(db, role, &session_user)),
+            ..Default::default()
+        };
+        for (name, oid) in &db.access_method_oids {
+            our_aux
+                .names
+                .insert((2601, oid.get()), format!("access method {name}"));
+        }
+        for (name, oid) in db.foreign_data.wrappers() {
+            our_aux
+                .names
+                .insert((2328, oid.get()), format!("foreign-data wrapper {name}"));
+        }
+        catalog_state::diff(
+            &catalog_state::normalize(&ours, db, &our_aux),
+            &catalog_state::normalize(&pg, db, &pg_aux),
+        )
     }
 
     /// Remember the roles the catalog has seen created. Called after every

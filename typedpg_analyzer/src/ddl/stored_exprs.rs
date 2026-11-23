@@ -182,6 +182,15 @@ pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str
         spec.rename_key_column(old, new);
         interp.partition_specs.insert(relid, spec);
     }
+    // A trigger's UPDATE OF columns (`tgattr`, by attnum: the rename
+    // reaches them).
+    if let Some(triggers) = interp.triggers.get_mut(&relid) {
+        for column in triggers.iter_mut().flat_map(|t| t.columns.iter_mut()) {
+            if column == old {
+                *column = new.to_owned();
+            }
+        }
+    }
     // The index expressions and predicates over the relation.
     let indexes: Vec<PgClassOid> = interp
         .pg_index
