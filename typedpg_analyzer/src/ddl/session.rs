@@ -383,6 +383,21 @@ impl PgCatalog {
         self.refresh_search_path();
     }
 
+    /// Tell the catalog what the configuration says of the migrations'
+    /// session (`migrations_user`, `database_name`): what it names is set,
+    /// the rest left as it is.
+    pub fn set_migrations_connection(
+        &mut self,
+        connection: &typedpg_core::config::MigrationsConnection,
+    ) {
+        if let Some(user) = &connection.user {
+            self.set_connecting_user(user);
+        }
+        if let Some(database) = &connection.database {
+            self.set_database_name(database);
+        }
+    }
+
     /// Tell the catalog the name of the database the migrations run in,
     /// which privilege errors on the database name. Unknown by default.
     pub fn set_database_name(&mut self, name: &str) {
@@ -412,8 +427,11 @@ impl PgCatalog {
             .filter(|&role| super::permissions::restricted(self, role))
             .map(|role| self.roles.name(role).to_owned());
         for name in setting {
-            // `$user` is the schema named after current_user — known only
-            // in the migrations' session, and once they name the role.
+            // `$user` is the schema named after current_user: in the
+            // migrations' session the role they named, else the connecting
+            // user; the application's queries are analyzed as the
+            // connecting user. While that user's name is unknown, its
+            // schema is the pending one (`schema_stmt::PENDING_USER_SCHEMA`).
             let name = match name.as_str() {
                 "pg_temp" => {
                     match self.temp_namespace.filter(|_| self.in_migration) {
@@ -426,10 +444,15 @@ impl PgCatalog {
                 "$user" => match self
                     .session_identity
                     .current_user()
+                    .filter(|_| self.in_migration)
                     .or(self.session_identity.connecting_user())
+                    .or(self
+                        .session_identity
+                        .pending_user_schema
+                        .then_some(super::schema_stmt::PENDING_USER_SCHEMA))
                 {
-                    Some(user) if self.in_migration => user,
-                    _ => continue,
+                    Some(user) => user,
+                    None => continue,
                 },
                 other => other,
             };

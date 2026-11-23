@@ -56,7 +56,22 @@ impl PgCatalog {
         if name == "pg_temp" {
             return temp;
         }
-        let oid = self.namespace_by_name.get(name).copied()?;
+        let Some(oid) = self.namespace_by_name.get(name).copied() else {
+            // Outside the migrations (an application's query), a schema
+            // that doesn't exist may be the connecting user's, whose name
+            // is unknown: the pending user schema. (In the migrations, a
+            // statement naming it renames that schema first:
+            // `schema_stmt::materialize_user_schema`.)
+            return (!self.in_migration
+                && self.session_identity.pending_user_schema
+                && crate::ddl::schema_stmt::may_name_pending_user_schema(name))
+            .then(|| {
+                self.namespace_by_name
+                    .get(crate::ddl::schema_stmt::PENDING_USER_SCHEMA)
+                    .copied()
+            })
+            .flatten();
+        };
         if Some(oid) == self.temp_namespace && temp.is_none() {
             return None;
         }

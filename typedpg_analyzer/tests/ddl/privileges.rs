@@ -3279,6 +3279,9 @@ fn a_schema_named_after_the_connecting_user() {
     .unwrap();
     assert!(db.resolve_table(Some("postgres"), "a").is_some());
     assert!(db.resolve_table(Some("postgres"), "b").is_some());
+    // The application's queries, analyzed as the connecting user (as the
+    // mirror's query session connects), find it unqualified too.
+    db.analyze("SELECT a.id FROM a JOIN b USING (id)").unwrap();
     // SESSION_USER under SET ROLE is still the connecting user, whom the
     // role can't become; but CREATE on the database comes first.
     ddl_denied(

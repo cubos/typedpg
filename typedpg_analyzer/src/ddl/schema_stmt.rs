@@ -9,12 +9,27 @@ use super::DdlError;
 use super::util::ensure_namespace;
 use crate::pg_catalog::PgCatalog;
 
+/// The name the schema named after the connecting user goes by while that
+/// user's name is unknown (`SessionIdentity::pending_user_schema`): `$user`
+/// in the search path finds it, as PostgreSQL's finds the user's schema.
+/// A search path entry `$user` is never looked up as a name.
+pub(crate) const PENDING_USER_SCHEMA: &str = "$user";
+
+/// Whether `name`, a schema that doesn't exist, may be the connecting
+/// user's unknown name — so the pending user schema (see
+/// [`PENDING_USER_SCHEMA`]) may be it.
+pub(crate) fn may_name_pending_user_schema(name: &str) -> bool {
+    super::session::role_may_exist(name) && !name.starts_with("pg_") && name != PENDING_USER_SCHEMA
+}
+
 /// While the connecting user's name is unknown and a schema named after it
 /// was created (`SessionIdentity::pending_user_schema`): the first schema
-/// `stmt` names that doesn't exist is taken to be that schema — the
-/// connecting user's name — and created, owned by the migrations' user.
-/// Taking a name for it may let a statement through that PostgreSQL
-/// rejects, never the other way round.
+/// `stmt` names that doesn't exist is taken to be that schema — its name
+/// the connecting user's — and the pending schema is renamed to it, with
+/// what was created in it. Taking a name for it may let a statement
+/// through that PostgreSQL rejects, never the other way round. (A query
+/// outside the migrations finds it under any such name the same way:
+/// `PgCatalog::namespace_oid`.)
 pub(crate) fn materialize_user_schema(interp: &mut PgCatalog, stmt: &ast::Node) {
     if !interp.session_identity.pending_user_schema
         || interp.session_identity.connecting_user().is_some()
@@ -23,19 +38,19 @@ pub(crate) fn materialize_user_schema(interp: &mut PgCatalog, stmt: &ast::Node) 
     }
     let Some(name) = named_schemas(stmt)
         .into_iter()
-        .find(|s| interp.namespace_oid(s).is_none() && super::session::role_may_exist(s))
+        .find(|s| interp.namespace_oid(s).is_none() && may_name_pending_user_schema(s))
     else {
         return;
     };
-    let current = interp.session_identity.clone();
-    let owner = interp.roles.migrations_user;
-    if ensure_namespace(interp, &name).is_ok()
-        && let Some(ns) = interp.namespace_oid(&name)
-    {
-        super::acl::schema_created(interp, ns, owner, false);
+    let rename = ast::RenameStmt {
+        rename_type: ObjectType::ObjectSchema,
+        subname: PENDING_USER_SCHEMA.to_owned(),
+        newname: name.clone(),
+        ..Default::default()
+    };
+    if super::alter::rename(interp, &rename).is_ok() {
+        interp.set_connecting_user(&name);
     }
-    interp.session_identity = current;
-    interp.set_connecting_user(&name);
 }
 
 /// The schemas `stmt` names: the schema of each qualified name in it (a
@@ -193,14 +208,10 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
                 Some(user) => user.to_owned(),
                 None => {
                     // The connecting user's name is unknown: so is the
-                    // schema's. A statement naming a schema that doesn't
-                    // exist is taken to name it (`materialize_user_schema`);
-                    // elements created in it can't be placed.
-                    if !stmt.schema_elts.is_empty() {
-                        interp.roles.uncertain.catalog = true;
-                    }
+                    // schema's, which goes by `PENDING_USER_SCHEMA` until a
+                    // statement names it (`materialize_user_schema`).
                     interp.session_identity.pending_user_schema = true;
-                    return Ok(());
+                    PENDING_USER_SCHEMA.to_owned()
                 }
             },
             None => return Ok(()),
@@ -435,5 +446,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.session_identity.connecting_user(), None);
+    }
+
+    /// Until a statement names it, the unknown connecting user's schema is
+    /// `$user` in the search path: unqualified objects go there and are
+    /// found there, and an application's query naming any schema that
+    /// could be the user's finds it.
+    #[test]
+    fn the_unknown_connecting_users_schema_is_dollar_user() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE SCHEMA AUTHORIZATION CURRENT_USER;
+             CREATE TABLE a (id int NOT NULL);
+             CREATE VIEW va AS SELECT id FROM a;",
+        )
+        .unwrap();
+        let pending = db.namespace_oid(super::PENDING_USER_SCHEMA).unwrap();
+        assert_eq!(db.resolve_table(None, "a").unwrap().relnamespace, pending);
+        assert!(db.resolve_table(Some("public"), "a").is_none());
+        for sql in [
+            "SELECT id FROM a",
+            "SELECT id FROM deployer.a",
+            "SELECT id FROM app.va",
+        ] {
+            db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        // A name that can't be a role's is no user's schema.
+        assert!(db.analyze("SELECT id FROM pg_nope.a").is_err());
+        // Named in a migration, the schema takes that name with its objects;
+        // other names are no schema any more.
+        db.apply_sql("CREATE TABLE deployer.b (id int);").unwrap();
+        assert!(db.resolve_table(Some("deployer"), "a").is_some());
+        assert!(db.namespace_oid(super::PENDING_USER_SCHEMA).is_none());
+        db.analyze("SELECT id FROM a JOIN deployer.b USING (id)")
+            .unwrap();
+        assert!(db.analyze("SELECT id FROM app.a").is_err());
+        // The schema's own elements go in it too.
+        let mut db = catalog();
+        db.apply_sql("CREATE SCHEMA AUTHORIZATION SESSION_USER CREATE TABLE e (id int);")
+            .unwrap();
+        assert!(db.analyze("SELECT id FROM e").is_ok());
     }
 }

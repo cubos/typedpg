@@ -56,11 +56,17 @@
 //! report PostgreSQL's `permission denied` when one of them may not run a
 //! query. Only roles the migrations create can be checked. Empty by default.
 //!
+//! `migrationsUser` names the user the migrations connect as and
+//! `databaseName` the database: `CURRENT_USER` and `$user` in the migrations
+//! name that user (`CREATE SCHEMA AUTHORIZATION CURRENT_USER`), and
+//! privilege errors on the database name it. Both optional.
+//!
 //! `migrations` is the directory, or an object with it and the runner's
 //! settings: `{ "dir", "table", "lockId", "useTransaction", "failOnDrift",
 //! "embed" }`. Several databases go under `databases`, each with the
 //! per-database keys (`out`, `sql`, `migrations`, `extraMigrations`,
-//! `types`, `roles`); the top level then carries none of them.
+//! `types`, `roles`, `migrationsUser`, `databaseName`); the top level then
+//! carries none of them.
 //!
 //! `sql` takes the queries of `.sql` files, each a `/* @name x */` block
 //! (see [`crate::sqlfile`]):
@@ -88,7 +94,8 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use typedpg_core::QualifiedName;
 use typedpg_core::config::{
-    LINT_RULES, LintConfig, LintLevel, LintSeverity, MigrationsConfig, SimplifyConfig,
+    LINT_RULES, LintConfig, LintLevel, LintSeverity, MigrationsConfig, MigrationsConnection,
+    SimplifyConfig,
 };
 
 pub const CONFIG_FILE: &str = "typedpg.config.json";
@@ -106,6 +113,8 @@ struct RawConfig {
     extra_migrations: Option<Vec<PathBuf>>,
     types: Option<BTreeMap<String, String>>,
     roles: Option<Vec<String>>,
+    migrations_user: Option<String>,
+    database_name: Option<String>,
     databases: Option<BTreeMap<String, RawDatabase>>,
     simplify: Option<RawSimplify>,
     lint: Option<RawLint>,
@@ -239,6 +248,10 @@ struct RawDatabase {
     /// The roles every query of this database is checked against, in
     /// addition to the schema's owner (see `PgCatalog::analyze_as`).
     roles: Option<Vec<String>>,
+    /// The user the migrations connect as (see `MigrationsConnection`).
+    migrations_user: Option<String>,
+    /// The database's name.
+    database_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,6 +471,9 @@ pub struct DatabaseConfig {
     /// The roles every query of this database is checked against, in
     /// addition to the schema's owner. Empty: nothing is checked.
     pub roles: Vec<String>,
+    /// What the config names of the migrations' session (`migrationsUser`,
+    /// `databaseName`).
+    pub connection: MigrationsConnection,
 }
 
 impl DatabaseConfig {
@@ -510,6 +526,8 @@ impl Config {
             extra_migrations: raw.extra_migrations,
             types: raw.types,
             roles: raw.roles,
+            migrations_user: raw.migrations_user,
+            database_name: raw.database_name,
         };
         // The databases' names and migration directories are also the `.sql`
         // loaders' cache recipe: `loader_cache::databases` is the one
@@ -669,6 +687,10 @@ fn database(
         types,
         simplify: simplify.clone(),
         roles: raw.roles.unwrap_or_default(),
+        connection: MigrationsConnection {
+            user: raw.migrations_user,
+            database: raw.database_name,
+        },
     })
 }
 
@@ -919,6 +941,35 @@ mod tests {
         let databases = typedpg_core::loader_cache::databases(text).unwrap();
         assert_eq!(databases.len(), 1);
         assert_eq!(databases[0].name, "default");
+    }
+
+    #[test]
+    fn the_migrations_connection_is_read_per_database() {
+        let c = Config::parse(
+            r#"{ "out": "db.ts", "migrationsUser": "deployer", "databaseName": "app" }"#,
+            Path::new("/p"),
+        )
+        .unwrap();
+        assert_eq!(
+            c.databases[0].connection,
+            MigrationsConnection {
+                user: Some("deployer".to_owned()),
+                database: Some("app".to_owned()),
+            }
+        );
+        let c = Config::parse(
+            r#"{ "databases": { "main": { "out": "a.ts", "migrationsUser": "etl" } } }"#,
+            Path::new("/p"),
+        )
+        .unwrap();
+        assert_eq!(c.databases[0].connection.user.as_deref(), Some("etl"));
+        assert_eq!(c.databases[0].connection.database, None);
+        let err = Config::parse(
+            r#"{ "migrationsUser": "x", "databases": { "main": { "out": "a.ts" } } }"#,
+            Path::new("/p"),
+        )
+        .unwrap_err();
+        assert!(err.contains("`migrationsUser`"), "{err}");
     }
 
     #[test]

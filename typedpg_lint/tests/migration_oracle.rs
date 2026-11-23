@@ -188,7 +188,7 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
     let options = LintOptions::from_config(&config);
     let run = catch_unwind(AssertUnwindSafe(|| {
         typedpg_lint::oracle::collect(|| {
-            lint_migrations(&files, case.use_transaction, &options).is_ok()
+            lint_migrations(&files, case.use_transaction, &Default::default(), &options).is_ok()
         })
     }));
     let stats = typedpg_lint::oracle::take_stats();

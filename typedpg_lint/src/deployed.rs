@@ -256,6 +256,8 @@ pub struct NewSchema<'a> {
     /// have (or has with other contents).
     pub first_new: usize,
     pub use_transaction: bool,
+    /// What the configuration names of the migrations' session.
+    pub connection: &'a typedpg_core::config::MigrationsConnection,
     /// The catalog `files` built, set up for queries as `prepare` sets one.
     pub catalog: &'a PgCatalog,
     /// Sets a catalog built from migrations up for analyzing queries, as the
@@ -437,6 +439,7 @@ fn place(
         return placements;
     };
     catalog.set_migrations_use_transaction(schema.use_transaction);
+    catalog.set_migrations_connection(schema.connection);
     for file in &schema.files[..schema.first_new] {
         if catalog.apply_migration(&file.path, &file.sql).is_err() {
             return placements;
@@ -3271,6 +3274,7 @@ mod tests {
                 files: &files,
                 first_new: old.len(),
                 use_transaction: true,
+                connection: &Default::default(),
                 catalog: &new_catalog,
                 prepare: &|_| Ok(()),
             },

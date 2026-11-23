@@ -1005,7 +1005,7 @@ let recent = sql!(db = analytics, role = "reporting", warehouse_pool,
 
 Only roles the migrations create can be checked: typedpg's catalog knows what those roles own and were granted, and nothing about the rest of the cluster. Naming another one is the compile error `role "x" does not exist (typedpg can check only the roles the migrations create)`.
 
-The migrations themselves are checked the same way once they switch to such a role (`SET ROLE`, `SET SESSION AUTHORIZATION`, `CREATE SCHEMA … AUTHORIZATION`): creating needs CREATE on the schema (on the database for a schema), `ALTER`, `DROP`, `COMMENT ON` and `CREATE INDEX` need ownership, the names a statement uses need USAGE on their schemas and types, a foreign key needs REFERENCES, and `OWNER TO` needs to be able to become the new owner, who needs CREATE on the schema — each with PostgreSQL's error, such as `permission denied for schema public` for a `CREATE TABLE` in `public` without a grant. The migrations' own user is taken to be a superuser, so nothing is checked before the switch.
+The migrations themselves are checked the same way once they switch to such a role (`SET ROLE`, `SET SESSION AUTHORIZATION`, `CREATE SCHEMA … AUTHORIZATION`): creating needs CREATE on the schema (on the database for a schema), `ALTER`, `DROP`, `COMMENT ON` and `CREATE INDEX` need ownership, the names a statement uses need USAGE on their schemas and types, a foreign key needs REFERENCES, and `OWNER TO` needs to be able to become the new owner, who needs CREATE on the schema — each with PostgreSQL's error, such as `permission denied for schema public` for a `CREATE TABLE` in `public` without a grant. The migrations' own user is taken to be a superuser, so nothing is checked before the switch. Name it with `migrations_user` (see [Configuration](#configuration)) when the migrations depend on its name: `CREATE SCHEMA AUTHORIZATION CURRENT_USER` then creates that schema and `$user` finds it. Left unnamed, that schema is the one `$user` finds — unqualified objects go in it — until something names a schema that doesn't exist, which is taken to be it.
 
 ### Keeping crates out of each other's tables
 
@@ -1132,6 +1132,12 @@ extra_migrations = ["../shared/migrations"]  # optional — extra migration dirs
                                              # owns shared tables
 roles = ["app_role"]               # optional — roles every sql! statement
                                    # must be runnable by (see Role checks)
+migrations_user = "deployer"       # optional — the user the migrations
+                                   # connect as: CURRENT_USER and $user name
+                                   # it (CREATE SCHEMA AUTHORIZATION
+                                   # CURRENT_USER creates schema deployer)
+database_name = "app"              # optional — the database, as privilege
+                                   # errors name it
 
 [package.metadata.typedpg.migrations]
 table = "public._migrations"       # optional — migration tracking table

@@ -339,6 +339,7 @@ fn build_lint(
         if let Ok(linted) = typedpg_lint::lint_migrations(
             &lint_files,
             project.migrations_use_transaction(db),
+            project.migrations_connection(db),
             &options,
         ) {
             for migration in linted.findings {
@@ -430,6 +431,7 @@ fn build_lint(
                             files,
                             first_new: *first_new,
                             use_transaction: project.migrations_use_transaction(db),
+                            connection: project.migrations_connection(db),
                             catalog,
                             prepare: &|catalog| project.prepare_catalog(db, catalog),
                         },
