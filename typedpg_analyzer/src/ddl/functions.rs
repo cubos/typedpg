@@ -1627,6 +1627,15 @@ pub(crate) fn rename_routine(
     // A stored policy expression calls the routine by name: follow it.
     let schema = interp.namespace_name(proc.pronamespace).map(str::to_owned);
     crate::ddl::policies::rewrite_function_refs(interp, oid, schema.as_deref(), &stmt.newname);
+    // So do the other stored expressions.
+    super::stored_exprs::follow_rename(
+        interp,
+        super::stored_exprs::Renamed::Function {
+            oid,
+            schema: None,
+            name: &stmt.newname,
+        },
+    );
     interp.rename_pg_proc(oid, stmt.newname.clone(), proc.pronamespace);
     Ok(())
 }
@@ -1656,6 +1665,15 @@ pub(crate) fn set_routine_schema(
     // A stored policy expression calls the routine by name: follow it.
     let schema = interp.namespace_name(new_nsoid).map(str::to_owned);
     crate::ddl::policies::rewrite_function_refs(interp, oid, schema.as_deref(), &proc.proname);
+    // So do the other stored expressions.
+    super::stored_exprs::follow_rename(
+        interp,
+        super::stored_exprs::Renamed::Function {
+            oid,
+            schema: schema.as_deref(),
+            name: &proc.proname,
+        },
+    );
     interp.rename_pg_proc(oid, proc.proname.clone(), new_nsoid);
     Ok(())
 }

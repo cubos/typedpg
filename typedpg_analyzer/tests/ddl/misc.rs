@@ -5359,18 +5359,21 @@ fn subscription_options_and_replication_slots() {
 #[test]
 fn a_subscription_moved_to_another_server_depends_on_that_one() {
     // ALTER SUBSCRIPTION ... SERVER moves the pg_depend entry. Moving runs
-    // the wrapper's connection function, which a stand-in like the test
-    // above's can't be on a live server, so the mirror sits this one out.
+    // the wrapper's connection function (ForeignServerConnectionString calls
+    // it with the owner's oid, the server's oid and a NULL pointer) and
+    // parses its result as a conninfo (walrcv_check_conninfo). `chr` reads
+    // only its first argument: the owner, the bootstrap superuser (oid 10),
+    // gives chr(10), a newline, which libpq parses as an empty conninfo. The
+    // other tests' `textlike_support` would dereference the oid as a pointer.
     let mut db = build_db(&[(
         "0001.sql",
         "CREATE FUNCTION cf(oid, oid, internal) RETURNS text LANGUAGE internal
-             AS 'textlike_support';
+             AS 'chr';
          CREATE FOREIGN DATA WRAPPER w CONNECTION cf;
          CREATE SERVER sv FOREIGN DATA WRAPPER w;
          CREATE SERVER sv2 FOREIGN DATA WRAPPER w;
          CREATE SUBSCRIPTION s SERVER sv PUBLICATION p WITH (connect = false);",
     )]);
-    db.skip_pg_sanity();
     db.apply_sql("ALTER SUBSCRIPTION s SERVER sv2; DROP SERVER sv;")
         .unwrap();
     let err = db.apply_sql("DROP SERVER sv2;").unwrap_err();

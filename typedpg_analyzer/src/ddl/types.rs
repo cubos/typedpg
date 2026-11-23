@@ -2638,6 +2638,14 @@ pub(crate) fn rename_type(
         super::policies::rewrite_relation_refs(interp, relid, None, &stmt.newname);
     }
     super::policies::rewrite_type_refs(interp, oid, None, &stmt.newname);
+    super::stored_exprs::follow_rename(
+        interp,
+        super::stored_exprs::Renamed::Type {
+            oid,
+            schema: None,
+            name: &stmt.newname,
+        },
+    );
     rename_type_internal(interp, oid, &stmt.newname, t.typnamespace)
 }
 
@@ -2687,6 +2695,14 @@ pub(crate) fn set_type_schema(
         interp.rename_pg_class(relid, t.typname.clone(), new_nsoid);
         super::policies::rewrite_relation_refs(interp, relid, Some(new_schema), &t.typname);
     }
+    super::stored_exprs::follow_rename(
+        interp,
+        super::stored_exprs::Renamed::Type {
+            oid,
+            schema: Some(new_schema),
+            name: &t.typname,
+        },
+    );
     interp.rename_pg_type(oid, t.typname.clone(), new_nsoid);
     super::policies::rewrite_type_refs(interp, oid, Some(new_schema), &t.typname);
     if let Some((array_oid, array_name)) = array {

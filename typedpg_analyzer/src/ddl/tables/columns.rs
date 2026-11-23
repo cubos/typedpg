@@ -1530,6 +1530,42 @@ pub(crate) fn drop_column(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
+    // ATExecDropColumn collects the column and the children's copies it
+    // drops along (a copy inherited from this parent only), and deletes
+    // them together: performMultipleDeletions reports a dependent of more
+    // than one object as one of "the desired objects".
+    let several = !rec.recursing
+        && rec.recurse
+        && inherit::children_of(interp, relid)
+            .into_iter()
+            .any(|child| {
+                interp
+                    .attribute_by_name(child, &cmd.name)
+                    .is_some_and(|a| a.attinhcount == 1 && !a.attislocal)
+            });
+    drop_column_and_copies(interp, relid, cmd, rec).map_err(|e| match e {
+        DdlError::DependencyError(msg) if several => {
+            const ONE: &str = " because other objects depend on it";
+            match (msg.strip_prefix("cannot drop "), msg.find(ONE)) {
+                (Some(_), Some(at)) => DdlError::DependencyError(format!(
+                    "cannot drop desired object(s) because other objects depend on them{}",
+                    &msg[at + ONE.len()..]
+                )),
+                _ => DdlError::DependencyError(msg),
+            }
+        }
+        e => e,
+    })
+}
+
+/// [`drop_column`] of `relid`'s column and, recursing, of the children's
+/// copies that go with it.
+fn drop_column_and_copies(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    cmd: &AlterTableCmd,
+    rec: inherit::Recursion,
+) -> Result<(), DdlError> {
     let Some(target) = interp.attribute_by_name(relid, &cmd.name).cloned() else {
         // ATExecDropColumn: a system column is found (IF EXISTS doesn't
         // skip it) and can't be dropped.
@@ -1627,7 +1663,7 @@ pub(crate) fn drop_column(
             missing_ok: true,
             ..cmd.clone()
         };
-        drop_column(interp, relid, &drop_dependent, rec)?;
+        drop_column_and_copies(interp, relid, &drop_dependent, rec)?;
     }
     interp.generated_refs.remove(&(relid, target.attnum));
     crate::ddl::depend::drop_column_dependents(interp, relid, target.attnum, cascade)?;
@@ -1787,7 +1823,7 @@ pub(crate) fn drop_column(
             continue;
         };
         if rec.recurse && child_col.attinhcount == 1 && !child_col.attislocal {
-            drop_column(interp, child, cmd, rec.child())?;
+            drop_column_and_copies(interp, child, cmd, rec.child())?;
         } else if let Some(attrs) = interp.pg_attribute.get_mut(&child)
             && let Some(a) = attrs.iter_mut().find(|a| a.attnum == child_col.attnum)
         {

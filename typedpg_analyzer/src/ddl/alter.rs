@@ -503,6 +503,14 @@ fn rename_schema(interp: &mut PgCatalog, stmt: &RenameStmt) -> Result<(), DdlErr
     }
     crate::ddl::schema_stmt::check_schema_name(new)?;
 
+    // The stored expressions naming what lives in it follow it.
+    crate::ddl::stored_exprs::follow_rename(
+        interp,
+        crate::ddl::stored_exprs::Renamed::Schema {
+            oid: nsoid,
+            name: new,
+        },
+    );
     interp.rename_pg_namespace(nsoid, new.clone());
     // Stored policy expressions that name the schema follow it.
     crate::ddl::policies::rewrite_schema_refs(interp, nsoid, new);
@@ -590,6 +598,13 @@ pub fn set_schema(interp: &mut PgCatalog, stmt: &AlterObjectSchemaStmt) -> Resul
                         .into(),
                 ));
             }
+            crate::ddl::stored_exprs::follow_rename(
+                interp,
+                crate::ddl::stored_exprs::Renamed::Operator {
+                    oid,
+                    schema: &new_schema,
+                },
+            );
             interp.move_pg_operator(oid, new_nsoid);
             crate::ddl::policies::rewrite_operator_refs(interp, oid, &new_schema);
             Ok(())

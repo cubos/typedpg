@@ -393,3 +393,108 @@ fn a_constraint_reads_its_table_however_it_was_qualified() {
         ),
     ]);
 }
+
+#[test]
+fn stored_expressions_call_renamed_and_moved_routines() {
+    // PG keeps a CHECK's, an index's and a default's functions by OID:
+    // ALTER COLUMN TYPE rebuilds them from pg_get_constraintdef /
+    // pg_get_indexdef, which name the functions as they are now called
+    // (schema-qualified when not visible) — renamed, moved, or in a
+    // renamed schema.
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA s;
+             CREATE FUNCTION pos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+             CREATE FUNCTION inc(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+             CREATE FUNCTION s.spos(int) RETURNS bool LANGUAGE sql IMMUTABLE
+                 AS 'SELECT $1 > 0';
+             CREATE FUNCTION dflt() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             CREATE TABLE t (a int CHECK (pos(a)), b int, c int CHECK (s.spos(c)),
+                 d int DEFAULT dflt());
+             CREATE INDEX i1 ON t (inc(b)) WHERE pos(b);
+             CREATE INDEX i2 ON t (c) WHERE s.spos(c);",
+        ),
+        (
+            "0002.sql",
+            "ALTER FUNCTION pos(int) RENAME TO pos2;
+             ALTER FUNCTION inc(int) SET SCHEMA s;
+             ALTER FUNCTION dflt() RENAME TO dflt2;
+             ALTER SCHEMA s RENAME TO s2;
+             ALTER TABLE t ALTER a TYPE smallint;
+             ALTER TABLE t ALTER b TYPE smallint;
+             ALTER TABLE t ALTER c TYPE smallint;
+             ALTER TABLE t ALTER d TYPE bigint;
+             CREATE TABLE c () INHERITS (t);
+             CREATE TABLE l (LIKE t INCLUDING ALL);",
+        ),
+    ]);
+}
+
+#[test]
+fn stored_expressions_name_renamed_and_moved_types_collations_and_operators() {
+    // The same for the types a stored expression casts to, the collations
+    // it names and the operators it calls.
+    build_db(&[
+        (
+            "0001.sql",
+            "CREATE SCHEMA s;
+             CREATE TYPE e AS ENUM ('x', 'y');
+             CREATE TYPE f AS ENUM ('x', 'y');
+             CREATE COLLATION mycoll FROM \"C\";
+             CREATE FUNCTION ieq(int, int) RETURNS bool LANGUAGE sql IMMUTABLE
+                 AS 'SELECT $1 = $2';
+             CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = ieq);
+             CREATE TABLE t (a text CHECK (a::e IS NOT NULL), b text CHECK (b::f IS NOT NULL),
+                 c text CHECK (c COLLATE mycoll > 'a'), x int, y int CHECK (x === y));
+             CREATE INDEX ic ON t ((c COLLATE mycoll));
+             CREATE INDEX io ON t (x) WHERE x === y;",
+        ),
+        (
+            "0002.sql",
+            "ALTER TYPE e RENAME TO e2;
+             ALTER TYPE f SET SCHEMA s;
+             ALTER COLLATION mycoll RENAME TO mycoll2;
+             ALTER COLLATION mycoll2 SET SCHEMA s;
+             ALTER OPERATOR === (int, int) SET SCHEMA s;
+             ALTER TABLE t ALTER a TYPE varchar;
+             ALTER TABLE t ALTER b TYPE varchar;
+             ALTER TABLE t ALTER c TYPE varchar;
+             ALTER TABLE t ALTER x TYPE int;
+             ALTER TABLE t ALTER y TYPE int;
+             CREATE TABLE c () INHERITS (t);",
+        ),
+    ]);
+}
+
+#[test]
+fn an_expression_index_keeps_its_column_names_until_rebuilt() {
+    // An index column over an expression is named when the index is
+    // created (`inc` for `inc(a)`): renaming the function leaves the name,
+    // and a rebuild by ALTER COLUMN TYPE names it anew from
+    // pg_get_indexdef (`inc2`).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION inc(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+         CREATE TABLE t (a int);
+         CREATE UNIQUE INDEX i ON t (inc(a));
+         ALTER FUNCTION inc(int) RENAME TO inc2;",
+    )]);
+    // ALTER TABLE ... RENAME COLUMN of the index finds the column by its
+    // name.
+    let missing = |db: &mut PgCatalog, name: &str| {
+        let sql = format!("ALTER TABLE i RENAME COLUMN {name} TO k;");
+        let err = db.apply_sql(&sql).expect_err(&sql);
+        assert!(
+            err.to_string()
+                .starts_with(&format!("column \"{name}\" does not exist")),
+            "got: {err}"
+        );
+    };
+    missing(&mut db, "inc2");
+    db.apply_sql("ALTER TABLE t ALTER a TYPE smallint;")
+        .unwrap();
+    missing(&mut db, "inc");
+    db.apply_sql("ALTER TABLE i RENAME COLUMN inc2 TO k;")
+        .unwrap();
+}

@@ -464,8 +464,15 @@ fn policy_expression_refs(
     let mut out = Vec::new();
     for expr in quals.0.iter().chain(quals.1.iter()) {
         for reference in super::depend::expression_references(interp, Some(expr), Some(relid)) {
+            // Its operators, and the types (a cast's, a typed literal's)
+            // and collations it names.
             if let super::depend::Reference::Object(addr) = reference
-                && addr.classid == crate::pg_catalog::PG_OPERATOR_RELID
+                && [
+                    crate::pg_catalog::PG_OPERATOR_RELID,
+                    crate::pg_catalog::PG_TYPE_RELID,
+                    crate::pg_catalog::PG_COLLATION_RELID,
+                ]
+                .contains(&addr.classid)
                 && !out.contains(&addr)
             {
                 out.push(addr);
@@ -600,16 +607,23 @@ pub(crate) fn record_trigger(
         return Ok(());
     };
     let mut refs = names_of(interp, relid, &stmt.columns);
+    let mut functions = Vec::new();
+    let mut objects = Vec::new();
     if let Some(when) = stmt.when_clause.as_ref() {
         let from = vec![
             Some(range_var_node(rv, Some("new"))),
             Some(range_var_node(rv, Some("old"))),
         ];
+        let select = select_of(&[when], from);
         refs.extend(
-            statement_refs(interp, &select_of(&[when], from), &[])
+            statement_refs(interp, &select, &[])
                 .into_iter()
                 .filter(|&(_, attnum)| attnum != 0),
         );
+        // recordDependencyOnExpr over the condition: the functions it
+        // calls, its operators and the cast functions it runs.
+        functions = super::views::statement_functions(interp, &select);
+        objects = trigger_when_expression_refs(interp, relid, when);
     }
     store(
         interp,
@@ -618,9 +632,69 @@ pub(crate) fn record_trigger(
             name: stmt.trigname.clone(),
         },
         refs,
-        Vec::new(),
-        Vec::new(),
+        functions,
+        objects,
     )
+}
+
+/// The operators and cast functions a trigger's WHEN condition runs, as
+/// [`policy_expression_refs`] finds a policy's — over the relation as
+/// `old` and `new`.
+fn trigger_when_expression_refs(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    when: &Node,
+) -> Vec<ObjectAddress> {
+    let Some(class) = interp.pg_class.get(&relid) else {
+        return Vec::new();
+    };
+    let nspname = interp
+        .namespace_name(class.relnamespace)
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = crate::scope::Scope::default();
+    for alias in ["old", "new"] {
+        scope.add_dml_target(
+            interp,
+            alias,
+            crate::qualified_name::QualifiedName::new(nspname.clone(), class.relname.clone()),
+            &attrs,
+        );
+    }
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let used = std::cell::RefCell::new(Vec::new());
+    let mut params = crate::param_collector::ParamCollector::default();
+    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).recording(&used);
+    let (_, references) = super::depend::collect(|| {
+        crate::expr::infer_expr(Some(when), ctx, &mut params, crate::expr::TypeGoal::NONE)
+    });
+    let mut out = Vec::new();
+    for reference in references {
+        // Its operators, and the types (a cast's, a typed literal's) and
+        // collations it names.
+        if let super::depend::Reference::Object(addr) = reference
+            && [
+                crate::pg_catalog::PG_OPERATOR_RELID,
+                crate::pg_catalog::PG_TYPE_RELID,
+                crate::pg_catalog::PG_COLLATION_RELID,
+            ]
+            .contains(&addr.classid)
+            && !out.contains(&addr)
+        {
+            out.push(addr);
+        }
+    }
+    for oid in used.into_inner() {
+        if !interp.pg_cast.values().any(|c| c.castfunc == Some(oid)) {
+            continue;
+        }
+        let addr = ObjectAddress::proc(oid);
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 /// CREATE RULE: what its WHERE condition and actions read, NEW and OLD

@@ -1627,3 +1627,29 @@ fn a_conditional_rule_cannot_notify() {
          CREATE RULE r2 AS ON INSERT TO t WHERE new.a > 0 DO ALSO SELECT 1;",
     )]);
 }
+
+#[test]
+fn a_view_selecting_a_field_of_a_row_depends_on_that_column() {
+    // `(t).a` is the Var of column `a` (ParseComplexProjection), not a
+    // whole-row read: the view depends on the column.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int);
+         CREATE VIEW v AS SELECT (t).a FROM t;",
+    )]);
+    for (sql, message) in [
+        (
+            "ALTER TABLE t DROP COLUMN a;",
+            "cannot drop column a of table t because other objects depend on it (view v \
+             depends on column a of table t)",
+        ),
+        (
+            "ALTER TABLE t ALTER a TYPE bigint;",
+            "cannot alter type of a column used by a view or rule",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+    db.apply_sql("ALTER TABLE t DROP COLUMN b;").unwrap();
+}

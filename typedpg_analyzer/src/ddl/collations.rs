@@ -198,6 +198,14 @@ pub(crate) fn rename_collation(
         return Ok(());
     };
     check_collation_name_free(interp, &stmt.newname, row.collnamespace)?;
+    super::stored_exprs::follow_rename(
+        interp,
+        super::stored_exprs::Renamed::Collation {
+            oid,
+            schema: None,
+            name: &stmt.newname,
+        },
+    );
     interp.remove_pg_collation(oid);
     row.collname.clone_from(&stmt.newname);
     interp.insert_pg_collation(row);
@@ -225,6 +233,14 @@ pub(crate) fn set_collation_schema(
     };
     check_collation_name_free(interp, &row.collname, new_nsoid)?;
     let name = row.collname.clone();
+    super::stored_exprs::follow_rename(
+        interp,
+        super::stored_exprs::Renamed::Collation {
+            oid,
+            schema: Some(&stmt.newschema),
+            name: &name,
+        },
+    );
     interp.remove_pg_collation(oid);
     row.collnamespace = new_nsoid;
     interp.insert_pg_collation(row);

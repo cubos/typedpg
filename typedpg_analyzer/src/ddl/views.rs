@@ -1410,6 +1410,23 @@ impl BindingWalker {
             // are expressions of their own (a function under an indirection
             // is recorded like any other).
             ast::Node::AIndirection(ind) => {
+                // `(t).c` on the whole row of FROM item `t` (no column is
+                // named `t`: transformColumnRef prefers one) is its column
+                // `c` — ParseComplexProjection turns it into that column's
+                // Var — not a read of the whole row.
+                if let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref()
+                    && let [Some(ast::Node::String(row))] = cr.fields.as_slice()
+                    && let Some(Some(ast::Node::String(field))) = ind.indirection.first()
+                    && resolve_column_unqualified(&row.sval, snapshot, stack).is_none()
+                    && let Some((relid, attnum)) =
+                        resolve_column_aliased(&row.sval, &field.sval, snapshot, stack)
+                {
+                    self.bindings.push(AstBinding::Column(relid, attnum));
+                    for step in ind.indirection.iter().skip(1).flatten() {
+                        self.walk_node(step, snapshot, stack);
+                    }
+                    return;
+                }
                 if let Some(arg) = ind.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
