@@ -164,6 +164,16 @@ for (const [name, connect] of drivers) {
       }));
     });
 
+    test("box arrays and int2vectors decode, and box arrays encode", async () => {
+      const boxes = ["(1,1),(0,0)", null, "(3,3),(2,2)"];
+      assert.deepEqual(await t.oddArrays.fetchOne(c.db, { boxes }), {
+        boxes,
+        built: boxes,
+        vec: [1, 2, -3],
+        empty_vec: [],
+      });
+    });
+
     test("an interval mixing signs is a DecodeError", async () => {
       await assert.rejects(t.mixedInterval.fetchOne(c.db), (e) => e instanceof DecodeError && /justify_interval/.test(e.message));
     });

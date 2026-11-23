@@ -99,7 +99,12 @@ export function embedMigrations(
   entries: readonly (readonly [name: string, sql: string, downSql: string | null])[],
   config: Partial<MigrationsConfig> = {},
 ): MigrationSet {
-  const migrations = entries.map(([name, sql, downSql]) => migration(name, `${name}.sql`, sql, downSql));
+  // A BOM is stripped, as `loadMigrations` and the Rust runner's
+  // `MigrationSource::from_embedded` do: PostgreSQL rejects it as a syntax
+  // error, and it would hide a `-- no-transaction` first line.
+  const migrations = entries.map(([name, sql, downSql]) =>
+    migration(name, `${name}.sql`, stripBom(sql), downSql === null ? null : stripBom(downSql)),
+  );
   return { migrations: sortByVersion(migrations), config: settings(config) };
 }
 
@@ -143,6 +148,19 @@ function settings(config: Partial<MigrationsConfig>): MigrationsConfig {
   // both runners accept exactly the same names.
   const invalid = validateTableName(s.table);
   if (invalid !== null) throw new MigrationError(invalid);
+  // The lock is a PostgreSQL bigint, as the Rust runner's `i64`: a number
+  // past 2^53 has already been rounded to another lock, and a bigint out of
+  // range would wrap to one.
+  const lock = s.lockId;
+  if (
+    typeof lock === "number"
+      ? !Number.isSafeInteger(lock)
+      : typeof lock !== "bigint" || BigInt.asIntN(64, lock) !== lock
+  ) {
+    throw new MigrationError(
+      `typedpg: lockId must be a bigint's value (a safe integer, or a bigint for a larger one), not ${String(lock)}`,
+    );
+  }
   return s;
 }
 

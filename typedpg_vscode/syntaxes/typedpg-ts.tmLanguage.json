@@ -24,6 +24,7 @@
           "endCaptures": { "1": { "name": "punctuation.definition.string.template.end.sql.typedpg" } },
           "contentName": "meta.embedded.sql",
           "patterns": [
+            { "include": "#escape" },
             { "include": "#spread-param" },
             { "include": "#named-param" },
             { "include": "source.sql" }
@@ -37,6 +38,7 @@
           "endCaptures": { "1": { "name": "punctuation.definition.string.end.sql.typedpg" } },
           "contentName": "meta.embedded.sql",
           "patterns": [
+            { "include": "#escape" },
             { "include": "#spread-param" },
             { "include": "#named-param" },
             { "include": "source.sql" }
@@ -50,12 +52,18 @@
           "endCaptures": { "1": { "name": "punctuation.definition.string.end.sql.typedpg" } },
           "contentName": "meta.embedded.sql",
           "patterns": [
+            { "include": "#escape" },
             { "include": "#spread-param" },
             { "include": "#named-param" },
             { "include": "source.sql" }
           ]
         }
       ]
+    },
+    "escape": {
+      "comment": "A JavaScript escape (\\\", \\`, \\n…): never the string's end, nor SQL's",
+      "name": "constant.character.escape.ts",
+      "match": "\\\\(?:x\\h{2}|u\\h{4}|u\\{\\h+\\}|.|$)"
     },
     "spread-param": {
       "comment": "Matches $..identifier and optionally $..identifier { field1, field2 }",

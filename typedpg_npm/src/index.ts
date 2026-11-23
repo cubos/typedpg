@@ -323,23 +323,29 @@ class QueryImpl {
    */
   private build(params: Record<string, unknown> = {}): Built {
     const { spec } = this;
-    const values = spec.params.map(([name, codec]) => {
+    // The codec knows the value, not the parameter it belongs to.
+    const encodeFor = (where: () => string, codec: Codec, value: unknown) => {
       try {
-        return encode(codec, params[name]);
+        return encode(codec, value);
       } catch (e) {
-        // The codec knows the value, not the parameter it belongs to.
-        if (e instanceof TypeError) {
-          throw new TypeError(`the parameter \`${name}\`: ${e.message}`);
-        }
+        if (e instanceof TypeError) throw new TypeError(`${where()}: ${e.message}`);
         throw e;
       }
-    });
+    };
+    const values = spec.params.map(([name, codec]) => encodeFor(() => `the parameter \`${name}\``, codec, params[name]));
     let n = values.length;
-    const placeholder = (codec: Codec, value: unknown, cast: string) => {
-      values.push(encode(codec, value));
+    const placeholder = (where: () => string, codec: Codec, value: unknown, cast: string) => {
+      values.push(encodeFor(where, codec, value));
       return `$${++n}${cast}`;
     };
-    const items = (i: number) => params[spec.spreads![i]![0]] as readonly unknown[];
+    const spread = (i: number) => `the spread \`${spec.spreads![i]![0]}\``;
+    const items = (i: number) => {
+      const list = params[spec.spreads![i]![0]];
+      if (!Array.isArray(list)) {
+        throw new TypeError(`${spread(i)} must be an array, not ${list === null ? "null" : typeof list}`);
+      }
+      return list as readonly unknown[];
+    };
     const write = (pieces: readonly SqlPiece[]): string =>
       pieces
         .map((piece) => {
@@ -349,9 +355,10 @@ class QueryImpl {
             const codec = spec.spreads![i]![1][0]![1];
             const list = items(i);
             if (op !== undefined && arrayCast !== undefined && list.length > ARRAY_THRESHOLD) {
-              return `(${lead}${op}(${placeholder(["array", codec], list, arrayCast)}))`;
+              return `(${lead}${op}(${placeholder(() => spread(i), ["array", codec], list, arrayCast)}))`;
             }
-            const written = list.length === 0 ? empty : `(${list.map((v) => placeholder(codec, v, cast)).join(", ")})`;
+            const written =
+              list.length === 0 ? empty : `(${list.map((v) => placeholder(() => spread(i), codec, v, cast)).join(", ")})`;
             return lead + keyword + written;
           }
           const [, rows, empty, unnest] = piece;
@@ -360,6 +367,7 @@ class QueryImpl {
             const values = items(only) as readonly Record<string, unknown>[];
             const arrays = spec.spreads![only]![1].map(([field, codec], c) =>
               placeholder(
+                () => `${spread(only)}, field \`${field}\``,
                 ["array", codec],
                 values.map((r) => r[field]),
                 unnest[c]!,
@@ -373,8 +381,12 @@ class QueryImpl {
             .map((item) => {
               if (item[0] === "row") return write(item[1]);
               const fields = spec.spreads![item[1]]![1];
-              const row = (r: Record<string, unknown>) =>
-                `(${fields.map(([field, codec, cast]) => placeholder(codec, r[field], cast)).join(", ")})`;
+              const row = (r: Record<string, unknown>, at: number) =>
+                `(${fields
+                  .map(([field, codec, cast]) =>
+                    placeholder(() => `${spread(item[1])}, item ${at}, field \`${field}\``, codec, r[field], cast),
+                  )
+                  .join(", ")})`;
               return (items(item[1]) as readonly Record<string, unknown>[]).map(row).join(", ");
             });
           return written.length === 0 ? empty : `VALUES ${written.join(", ")}`;
@@ -523,14 +535,23 @@ async function* copyText(
   rows: Iterable<Record<string, unknown>> | AsyncIterable<Record<string, unknown>>,
 ): AsyncIterable<string> {
   let chunk = "";
+  let at = 0;
   for await (const row of rows) {
     for (let i = 0; i < spec.columns.length; i++) {
       const [name, codec] = spec.columns[i]!;
-      const text = encode(codec, row[name]);
+      let text: string | null;
+      try {
+        text = encode(codec, row[name]);
+      } catch (e) {
+        // The codec knows the value, not the row and column it belongs to.
+        if (e instanceof TypeError) throw new TypeError(`row ${at}, column \`${name}\`: ${e.message}`);
+        throw e;
+      }
       if (i > 0) chunk += "\t";
       chunk += text === null ? "\\N" : copyEscape(text);
     }
     chunk += "\n";
+    at++;
     if (chunk.length >= COPY_CHUNK) {
       yield chunk;
       chunk = "";

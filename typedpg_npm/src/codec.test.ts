@@ -91,6 +91,22 @@ test("arrays", () => {
   assert.throws(() => decode(["array", "number"], "{{1},{2}}"), /multidimensional/);
 });
 
+test("a box array separates its elements with semicolons", () => {
+  // `box`'s typdelim is `;`: its own text holds commas.
+  assert.deepEqual(decode(["array", "box"], "{(1,1),(0,0);(3,3),(2,2);NULL}"), [
+    "(1,1),(0,0)",
+    "(3,3),(2,2)",
+    null,
+  ]);
+  assert.equal(encode(["array", "box"], ["(1,1),(0,0)", null, "(3,3),(2,2)"]), '{"(1,1),(0,0)";NULL;"(3,3),(2,2)"}');
+  assert.equal(decode("box", "(1,1),(0,0)"), "(1,1),(0,0)");
+});
+
+test("int2vector and oidvector print their elements space-separated", () => {
+  assert.deepEqual(decode(["array", "number"], "1 2 -3"), [1, 2, -3]);
+  assert.deepEqual(decode(["array", "number"], ""), []);
+});
+
 test("records", () => {
   const codec = ["record", [["a", "number"], ["b", "text"], ["c", "text"], ["d", ["array", "number"]]]] as const;
   assert.deepEqual(decode(codec, '(1,"x ""y"" \\\\z",,"{1,2}")'), {
@@ -123,6 +139,13 @@ test("encode", () => {
   assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Buffer or a Uint8Array, not a string/);
   assert.equal(encode(["array", "text"], ["a", null, 'q"\\']), '{"a",NULL,"q\\"\\\\"}');
   assert.equal(encode("text", null), null);
+});
+
+test("a float's negative zero is encoded as one", () => {
+  assert.equal(encode("number", -0), "-0");
+  assert.equal(encode("number", 0), "0");
+  assert.equal(encode(["array", "number"], [-0, 1.5]), '{"-0","1.5"}');
+  assert.ok(Object.is(decode("number", encode("number", -0)!), -0));
 });
 
 test("encode dates and times", () => {

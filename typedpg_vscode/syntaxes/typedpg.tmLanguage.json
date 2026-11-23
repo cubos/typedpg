@@ -9,13 +9,13 @@
       "end": "\\)",
       "patterns": [
         {
-          "comment": "Raw string literal containing SQL",
+          "comment": "Raw string literal containing SQL: it ends at a quote followed by as many # as it opened with",
           "name": "meta.embedded.sql.typedpg",
-          "begin": "(r\\#*\")",
+          "begin": "(r(\\#*)\")",
           "beginCaptures": {
             "1": { "name": "punctuation.definition.string.begin.sql.typedpg" }
           },
-          "end": "(\"\\#*)",
+          "end": "(\"\\2)",
           "endCaptures": {
             "1": { "name": "punctuation.definition.string.end.sql.typedpg" }
           },
@@ -39,6 +39,7 @@
           },
           "contentName": "meta.embedded.sql",
           "patterns": [
+            { "include": "#escape" },
             { "include": "#spread-param" },
             { "include": "#named-param" },
             { "include": "source.sql" }
@@ -48,6 +49,11 @@
     }
   ],
   "repository": {
+    "escape": {
+      "comment": "A Rust escape (\\\", \\n, a line continuation…) in a regular string: never the string's end, nor SQL's",
+      "name": "constant.character.escape.rust",
+      "match": "\\\\(?:x\\h{2}|u\\{\\h+\\}|.|$)"
+    },
     "spread-param": {
       "comment": "Matches $..identifier and optionally $..identifier { field1, field2 }",
       "name": "variable.spread.typedpg",
@@ -56,7 +62,7 @@
     "named-param": {
       "comment": "Matches $identifier (but not $..identifier which is handled above)",
       "name": "variable.parameter.typedpg",
-      "match": "\\$(?!\\.\\.)([a-zA-Z_][a-zA-Z0-9_]*\\??)"
+      "match": "\\$(?!\\.\\.)([a-zA-Z_][a-zA-Z0-9_]*[?!]?)"
     }
   }
 }

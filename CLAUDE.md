@@ -91,6 +91,7 @@ casually: an existing cache stays valid.
 cargo nextest run --release -p typedpg_ts        # scanner, codegen, incremental project
 (cd typedpg_npm && npm ci && npm test)           # runtime unit tests (codecs, wasm bridge)
 (cd typedpg_npm_cli && npm ci && npm test)       # command package (after typedpg_npm builds)
+(cd typedpg_vscode && npm ci && npm test)        # editor grammars (VS Code's TextMate engine)
 scripts/run-ts-e2e.sh                            # everything, on a PostgreSQL container
 BLESS=1 scripts/run-ts-e2e.sh                    # rewrite the errors fixtures' expected outputs
 ```

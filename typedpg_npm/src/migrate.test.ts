@@ -19,6 +19,27 @@ test("migrations are ordered by their numeric prefix", () => {
   );
 });
 
+test("embedded migrations lose their BOM, as the Rust runner's and loadMigrations' do", () => {
+  const [m] = embedMigrations([
+    ["1_a", "\ufeff-- no-transaction\nCREATE INDEX CONCURRENTLY i ON a (id);", "\ufeffDROP INDEX i;"],
+  ]).migrations;
+  assert.equal(m!.sql, "-- no-transaction\nCREATE INDEX CONCURRENTLY i ON a (id);");
+  assert.equal(m!.downSql, "DROP INDEX i;");
+  assert.equal(m!.noTransaction, true);
+  // Only a leading one: elsewhere it is text.
+  assert.equal(embedMigrations([["1_a", "SELECT '\ufeff';", null]]).migrations[0]!.sql, "SELECT '\ufeff';");
+});
+
+test("a lock id must be a bigint's value, taken exactly", () => {
+  const lock = (lockId: number | bigint) => embedMigrations([], { lockId }).config.lockId;
+  assert.equal(lock(9007199254740991), 9007199254740991);
+  assert.equal(lock(-(2n ** 63n)), -(2n ** 63n));
+  // Rounded already, or out of range (it would wrap): another lock.
+  assert.throws(() => lock(2 ** 53), MigrationError);
+  assert.throws(() => lock(1.5), MigrationError);
+  assert.throws(() => lock(2n ** 63n), MigrationError);
+});
+
 test("two migrations of the same version keep a deterministic order", () => {
   // The name settles it, so the runner and the compiler agree.
   const set = embedMigrations([

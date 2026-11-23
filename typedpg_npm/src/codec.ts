@@ -12,6 +12,8 @@
 /** How a value is converted; the generator writes one per column and parameter. */
 export type Codec =
   | "text"
+  // `box`: text, but its arrays separate elements with `;` (its typdelim).
+  | "box"
   | "bool"
   | "number"
   | "bigint"
@@ -94,6 +96,7 @@ export function decode(codec: Codec, text: string): unknown {
   }
   switch (codec) {
     case "text":
+    case "box":
       return text;
     case "bool":
       return text === "t";
@@ -167,6 +170,9 @@ export function encode(codec: Codec, value: unknown): string | null {
       return "\\x" + Buffer.from(value as Uint8Array).toString("hex");
     case "interval":
       return formatInterval(value);
+    case "number":
+      // `String(-0)` is `0`: a float's negative zero would be lost.
+      return Object.is(value, -0) ? "-0" : String(value);
     case "vector":
       return "[" + (value as readonly number[]).join(",") + "]";
     case "hstore":
@@ -176,6 +182,11 @@ export function encode(codec: Codec, value: unknown): string | null {
     default:
       return String(value);
   }
+}
+
+/** What an array of `codec` separates its elements with (`pg_type.typdelim`). */
+function delimiter(codec: Codec): string {
+  return codec === "box" ? ";" : ",";
 }
 
 /** `"…"` with `"` and `\` escaped, as array, record and range literals read it. */
@@ -190,7 +201,7 @@ function encodeArray(codec: Codec, items: readonly unknown[]): string {
     const text = encode(codec, item);
     return text === null ? "NULL" : quote(text);
   });
-  return "{" + parts.join(",") + "}";
+  return "{" + parts.join(delimiter(codec)) + "}";
 }
 
 function encodeRecord(fields: readonly (readonly [string, Codec])[], value: Record<string, unknown>): string {
@@ -258,11 +269,19 @@ function readItem(text: string, i: number, stops: string, doubled: boolean): [st
 }
 
 /**
- * `{a,"b c",NULL}` (with an optional `[1:3]=` bounds decoration) as an array.
+ * `{a,"b c",NULL}` (with an optional `[1:3]=` bounds decoration, and `;`
+ * between the elements of a `box[]`) as an array.
  * A multidimensional array is an error, as on the Rust side: its type is the
  * one-dimensional one's.
  */
 function parseArray(text: string, codec: Codec): unknown[] {
+  const delim = delimiter(codec);
+  // `int2vector` and `oidvector` are arrays of `int2` / `oid` to the
+  // analysis, but print their elements space-separated, without braces
+  // (`1 2 3`, the empty one as nothing); no element is NULL or quoted.
+  if (text[0] !== "{" && text[0] !== "[") {
+    return text.split(" ").filter((item) => item !== "").map((item) => decode(codec, item));
+  }
   let i = 0;
   if (text[0] === "[") {
     i = text.indexOf("=") + 1;
@@ -275,11 +294,11 @@ function parseArray(text: string, codec: Codec): unknown[] {
     if (text[i] === "{") {
       throw new DecodeError("typedpg: multidimensional arrays are not supported");
     }
-    const [item, quoted, next] = readItem(text, i, ",}", false);
+    const [item, quoted, next] = readItem(text, i, delim + "}", false);
     i = next;
     out.push(!quoted && item.toUpperCase() === "NULL" ? null : decode(codec, item));
     if (text[i] === "}") return out;
-    if (text[i] !== ",") throw new DecodeError(`typedpg: malformed array: ${text}`);
+    if (text[i] !== delim) throw new DecodeError(`typedpg: malformed array: ${text}`);
     i++;
   }
 }

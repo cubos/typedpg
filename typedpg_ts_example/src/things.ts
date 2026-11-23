@@ -37,6 +37,17 @@ export const constructed = sql(`
          '23:59:59.999999'::time AS last
 `);
 
+/**
+ * Arrays whose text isn't `{a,b}`: a box array's elements are separated by
+ * `;` (a box's own text holds commas), an int2vector's by spaces.
+ */
+export const oddArrays = sql(`
+  SELECT $boxes::box[] AS boxes,
+         ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,
+         '1 2 -3'::int2vector AS vec,
+         ''::int2vector AS empty_vec
+`);
+
 /** A Duration's fields share one sign: this interval's don't. */
 export const mixedInterval = sql("SELECT interval '1 mon -1 days' AS iv");
 

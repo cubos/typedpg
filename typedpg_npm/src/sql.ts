@@ -30,6 +30,11 @@ export function stripTrailingJunk(sql: string): string {
     } else if (c === "/" && sql[i + 1] === "*") {
       step = skipBlockComment(sql, i);
       isCode = false;
+    } else if (isIdentStart(c)) {
+      // An identifier or keyword, its `$`s included (`a$x$`, as scan.l's
+      // `ident_cont`): a `$` inside one opens no dollar quote.
+      step = i + 1;
+      while (step < sql.length && (isIdentChar(sql[step]!) || sql[step] === "$")) step++;
     } else if (c === "$") {
       step = dollarQuoteEnd(sql, i) ?? i + 1;
     } else if (c === ";") {

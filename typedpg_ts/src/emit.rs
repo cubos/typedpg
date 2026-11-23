@@ -281,11 +281,19 @@ impl Module<'_> {
                 let _ = writeln!(out, "  [{}, {}, {down}],", js_string(name), js_string(sql));
             }
             let r = m.runner;
+            // A number past 2^53 would round to another lock than the Rust
+            // runner's: such an id is a bigint.
+            const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+            let lock_id = if r.lock_id.unsigned_abs() > MAX_SAFE_INTEGER {
+                format!("{}n", r.lock_id)
+            } else {
+                r.lock_id.to_string()
+            };
             let _ = writeln!(
                 out,
                 "], {{ table: {}, lockId: {}, useTransaction: {}, failOnDrift: {} }});",
                 js_string(&r.table),
-                r.lock_id,
+                lock_id,
                 r.use_transaction,
                 r.fail_on_drift
             );
@@ -415,6 +423,38 @@ mod tests {
         let files = m.files(Path::new("/p/db.js"), OutKind::EsModule);
         assert_eq!(files[1].0, PathBuf::from("/p/db.d.ts"));
         assert!(files[0].1.contains("export const sql = createSql({"));
+    }
+
+    /// A lock id a JS number can't hold exactly is written as a bigint:
+    /// rounded, it would be another lock than the Rust runner takes.
+    #[test]
+    fn a_large_lock_id_is_a_bigint() {
+        let lock = |lock_id: i64| {
+            let runner = MigrationsConfig {
+                lock_id,
+                ..MigrationsConfig::default()
+            };
+            let m = Module {
+                runtime: "@cubos/typedpg",
+                imports: &[],
+                checks: &[],
+                queries: &[],
+                copies: &[],
+                migrations: Some(Embedded {
+                    migrations: &[],
+                    runner: &runner,
+                }),
+            };
+            let ts = m.files(Path::new("/p/db.ts"), OutKind::TypeScript)[0]
+                .1
+                .clone();
+            let at = ts.find("lockId: ").expect("the runner's settings") + "lockId: ".len();
+            ts[at..].split(',').next().unwrap().to_owned()
+        };
+        assert_eq!(lock(9_007_199_254_740_991), "9007199254740991");
+        assert_eq!(lock(-9_007_199_254_740_991), "-9007199254740991");
+        assert_eq!(lock(9_007_199_254_740_993), "9007199254740993n");
+        assert_eq!(lock(i64::MIN), "-9223372036854775808n");
     }
 
     /// Every name the module binds at its top level is an imported

@@ -27,6 +27,10 @@ pub const RUNTIME_NS: &str = "typedpg";
 pub enum Codec {
     /// The text as is.
     Text,
+    /// `box`: its text as is, like [`Codec::Text`] — but an array of it
+    /// separates its elements with `;` (`pg_type.typdelim`), as a box's
+    /// own text holds commas.
+    Box,
     /// `t` / `f` ↔ `boolean`.
     Bool,
     /// Integers and floats that fit a JS `number` (`NaN` and the
@@ -72,6 +76,7 @@ impl Codec {
         use serde_json::{Value, json};
         match self {
             Codec::Text => json!("text"),
+            Codec::Box => json!("box"),
             Codec::Bool => json!("bool"),
             Codec::Number => json!("number"),
             Codec::BigInt => json!("bigint"),
@@ -105,7 +110,7 @@ impl Codec {
     /// TS type says. Any type fits JSON.
     pub fn fits(&self) -> String {
         match self {
-            Codec::Text => "string".into(),
+            Codec::Text | Codec::Box => "string".into(),
             Codec::Bool => "boolean".into(),
             Codec::Number => "number".into(),
             Codec::BigInt => "bigint".into(),
@@ -478,6 +483,8 @@ impl TypeMapper<'_> {
                 codec: Codec::Bytea,
             },
             "void" => same("undefined".into(), Codec::Void),
+            // The only built-in type whose arrays aren't comma-separated.
+            "box" => same("string".into(), Codec::Box),
             _ => text(),
         }
     }
@@ -614,6 +621,22 @@ mod tests {
             Codec::Multirange(Box::new(Codec::Timestamptz)).fits(),
             "readonly typedpg.Range<Temporal.Instant>[]"
         );
+    }
+
+    /// A `box[]` separates its elements with `;`: the runtime must know an
+    /// element is a box to split (and write) its arrays.
+    #[test]
+    fn a_box_has_its_own_codec() {
+        with(|m| {
+            let boxes = Type::Array {
+                element: Box::new(basic_ty("box")),
+                element_nullable: None,
+            };
+            let mapped = m.map(&boxes);
+            assert_eq!(mapped.output, "(string | null)[]");
+            assert_eq!(mapped.codec.to_json(), serde_json::json!(["array", "box"]));
+            assert_eq!(m.map(&basic_ty("point")).codec, Codec::Text);
+        });
     }
 
     #[test]
