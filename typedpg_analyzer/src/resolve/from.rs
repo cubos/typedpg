@@ -3381,7 +3381,7 @@ fn process_json_table(
     for (c, n) in cols.iter_mut().zip(col_aliases) {
         c.name = n;
     }
-    scope.add_derived(alias, cols, crate::scope::SourceKind::Other)
+    scope.add_derived(alias, cols, crate::scope::SourceKind::TableFunc)
 }
 
 /// A JSON_TABLE path (the row pattern, a column's `PATH` / `EXISTS PATH`,

@@ -698,11 +698,7 @@ pub(crate) fn transform_array_expr_typed(
             t.nullable
                 || (t.type_oid != oid::UNKNOWN
                     && t.type_oid != coerce_type
-                    && super::literals::cast_function_can_return_null(
-                        t.type_oid,
-                        coerce_type,
-                        snapshot,
-                    ))
+                    && super::literals::value_cast_can_return_null(t, coerce_type, snapshot))
         }))
     };
     // What its non-NULL elements are: each listed value's (a sub-array's

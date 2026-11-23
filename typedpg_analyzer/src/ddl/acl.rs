@@ -718,6 +718,13 @@ pub(crate) struct Acls {
     /// `pg_parameter_acl`: by lowercased parameter name, the row's OID and
     /// its ACL. Absent means no row (no privilege granted).
     parameters: HashMap<String, (u32, Vec<AclItem>)>,
+    /// The grantees of a `GRANT CREATE` (or `ALL`) `ON DATABASE`: the
+    /// database's own ACL isn't modelled, only who was granted CREATE on
+    /// it ([`has_database_create`]).
+    database_create: Vec<Grantee>,
+    /// A `REVOKE … ON DATABASE` or a new database owner: who may create
+    /// in it is unknown.
+    database_unknown: bool,
 }
 
 impl Acls {
@@ -1259,6 +1266,13 @@ pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
     }
     let grantees = resolve_grantees(interp, &stmt.grantees)?;
     let privileges = check_privileges(objtype, &stmt.privileges, false)?;
+    if objtype == ObjectType::ObjectDatabase {
+        if !stmt.is_grant {
+            interp.acls.database_unknown = true;
+        } else if privileges.all || privileges.mask & bits::CREATE != 0 {
+            interp.acls.database_create.extend(grantees.iter().copied());
+        }
+    }
     for target in &targets {
         check_target(interp, objtype, target, &privileges)?;
     }
@@ -1656,6 +1670,27 @@ fn apply_parameter_grant(
         .parameters
         .insert(name.to_owned(), (oid, new_acl));
     Ok(())
+}
+
+/// Whether `role` has CREATE on the current database (`object_aclcheck`
+/// on it): its owner — the migrations' user — or a superuser does, and
+/// whoever a `GRANT CREATE ON DATABASE` reached; anyone once the
+/// database's privileges are unknown, or once the role may hold
+/// privileges the catalog doesn't record.
+pub(crate) fn has_database_create(db: &PgCatalog, role: RoleId) -> bool {
+    db.acls.database_unknown
+        || db.roles.has_privs_of_role(role, db.roles.migrations_user)
+        || may_have_gained_privileges(db, role)
+        || db.acls.database_create.iter().any(|g| match g {
+            Grantee::Public => true,
+            Grantee::Role(r) => db.roles.has_privs_of_role(role, *r),
+        })
+}
+
+/// Who may create in the current database is no longer known (a new
+/// database owner).
+pub(crate) fn forget_database_privileges(db: &mut PgCatalog) {
+    db.acls.database_unknown = true;
 }
 
 /// What `aclcheck_error` names an object: its kind and unqualified name

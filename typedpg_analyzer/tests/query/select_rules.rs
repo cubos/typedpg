@@ -149,6 +149,81 @@ fn locking_clause_targets() {
     }
 }
 
+/// `transformLockingClause` searches the range table in order for the
+/// first entry of the name — one an aliased join hides included — so a
+/// name both hidden and visible means whichever entry comes first: a
+/// join's sides come before the join, and each FROM item after the
+/// previous ones. Entries of an enclosing level are never named.
+#[test]
+fn locking_clause_takes_the_first_range_table_entry_of_the_name() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE w (id int PRIMARY KEY);")
+        .unwrap();
+    let nullable = "FOR UPDATE cannot be applied to the nullable side of an outer join";
+    for (sql, msg) in [
+        // The hidden `u` (the join's nullable side) comes first.
+        (
+            "SELECT * FROM (t LEFT JOIN u ON u.t_id = t.id) j, u u2, w u FOR UPDATE OF u",
+            nullable,
+        ),
+        // The hidden `g` relation comes before the visible function `g`;
+        // the visible function `g` before the hidden one.
+        (
+            "SELECT * FROM generate_series(1, 2) g, (t g JOIN u ON true) j FOR UPDATE OF g",
+            "FOR UPDATE cannot be applied to a function",
+        ),
+        // In a join's sides, the left one comes first.
+        (
+            "SELECT * FROM (u t LEFT JOIN (t JOIN w ON true) x ON true) y FOR UPDATE OF t",
+            "",
+        ),
+        (
+            "SELECT * FROM (w LEFT JOIN (t JOIN u ON true) x ON true) y, t FOR UPDATE OF t",
+            nullable,
+        ),
+        // An entry an aliased join hides is on the nullable side of the
+        // outer joins the hiding join is.
+        (
+            "SELECT * FROM (w LEFT JOIN (t JOIN u ON true) x ON true) y FOR UPDATE OF t",
+            nullable,
+        ),
+        (
+            "SELECT * FROM (w LEFT JOIN (t JOIN u ON true) x ON true) y FOR UPDATE",
+            nullable,
+        ),
+        // A JSON_TABLE is a table function.
+        (
+            "SELECT * FROM t, JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (v int PATH '$')) jt \
+             FOR UPDATE OF jt",
+            "FOR UPDATE cannot be applied to a table function",
+        ),
+        // An enclosing level's entries, visible or hidden, are not this
+        // level's.
+        (
+            "SELECT * FROM (t JOIN u ON true) j, LATERAL (SELECT 1 FROM w FOR UPDATE OF t) s",
+            "relation \"t\" in FOR UPDATE clause not found in FROM clause",
+        ),
+        (
+            "SELECT * FROM (t JOIN u ON true) j \
+             WHERE EXISTS (SELECT 1 FROM w FOR UPDATE OF u)",
+            "relation \"u\" in FOR UPDATE clause not found in FROM clause",
+        ),
+    ] {
+        if msg.is_empty() {
+            db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        } else {
+            assert_err_prefix(&db, sql, msg);
+        }
+    }
+    // The visible `g` relation comes before the hidden function `g`.
+    for sql in [
+        "SELECT * FROM t g, (generate_series(1, 2) g JOIN u ON true) j FOR UPDATE OF g",
+        "SELECT * FROM (t JOIN u ON true) j, (u LEFT JOIN w ON true) k FOR UPDATE OF u",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 /// transformValuesClause: a bare VALUES has no relation to lock (0A000),
 /// while a VALUES in FROM is skipped by an unnamed locking clause.
 #[test]

@@ -306,7 +306,9 @@ fn writes_shared_catalog(sql: &str) -> bool {
 impl PgSanityServer {
     /// Read `POSTGRES_URL`, create a per-instance scratch database with a
     /// random name, and return a client connected to it.
-    pub(crate) fn spawn() -> Result<Self, String> {
+    /// `db_name`: the scratch database's name, when the catalog already
+    /// chose it.
+    pub(crate) fn spawn(db_name: Option<String>) -> Result<Self, String> {
         let admin_conn_str = std::env::var("POSTGRES_URL").map_err(|_| {
             "pg_sanity: POSTGRES_URL is not set. Run tests via `scripts/run-pg-sanity.sh`, \
              which spins up a Docker PostgreSQL and exports the URL."
@@ -317,7 +319,7 @@ impl PgSanityServer {
         // wall-clock nanos gives us enough entropy that concurrent test
         // binaries don't collide; underscore-prefix keeps it valid as an
         // unquoted SQL identifier.
-        let db_name = scratch_db_name();
+        let db_name = db_name.unwrap_or_else(scratch_db_name);
 
         // Connect to the admin database (whatever `POSTGRES_URL` points at)
         // and CREATE DATABASE. Drop the admin client immediately — we keep
@@ -2913,6 +2915,13 @@ impl Drop for PgSanityServer {
 /// Build a unique-ish scratch database name: `pg_sanity_<pid>_<counter>_<nanos>`.
 /// Underscores-only so it doesn't need quoting; lowercase prefix dodges any
 /// PG identifier folding subtleties.
+/// The user `POSTGRES_URL` connects as, when it names one.
+pub(crate) fn connecting_user() -> Option<String> {
+    let url = std::env::var("POSTGRES_URL").ok()?;
+    let config: postgres::Config = url.parse().ok()?;
+    config.get_user().map(str::to_owned)
+}
+
 pub fn scratch_db_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();

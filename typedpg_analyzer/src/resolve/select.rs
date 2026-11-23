@@ -2954,6 +2954,62 @@ pub(crate) fn full_join_unplannable_error() -> AnalyzeError {
     .finalize_implicit()
 }
 
+/// Whether FROM entry `source` is on the nullable side of an outer join
+/// the plan keeps: its own, or — an entry an aliased join hides — one the
+/// hiding join (and the one hiding that, …) is on the nullable side of.
+fn plan_nullable_entry(
+    source: &crate::scope::TableSource,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+) -> bool {
+    if null_ctx.plan_nullable(&source.alias) {
+        return true;
+    }
+    let Some(h) = &source.hidden else {
+        return false;
+    };
+    scope
+        .sources
+        .iter()
+        .chain(scope.shadowed_sources.iter())
+        .find(|s| s.alias == h.join)
+        .is_some_and(|join| plan_nullable_entry(join, scope, null_ctx))
+}
+
+/// The range-table entries of `scope`'s own level, in range-table order
+/// ([`crate::scope::TableSource::seq`]): its visible FROM entries and those
+/// its aliased joins hide — not an enclosing level's, which a LATERAL item
+/// or a sublink also keeps among its hidden entries.
+fn level_range_table(scope: &Scope) -> Vec<&crate::scope::TableSource> {
+    use crate::scope::SourceKind;
+    fn own(s: &crate::scope::TableSource, scope: &Scope) -> bool {
+        let Some(h) = &s.hidden else {
+            return true;
+        };
+        scope
+            .sources
+            .iter()
+            .any(|v| v.alias == h.join && matches!(v.kind, SourceKind::Join { .. }))
+            || scope
+                .shadowed_sources
+                .iter()
+                .any(|p| p.hidden.is_some() && p.alias == h.join && own(p, scope))
+    }
+    let mut entries: Vec<&crate::scope::TableSource> = scope
+        .sources
+        .iter()
+        .filter(|s| !s.table_only && !s.shares_rte)
+        .chain(
+            scope
+                .shadowed_sources
+                .iter()
+                .filter(|s| s.hidden.is_some() && own(s, scope)),
+        )
+        .collect();
+    entries.sort_by_key(|s| s.seq);
+    entries
+}
+
 /// Validate a SELECT's locking clauses like PG: `CheckSelectLocking` (the
 /// query may not use DISTINCT / GROUP BY / HAVING / aggregates / window
 /// functions / target-list SRFs), then `transformLockingClause` — each
@@ -2987,13 +3043,14 @@ fn check_locking_clause(
             )));
         }
         let mut locked: Vec<&crate::scope::TableSource> = Vec::new();
-        // The range table's entries: the visible ones, and those an aliased
-        // join hides (`(t JOIN u) j`), which `transformLockingClause` finds
-        // by their names all the same.
-        let hidden = || scope.shadowed_sources.iter().filter(|s| s.hidden.is_some());
+        // The level's range table, in order: the visible entries and those
+        // an aliased join hides (`(t JOIN u) j`), which
+        // `transformLockingClause` finds by their names all the same — the
+        // first one named wins, wherever it is.
+        let range_table = level_range_table(scope);
         if lc.locked_rels.is_empty() {
             locked.extend(
-                scope.sources.iter().chain(hidden()).filter(|s| {
+                range_table.iter().copied().filter(|s| {
                     matches!(s.kind, SourceKind::Relation | SourceKind::Subquery { .. })
                 }),
             );
@@ -3012,11 +3069,10 @@ fn check_locking_clause(
                 )
                 .finalize_implicit());
             }
-            let Some(source) = scope
-                .sources
+            let Some(source) = range_table
                 .iter()
-                .find(|s| s.alias == rv.relname)
-                .or_else(|| hidden().find(|s| query_name(s) == rv.relname))
+                .copied()
+                .find(|s| query_name(s) == rv.relname)
             else {
                 return Err(crate::error::RawError::new(
                     AnalyzeError::UndefinedTable(format!(
@@ -3031,6 +3087,7 @@ fn check_locking_clause(
             let what = match source.kind {
                 SourceKind::Cte => Some("a WITH query"),
                 SourceKind::Function => Some("a function"),
+                SourceKind::TableFunc => Some("a table function"),
                 SourceKind::Join { .. } => Some("a join"),
                 _ => None,
             };
@@ -3109,7 +3166,7 @@ fn check_locking_clause(
             // reduces the join (`COALESCE($1, t.x) = 1` with `$1` NULL).
             if marks_rows
                 && expr::plan_time_checks()
-                && null_ctx.plan_nullable(&source.alias)
+                && plan_nullable_entry(source, scope, null_ctx)
                 && let Some(e) =
                     expr::plan_time_error(first_from_location(sel), nullable_side(clause))
             {

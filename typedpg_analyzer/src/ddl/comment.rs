@@ -78,6 +78,9 @@ pub fn alter_owner(interp: &mut PgCatalog, stmt: &AlterOwnerStmt) -> Result<(), 
     let Some(owner) = new_owner else {
         return Ok(());
     };
+    if objtype == ObjectType::ObjectDatabase {
+        acl::forget_database_privileges(interp);
+    }
     match objtype {
         ObjectType::ObjectTable
         | ObjectType::ObjectView

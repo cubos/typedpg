@@ -2837,7 +2837,12 @@ fn writes_every_row_into(
             event == 'w' && s.with_clause.is_none() && stored(WriteCommand::Update)
         }
         Some(N::DeleteStmt(s)) => {
-            event == 'd' && s.with_clause.is_none() && view.relation_uses().contains(&(relid, 'd'))
+            event == 'd'
+                && s.with_clause.is_none()
+                && view
+                    .relation_uses()
+                    .iter()
+                    .any(|&(r, c)| c == 'd' && view.delete_base(r).unwrap_or(r) == relid)
         }
         _ => false,
     }
@@ -3050,6 +3055,9 @@ fn referenced(
         if command != 'd' {
             continue;
         }
+        // Through an automatically updatable view, the rows deleted are
+        // the base table's.
+        let relid = view.delete_base(relid).unwrap_or(relid);
         if let Some(name) = relation_display(new_catalog, relid) {
             changes.push((relid, true, Vec::new(), format!("its DELETE from {name}")));
         }
@@ -5721,6 +5729,52 @@ mod tests {
             "its DELETE from customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
              DELETE SET NULL) now rejects deleting a row still referenced"
         );
+    }
+
+    #[test]
+    fn a_new_foreign_key_meets_a_delete_through_a_view() {
+        // The rows a DELETE (or a MERGE's DELETE) through an automatically
+        // updatable view deletes — through a chain of them — are the base
+        // table's, and so are the keys an UPDATE through it changes.
+        let views = "CREATE VIEW vip AS SELECT id, name FROM customers WHERE id > 10;
+                     CREATE VIEW top_vip AS SELECT * FROM vip WHERE id < 1000;";
+        let fk = "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                      FOREIGN KEY (customer_id) REFERENCES customers NOT VALID;";
+        let message = "its DELETE from customers may fail: foreign key \"orders_customer_fk\" of \
+                       orders (ON DELETE NO ACTION) now rejects deleting a row still referenced";
+        for delete in [
+            "DELETE FROM vip WHERE id = $id",
+            "DELETE FROM top_vip WHERE id = $id",
+            "MERGE INTO top_vip v USING (SELECT $id::int AS id) s ON v.id = s.id \
+             WHEN MATCHED THEN DELETE",
+        ] {
+            assert_eq!(
+                only(&check(&[ORDERS, views], &[fk], &[delete])),
+                message,
+                "{delete}"
+            );
+        }
+        assert_eq!(
+            only(&check(
+                &[ORDERS, views],
+                &[fk],
+                &["UPDATE top_vip SET id = $new WHERE id = $id"]
+            )),
+            "its UPDATE of customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
+             UPDATE NO ACTION) now rejects changing the key (id) of a row still referenced"
+        );
+        // A view whose deletes an INSTEAD OF trigger takes over deletes
+        // nothing of the table itself.
+        let instead = "CREATE FUNCTION skip() RETURNS trigger LANGUAGE plpgsql
+                           AS $$ BEGIN RETURN NULL; END $$;
+                       CREATE TRIGGER skip INSTEAD OF DELETE ON vip
+                           FOR EACH ROW EXECUTE FUNCTION skip();";
+        let findings = check(
+            &[ORDERS, views, instead],
+            &[fk],
+            &["DELETE FROM top_vip WHERE id = $id"],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]

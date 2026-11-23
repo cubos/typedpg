@@ -739,6 +739,12 @@ impl PgCatalog {
             // instance.
             let mut cat = Self::from_seed(load_seed()?);
             cat.pg_sanity = Some(std::sync::Arc::new(std::sync::OnceLock::new()));
+            // The mirror's session: its user and its scratch database,
+            // which `CURRENT_USER` and privilege errors name.
+            if let Some(user) = crate::pg_sanity::connecting_user() {
+                cat.set_connecting_user(&user);
+            }
+            cat.set_database_name(&crate::pg_sanity::scratch_db_name());
             Ok(cat)
         }
     }
@@ -1855,6 +1861,7 @@ impl PgCatalog {
             null_test_settled: lint_facts.null_test_settled,
             writes: lint_facts.writes,
             relation_uses: lint_facts.relation_uses,
+            delete_bases: lint_facts.delete_bases,
             relations_at: lint_facts.relations_at,
         })
     }
@@ -2290,8 +2297,10 @@ impl PgCatalog {
     ) -> Option<R> {
         let cell = self.pg_sanity.as_ref()?;
         let mutex = cell.get_or_init(|| {
-            let server = crate::pg_sanity::PgSanityServer::spawn()
-                .unwrap_or_else(|e| panic!("pg_sanity: {e}"));
+            let server = crate::pg_sanity::PgSanityServer::spawn(
+                self.session_identity.database().map(str::to_owned),
+            )
+            .unwrap_or_else(|e| panic!("pg_sanity: {e}"));
             std::sync::Mutex::new(server)
         });
         let mut guard = mutex.lock().expect("pg_sanity: pg sanity mutex poisoned");
@@ -3124,6 +3133,7 @@ struct LintFacts {
     /// last.
     open_writes: Vec<usize>,
     relation_uses: Vec<(PgClassOid, char)>,
+    delete_bases: Vec<(PgClassOid, PgClassOid)>,
     relations_at: HashMap<i32, RelationAt>,
 }
 
@@ -3254,6 +3264,27 @@ pub(crate) fn note_relation_use(relid: PgClassOid, cmd: char) {
             && !facts.relation_uses.contains(&(relid, cmd))
         {
             facts.relation_uses.push((relid, cmd));
+        }
+    });
+}
+
+/// Record that the query deletes rows of `relid` and, when it is a view
+/// automatically updatable down to a table for the delete, `base()`: that
+/// table (see [`QueryView::delete_base`]), computed only while the facts
+/// are collected.
+pub(crate) fn note_delete_base(relid: PgClassOid, base: impl FnOnce() -> Option<PgClassOid>) {
+    if !LINT_FACTS.with(|facts| facts.borrow().is_some()) {
+        return;
+    }
+    // (Before borrowing the facts: following the view may note some.)
+    let Some(base) = base() else {
+        return;
+    };
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && !facts.delete_bases.iter().any(|(view, _)| *view == relid)
+        {
+            facts.delete_bases.push((relid, base));
         }
     });
 }
@@ -3730,6 +3761,9 @@ pub struct QueryView {
     writes: Vec<crate::condition::WriteStatement>,
     /// The relations whose rows the query reads or writes, with the command.
     relation_uses: Vec<(PgClassOid, char)>,
+    /// The views the query deletes from, each with the table the rows are
+    /// deleted from (see [`QueryView::delete_base`]).
+    delete_bases: Vec<(PgClassOid, PgClassOid)>,
     /// What each table reference resolved to, by its location in
     /// [`Self::sql`].
     relations_at: HashMap<i32, RelationAt>,
@@ -3761,6 +3795,20 @@ impl QueryView {
     /// each command it has an action of), as the analyzer resolved them.
     pub fn relation_uses(&self) -> &[(PgClassOid, char)] {
         &self.relation_uses
+    }
+
+    /// When the query deletes rows of view `relid` (a DELETE, a MERGE's
+    /// DELETE action: a `d` of [`Self::relation_uses`]) and the view is
+    /// automatically updatable down to a table for it — through a chain of
+    /// views, with no DO INSTEAD rule or INSTEAD OF trigger for the command
+    /// on the way, as PostgreSQL's rewriter follows it: that table, whose
+    /// rows are the ones deleted. `None` for a table, or a view whose
+    /// deletes are something else.
+    pub fn delete_base(&self, relid: PgClassOid) -> Option<PgClassOid> {
+        self.delete_bases
+            .iter()
+            .find(|(view, _)| *view == relid)
+            .map(|&(_, base)| base)
     }
 
     /// What the table reference `rv` — a `RangeVar` of [`Self::tree`] in a

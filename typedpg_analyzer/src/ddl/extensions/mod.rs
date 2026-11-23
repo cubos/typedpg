@@ -491,7 +491,7 @@ fn apply_with_schema(
         }
     }
     path.push("pg_temp".to_owned());
-    let original = interp.replace_search_path(path);
+    let original = crate::ddl::permissions::suspended(|| interp.replace_search_path(path));
 
     let mut result = Ok(());
     for sql in scripts {
@@ -508,7 +508,7 @@ fn apply_with_schema(
                     break;
                 }
             };
-            result = super::apply_sql_to(interp, &sql);
+            result = crate::ddl::permissions::suspended(|| super::apply_sql_to(interp, &sql));
             if result.is_err() {
                 break;
             }

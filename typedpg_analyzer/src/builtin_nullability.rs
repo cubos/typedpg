@@ -364,6 +364,16 @@ pub(crate) const NULLABLE_STRICT: &[&str] = &[
     "uuid_extract_version(uuid)",
 ];
 
+/// The [`NULLABLE_STRICT`] functions whose only NULL result for non-NULL
+/// arguments is for an infinite date / time one (`TIMESTAMP_NOT_FINITE`
+/// in date.c): never NULL for finite arguments. (`to_char`, `extract` and
+/// `date_part` have other NULL cases too: see `value_gated_non_null`.)
+pub(crate) const NULL_ONLY_ON_INFINITE: &[&str] = &[
+    "time(timestamp)",
+    "time(timestamptz)",
+    "timetz(timestamptz)",
+];
+
 /// Non-strict functions that never return NULL, whatever their arguments.
 pub(crate) const NEVER_NULL_NONSTRICT: &[&str] = &[
     "array_append(anycompatiblearray,anycompatible)",

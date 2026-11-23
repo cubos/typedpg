@@ -9,6 +9,125 @@ use super::DdlError;
 use super::util::ensure_namespace;
 use crate::pg_catalog::PgCatalog;
 
+/// While the connecting user's name is unknown and a schema named after it
+/// was created (`SessionIdentity::pending_user_schema`): the first schema
+/// `stmt` names that doesn't exist is taken to be that schema — the
+/// connecting user's name — and created, owned by the migrations' user.
+/// Taking a name for it may let a statement through that PostgreSQL
+/// rejects, never the other way round.
+pub(crate) fn materialize_user_schema(interp: &mut PgCatalog, stmt: &ast::Node) {
+    if !interp.session_identity.pending_user_schema
+        || interp.session_identity.connecting_user().is_some()
+    {
+        return;
+    }
+    let Some(name) = named_schemas(stmt)
+        .into_iter()
+        .find(|s| interp.namespace_oid(s).is_none() && super::session::role_may_exist(s))
+    else {
+        return;
+    };
+    let current = interp.session_identity.clone();
+    let owner = interp.roles.migrations_user;
+    if ensure_namespace(interp, &name).is_ok()
+        && let Some(ns) = interp.namespace_oid(&name)
+    {
+        super::acl::schema_created(interp, ns, owner, false);
+    }
+    interp.session_identity = current;
+    interp.set_connecting_user(&name);
+}
+
+/// The schemas `stmt` names: the schema of each qualified name in it (a
+/// relation, a type, a function, an object of a DROP / COMMENT / …) and
+/// the schemas a schema statement names. Not the one a `CREATE SCHEMA`
+/// creates.
+fn named_schemas(stmt: &ast::Node) -> Vec<String> {
+    use typedpg_pg_query::NodeRef;
+    let strings = |items: &[Option<ast::Node>]| -> Option<Vec<String>> {
+        items
+            .iter()
+            .map(|n| match n {
+                Some(ast::Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let qualifier = |names: Vec<String>| -> Option<String> {
+        (names.len() >= 2).then(|| names[names.len() - 2].clone())
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |name: Option<String>| {
+        if let Some(name) = name
+            && !name.is_empty()
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+    };
+    // The schemas a schema statement names, by their bare names.
+    match stmt {
+        ast::Node::DropStmt(d) if d.remove_type == ObjectType::ObjectSchema => {
+            for o in &d.objects {
+                add(super::util::node_string(o.as_ref()).map(str::to_owned));
+            }
+        }
+        ast::Node::GrantStmt(g) if g.objtype == ObjectType::ObjectSchema => {
+            for o in &g.objects {
+                add(super::util::node_string(o.as_ref()).map(str::to_owned));
+            }
+        }
+        ast::Node::AlterObjectSchemaStmt(a) => add(Some(a.newschema.clone())),
+        ast::Node::AlterOwnerStmt(a) if a.object_type == ObjectType::ObjectSchema => {
+            add(super::util::node_string(a.object.as_ref()).map(str::to_owned));
+        }
+        ast::Node::RenameStmt(r) if r.rename_type == ObjectType::ObjectSchema => {
+            add(Some(r.subname.clone()));
+        }
+        ast::Node::CommentStmt(c) if c.objtype == ObjectType::ObjectSchema => {
+            add(super::util::node_string(c.object.as_ref()).map(str::to_owned));
+        }
+        // A relation's qualified name (not a column's: `t.c`).
+        ast::Node::DropStmt(d) if is_relation_kind(d.remove_type) => {
+            for o in d.objects.iter().flatten() {
+                if let ast::Node::List(l) = o {
+                    add(strings(&l.items).and_then(qualifier));
+                }
+            }
+        }
+        ast::Node::CommentStmt(c) if is_relation_kind(c.objtype) => {
+            if let Some(ast::Node::List(l)) = c.object.as_ref() {
+                add(strings(&l.items).and_then(qualifier));
+            }
+        }
+        _ => {}
+    }
+    for (node, _) in stmt.nodes() {
+        match node {
+            NodeRef::CreateSchemaStmt(_) => return out,
+            NodeRef::RangeVar(rv) => add(Some(rv.schemaname.clone())),
+            NodeRef::TypeName(t) => add(strings(&t.names).and_then(qualifier)),
+            NodeRef::FuncCall(f) => add(strings(&f.funcname).and_then(qualifier)),
+            NodeRef::ObjectWithArgs(o) => add(strings(&o.objname).and_then(qualifier)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Object kinds a DROP or COMMENT names by a relation's qualified name.
+fn is_relation_kind(t: ObjectType) -> bool {
+    matches!(
+        t,
+        ObjectType::ObjectTable
+            | ObjectType::ObjectView
+            | ObjectType::ObjectMatview
+            | ObjectType::ObjectSequence
+            | ObjectType::ObjectForeignTable
+            | ObjectType::ObjectIndex
+    )
+}
+
 /// CreateSchemaCommand / RenameSchema: the `pg_` prefix is reserved for
 /// system schemas (IsReservedName), even for a superuser.
 pub(crate) fn check_schema_name(name: &str) -> Result<(), DdlError> {
@@ -25,34 +144,65 @@ pub(crate) fn check_schema_name(name: &str) -> Result<(), DdlError> {
 /// (`CreateSchemaCommand`, schemacmds.c).
 pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<(), DdlError> {
     // get_rolespec_oid: the owner role must exist — `public` never does.
-    // CURRENT_USER / CURRENT_ROLE / SESSION_USER are known once the
-    // migrations name them (SET ROLE / SET SESSION AUTHORIZATION).
+    // CURRENT_USER / CURRENT_ROLE / SESSION_USER are the role the migrations
+    // named (SET ROLE / SET SESSION AUTHORIZATION), else the connecting
+    // user, whose name is known only when the caller told it.
     use typedpg_pg_query::ast::RoleSpecType;
-    let role = stmt.authrole.as_ref().and_then(|r| match r.roletype {
-        RoleSpecType::RolespecCstring => Some(Ok(r.rolename.clone())),
-        RoleSpecType::RolespecPublic => Some(Err("public".to_owned())),
-        RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => interp
-            .session_identity
-            .current_user()
-            .map(|u| Ok(u.to_owned())),
-        RoleSpecType::RolespecSessionUser => interp
-            .session_identity
-            .session_user()
-            .map(|u| Ok(u.to_owned())),
-    });
-    let role = match role {
-        Some(Ok(name)) if super::session::role_may_exist(&name) => Some(name),
-        Some(Ok(name)) | Some(Err(name)) => {
-            return Err(DdlError::TypeNotFound(format!(
-                "role \"{name}\" does not exist"
-            )));
-        }
+    enum Auth {
+        Named(String),
+        Connecting,
+    }
+    let auth = match stmt.authrole.as_ref() {
         None => None,
+        Some(r) => Some(match r.roletype {
+            RoleSpecType::RolespecCstring => Auth::Named(r.rolename.clone()),
+            RoleSpecType::RolespecPublic => {
+                return Err(DdlError::TypeNotFound(
+                    "role \"public\" does not exist".to_owned(),
+                ));
+            }
+            RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => interp
+                .session_identity
+                .current_user()
+                .map_or(Auth::Connecting, |u| Auth::Named(u.to_owned())),
+            RoleSpecType::RolespecSessionUser => interp
+                .session_identity
+                .session_user()
+                .map_or(Auth::Connecting, |u| Auth::Named(u.to_owned())),
+        }),
+    };
+    if let Some(Auth::Named(name)) = &auth
+        && !super::session::role_may_exist(name)
+    {
+        return Err(DdlError::TypeNotFound(format!(
+            "role \"{name}\" does not exist"
+        )));
+    }
+    // NamespaceCreate: owned by `AUTHORIZATION`'s role, else the current
+    // role, with that role's schema default privileges.
+    let owner = match &auth {
+        Some(Auth::Named(role)) => interp.roles.id_or_intern(role),
+        Some(Auth::Connecting) => interp.roles.migrations_user,
+        None => super::roles::current_role(interp),
     };
     // `CREATE SCHEMA AUTHORIZATION role` names the schema after the role.
     let name = if stmt.schemaname.is_empty() {
-        match &role {
-            Some(role) => role.clone(),
+        match &auth {
+            Some(Auth::Named(role)) => role.clone(),
+            Some(Auth::Connecting) => match interp.session_identity.connecting_user() {
+                Some(user) => user.to_owned(),
+                None => {
+                    // The connecting user's name is unknown: so is the
+                    // schema's. A statement naming a schema that doesn't
+                    // exist is taken to name it (`materialize_user_schema`);
+                    // elements created in it can't be placed.
+                    if !stmt.schema_elts.is_empty() {
+                        interp.roles.uncertain.catalog = true;
+                    }
+                    interp.session_identity.pending_user_schema = true;
+                    return Ok(());
+                }
+            },
             None => return Ok(()),
         }
     } else {
@@ -68,12 +218,6 @@ pub fn create_schema(interp: &mut PgCatalog, stmt: &CreateSchemaStmt) -> Result<
         )));
     }
     ensure_namespace(interp, &name)?;
-    // NamespaceCreate: owned by `AUTHORIZATION`'s role, else the current
-    // role, with that role's schema default privileges.
-    let owner = match &role {
-        Some(role) => interp.roles.id_or_intern(role),
-        None => super::roles::current_role(interp),
-    };
     if let Some(ns) = interp.namespace_oid(&name) {
         super::acl::schema_created(interp, ns, owner, false);
     }
@@ -248,4 +392,48 @@ fn split_foreign_keys<'a>(
         Cow::Owned(ast::Node::CreateStmt(NodeBox::new(new_stmt))),
         fks,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pg_catalog::PgCatalog;
+
+    /// A catalog that doesn't know the connecting user's name (no mirror).
+    fn catalog() -> PgCatalog {
+        PgCatalog::from_seed(crate::seed::load_seed().expect("embedded seed"))
+    }
+
+    /// With the connecting user's name unknown, the schema `CREATE SCHEMA
+    /// AUTHORIZATION CURRENT_USER` creates is the first missing schema a
+    /// later statement names: no false "schema does not exist".
+    #[test]
+    fn the_unknown_connecting_users_schema_is_the_first_missing_one_named() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE SCHEMA AUTHORIZATION CURRENT_USER;
+             CREATE TABLE deployer.t (id int);
+             CREATE TABLE deployer.u (id int);",
+        )
+        .unwrap();
+        assert!(db.resolve_table(Some("deployer"), "t").is_some());
+        assert_eq!(db.session_identity.connecting_user(), Some("deployer"));
+        // `$user` now names it: an unqualified table goes there.
+        db.apply_sql("CREATE TABLE v (id int);").unwrap();
+        assert!(db.resolve_table(Some("deployer"), "v").is_some());
+        // Another schema, once the user's is known, doesn't exist.
+        assert!(db.apply_sql("CREATE TABLE other.t (id int);").is_err());
+        // Named by DROP SCHEMA, it exists to be dropped.
+        let mut db = catalog();
+        db.apply_sql("CREATE SCHEMA AUTHORIZATION SESSION_USER; DROP SCHEMA app;")
+            .unwrap();
+        // The table of a column is no schema.
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE t (id int);
+             CREATE SCHEMA AUTHORIZATION CURRENT_USER;
+             COMMENT ON COLUMN t.id IS 'x';",
+        )
+        .unwrap();
+        assert_eq!(db.session_identity.connecting_user(), None);
+    }
 }

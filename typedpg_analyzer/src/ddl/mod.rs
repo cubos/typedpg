@@ -35,6 +35,7 @@ pub(crate) mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
 pub(crate) mod opfamily_members;
+pub(crate) mod permissions;
 pub(crate) mod policies;
 pub(crate) mod prepared;
 pub(crate) mod publications;
@@ -511,6 +512,14 @@ pub(super) fn note_user_code(db: &mut PgCatalog) {
 /// Apply a single parsed statement, noting what it does to foreign-key
 /// checks (`fk_bypass`).
 fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
+    schema_stmt::materialize_user_schema(db, stmt);
+    // Under a role the privilege checks apply to, the search path holds
+    // only the schemas it may use, which the previous statement may have
+    // changed.
+    if permissions::restricted_role(db).is_some() {
+        db.refresh_search_path();
+    }
+    permissions::check_statement(db, stmt)?;
     fk_bypass::note(db, stmt);
     dispatch_statement(db, stmt)?;
     // The stored expressions it wrote are bound to the objects their names

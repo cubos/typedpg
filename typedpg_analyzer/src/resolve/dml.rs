@@ -3411,6 +3411,9 @@ fn analyze_delete_here(
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
     crate::pg_catalog::note_relation_use(table_oid, 'd');
+    crate::pg_catalog::note_delete_base(table_oid, || {
+        write_base(snapshot, table_oid, &[DmlEvent::Delete], false).map(|b| b.relid)
+    });
     crate::pg_catalog::note_target_relation(relation, table_oid);
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
     crate::privileges::note_write(

@@ -346,6 +346,17 @@ pub(crate) struct TableSource {
     /// whose alias is then a fresh one: names may repeat across hidden
     /// entries (`(t a JOIN u b) j, (t a JOIN u b) k`).
     pub hidden: Option<HiddenEntry>,
+    /// When the entry was built ([`next_source_seq`]): a level's FROM items
+    /// are built in the order PG adds their range-table entries (left to
+    /// right, a join after its sides), so this orders them like the range
+    /// table, which `transformLockingClause` searches for a name.
+    pub seq: u64,
+}
+
+/// A fresh, increasing [`TableSource::seq`].
+pub(crate) fn next_source_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a hidden entry was: its name in the query, and the alias of the
@@ -402,6 +413,8 @@ pub(crate) enum SourceKind {
     Cte,
     /// A FROM function (`RTE_FUNCTION`).
     Function,
+    /// A `JSON_TABLE` (`RTE_TABLEFUNC`).
+    TableFunc,
     /// A join (`RTE_JOIN`): an aliased one, or the merged columns of a
     /// `JOIN USING` — named by its `AS` alias when `using_alias`, a name
     /// in the join's namespace only, not the range table's.
@@ -479,6 +492,7 @@ impl TableSource {
             only: false,
             min_one_row: false,
             hidden: None,
+            seq: next_source_seq(),
         }
     }
 

@@ -118,6 +118,13 @@ fn queries() -> Vec<(String, DeployedKind)> {
         ),
         q("DELETE FROM accounts WHERE id = $id"),
         q("UPDATE accounts SET id = $new_id WHERE id = $id"),
+        // Through the view, the rows deleted or changed are `accounts`'.
+        q("DELETE FROM active_accounts WHERE id = $id"),
+        q("UPDATE active_accounts SET id = $new_id WHERE id = $id"),
+        q(
+            "MERGE INTO active_accounts a USING (SELECT $id::integer AS id) v ON a.id = v.id \
+           WHEN MATCHED THEN DELETE",
+        ),
         q(
             "MERGE INTO accounts a USING (SELECT $id::integer AS id, $name::varchar AS name) v ON a.id = v.id \
            WHEN MATCHED THEN UPDATE SET name = v.name \

@@ -77,6 +77,17 @@ struct Identity {
 pub(crate) struct SessionIdentity {
     session: Identity,
     local: Option<Identity>,
+    /// The connecting user's name — the migrations' user's — when the
+    /// caller told it ([`PgCatalog::set_connecting_user`]).
+    connecting_user: Option<String>,
+    /// The current database's name, when the caller told it
+    /// ([`PgCatalog::set_database_name`]).
+    database: Option<String>,
+    /// A schema named after the connecting user, whose name is unknown, was
+    /// created (`CREATE SCHEMA AUTHORIZATION CURRENT_USER`): the first
+    /// schema a statement names that doesn't exist is taken to be it
+    /// (see `schema_stmt::materialize_user_schema`).
+    pub(crate) pending_user_schema: bool,
 }
 
 impl SessionIdentity {
@@ -100,6 +111,23 @@ impl SessionIdentity {
     /// `session_user`, when the migrations named it.
     pub(crate) fn session_user(&self) -> Option<&str> {
         self.effective().session_user.as_deref()
+    }
+
+    /// The connecting user's name, when known.
+    pub(crate) fn connecting_user(&self) -> Option<&str> {
+        self.connecting_user.as_deref()
+    }
+
+    /// The current database's name, when known.
+    pub(crate) fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    /// Name the connecting user: a schema named after it is no longer
+    /// pending.
+    pub(crate) fn set_connecting_user(&mut self, name: String) {
+        self.connecting_user = Some(name);
+        self.pending_user_schema = false;
     }
 
     fn update(&mut self, is_local: bool, f: impl FnOnce(&mut Identity)) {
@@ -304,6 +332,21 @@ impl PgCatalog {
     /// or the database's (`ALTER DATABASE ... SET`): the application's
     /// queries run in sessions of their own, which a migration's `SET
     /// search_path` doesn't reach.
+    /// Tell the catalog the connecting user's name — the role the
+    /// migrations run as (see [`PgCatalog::MIGRATIONS_USER`]) — which
+    /// `CURRENT_USER` / `SESSION_USER` name in `CREATE SCHEMA AUTHORIZATION`
+    /// and `$user` names in the search path. Unknown by default.
+    pub fn set_connecting_user(&mut self, name: &str) {
+        self.session_identity.set_connecting_user(name.to_owned());
+        self.refresh_search_path();
+    }
+
+    /// Tell the catalog the name of the database the migrations run in,
+    /// which privilege errors on the database name. Unknown by default.
+    pub fn set_database_name(&mut self, name: &str) {
+        self.session_identity.database = Some(name.to_owned());
+    }
+
     pub(crate) fn refresh_search_path(&mut self) {
         let mut resolved = Vec::new();
         let setting = if self.in_migration {
@@ -316,6 +359,16 @@ impl PgCatalog {
         // where new objects go even before it exists (activeTempCreationPending
         // — the analyzer creates it right away).
         let mut temp_first = false;
+        // recomputeNamespacePath leaves out the schemas the current role
+        // has no USAGE on — known for a role the DDL privilege checks
+        // apply to (`permissions::restricted`).
+        let restricted = self
+            .session_identity
+            .current_user()
+            .filter(|_| self.in_migration)
+            .and_then(|name| self.roles.id(name))
+            .filter(|&role| super::permissions::restricted(self, role))
+            .map(|role| self.roles.name(role).to_owned());
         for name in setting {
             // `$user` is the schema named after current_user — known only
             // in the migrations' session, and once they name the role.
@@ -328,7 +381,11 @@ impl PgCatalog {
                     }
                     continue;
                 }
-                "$user" => match self.session_identity.current_user() {
+                "$user" => match self
+                    .session_identity
+                    .current_user()
+                    .or(self.session_identity.connecting_user())
+                {
                     Some(user) if self.in_migration => user,
                     _ => continue,
                 },
@@ -336,6 +393,9 @@ impl PgCatalog {
             };
             if let Some(oid) = self.namespace_oid(name)
                 && !resolved.contains(&oid)
+                && restricted.as_deref().is_none_or(|role| {
+                    self.has_schema_privilege(role, oid, super::acl::Privilege::Usage)
+                })
             {
                 resolved.push(oid);
             }

@@ -180,9 +180,10 @@ checked against every constraint when the migration changes the default:
   for `SET c = DEFAULT` also when the column becomes `NOT NULL` without a
   default, or loses its default while `NOT NULL`.
 
-A write through an automatically updatable view is checked against the
-table below it, unless an `INSTEAD OF` trigger or `DO INSTEAD` rule for that
-command takes it over (then only the view's own columns are checked).
+A write or a `DELETE` through an automatically updatable view is checked
+against the table below it — its constraints, triggers and the foreign keys
+referencing it — unless an `INSTEAD OF` trigger or `DO INSTEAD` rule for
+that command takes it over (then only the view's own columns are checked).
 
 ## Not reported
 
@@ -219,8 +220,7 @@ command takes it over (then only the view's own columns are checked).
 - A foreign key validated (`VALIDATE CONSTRAINT`: a `NOT VALID` one already
   checks every row written), one whose `CASCADE`, or `SET NULL` into a
   nullable column, deletes or changes referencing rows (the statement
-  runs); the foreign keys referencing the table below a view a `DELETE`
-  goes through.
+  runs).
 - Row-level security narrowing the rows a read or an `UPDATE` sees (short of
   denying all of them), and the policies of a table written through a view
   (the view owner's).

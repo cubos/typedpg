@@ -459,8 +459,8 @@ pub(crate) fn infer_type_cast(
         cast_func.is_none() || ctx.proc_is_strict(cast_func),
     );
     let state = cast_collation(&inner_type, target_oid, written_typmod, snapshot)?;
-    let nullable = inner_type.nullable
-        || cast_function_can_return_null(inner_type.type_oid, target_oid, snapshot);
+    let nullable =
+        inner_type.nullable || value_cast_can_return_null(&inner_type, target_oid, snapshot);
     // The elements of an array cast to an array type: an array literal
     // says (`'{1,2}'::int[]` has no NULL element), an `ARRAY[…]` built
     // for the target or an array of the same type keeps its own (a
@@ -604,7 +604,44 @@ pub(crate) fn assignment_nullable(t: &ExprType, target: PgTypeOid, snapshot: &Pg
     t.nullable
         || (t.type_oid != oid::UNKNOWN
             && snapshot.unwrap_domain(t.type_oid) != snapshot.unwrap_domain(target)
-            && cast_function_can_return_null(t.type_oid, target, snapshot))
+            && value_cast_can_return_null(t, target, snapshot))
+}
+
+/// [`cast_function_can_return_null`] for a value known as `t`: a built-in
+/// cast function that returns NULL only for an infinite input
+/// ([`crate::builtin_nullability::NULL_ONLY_ON_INFINITE`]: `time(timestamp)`
+/// & co.) never does for a finite one (`now()`, `LOCALTIMESTAMP`, a column
+/// CHECKed `isfinite`, … see [`crate::refine`]).
+pub(crate) fn value_cast_can_return_null(
+    t: &ExprType,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    cast_function_can_return_null(t.type_oid, target, snapshot)
+        && !(crate::refine::finite_value(t, snapshot)
+            && builtin_cast_signature(t.type_oid, target, snapshot).is_some_and(|sig| {
+                crate::builtin_nullability::NULL_ONLY_ON_INFINITE.contains(&sig.as_str())
+            }))
+}
+
+/// The signature (`time(timestamp)`) of the built-in function the cast from
+/// `source` to `target` runs: PG names a built-in cast function after its
+/// target type (`pg_cast.castfunc` isn't in the snapshot).
+fn builtin_cast_signature(
+    source: PgTypeOid,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<String> {
+    let (source, target) = (
+        snapshot.unwrap_domain(source),
+        snapshot.unwrap_domain(target),
+    );
+    let (src, tgt) = (snapshot.get_type(source)?, snapshot.get_type(target)?);
+    snapshot
+        .find_functions(Some("pg_catalog"), &tgt.typname)
+        .iter()
+        .find(|f| f.proargtypes.first() == Some(&source) && f.prorettype == target)
+        .map(|f| format!("{}({})", f.proname, src.typname))
 }
 
 /// Whether the cast from `source` to `target` runs a cast function that can

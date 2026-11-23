@@ -2063,6 +2063,8 @@ fn is_zero_string(s: &str) -> bool {
 ///   infinity, a column CHECKed `isfinite`, … see [`crate::refine`]);
 /// - `extract` / `date_part` over such a finite timestamp or date has no
 ///   infinite input to be NULL for;
+/// - `time(timestamp)`, `time(timestamptz)` and `timetz(timestamptz)` are
+///   NULL only for an infinite timestamp;
 /// - `array_length` / `array_lower` / `array_upper` (dimension literal 1),
 ///   `array_ndims` and `array_dims` of a non-empty `ARRAY[…]` of scalars,
 ///   a one-dimensional array.
@@ -2124,6 +2126,11 @@ fn value_gated_non_null(
                     .exprs
                     .get(1)
                     .is_some_and(|a| finite_value(a, ctx.snapshot))
+        }
+        _ if crate::builtin_nullability::NULL_ONLY_ON_INFINITE
+            .contains(&resolved.signature.as_str()) =>
+        {
+            args.exprs.iter().all(|a| finite_value(a, ctx.snapshot))
         }
         "array_length" | "array_lower" | "array_upper"
             if func.args.len() == 2 && positional.len() == 2 =>
