@@ -71,6 +71,12 @@ its INSERT into audit fails as role "app": row-level security applies to the rol
 its INSERT into orders may fail as role "app": row-level security now checks the rows it writes against policies the deployed schema didn't, and a row they reject fails
 its UPDATE of users keeps the stored value of column kind, which the new NOT VALID CHECK constraint "users_kind" reads: updating a row already stored that breaks it fails
 its INSERT into users leaves out column kind, written its default, which CHECK constraint "users_kind" now limits it to 'b': writing another value fails
+it calls function account_name(integer), a statement of whose body now fails: column "name" does not exist
+its INSERT fires trigger "accounts_audit" on accounts (function audit_account()), a statement of whose body now fails: relation "audit" does not exist
+its UPDATE fires trigger "accounts_ro" on accounts (function read_only()), which now fails for every row it writes: accounts are read-only
+its INSERT fires trigger "no_long" on accounts (function no_long()), which may now raise an error: a row it rejects fails
+its INSERT into orders may fail: foreign key "orders_customer_fk" now requires column customer_id to match a row of customers, and a row with no match fails
+its DELETE from customers may fail: foreign key "orders_customer_fk" of orders (ON DELETE NO ACTION) now rejects deleting a row still referenced
 ```
 
 ## Why
@@ -99,7 +105,9 @@ Against the new schema, a deployed query:
 
 - no longer analyzes; PostgreSQL's error is quoted;
 - loses a result column, or one changes type (type modifiers and collations
-  aside) or may now be `NULL` (also array elements and record fields);
+  aside, and a domain added or removed over the same type when the type
+  mapping — Rust `[types]`, TypeScript `types` — gives both sides the same
+  type) or may now be `NULL` (also array elements and record fields);
 - returns a different column list (`SELECT *` gaining a column);
 - may return a value the code doesn't know: a new enum label, a `CHECK`
   admitting more values or a wider range (also in arrays and composites).
@@ -120,6 +128,28 @@ Against the new schema, a deployed query:
 - `UPDATE`s (also `ON CONFLICT DO UPDATE`, a `MERGE`'s `UPDATE`) a table
   with a new `NOT VALID` `CHECK` or `NOT NULL` reading a column it doesn't
   write: a row already stored that breaks it fails whatever is written;
+- calls a function, or fires a trigger (its `INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`, `COPY`), with a statement in its body — a `LANGUAGE sql` string
+  or PL/pgSQL, through the functions it calls too — that no longer
+  analyzes: a table it reads renamed, a column dropped. PostgreSQL fails
+  the statement when it runs;
+- fires a trigger whose function may now raise an error: a new trigger, or
+  a function replaced, with a `RAISE EXCEPTION`, `ASSERT`, `INTO STRICT` or
+  dynamic `EXECUTE` the deployed one didn't have ("may raise"). One that
+  raises before anything depending on the row (`BEGIN RAISE EXCEPTION
+  '…'; END`) fails every row a plain `INSERT`, `UPDATE`, `DELETE` or `COPY`
+  of its table writes, a statement trigger every run — under a `WHEN`, `ON
+  CONFLICT`, a `MERGE` or a partition's trigger, it "may raise";
+- writes a column a new foreign key covers (or one `NOT ENFORCED` at the
+  ref): a row with no match fails ("may fail"). Not when every row's key is
+  certainly `NULL` — a `NULL` written, a column left out without a default;
+  one key column for `MATCH SIMPLE`, all for `MATCH FULL` — nor for an
+  `UPDATE` not writing the key;
+- `DELETE`s from a table, or `UPDATE`s its referenced columns, where a new
+  foreign key (or one whose action changed) now rejects that for a row
+  still referenced ("may fail"): `NO ACTION`, `RESTRICT`, `SET NULL` into a
+  column that holds no `NULL`, `SET DEFAULT`, also reached through an `ON
+  DELETE` / `ON UPDATE CASCADE`;
 - runs as a role (`role = "…"` at the call site, or the database's `roles`)
   that lost a privilege, or that row-level security now denies: enabled
   with no policy for the role, a policy dropped, or `USING (false)`; or
@@ -181,11 +211,19 @@ command takes it over (then only the view's own columns are checked).
   timestamp, time or interval precision change (rounds); a length or
   precision change of a column only read.
 - A ref with no typedpg configuration, or whose migrations don't build.
-- What a function's or trigger's body does: a new trigger that raises, a
-  string-bodied function a migration breaks (its body isn't checked
-  again). Row-level security narrowing the rows a read or an `UPDATE`
-  sees (short of denying all of them), and the policies of a table written
-  through a view (the view owner's).
+- Of a body, what only running it shows: a value it computes failing a
+  cast, the constraints of what it writes, a dynamic `EXECUTE`'s text; a new
+  trigger with nothing that raises (`NEW.updated_at := now()`). A `BEGIN
+  ATOMIC` body names its objects when created: a migration can't break it
+  without dropping it, which the call then reports.
+- A foreign key validated (`VALIDATE CONSTRAINT`: a `NOT VALID` one already
+  checks every row written), one whose `CASCADE`, or `SET NULL` into a
+  nullable column, deletes or changes referencing rows (the statement
+  runs); the foreign keys referencing the table below a view a `DELETE`
+  goes through.
+- Row-level security narrowing the rows a read or an `UPDATE` sees (short of
+  denying all of them), and the policies of a table written through a view
+  (the view owner's).
 - SQL built at run time, other services, ad-hoc scripts.
 
 ## Configuration

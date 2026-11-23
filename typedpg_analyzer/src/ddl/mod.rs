@@ -19,7 +19,7 @@ pub(crate) mod cursors;
 pub(crate) mod defaults;
 pub(crate) mod depend;
 mod dml;
-mod do_block;
+pub(crate) mod do_block;
 pub mod drop;
 pub(crate) mod event_triggers;
 mod expr_kind;

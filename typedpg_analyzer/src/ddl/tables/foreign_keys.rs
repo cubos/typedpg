@@ -711,9 +711,7 @@ impl FkDetails {
         self.initdeferred = initdeferred;
     }
 
-    /// `confupdtype`, `confdeltype` and `confmatchtype` (for the catalog
-    /// oracle).
-    #[cfg(feature = "pg_sanity")]
+    /// `confupdtype`, `confdeltype` and `confmatchtype`.
     pub(crate) fn catalog_codes(&self) -> (char, char, char) {
         let code = |s: &str| s.chars().next().unwrap_or(' ');
         (

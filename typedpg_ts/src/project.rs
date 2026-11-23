@@ -1253,6 +1253,12 @@ impl Project {
         self.dbs[db].catalog.as_ref().map_err(Clone::clone)
     }
 
+    /// Database `db`'s type overrides (`types`): the TypeScript type name
+    /// each overridden PG type maps to.
+    pub fn type_overrides(&self, db: usize) -> &HashMap<QualifiedName, String> {
+        &self.dbs[db].overrides
+    }
+
     /// The migrations `typedpg lint` runs for database `i`: the runner's
     /// directory (reported) and the extra directories (applied, never
     /// reported), in the order the catalog applies them.

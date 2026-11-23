@@ -127,11 +127,11 @@ pub use condition::{
 pub use ddl::DdlError;
 pub use error::AnalyzeError;
 pub use pg_catalog::{
-    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement,
-    NullifiedJoin, PgCatalog, QueryView, RelationRef, SublinkNullability, UserObjectCounts,
-    ValueLimit,
+    CoalesceFact, ColumnRefBinding, LintForeignKey, LocatedError, MigrationObserver,
+    MigrationStatement, NullifiedJoin, PgCatalog, QueryView, RelationRef, SublinkNullability,
+    UserObjectCounts, ValueLimit,
 };
-pub use privileges::RowSecurityChecks;
+pub use privileges::{BodyDiagnostics, BodyFailure, BodyReach, FiredTrigger, RowSecurityChecks};
 pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{

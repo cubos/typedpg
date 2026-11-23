@@ -813,6 +813,77 @@ fn run_plpgsql_body(
     run.block(interp, action)
 }
 
+/// What may fail in trigger function `function`'s body (a `LANGUAGE
+/// plpgsql` one; `None` for another), for a trigger firing it: the error
+/// it raises every time it runs, when running it as far as it can be known
+/// statically reaches one (a `RAISE EXCEPTION` before any statement whose
+/// effect depends on the row, a statement that fails) — the row's values
+/// and the trigger's variables are unknown — and the statements that may
+/// raise one depending on the data, as their text: `RAISE` at `EXCEPTION`
+/// level, `ASSERT`, `INTO STRICT` and dynamic `EXECUTE`.
+pub(crate) fn trigger_body_outcome(
+    interp: &PgCatalog,
+    function: PgProcOid,
+) -> Option<(Option<String>, std::collections::BTreeSet<String>)> {
+    /// `ERROR` (elog.h): RAISE EXCEPTION's level.
+    const ERROR: i32 = 21;
+    let routine = interp.routine_bodies.get(&function)?;
+    let ("plpgsql", RoutineSource::Plpgsql { create_sql }) =
+        (routine.language.as_str(), &routine.source)
+    else {
+        return None;
+    };
+    let parsed = typedpg_pg_query::parse_plpgsql_with_catalog(create_sql, interp).ok()?;
+    let compiled = parsed.first()?;
+    let action = compiled.action.as_ref()?;
+    let mut sites = std::collections::BTreeSet::new();
+    let text = |expr: Option<&plpgsql::Expr>| expr_query(expr).unwrap_or_default().to_owned();
+    crate::privileges::walk_plpgsql_block(action, &mut |stmt| match stmt {
+        Stmt::Raise(s) if s.elog_level >= ERROR => {
+            let params: Vec<String> = s.params.iter().map(|p| text(Some(p))).collect();
+            sites.insert(format!(
+                "RAISE {} {} {}",
+                s.condname.as_deref().unwrap_or_default(),
+                s.message.as_deref().unwrap_or_default(),
+                params.join(", ")
+            ));
+        }
+        Stmt::Assert(s) => {
+            sites.insert(format!("ASSERT {}", text(s.cond.as_ref())));
+        }
+        Stmt::Execsql(s) if s.strict => {
+            sites.insert(format!("STRICT {}", text(s.sqlstmt.as_ref())));
+        }
+        Stmt::Dynexecute(s) => {
+            sites.insert(format!("EXECUTE {}", text(s.query.as_ref())));
+        }
+        _ => {}
+    });
+    // Run on a copy: what the body's statements do to the catalog is no
+    // migration's.
+    let mut scratch = interp.clone();
+    let always = {
+        let _barrier = crate::error::DiagContextGuard::barrier();
+        let mut run = Run {
+            variables: variables(compiled),
+            atomic: true,
+            arguments: true,
+        };
+        for variable in &mut run.variables {
+            variable.value = None;
+        }
+        match enter_body(Some(function)) {
+            Some(_leave) => run.block(&mut scratch, action).err(),
+            None => None,
+        }
+    };
+    let always = always.map(|e| {
+        let message = e.to_string();
+        message.lines().next().unwrap_or_default().trim().to_owned()
+    });
+    Some((always, sites))
+}
+
 /// SQL `sql` a running PL/pgSQL body executes through SPI (a constant
 /// `EXECUTE`, a `CALL` or `DO`): its statements apply as a migration's
 /// do, a `CALL` running its procedure and a `DO` its block, atomically

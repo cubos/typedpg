@@ -367,6 +367,110 @@ impl PgCatalog {
         tables.sort();
         tables
     }
+
+    /// What the bodies statement `sql` runs do (see
+    /// [`crate::BodyDiagnostics`]): every routine it calls and trigger its
+    /// writes fire, walked as the privilege check walks them for a
+    /// superuser, with the body statements that don't analyze against this
+    /// catalog. `None` when the statement itself doesn't analyze.
+    pub fn lint_body_diagnostics(&self, sql: &str) -> Option<crate::BodyDiagnostics> {
+        let (result, diagnostics) = crate::privileges::collect_body_diagnostics(|| {
+            self.analyze_as_with_sql(sql, Self::MIGRATIONS_USER).1
+        });
+        result.ok().map(|_| diagnostics)
+    }
+
+    /// [`Self::lint_body_diagnostics`] for a `copy_in!` target (`table
+    /// (columns)`): the triggers its rows fire.
+    pub fn lint_copy_in_body_diagnostics(&self, target: &str) -> Option<crate::BodyDiagnostics> {
+        let (result, diagnostics) = crate::privileges::collect_body_diagnostics(|| {
+            self.analyze_copy_in_as(target, Self::MIGRATIONS_USER)
+        });
+        result.ok().map(|_| diagnostics)
+    }
+
+    /// What may fail in trigger function `function`'s body (`LANGUAGE
+    /// plpgsql`; `None` for another): the error it raises every time it
+    /// runs, when running its statements as far as they can be known
+    /// statically — the row's values unknown — reaches one before anything
+    /// depending on the row (an unconditional `RAISE EXCEPTION`), and the
+    /// statements that may raise one depending on the data, as text
+    /// (`RAISE` at `EXCEPTION` level, `ASSERT`, `INTO STRICT`, dynamic
+    /// `EXECUTE`).
+    pub fn lint_trigger_function_failures(
+        &self,
+        function: PgProcOid,
+    ) -> Option<(Option<String>, std::collections::BTreeSet<String>)> {
+        crate::ddl::do_block::trigger_body_outcome(self, function)
+    }
+
+    /// The enforced foreign keys of the catalog (`NOT ENFORCED` ones check
+    /// nothing): each one's referencing and referenced relations and
+    /// columns, match type and actions. A foreign key of a partitioned
+    /// table has a row per partition it was cloned into, and per partition
+    /// of a partitioned referenced table.
+    pub fn lint_foreign_keys(&self) -> Vec<LintForeignKey> {
+        let column_names = |relid: PgClassOid, attnums: &[i16]| -> Option<Vec<String>> {
+            attnums
+                .iter()
+                .map(|attnum| {
+                    self.attributes_of(relid)
+                        .iter()
+                        .find(|a| a.attnum == *attnum)
+                        .map(|a| a.attname.clone())
+                })
+                .collect()
+        };
+        let mut out: Vec<LintForeignKey> = self
+            .pg_constraint
+            .values()
+            .filter(|c| c.contype == super::rows::ConType::ForeignKey && c.conenforced)
+            .filter_map(|c| {
+                let referenced = c.confrelid?;
+                let (on_update, on_delete, match_type) = self
+                    .fk_details
+                    .get(&c.oid)
+                    .map_or(('a', 'a', 's'), |d| d.catalog_codes());
+                Some(LintForeignKey {
+                    name: c.conname.clone(),
+                    relid: c.conrelid,
+                    columns: column_names(c.conrelid, &c.conkey)?,
+                    referenced,
+                    referenced_columns: column_names(referenced, &c.confkey)?,
+                    match_full: match_type == 'f',
+                    on_update,
+                    on_delete,
+                    derived: crate::ddl::tables::foreign_keys::fk_parent(self, c.oid)
+                        .is_some_and(|parent| parent.conrelid == c.conrelid),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (a.relid, &a.name, a.referenced).cmp(&(b.relid, &b.name, b.referenced)));
+        out
+    }
+}
+
+/// An enforced foreign key (see [`PgCatalog::lint_foreign_keys`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintForeignKey {
+    pub name: String,
+    /// The referencing relation, and its columns.
+    pub relid: PgClassOid,
+    pub columns: Vec<String>,
+    /// The referenced relation, and its columns.
+    pub referenced: PgClassOid,
+    pub referenced_columns: Vec<String>,
+    /// `MATCH FULL`: a row with some referencing columns NULL and others
+    /// not fails; else (`MATCH SIMPLE`) one with a NULL is not checked.
+    pub match_full: bool,
+    /// `confupdtype`, `confdeltype`: `a` NO ACTION, `r` RESTRICT, `c`
+    /// CASCADE, `n` SET NULL, `d` SET DEFAULT.
+    pub on_update: char,
+    pub on_delete: char,
+    /// The row of one partition of a partitioned referenced table, derived
+    /// from the foreign key referencing the whole table (`conparentid` on
+    /// the same referencing relation).
+    pub derived: bool,
 }
 
 /// What a type modifier limits the values of a column to (see
