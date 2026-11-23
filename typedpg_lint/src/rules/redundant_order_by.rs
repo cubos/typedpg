@@ -10,7 +10,9 @@
 //! - A plain column an earlier key already sorts by: rows tied up to it
 //!   have equal values.
 //! - The whole `ORDER BY` of a query the analyzer proves returns at most
-//!   one row, or of an `EXISTS`, `IN` / `= ANY` or `ALL` subquery without
+//!   one row (with `DISTINCT ON`, has at most one row before it: the keys
+//!   after its expressions pick the row it keeps, even when it returns a
+//!   single group), or of an `EXISTS`, `IN` / `= ANY` or `ALL` subquery without
 //!   `LIMIT`, `OFFSET`, `DISTINCT ON` or a locking clause: those only test
 //!   membership, so the order of the subquery's rows is never observed.
 //!   (`FROM` subqueries, CTEs and `ARRAY(…)` are not judged: an aggregate
@@ -26,10 +28,11 @@
 
 use std::collections::HashSet;
 
-use typedpg_analyzer::{order_keys, select_at_most_one_row, unique_order_prefix};
+use typedpg_analyzer::{order_keys, unique_order_prefix};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{AConstValue, Node, SelectStmt, SubLinkType};
 
+use super::limit_without_order::picks_from_at_most_one_row;
 use super::{clause_item_spans, list_item_removal};
 use crate::{Ctx, RawFinding, SqlEdit};
 
@@ -57,7 +60,10 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let whole =
             if unobserved.contains(&pointer) && !picks_rows && select.locking_clause.is_empty() {
                 Some("a subquery that only tests membership never observes its rows' order")
-            } else if select_at_most_one_row(ctx.catalog, ctx.view, select) {
+            } else if picks_from_at_most_one_row(ctx, select) {
+                // With DISTINCT ON, the rows before it: the keys after its
+                // expressions pick the row each group keeps, even when only
+                // one group is returned.
                 Some("the query returns at most one row")
             } else {
                 None
@@ -410,6 +416,43 @@ mod tests {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");
         }
+    }
+
+    #[test]
+    fn the_keys_picking_distinct_ons_row_are_kept() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE imgs (
+                id int PRIMARY KEY,
+                project_id int NOT NULL,
+                arch text NOT NULL,
+                version int NOT NULL
+             );",
+        )
+        .unwrap();
+        // One group (WHERE fixes the DISTINCT ON key), but the keys after it
+        // pick which of the group's rows is returned.
+        for sql in [
+            "SELECT DISTINCT ON (project_id) id FROM imgs WHERE project_id = $p              ORDER BY project_id, version DESC, id",
+            "SELECT DISTINCT ON (project_id) id FROM imgs WHERE project_id = $p              ORDER BY project_id, version DESC, id LIMIT 1",
+            "SELECT DISTINCT ON (project_id, arch) id FROM imgs              WHERE project_id = $p AND arch = $a ORDER BY project_id, arch, version DESC",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // A pinned key after the DISTINCT ON expressions sorts every row the
+        // same; the key that picks the row stays.
+        check(
+            &db,
+            "SELECT DISTINCT ON (project_id) id FROM imgs              WHERE project_id = $p AND arch = 'x' ORDER BY project_id, arch, version DESC",
+            "SELECT DISTINCT ON (project_id) id FROM imgs              WHERE project_id = $p AND arch = 'x' ORDER BY project_id, version DESC",
+        );
+        // At most one row before DISTINCT ON: nothing to pick from.
+        check(
+            &db,
+            "SELECT DISTINCT ON (project_id) id FROM imgs WHERE id = $id              ORDER BY project_id, version DESC",
+            "SELECT DISTINCT ON (project_id) id FROM imgs WHERE id = $id",
+        );
     }
 
     #[test]

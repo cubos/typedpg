@@ -62,6 +62,8 @@ which values the outer query sees.
   [`unstable_order`](unstable_order.md).
 - A query that returns at most one row anyway:
   `WHERE id = $id LIMIT 1` (see [`redundant_limit`](redundant_limit.md)).
+  For `DISTINCT ON`, the rows before it count: `DISTINCT ON (user_id) …
+  WHERE user_id = $u` returns one row, but an arbitrary one of the user's.
 - An `EXISTS` subquery: `EXISTS (SELECT 1 FROM posts WHERE … LIMIT 1)`.
 - Batching in an `UPDATE` / `DELETE`:
   `DELETE FROM posts WHERE id IN (SELECT id FROM posts WHERE … LIMIT 1000)`.
@@ -69,8 +71,10 @@ which values the outer query sees.
 - Every row would produce the same output:
   - the select list reads no column and calls nothing volatile:
     `SELECT 1 AS one FROM posts LIMIT 1`, `now()`, but not `random()`;
-  - over one table, it outputs only columns `WHERE` fixes to a parameter or
-    constant: `SELECT status FROM posts WHERE status = $status LIMIT 1`.
+  - over tables and joins of them, it outputs only columns `WHERE` fixes to
+    a parameter or constant: `SELECT status FROM posts WHERE status =
+    $status LIMIT 1`, also with `JOIN users u ON …`. A join multiplies rows,
+    never changes those values.
     Not for types whose equal values can print differently (`numeric`,
     floats, `interval`, `char(n)`) or under a nondeterministic collation.
 

@@ -3532,7 +3532,23 @@ pub enum OrderTies {
 /// `Ties` is only claimed when the FROM clause is base tables and joins the
 /// proof models, none with a partial, expression or deferrable unique index
 /// (which may make the keys unique in a way not followed).
-pub(super) fn order_ties(ctx: &Ctx<'_>, ctes: &HashSet<String>, s: &ast::SelectStmt) -> OrderTies {
+///
+/// `outer` is the scope of `s`'s own level and the levels around it, when
+/// known: a column of an enclosing level (a correlated subquery's, a
+/// `LATERAL` item's reference to the items on its left) is one value per
+/// evaluation of `s`, so `WHERE` equating a column to it fixes the column
+/// like a parameter does. Without it, such a reference fixes nothing.
+///
+/// A key `col COLLATE c` under a deterministic collation `c` sorts by
+/// `col` as far as ties go: a deterministic collation compares only
+/// identical strings equal, so values distinct under the column's own
+/// (deterministic) collation stay distinct under `c`.
+pub(super) fn order_ties(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    s: &ast::SelectStmt,
+    outer: Option<&FromScope<'_>>,
+) -> OrderTies {
     if s.op != SetOperation::SetopNone
         || s.into_clause.is_some()
         || s.sort_clause.is_empty()
@@ -3574,6 +3590,15 @@ pub(super) fn order_ties(ctx: &Ctx<'_>, ctes: &HashSet<String>, s: &ast::SelectS
         };
         let Some(key) = sort_key(s, sort.node.as_ref()) else {
             continue;
+        };
+        let key = match key {
+            Node::CollateClause(collate) if deterministic_collate_clause(ctx, collate) => {
+                match collate.arg.as_ref() {
+                    Some(arg) => arg,
+                    None => continue,
+                }
+            }
+            key => key,
         };
         let Node::ColumnRef(cr) = key else {
             continue;
@@ -3635,7 +3660,7 @@ pub(super) fn order_ties(ctx: &Ctx<'_>, ctes: &HashSet<String>, s: &ast::SelectS
     let all: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
     let where_facts = conjuncts(s.where_clause.as_ref())
         .into_iter()
-        .flat_map(|c| scope.equality_facts(ctx, c, None))
+        .flat_map(|c| scope.equality_facts(ctx, c, outer))
         .collect::<Vec<_>>();
     let mut deps: Vec<(u64, usize)> = Vec::new();
     for b in 0..n {
@@ -3646,7 +3671,7 @@ pub(super) fn order_ties(ctx: &Ctx<'_>, ctes: &HashSet<String>, s: &ast::SelectS
     for join in &scope.joins {
         let mut facts: Vec<EqFact> = Vec::new();
         for c in conjuncts(join.quals) {
-            facts.extend(scope.equality_facts(ctx, c, None));
+            facts.extend(scope.equality_facts(ctx, c, outer));
         }
         for name in &join.using {
             facts.extend(scope.using_facts(ctx, name, join.left, join.right));
@@ -3780,6 +3805,19 @@ pub(super) fn order_ties(ctx: &Ctx<'_>, ctes: &HashSet<String>, s: &ast::SelectS
         })
         .collect();
     OrderTies::Ties(undetermined)
+}
+
+/// Whether `COLLATE` names a collation the catalog records as deterministic
+/// (see [`deterministic`]). An unknown name is refused.
+fn deterministic_collate_clause(ctx: &Ctx<'_>, collate: &ast::CollateClause) -> bool {
+    let (schema, name) = match string_list(&collate.collname).as_slice() {
+        [name] => (None, *name),
+        [schema, name] => (Some(*schema), *name),
+        _ => return false,
+    };
+    ctx.catalog
+        .resolve_collation(schema, name)
+        .is_some_and(|collation| collation.collisdeterministic)
 }
 
 /// The expression an `ORDER BY` item sorts by: an output column's
@@ -3986,7 +4024,7 @@ pub(super) fn unique_order_prefix(
     (1..s.sort_clause.len()).find(|&k| {
         let mut prefix = s.clone();
         prefix.sort_clause.truncate(k);
-        order_ties(ctx, ctes, &prefix) == OrderTies::Unique
+        order_ties(ctx, ctes, &prefix, None) == OrderTies::Unique
     })
 }
 

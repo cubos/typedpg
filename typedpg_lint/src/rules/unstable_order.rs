@@ -6,12 +6,15 @@
 //! and `DISTINCT ON` may keep either row of a group.
 //!
 //! The keys are unique when, with the columns `WHERE` equates to
-//! constants or parameters, they cover a unique key (NOT NULL, or `NULLS
-//! NOT DISTINCT`) of every table — or of the tables the others determine
+//! constants, parameters or columns of an enclosing query level (one value
+//! per evaluation), they cover a unique key (NOT NULL, or `NULLS NOT
+//! DISTINCT`; `col COLLATE c` counts as `col` under a deterministic `c`)
+//! of every table — or of the tables the others determine
 //! through equalities to a key (a join on a primary key) — or, for a
 //! grouped query, every grouping column (see
 //! [`typedpg_analyzer::order_ties`]). A query returning at most one row is
-//! not reported, nor `FETCH … WITH TIES` (it returns every tie), a
+//! not reported (with `DISTINCT ON`, one with at most one row before it: a
+//! single group still picks among its rows), nor `FETCH … WITH TIES` (it returns every tie), a
 //! `SKIP LOCKED` queue, an `EXISTS` subquery or a batching `IN` in an
 //! `UPDATE` / `DELETE` (which don't care which rows), nor a select whose
 //! output is the same for every row. Nothing is reported when the proof
@@ -24,11 +27,11 @@
 
 use typedpg_analyzer::{OrderTies, order_ties, select_at_most_one_row};
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{LimitOption, Node, SelectStmt};
+use typedpg_pg_query::ast::{AConstValue, LimitOption, Node, SelectStmt};
 
 use super::limit_without_order::{
     batched_subqueries, constant_target, distinct_on_span, has_skip_locked, invariant_target,
-    limit_is_zero, limit_span, offset_span,
+    limit_is_zero, limit_span, offset_span, picks_from_at_most_one_row,
 };
 use super::{leftmost_start, scan_until, starts_clause};
 use crate::{Ctx, RawFinding};
@@ -62,7 +65,11 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             || limit_is_zero(select)
             || constant_target(ctx, select)
             || invariant_target(ctx, select)
-            || select_at_most_one_row(ctx.catalog, ctx.view, select)
+            || if picks == "DISTINCT ON" {
+                picks_from_at_most_one_row(ctx, select)
+            } else {
+                select_at_most_one_row(ctx.catalog, ctx.view, select)
+            }
         {
             continue;
         }
@@ -78,6 +85,8 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             .collect();
         let what = if picks == "DISTINCT ON" {
             "DISTINCT ON keeps an arbitrary row of the tied ones in each group"
+        } else if limit_is_one(select) && offset_span(ctx, select).is_none() {
+            "which of the tied rows comes back is arbitrary"
         } else {
             "rows that tie come back in an arbitrary order, so pages may skip or repeat rows"
         };
@@ -113,6 +122,17 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         });
     }
     out
+}
+
+/// Whether the row count is the literal 1 (`LIMIT 1`, `FETCH FIRST 1 ROW
+/// ONLY`).
+fn limit_is_one(select: &SelectStmt) -> bool {
+    matches!(
+        select.limit_count.as_ref(),
+        Some(Node::AConst(value))
+            if !value.isnull
+                && matches!(value.val, Some(AConstValue::Integer(ref count)) if count.ival == 1)
+    )
 }
 
 /// The `ORDER BY …` clause of `select`.
@@ -159,7 +179,17 @@ mod tests {
                  );
                  CREATE TABLE logs (at timestamptz NOT NULL, msg text);
                  CREATE TABLE slugs (id int PRIMARY KEY, slug text NOT NULL);
-                 CREATE UNIQUE INDEX ON slugs (lower(slug));",
+                 CREATE UNIQUE INDEX ON slugs (lower(slug));
+                 CREATE TABLE src (id int PRIMARY KEY);
+                 CREATE TABLE ver (
+                    source_id int NOT NULL REFERENCES src,
+                    version int NOT NULL,
+                    digest text,
+                    PRIMARY KEY (source_id, version)
+                 );
+                 CREATE TABLE mig (name text PRIMARY KEY);
+                 CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', \
+                    deterministic = false);",
             )
             .unwrap();
         catalog
@@ -231,6 +261,88 @@ mod tests {
             }
             assert!(findings[0].fix.is_empty());
         }
+    }
+
+    #[test]
+    fn distinct_on_picking_from_one_group_is_reported() {
+        let db = catalog();
+        // WHERE fixes the DISTINCT ON key: one row comes back, but which of
+        // the group's rows is arbitrary.
+        let sql = "SELECT DISTINCT ON (tenant) id FROM users WHERE tenant = $1 ORDER BY tenant";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("DISTINCT ON keeps an arbitrary row"),
+            "{findings:?}"
+        );
+        // One row before DISTINCT ON: nothing to pick from.
+        let sql = "SELECT DISTINCT ON (tenant) id FROM users WHERE id = $1 ORDER BY tenant";
+        assert!(lint_rule(&db, sql, RULE).is_empty());
+    }
+
+    #[test]
+    fn a_single_row_limit_says_which_row_is_arbitrary() {
+        let db = catalog();
+        for sql in [
+            "SELECT id FROM users ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM users ORDER BY created_at DESC FETCH FIRST 1 ROW ONLY",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                findings[0]
+                    .message
+                    .ends_with("which of the tied rows comes back is arbitrary"),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A page past the first still pages.
+        let findings = lint_rule(
+            &db,
+            "SELECT id FROM users ORDER BY created_at LIMIT 1 OFFSET $1",
+            RULE,
+        );
+        assert!(
+            findings[0]
+                .message
+                .ends_with("pages may skip or repeat rows")
+        );
+    }
+
+    #[test]
+    fn outer_columns_fix_a_key_like_parameters() {
+        let db = catalog();
+        for sql in [
+            "SELECT s.id, (SELECT v.digest FROM ver v WHERE v.source_id = s.id              ORDER BY v.version DESC LIMIT 1) FROM src s",
+            "SELECT s.id, l.digest FROM src s CROSS JOIN LATERAL              (SELECT v.digest FROM ver v WHERE v.source_id = s.id              ORDER BY v.version DESC LIMIT 1) l",
+            "SELECT s.id, l.digest FROM src s LEFT JOIN LATERAL              (SELECT v.digest FROM ver v WHERE s.id = v.source_id              ORDER BY v.version DESC LIMIT 1) l ON true",
+            "SELECT (SELECT v.digest FROM ver v WHERE v.source_id = $1              ORDER BY v.version DESC LIMIT 1)",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // Not an equality: the outer column fixes nothing.
+        let sql = "SELECT s.id, (SELECT v.digest FROM ver v WHERE v.source_id > s.id \
+                   ORDER BY v.version DESC LIMIT 1) FROM src s";
+        assert_eq!(lint_rule(&db, sql, RULE).len(), 1, "{sql}");
+    }
+
+    #[test]
+    fn a_deterministic_collate_keeps_a_unique_key_unique() {
+        let db = catalog();
+        for sql in [
+            "SELECT name FROM mig ORDER BY name COLLATE \"C\" LIMIT 10",
+            "SELECT name FROM mig ORDER BY name COLLATE \"C\" DESC LIMIT 10",
+            "SELECT name FROM mig ORDER BY name COLLATE pg_catalog.\"POSIX\" LIMIT 10",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // A nondeterministic collation compares distinct names equal.
+        let sql = "SELECT name FROM mig ORDER BY name COLLATE ci LIMIT 10";
+        assert_eq!(lint_rule(&db, sql, RULE).len(), 1, "{sql}");
     }
 
     #[test]

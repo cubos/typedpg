@@ -133,7 +133,8 @@ pub use resolve::{
 pub use simplify::{
     AppliedSimplification, OrderKey, OrderTies, RedundantJoin, RedundantJoinProof, Rule,
     SimplifyOptions, order_keys, order_ties, redundant_distinct_spans, redundant_group_keys,
-    select_at_most_one_row, statement_at_most_one_row, unique_order_prefix,
+    select_at_most_one_row, statement_at_most_one_row, statement_node_at_most_one_row,
+    unique_order_prefix,
 };
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the

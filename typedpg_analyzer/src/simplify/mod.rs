@@ -26,7 +26,7 @@ mod safe_builtins;
 
 pub use cardinality::{
     order_keys, order_ties, redundant_distinct_spans, redundant_group_keys, select_at_most_one_row,
-    statement_at_most_one_row, unique_order_prefix,
+    statement_at_most_one_row, statement_node_at_most_one_row, unique_order_prefix,
 };
 pub use dedup::{OrderKey, OrderTies};
 pub use fk_join::{RedundantJoin, RedundantJoinProof};

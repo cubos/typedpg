@@ -97,7 +97,9 @@ pub fn redundant_distinct_spans(
 
 /// Whether the `ORDER BY` keys of `select` — a node borrowed from
 /// `view.tree` at any nesting depth — can tie: two rows the schema allows
-/// sharing every key (see [`dedup::OrderTies`]). `Unknown` for a query
+/// sharing every key (see [`dedup::OrderTies`]). A `WHERE` equality to a
+/// column of an enclosing query level fixes a column like a parameter does
+/// (it is one value per evaluation of `select`). `Unknown` for a query
 /// with spreads.
 pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) -> dedup::OrderTies {
     if !view.analyzed.spreads.is_empty() {
@@ -109,7 +111,35 @@ pub fn order_ties(catalog: &PgCatalog, view: &QueryView, select: &SelectStmt) ->
         catalog,
         analyzed: &view.analyzed,
     };
-    dedup::order_ties(&ctx, &dedup::cte_names(&view.tree), select)
+    let ties = dedup::order_ties(&ctx, &dedup::cte_names(&view.tree), select, None);
+    if !matches!(ties, dedup::OrderTies::Ties(_)) {
+        return ties;
+    }
+    // Again with the levels around `select`, which only the walk from the
+    // statement's root knows.
+    let mut found = None;
+    let env = CteEnv::default();
+    for raw in &view.tree.stmts {
+        if let Some(root) = raw.stmt.as_ref() {
+            find_select(
+                &ctx,
+                root.to_ref(),
+                None,
+                &env,
+                select,
+                SelectCheck::OrderUnique,
+                &mut found,
+            );
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    if found == Some(true) {
+        dedup::OrderTies::Unique
+    } else {
+        ties
+    }
 }
 
 /// What each `ORDER BY` item of `select` — a node borrowed from `view.tree`
@@ -366,6 +396,29 @@ pub fn statement_at_most_one_row(catalog: &PgCatalog, view: &QueryView) -> bool 
         return false;
     };
     statement_at_most_one_row_in(&ctx, statement.to_ref(), &CteEnv::default(), None)
+}
+
+/// Whether `statement` — a statement node such as a `WITH` query's body, a
+/// node of `view.tree` at any nesting depth — provably yields at most one
+/// row by [`statement_at_most_one_row`]'s proof. It is judged without the
+/// query levels and `WITH` queries around it: a reference to an outer column
+/// or to any CTE of the tree proves nothing.
+pub fn statement_node_at_most_one_row(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    statement: NodeRef<'_>,
+) -> bool {
+    if !view.analyzed.spreads.is_empty() {
+        return false;
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    let env = CteEnv::blocked(&dedup::cte_names(&view.tree));
+    statement_at_most_one_row_in(&ctx, statement, &env, None)
 }
 
 // ── CTEs ────────────────────────────────────────────────────────────────────
@@ -920,6 +973,9 @@ enum SelectCheck {
     OneRow,
     /// [`proof::error_free_select_allow_count`] (the lint fix's proof).
     ErrorFree,
+    /// [`dedup::order_ties`] is `Unique`, with the enclosing levels' columns
+    /// as values.
+    OrderUnique,
 }
 
 /// Search `node`'s subtree for `target`, giving each nested query level the
@@ -952,6 +1008,10 @@ fn find_select(
                     }
                     SelectCheck::ErrorFree => {
                         proof::error_free_select_allow_count(ctx, select, &scope)
+                    }
+                    SelectCheck::OrderUnique => {
+                        dedup::order_ties(ctx, &dedup::cte_names(ctx.tree), select, Some(&scope))
+                            == dedup::OrderTies::Unique
                     }
                 });
                 return;

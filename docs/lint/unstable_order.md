@@ -42,23 +42,32 @@ the data, so tests rarely catch it. End the `ORDER BY` with a unique column.
 
 ## Reported when
 
-The `ORDER BY` keys, together with the columns `WHERE` equates to constants
-or parameters, don't cover a unique key of every table in `FROM`:
+The `ORDER BY` keys, together with the columns `WHERE` equates to constants,
+parameters or columns of an enclosing query (one value per evaluation of a
+correlated or `LATERAL` subquery), don't cover a unique key of every table in
+`FROM`:
 
 - a table joined on its primary key needs no key of its own;
 - in a grouped query, the `GROUP BY` columns count;
 - a unique key counts only if its columns are `NOT NULL` (or proven non-NULL
   by `WHERE`) or it is `NULLS NOT DISTINCT`. With `nick` nullable,
-  `WHERE tenant = $t ORDER BY nick LIMIT 20` is reported.
+  `WHERE tenant = $t ORDER BY nick LIMIT 20` is reported;
+- `col COLLATE "C"` covers `col` under a deterministic collation; under a
+  nondeterministic one, distinct values can compare equal.
 
-The help names each undetermined table's primary key.
+A `DISTINCT ON` whose keys `WHERE` fixes returns one row, still picked
+among ties. The help names each undetermined table's primary key.
 
 ## Not reported
 
 - A unique tiebreaker: `ORDER BY created_at DESC, id DESC LIMIT 20`, or a
   unique `NOT NULL` key: `SELECT id, email FROM users ORDER BY email LIMIT 20`.
+- The rest of the key fixed by the enclosing row: with key `(user_id,
+  created_at)`, `(SELECT … WHERE p.user_id = u.id ORDER BY p.created_at DESC
+  LIMIT 1)`.
 - No `LIMIT`, `OFFSET` or `DISTINCT ON`.
-- A query that returns at most one row, or `LIMIT 0`.
+- A query that returns at most one row (with `DISTINCT ON`, has at most one
+  row before it), or `LIMIT 0`.
 - `FETCH FIRST … WITH TIES`, which returns every tie.
 - `FOR UPDATE … SKIP LOCKED` queues:
   `ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED`.

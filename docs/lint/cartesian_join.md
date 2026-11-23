@@ -42,6 +42,8 @@ connected by:
 
 - a `WHERE`, `ON` or `HAVING` condition (or one `AND` argument of it) that
   references both, directly or through other items;
+- two `AND` arguments equating a column of each to the same parameter or
+  outer column: `a.tenant_id = $t AND s.tenant_id = $t`;
 - `USING (…)` or `NATURAL`;
 - a `LATERAL` subquery or `FROM` function referencing items to its left.
 
@@ -52,7 +54,11 @@ An unqualified column counts for the table it belongs to.
 - `CROSS JOIN`: the product is meant.
 - An item that returns at most one row:
   `users u, (SELECT count(*) AS total FROM posts) t`, a subquery with
-  `LIMIT 1`, a one-row `VALUES`, or a `WITH` query of that kind.
+  `LIMIT 1`, a one-row `VALUES`, a `WITH` query of that kind (an
+  `UPDATE … WHERE id = $id RETURNING …` too), or a table whose unique key
+  the conditions on it alone pin: `projects p, users u WHERE p.id = $p AND
+  u.email = $e`, `JOIN users u ON u.email = $e`. The conditions are `WHERE`
+  and the `ON` of an inner join or of an outer join's nullable side.
 - A function in `FROM`: `users u, generate_series(1, 7) AS d(day)`.
 - A condition on a merged `USING` column, which may connect anything.
 - `UPDATE … FROM` and `DELETE … USING`.

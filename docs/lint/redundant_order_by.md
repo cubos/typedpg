@@ -59,9 +59,9 @@ A key is redundant when:
 - an earlier key sorts by the same column, in either direction.
 
 The whole `ORDER BY` is reported when the query returns at most one row
-(`WHERE id = $id`, an aggregate without `GROUP BY`), when it belongs to an
-`EXISTS`, `IN`/`= ANY` or `ALL` subquery, or when every key is pinned or
-repeated.
+(`WHERE id = $id`, an aggregate without `GROUP BY`; with `DISTINCT ON`, has
+at most one row before it), when it belongs to an `EXISTS`, `IN`/`= ANY` or
+`ALL` subquery, or when every key is pinned or repeated.
 
 ## Not reported
 
@@ -73,7 +73,10 @@ repeated.
 - A `COLLATE` key: `ORDER BY name, name COLLATE "C"`.
 - Every key pinned under `LIMIT`, `OFFSET` or `DISTINCT ON`: that is
   [`unstable_order`](unstable_order.md)'s finding.
-- The leading keys of a `DISTINCT ON`.
+- The leading keys of a `DISTINCT ON`, and the keys after them that pick
+  the row each group keeps, even when `WHERE` leaves one group:
+  `DISTINCT ON (project_id) … WHERE project_id = $p ORDER BY project_id,
+  version DESC` returns the latest version.
 - The `ORDER BY` of a `FROM` subquery, a CTE, `ARRAY(…)` or a set operation.
 - A membership subquery with `LIMIT`, `OFFSET`, `DISTINCT ON` or
   `FOR UPDATE`/`FOR SHARE`.

@@ -3,7 +3,9 @@
 //! `DISTINCT ON`, an arbitrary row per group).
 //!
 //! Not reported when the choice doesn't matter: a query proven to return at
-//! most one row ([`typedpg_analyzer::select_at_most_one_row`]), a subquery
+//! most one row ([`typedpg_analyzer::select_at_most_one_row`]; for `DISTINCT
+//! ON`, to have at most one row before it), a select list that is the same
+//! for every row (constants, or columns `WHERE` fixes), a subquery
 //! of `EXISTS` (existence doesn't care which rows), an `IN` / `= ANY` /
 //! `ALL` in the `WHERE` of an `UPDATE` or `DELETE` (the batching idiom), a
 //! `LIMIT 0`, or a locking clause with `SKIP LOCKED` (the queue pattern
@@ -42,9 +44,12 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         if constant_target(ctx, select) || invariant_target(ctx, select) {
             continue;
         }
-        if select_at_most_one_row(ctx.catalog, ctx.view, select) {
+        if picks_from_at_most_one_row(ctx, select) {
             continue;
         }
+        // DISTINCT ON may still pick from several rows when it returns one;
+        // LIMIT and OFFSET apply to what it returns.
+        let one_row = select_at_most_one_row(ctx.catalog, ctx.view, select);
         if let Some(span) = distinct_on_span(ctx, select) {
             out.push(RawFinding {
                 span,
@@ -53,6 +58,9 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 help: Some(HELP.to_owned()),
                 fix: Vec::new(),
             });
+        }
+        if one_row {
+            continue;
         }
         if let Some(span) = limit_span(ctx, select) {
             out.push(RawFinding {
@@ -72,6 +80,21 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         }
     }
     out
+}
+
+/// Whether `select` has at most one row to pick from
+/// ([`select_at_most_one_row`]). With `DISTINCT ON` that is the rows
+/// before it: a `DISTINCT ON` whose keys `WHERE` fixes returns one row, but
+/// still an arbitrary one of the group's rows.
+pub(super) fn picks_from_at_most_one_row(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    if !matches!(select.distinct_clause.first(), Some(Some(_))) {
+        return select_at_most_one_row(ctx.catalog, ctx.view, select);
+    }
+    // A copy is judged without the levels around it, which only withholds
+    // proofs that need an outer column.
+    let mut rows = select.clone();
+    rows.distinct_clause.clear();
+    select_at_most_one_row(ctx.catalog, ctx.view, &rows)
 }
 
 /// The selects whose arbitrary row choice doesn't matter: the subquery of
@@ -383,10 +406,12 @@ fn cast_may_vary(
 }
 
 /// Whether every output row carries the same values because each target
-/// entry is a constant / parameter, or a bare column a top-level `WHERE`
-/// conjunct fixes to a parameter or constant through its type's default
-/// btree equality under a deterministic collation. Whichever rows a LIMIT
-/// or OFFSET picks then project the same values.
+/// entry is a constant / parameter, or a bare column of a table of the
+/// `FROM` clause that a top-level `WHERE` conjunct fixes to a parameter or
+/// constant through its type's default btree equality under a
+/// deterministic collation. Whichever rows a LIMIT or OFFSET picks then
+/// project the same values. Joins don't change that: they only multiply
+/// or drop rows, and every row they leave has the fixed values.
 pub(super) fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     if select.op != typedpg_pg_query::ast::SetOperation::SetopNone
         || select.target_list.is_empty()
@@ -394,31 +419,13 @@ pub(super) fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
     {
         return false;
     }
-    // A single plain relation keeps the column resolution below obvious;
-    // joins, subqueries and functions are refused.
-    let [from] = select.from_clause.as_slice() else {
-        return false;
-    };
-    let Some(Node::RangeVar(relation)) = from.as_ref() else {
-        return false;
-    };
-    // An alias column list renames the columns; the attname mapping below
-    // would then be wrong.
-    if relation
-        .alias
-        .as_ref()
-        .is_some_and(|alias| !alias.colnames.is_empty())
-    {
+    let mut relations = Vec::new();
+    for item in &select.from_clause {
+        from_relations(ctx, item.as_ref(), &mut relations);
+    }
+    if relations.is_empty() {
         return false;
     }
-    // The relation as the analyzer resolved it (a `WITH` query of the
-    // same name is none).
-    let Some(typedpg_analyzer::RelationRef::Relation(oid)) = ctx.view.relation_of(relation) else {
-        return false;
-    };
-    let Some(class) = ctx.catalog.class_row(oid) else {
-        return false;
-    };
     if !no_volatile_functions(ctx, NodeRef::SelectStmt(select)) {
         return false;
     }
@@ -428,7 +435,7 @@ pub(super) fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         and_conjuncts(select.where_clause.as_ref(), &mut conjuncts);
     }
     for conjunct in conjuncts {
-        if let Some(column) = equated_column(ctx, relation, class, conjunct) {
+        if let Some(column) = equated_column(ctx, &relations, conjunct) {
             equated.insert(column);
         }
     }
@@ -443,19 +450,72 @@ pub(super) fn invariant_target(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
         if constant_expression(ctx, value.as_ref()) {
             return true;
         }
-        relation_column(ctx, value.as_ref(), relation, class)
+        relation_column(ctx, value.as_ref(), &relations)
             .is_some_and(|column| equated.contains(&column))
     })
 }
 
-/// The bare column `node` names in `relation`, unqualified or qualified by
-/// the relation's name or alias.
+/// A plain table of a `FROM` clause, as the analyzer resolved it.
+struct FromRelation<'a> {
+    range: &'a typedpg_pg_query::ast::RangeVar,
+    class: &'a typedpg_analyzer::PgClass,
+}
+
+impl FromRelation<'_> {
+    /// The name a column reference qualifies it with.
+    fn refname(&self) -> &str {
+        self.range
+            .alias
+            .as_ref()
+            .map_or(self.range.relname.as_str(), |alias| {
+                alias.aliasname.as_str()
+            })
+    }
+}
+
+/// The plain tables of the `FROM` item `node`, through its joins. Any other
+/// item (a subquery, a function, an aliased join) contributes none: a
+/// reference to its columns then resolves to no table.
+fn from_relations<'a>(ctx: &Ctx<'a>, node: Option<&'a ast::Node>, out: &mut Vec<FromRelation<'a>>) {
+    match node {
+        Some(Node::RangeVar(range)) => {
+            // An alias column list renames the columns; the attname mapping
+            // below would then be wrong.
+            if range
+                .alias
+                .as_ref()
+                .is_some_and(|alias| !alias.colnames.is_empty())
+            {
+                return;
+            }
+            // The relation as the analyzer resolved it (a `WITH` query of
+            // the same name is none).
+            let Some(typedpg_analyzer::RelationRef::Relation(oid)) = ctx.view.relation_of(range)
+            else {
+                return;
+            };
+            if let Some(class) = ctx.catalog.class_row(oid) {
+                out.push(FromRelation { range, class });
+            }
+        }
+        Some(Node::JoinExpr(join)) if join.alias.is_none() => {
+            from_relations(ctx, join.larg.as_ref(), out);
+            from_relations(ctx, join.rarg.as_ref(), out);
+        }
+        _ => {}
+    }
+}
+
+/// The bare column `node` names — by its position in `relations` and its
+/// name — in one of `relations`: the table the analyzer bound it to at this
+/// query level, or, when only one table is in `relations` and no binding
+/// was recorded, that table's column unqualified or qualified by its name
+/// or alias.
 fn relation_column(
     ctx: &Ctx<'_>,
     node: Option<&ast::Node>,
-    relation: &typedpg_pg_query::ast::RangeVar,
-    class: &typedpg_analyzer::PgClass,
-) -> Option<String> {
+    relations: &[FromRelation<'_>],
+) -> Option<(usize, String)> {
     let Node::ColumnRef(reference) = node? else {
         return None;
     };
@@ -463,35 +523,48 @@ fn relation_column(
     let Some(Node::String(column)) = last.as_ref() else {
         return None;
     };
-    if !ctx
-        .catalog
-        .attributes_of(class.oid)
+    let index = match ctx.view.column_ref_binding(reference.location) {
+        Some(binding) => {
+            if binding.outer {
+                return None;
+            }
+            let source = binding.source.as_deref()?;
+            let mut found = relations
+                .iter()
+                .enumerate()
+                .filter(|(_, relation)| relation.refname() == source);
+            match (found.next(), found.next()) {
+                (Some((index, _)), None) => index,
+                _ => return None,
+            }
+        }
+        None => {
+            let [relation] = relations else {
+                return None;
+            };
+            match qualifiers {
+                [] => {}
+                [node] if matches!(node.as_ref(), Some(Node::String(name)) if name.sval == relation.refname()) =>
+                    {}
+                _ => return None,
+            }
+            0
+        }
+    };
+    ctx.catalog
+        .attributes_of(relations[index].class.oid)
         .iter()
         .any(|attribute| attribute.attname == column.sval)
-    {
-        return None;
-    }
-    let qualifier = relation
-        .alias
-        .as_ref()
-        .map_or(relation.relname.as_str(), |alias| alias.aliasname.as_str());
-    match qualifiers {
-        [] => Some(column.sval.clone()),
-        [node] if matches!(node.as_ref(), Some(Node::String(name)) if name.sval == qualifier) => {
-            Some(column.sval.clone())
-        }
-        _ => None,
-    }
+        .then(|| (index, column.sval.clone()))
 }
 
 /// The column a top-level `column = <parameter|constant>` conjunct fixes,
 /// when the equality is the column type's default btree one.
 fn equated_column(
     ctx: &Ctx<'_>,
-    relation: &typedpg_pg_query::ast::RangeVar,
-    class: &typedpg_analyzer::PgClass,
+    relations: &[FromRelation<'_>],
     node: Option<&ast::Node>,
-) -> Option<String> {
+) -> Option<(usize, String)> {
     let Node::AExpr(expr) = node? else {
         return None;
     };
@@ -515,19 +588,21 @@ fn equated_column(
     if left.is_none() || right.is_none() {
         return None;
     }
-    let (name, other) = match (
-        relation_column(ctx, left.as_ref(), relation, class),
-        relation_column(ctx, right.as_ref(), relation, class),
+    let (column, other) = match (
+        relation_column(ctx, left.as_ref(), relations),
+        relation_column(ctx, right.as_ref(), relations),
     ) {
-        (Some(name), _) => (name, right),
-        (None, Some(name)) => (name, left),
+        (Some(column), _) => (column, right),
+        (None, Some(column)) => (column, left),
         (None, None) => return None,
     };
+    let class = relations[column.0].class;
+    let name = &column.1;
     let attribute = ctx
         .catalog
         .attributes_of(class.oid)
         .iter()
-        .find(|attribute| attribute.attname == name)?;
+        .find(|attribute| attribute.attname == *name)?;
     if !attribute
         .attcollation
         .is_none_or(|collation| matches!(collation.get(), 100 | 950 | 951))
@@ -567,7 +642,7 @@ fn equated_column(
                     && ctx.catalog.namespace_name(proc.pronamespace) == Some("pg_catalog")
             })
         });
-    default_equality.then_some(name)
+    default_equality.then_some(column)
 }
 
 /// Whether two equal values of type `oid` always print the same: the type's
@@ -966,6 +1041,62 @@ mod tests {
                 .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
                 .collect();
             assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn distinct_on_picking_from_one_group_is_reported() {
+        let db = catalog();
+        // WHERE fixes the DISTINCT ON key: one row comes back, but which of
+        // the group's rows is arbitrary. The LIMIT, past DISTINCT ON, then
+        // picks from one row.
+        for sql in [
+            "SELECT DISTINCT ON (name) id FROM users WHERE name = $1",
+            "SELECT DISTINCT ON (name) id FROM users WHERE name = $1 LIMIT 1",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], "DISTINCT ON (name)");
+        }
+        // One row before DISTINCT ON.
+        let sql = "SELECT DISTINCT ON (name) id FROM users WHERE id = $1";
+        assert!(lint(&db, sql).is_empty(), "{sql}");
+    }
+
+    #[test]
+    fn output_fixed_by_where_needs_no_order_through_joins() {
+        let db = catalog();
+        for sql in [
+            "SELECT g.name FROM users g JOIN users m ON m.id = g.id WHERE g.name = 'x' LIMIT 1",
+            "SELECT g.name, m.email FROM users g, users m \
+             WHERE g.name = $1 AND m.email = $2 LIMIT 1",
+            "SELECT name FROM users g JOIN posts p ON p.user_id = g.id WHERE name = $1 LIMIT 1",
+            "SELECT g.name FROM users g LEFT JOIN posts p ON p.user_id = g.id \
+             WHERE g.name = $1 LIMIT 1",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        for sql in [
+            // The other table's column isn't fixed.
+            "SELECT m.name FROM users g JOIN users m ON m.id <> g.id WHERE g.name = 'x' LIMIT 1",
+            // Fixed only in a LEFT JOIN's ON.
+            "SELECT p.id FROM users g LEFT JOIN posts p ON p.user_id = g.id AND p.id = $1 \
+             LIMIT 1",
+            // A join's merged USING column.
+            "SELECT id FROM users JOIN posts USING (id) WHERE id = $1 OR id = $2 LIMIT 1",
+        ] {
+            let findings: Vec<Finding> = lint(&db, sql)
+                .into_iter()
+                .filter(|finding| finding.rule == Rule::LimitWithoutOrder)
+                .collect();
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
         }
     }
 
