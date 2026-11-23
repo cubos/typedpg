@@ -653,6 +653,11 @@ pub struct PgCatalog {
     /// analyzer assertion.
     #[cfg(feature = "pg_sanity")]
     pg_sanity_skip: bool,
+
+    /// Every migration applied so far, in order, for the corpus recorder
+    /// (see [`crate::corpus`]).
+    #[cfg(feature = "record_corpus")]
+    corpus_ddl: Vec<std::sync::Arc<str>>,
 }
 
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
@@ -1036,6 +1041,8 @@ impl PgCatalog {
             pg_sanity_tainted: false,
             #[cfg(feature = "pg_sanity")]
             pg_sanity_skip: false,
+            #[cfg(feature = "record_corpus")]
+            corpus_ddl: Vec::new(),
         }
     }
 
@@ -1267,6 +1274,8 @@ impl PgCatalog {
                 }
             }
         }
+        #[cfg(feature = "record_corpus")]
+        self.corpus_ddl.push(std::sync::Arc::from(stripped));
         result.map_err(|error| crate::ddl::MigrationFailure { error, location })
     }
 
@@ -1608,6 +1617,11 @@ impl PgCatalog {
         #[cfg(feature = "pg_sanity")]
         if !self.pg_sanity_tainted && !self.pg_sanity_skip {
             self.run_pg_sanity_analyze_check(&_analysis_sql, &result);
+        }
+
+        #[cfg(feature = "record_corpus")]
+        if result.is_ok() {
+            crate::corpus::record(&self.corpus_ddl, sql);
         }
 
         result
@@ -2291,6 +2305,27 @@ impl PgCatalog {
         let finite = self.finite_param_oids();
         self.with_pg_sanity(|server| server.check_rewrite(&analysis_sql, &ours, &finite))
             .flatten()
+    }
+
+    /// Run the lint oracle's `probes` (see [`crate::LintProbe`]) for the
+    /// query whose analyzed text is `analysis_sql` (a [`QueryView::sql`])
+    /// and analysis `analyzed`: one result per probe. Every probe is
+    /// inconclusive without a live mirror.
+    #[cfg(feature = "pg_sanity")]
+    pub fn pg_sanity_lint_probes(
+        &self,
+        analysis_sql: &str,
+        analyzed: &AnalyzedQuery,
+        probes: &[crate::LintProbe],
+    ) -> Vec<crate::LintProbeResult> {
+        let none =
+            |why: &str| vec![crate::LintProbeResult::Inconclusive(why.to_owned()); probes.len()];
+        if self.pg_sanity_tainted || self.pg_sanity_skip {
+            return none("the catalog has no live mirror");
+        }
+        let finite = self.finite_param_oids();
+        self.with_pg_sanity(|server| server.lint_probes(analysis_sql, analyzed, probes, &finite))
+            .unwrap_or_else(|| none("the catalog has no live mirror"))
     }
 
     /// Run the role oracle on `analysis` as if the analyzer had produced it

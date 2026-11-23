@@ -225,6 +225,11 @@ element, a non-nullable record field — comes back NULL
 (`typedpg_analyzer/src/pg_sanity/soundness.rs`). A divergence there is a
 soundness bug in the analyzer: fix the inference, never the expectation.
 
+**Lint soundness.** `scripts/run-lint-oracle.sh` runs every lint finding over the
+same scenarios (`typedpg_lint/src/rules/oracle.rs`): a `--fix` must keep rows, row
+count, table contents and SQLSTATE, and a claim (never NULL, always true, at most one
+row, …) runs as an assertion or equivalent query. A broken claim is a rule bug.
+
 **Declared constraints are trusted.** Nullability inference may rely on
 what the schema states — a foreign key's referenced row exists, a CHECK
 holds for every row — including `NOT VALID` and deferrable constraints;

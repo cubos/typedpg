@@ -17,6 +17,11 @@ internal = []
 # shared cluster pointed to by `POSTGRES_URL` and tears it down on Drop.
 # Spin up the cluster + run tests via `scripts/run-pg-sanity.sh`.
 pg_sanity = ["dep:postgres", "dep:bytes"]
+# Record every query `analyze` accepts, with the migrations its catalog
+# applied before it, to `$TYPEDPG_RECORD_CORPUS/` (JSON lines): the lint
+# oracle replays the analyzer's test suite as its corpus
+# (`scripts/run-lint-oracle.sh`).
+record_corpus = []
 
 [dependencies]
 typedpg_core = { path = "../typedpg_core", version = "0.8.0" }

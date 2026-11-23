@@ -33,6 +33,8 @@
 
 mod soundness;
 
+pub use soundness::lint::{CLAIM_VIOLATED, LintProbe, LintProbeResult};
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -164,6 +166,13 @@ pub(crate) struct PgSanityServer {
     /// Every role the catalog saw created by a migration, so `Drop` can drop
     /// them from the shared cluster after the scratch database goes.
     created_roles: Vec<String>,
+    /// `PG_SANITY_MIRROR_ONLY=1`: migrations are still applied to the
+    /// server, but nothing is compared — no outcome, privilege, Describe
+    /// or role check. For the lint oracle (`typedpg_lint`'s `pg_sanity`
+    /// feature), which needs the schema and seeded rows, and whose crate's
+    /// tests build catalogs the mirror can't follow (clones sharing one
+    /// server, migrations the runner's transaction wraps).
+    mirror_only: bool,
 }
 
 /// Serializes the migrations writing a shared (cluster-wide) catalog
@@ -326,6 +335,7 @@ impl PgSanityServer {
             type_name_cache: HashMap::new(),
             soundness: soundness::Soundness::new(),
             created_roles: Vec::new(),
+            mirror_only: std::env::var("PG_SANITY_MIRROR_ONLY").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -337,6 +347,10 @@ impl PgSanityServer {
         sql: &str,
         our_result: &Result<(), E>,
     ) {
+        if self.mirror_only {
+            let _ = self.run_migration(sql);
+            return;
+        }
         if let Some(div) = self.compare_apply_matches(sql, our_result) {
             panic!("{}", div.message);
         }
@@ -442,6 +456,9 @@ impl PgSanityServer {
         {
             return None;
         }
+        if self.mirror_only {
+            return Some(None);
+        }
         Some(compare_apply_outcome(sql, our_result, &pg_result))
     }
 
@@ -455,6 +472,9 @@ impl PgSanityServer {
         our_result: &Result<AnalyzedQuery, AnalyzeError>,
         finite_params: &std::collections::HashSet<u32>,
     ) {
+        if self.mirror_only {
+            return;
+        }
         if let Some(div) = self.compare_analyze_matches(analysis_sql, our_result, finite_params) {
             panic!("{}", div.message);
         }
@@ -477,6 +497,24 @@ impl PgSanityServer {
             .prepare(written)
             .unwrap_or_else(|e| panic!("pg_sanity: the written query must prepare: {e}"));
         self.check_simplification(written, ours, &original, finite_params)
+    }
+
+    /// Run the lint oracle's `probes` next to `analysis_sql` (see
+    /// [`soundness::lint`]).
+    pub(crate) fn lint_probes(
+        &mut self,
+        analysis_sql: &str,
+        ours: &AnalyzedQuery,
+        probes: &[LintProbe],
+        finite_params: &std::collections::HashSet<u32>,
+    ) -> Vec<LintProbeResult> {
+        self.soundness.lint_probes(
+            &mut self.query_client,
+            analysis_sql,
+            ours,
+            probes,
+            finite_params,
+        )
     }
 
     fn check_simplification(
@@ -790,6 +828,9 @@ impl PgSanityServer {
     /// owner of every object the migrations created. Panics on the first
     /// disagreement.
     pub(crate) fn assert_privileges_match(&mut self, db: &crate::pg_catalog::PgCatalog) {
+        if self.mirror_only {
+            return;
+        }
         let created = db.created_roles();
         let session_user: String = self
             .client
@@ -2150,6 +2191,9 @@ impl PgSanityServer {
         role: &str,
         ours: &Result<crate::resolve::AnalyzedQuery, crate::AnalyzeError>,
     ) {
+        if self.mirror_only {
+            return;
+        }
         if let Some(div) = self.compare_role_matches(sql, role, ours) {
             panic!("{}", div.message);
         }

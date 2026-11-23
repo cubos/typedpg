@@ -23,6 +23,8 @@ mod left_join_nullified;
 mod like_unescaped_param;
 mod limit_without_order;
 mod non_sargable_predicate;
+#[cfg(feature = "pg_sanity")]
+pub(crate) mod oracle;
 mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;

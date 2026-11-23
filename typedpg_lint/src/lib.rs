@@ -27,6 +27,13 @@ mod migrations;
 pub mod report;
 mod rules;
 
+/// The lint oracle's hooks for its corpus run (`tests/lint_oracle.rs`).
+#[cfg(feature = "pg_sanity")]
+#[doc(hidden)]
+pub mod oracle {
+    pub use crate::rules::oracle::{collect, take_stats};
+}
+
 pub use deployed::{
     Decoding, DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries,
 };
@@ -917,6 +924,19 @@ pub fn lint_query_called_as(
                 }),
         );
     }
+    // The findings in the analyzed text, for the lint oracle.
+    #[cfg(feature = "pg_sanity")]
+    let raw: Vec<(Rule, Range<usize>, String, Vec<SqlEdit>)> = placed
+        .iter()
+        .map(|p| {
+            (
+                p.finding.rule,
+                p.finding.span.clone(),
+                p.finding.message.clone(),
+                p.finding.fix.clone(),
+            )
+        })
+        .collect();
     for finding in &mut placed {
         if finding.call.is_some() {
             // A call-site finding is placed at the method identifier in the
@@ -971,6 +991,23 @@ pub fn lint_query_called_as(
                 },
             });
         }
+    }
+    #[cfg(feature = "pg_sanity")]
+    if roles.is_empty() {
+        let records: Vec<rules::oracle::Record> = raw
+            .into_iter()
+            .zip(&placed)
+            .map(
+                |((rule, span, message, fix), placed)| rules::oracle::Record {
+                    rule,
+                    span,
+                    message,
+                    fix,
+                    written_fix: placed.finding.fix.clone(),
+                },
+            )
+            .collect();
+        rules::oracle::check(&ctx, &records);
     }
     placed.extend(bugs);
     // A deterministic order: the query's own findings by position, then the

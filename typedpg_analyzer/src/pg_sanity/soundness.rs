@@ -76,6 +76,8 @@ use postgres::types::{Format, FromSql, IsNull, ToSql, Type as PgType};
 use postgres::{Client, Statement, Transaction};
 
 use super::{Divergence, DivergenceKind, NullParam};
+
+pub mod lint;
 use crate::resolve::AnalyzedQuery;
 use crate::types::Type;
 
@@ -184,6 +186,8 @@ struct Stats {
 pub(super) struct Soundness {
     enabled: bool,
     installed: bool,
+    /// Whether the lint oracle's assertion functions exist (see [`lint`]).
+    lint_installed: bool,
     /// Bumped on every DDL batch: seeding plans and parameter samples are
     /// valid for one schema generation only.
     schema_gen: u64,
@@ -199,6 +203,7 @@ impl Soundness {
         Self {
             enabled: std::env::var("PG_SANITY_NULLABILITY").map_or(true, |v| v != "0"),
             installed: false,
+            lint_installed: false,
             schema_gen: 0,
             plans: HashMap::new(),
             param_texts: HashMap::new(),

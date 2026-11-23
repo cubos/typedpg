@@ -41,6 +41,8 @@ mod builtin_nullability;
 mod clause;
 mod coerce;
 mod condition;
+#[cfg(feature = "record_corpus")]
+mod corpus;
 mod datetime_input;
 mod ddl;
 mod decimal;
@@ -69,7 +71,7 @@ mod pgmsg;
 mod polymorphic;
 mod privileges;
 #[cfg(feature = "pg_sanity")]
-pub use pg_sanity::{Divergence, DivergenceKind};
+pub use pg_sanity::{CLAIM_VIOLATED, Divergence, DivergenceKind, LintProbe, LintProbeResult};
 mod range_input;
 mod refine;
 mod refine_bounds;

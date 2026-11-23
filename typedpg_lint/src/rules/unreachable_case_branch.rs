@@ -146,6 +146,20 @@ mod tests {
     const RULE: Rule = Rule::UnreachableCaseBranch;
 
     #[test]
+    fn a_null_operand_of_distinct_from_or_in_is_no_constant() {
+        let db = catalog();
+        for sql in [
+            "SELECT CASE WHEN name IS DISTINCT FROM NULL THEN 1 ELSE 0 END AS v FROM users",
+            "SELECT CASE WHEN name IS NOT DISTINCT FROM NULL THEN 1 ELSE 0 END AS v FROM users",
+            // TRUE when another item matches.
+            "SELECT CASE WHEN name IN ('a', NULL) THEN 1 ELSE 0 END AS v FROM users",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
     fn branches_never_taken_are_reported() {
         let db = catalog();
         for (sql, reported) in [

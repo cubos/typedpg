@@ -1884,8 +1884,12 @@ fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
     let names = extract_names(&e.name);
     let operator = names.last().map(String::as_str);
     // An operator all of whose implementations are strict folds a NULL
-    // operand to NULL (`NULL + x`).
+    // operand to NULL (`NULL + x`). Only a plain operator call: `x IS
+    // DISTINCT FROM NULL` and `NULLIF(x, NULL)` name the strict `=` but are
+    // never NULL / are `x`, an `IN` list with a NULL item is TRUE when
+    // another item matches, and `NULL = ANY ('{}')` is false.
     if folded.contains(&Certain::Null)
+        && kind == ast::AExprKind::AexprOp
         && operator.is_some_and(|op| operator_certain(op, snapshot, ProVolatile::Volatile, true))
     {
         return Certain::Null;
