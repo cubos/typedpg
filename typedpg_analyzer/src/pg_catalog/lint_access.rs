@@ -301,6 +301,72 @@ impl PgCatalog {
                 )
         })
     }
+    /// Whether `oid` is a domain (or a domain over one) with a CHECK or NOT
+    /// NULL constraint: a column of it added with `ADD COLUMN` makes
+    /// PostgreSQL evaluate the constraints on every row, rewriting the table
+    /// (ATExecAddColumn, `DomainHasConstraints`).
+    pub fn lint_domain_has_constraints(&self, oid: PgTypeOid) -> bool {
+        let mut current = oid;
+        for _ in 0..64 {
+            let Some(ty) = self.pg_type.get(&current) else {
+                return false;
+            };
+            let Some(base) = ty.typbasetype else {
+                return false;
+            };
+            if ty.typnotnull
+                || self
+                    .domain_constraints
+                    .get(&current)
+                    .is_some_and(|constraints| !constraints.is_empty())
+            {
+                return true;
+            }
+            current = base;
+        }
+        false
+    }
+
+    /// Whether `relid` is a materialized view created `WITH NO DATA` (or
+    /// refreshed so) and not refreshed since.
+    pub fn lint_matview_unpopulated(&self, relid: PgClassOid) -> bool {
+        self.unpopulated_matviews.contains(&relid)
+    }
+
+    /// The names of the triggers on `relid`.
+    pub fn lint_relation_triggers(&self, relid: PgClassOid) -> Vec<&str> {
+        self.triggers
+            .get(&relid)
+            .map(|triggers| triggers.iter().map(|t| t.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The names of the rewrite rules on `relid`.
+    pub fn lint_relation_rules(&self, relid: PgClassOid) -> Vec<&str> {
+        self.rules
+            .get(&relid)
+            .map(|rules| rules.iter().map(|r| r.name.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The partitioned index `index` is attached to, when it is a
+    /// partition's index.
+    pub fn lint_index_parent(&self, index: PgClassOid) -> Option<PgClassOid> {
+        self.index_parents.get(&index).copied()
+    }
+
+    /// The typed tables (`CREATE TABLE … OF type`) of the composite type
+    /// `oid`.
+    pub fn lint_typed_tables(&self, oid: PgTypeOid) -> Vec<PgClassOid> {
+        let mut tables: Vec<PgClassOid> = self
+            .typed_tables
+            .iter()
+            .filter(|(_, ty)| **ty == oid)
+            .map(|(table, _)| *table)
+            .collect();
+        tables.sort();
+        tables
+    }
 }
 
 /// What a type modifier limits the values of a column to (see

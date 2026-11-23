@@ -80,6 +80,28 @@ pub(crate) fn surely_volatile(fc: &ast::FuncCall, snapshot: &PgCatalog) -> bool 
     funcall_volatility(fc, snapshot).is_some_and(|(v, _)| v == ProVolatile::Volatile)
 }
 
+/// Whether `node` calls a surely VOLATILE function, a simple SQL function
+/// counting for the body PG inlines in its place.
+#[cfg(any(test, feature = "internal"))]
+pub(crate) fn volatile_after_inlining(
+    node: &ast::Node,
+    snapshot: &PgCatalog,
+    depth: usize,
+) -> bool {
+    node.nodes().any(|(n, _)| {
+        let typedpg_pg_query::NodeRef::FuncCall(fc) = n else {
+            return false;
+        };
+        match funcall_volatility(fc, snapshot) {
+            Some((ProVolatile::Volatile, Some(body))) if depth < MAX_INLINE_DEPTH => {
+                volatile_after_inlining(body, snapshot, depth + 1)
+            }
+            Some((ProVolatile::Volatile, _)) => true,
+            _ => false,
+        }
+    })
+}
+
 /// Inlining depth cap: PG refuses to inline a function into itself.
 const MAX_INLINE_DEPTH: usize = 16;
 

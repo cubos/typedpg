@@ -20,9 +20,10 @@
 //! `BETWEEN` an `AND`. Constants compare across types where predtest's
 //! test operator is immutable and the analyzer compares them exactly: the
 //! integer types among themselves, `date` against `timestamp`, and an
-//! integer constant folded into a `numeric` key's type. A boolean key's
-//! `b = true` / `b <> true` is folded to `b` / `NOT b` on both sides, as
-//! eval_const_expressions does before the proof. Whatever it can't model —
+//! integer constant folded into a `numeric` or `float8` key's type. A
+//! boolean key's `b = true` / `b <> true` is folded to `b` / `NOT b` on
+//! both sides, as eval_const_expressions does before the proof. Whatever it
+//! can't model —
 //! an expression key, a key whose operator class or collation differs from
 //! the column's, a constant it can't order (strings under a collation that
 //! doesn't order by code point: the analyzer has no libc / ICU
@@ -697,9 +698,10 @@ fn column_name(node: Option<&ast::Node>) -> Option<&str> {
 /// to the key's type. A constant that makes PostgreSQL cast the column
 /// instead (`int_col >= 1.5` compares numerics) is not one.
 ///
-/// Two casts to another type are read too, where predtest compares the
+/// Three casts to another type are read too, where predtest compares the
 /// constants exactly: an integer cast for a `numeric` key (no cross-type
-/// operator: the constant is coerced to `numeric`, and folded), and a
+/// operator: the constant is coerced to `numeric`, and folded), the same
+/// for a `float8` key, and a
 /// `timestamp` for a `date` key or a `date` for a `timestamp` key (the
 /// immutable cross-type operators of `datetime_ops`; those with
 /// `timestamptz` are only stable, which get_btree_test_op refuses).
@@ -733,6 +735,18 @@ fn check_value(interp: &PgCatalog, v: &ast::Node, key: &PartKey) -> Option<Val> 
         && target != base
         && !(integer_key && integer(target))
     {
+        // `float8_col >= 1::integer` resolves to float8's own `>=` (float8
+        // is its category's preferred type), the integer coerced by
+        // int4_float8 / int8_float8 and folded to a float8 constant before
+        // the proof.
+        if base == oid::FLOAT8 && integer(target) {
+            let value = i64::try_from(integer_value()?).ok()?;
+            return Some(Val {
+                datum: Datum::Float(super::float_key(value as f64)),
+                raw: None,
+                days: false,
+            });
+        }
         if base == oid::NUMERIC && integer(target) {
             let value = NumericKey::parse(&integer_value()?.to_string())?;
             return Some(Val {

@@ -658,6 +658,14 @@ pub struct PgCatalog {
     /// (see [`crate::corpus`]).
     #[cfg(feature = "record_corpus")]
     corpus_ddl: Vec<std::sync::Arc<str>>,
+    /// The migrations applied successfully so far, for the migration
+    /// oracle's corpus (see [`crate::corpus::record_migrations`]).
+    #[cfg(feature = "record_corpus")]
+    corpus_migrations: Vec<std::sync::Arc<str>>,
+    /// Set by [`Self::skip_pg_sanity`]: the migrations after it are not
+    /// recorded for the migration oracle.
+    #[cfg(feature = "record_corpus")]
+    corpus_migrations_skip: bool,
 }
 
 /// Starting OID for user-defined objects. Well above PG system OIDs (~16384).
@@ -1043,6 +1051,10 @@ impl PgCatalog {
             pg_sanity_skip: false,
             #[cfg(feature = "record_corpus")]
             corpus_ddl: Vec::new(),
+            #[cfg(feature = "record_corpus")]
+            corpus_migrations: Vec::new(),
+            #[cfg(feature = "record_corpus")]
+            corpus_migrations_skip: false,
         }
     }
 
@@ -1275,7 +1287,13 @@ impl PgCatalog {
             }
         }
         #[cfg(feature = "record_corpus")]
-        self.corpus_ddl.push(std::sync::Arc::from(stripped));
+        {
+            self.corpus_ddl.push(std::sync::Arc::from(stripped));
+            if result.is_ok() && !self.corpus_migrations_skip {
+                self.corpus_migrations.push(std::sync::Arc::from(stripped));
+                crate::corpus::record_migrations(&self.corpus_migrations);
+            }
+        }
         result.map_err(|error| crate::ddl::MigrationFailure { error, location })
     }
 
@@ -1495,6 +1513,16 @@ impl PgCatalog {
     #[cfg(any(test, feature = "internal"))]
     pub fn call_is_volatile(&self, call: &typedpg_pg_query::ast::FuncCall) -> bool {
         crate::ddl::volatile::surely_volatile(call, self)
+    }
+
+    /// Whether `expr` calls a surely VOLATILE function once
+    /// expression_planner has inlined the simple SQL functions it calls
+    /// (`inline_function`): a VOLATILE SQL function whose body is `SELECT
+    /// 1` is no longer volatile. What `contain_volatile_functions` sees of
+    /// a column DEFAULT in ATExecAddColumn.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn expression_is_volatile(&self, expr: &typedpg_pg_query::ast::Node) -> bool {
+        crate::ddl::volatile::volatile_after_inlining(expr, self, 0)
     }
 
     /// Whether altering `column` of `relid` to `type_name` rewrites the
@@ -2138,6 +2166,12 @@ impl PgCatalog {
         #[cfg(feature = "pg_sanity")]
         {
             self.pg_sanity_skip = true;
+        }
+        // What the mirror must not run, the migration oracle must not
+        // replay either.
+        #[cfg(feature = "record_corpus")]
+        {
+            self.corpus_migrations_skip = true;
         }
     }
 

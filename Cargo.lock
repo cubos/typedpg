@@ -3731,6 +3731,7 @@ name = "typedpg_lint"
 version = "0.8.0"
 dependencies = [
  "globset",
+ "postgres",
  "rand 0.10.4",
  "serde",
  "serde_json",

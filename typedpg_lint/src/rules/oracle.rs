@@ -77,7 +77,7 @@ pub fn take_stats() -> BTreeMap<(String, String), u64> {
     STATS.with(|s| std::mem::take(&mut *s.borrow_mut()))
 }
 
-fn count(stats: &mut Vec<(String, String)>, rule: Rule, what: &str) {
+pub(crate) fn count(stats: &mut Vec<(String, String)>, rule: Rule, what: &str) {
     stats.push((rule.name().to_owned(), what.to_owned()));
 }
 
@@ -131,6 +131,12 @@ pub(crate) fn check(ctx: &Ctx<'_>, records: &[Record]) {
         }
     }
     record_stats(&stats);
+    report_broken(broken);
+}
+
+/// Hand broken claims to [`collect`], or panic with them when nothing
+/// collects (the migration oracle reports through it too).
+pub(crate) fn report_broken(broken: Vec<String>) {
     if broken.is_empty() {
         return;
     }
@@ -147,7 +153,7 @@ pub(crate) fn check(ctx: &Ctx<'_>, records: &[Record]) {
     }
 }
 
-fn record_stats(stats: &[(String, String)]) {
+pub(crate) fn record_stats(stats: &[(String, String)]) {
     STATS.with(|s| {
         let mut s = s.borrow_mut();
         for key in stats {

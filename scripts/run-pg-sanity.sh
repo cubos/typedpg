@@ -169,8 +169,8 @@ if [[ -s "$TYPEDPG_LINT_ORACLE_STATS" ]]; then
         END {
             for (r in rules) {
                 line = ""
-                split("fix held|fix broken|fix inconclusive|claim held|claim broken|claim inconclusive", kinds, "|")
-                for (k = 1; k <= 6; k++) {
+                split("fix held|fix broken|fix inconclusive|claim held|claim broken|claim inconclusive|missed", kinds, "|")
+                for (k = 1; k <= 7; k++) {
                     c = n[r "\t" kinds[k]]
                     if (c) line = line sprintf("  %s=%d", kinds[k], c)
                 }

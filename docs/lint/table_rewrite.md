@@ -58,8 +58,13 @@ On a table that existed before the migration file started:
   (`integer` → `bigint`, a narrower `varchar(n)`, `text` → `varchar(n)`), or
   with a `USING` that computes a value.
 - `ADD COLUMN` with a volatile `DEFAULT` (`clock_timestamp()`, `random()`,
-  `nextval(…)`), a `serial` type, an identity column, or a `STORED`
-  generated column.
+  `nextval(…)`; a SQL function PostgreSQL inlines counts by its body, so
+  one returning a constant does not), a `serial` type, an identity column, a `STORED`
+  generated column, or a domain type with a `CHECK` or `NOT NULL`
+  constraint (each row is checked, default or not).
+- `ALTER COLUMN … SET EXPRESSION` of a `STORED` generated column.
+- `ALTER TYPE … ALTER ATTRIBUTE … TYPE … CASCADE` that changes a typed
+  table's column as `ALTER COLUMN … TYPE` would.
 - `SET LOGGED` / `SET UNLOGGED` that changes the table's persistence.
 - `SET ACCESS METHOD` to anything but `heap`.
 - `SET TABLESPACE`, even to the tablespace the table is already in

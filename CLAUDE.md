@@ -234,6 +234,14 @@ its own tests and the `deployed_oracle_corpus` test): deployed queries are calle
 sampled values before and after the new migrations, over seeded rows; a call that breaks
 with no finding, or that runs where a finding says it can't, is a rule bug.
 
+**Migration rules.** Under `pg_sanity`, every `lint_migrations` call is replayed
+statement by statement on PG (`typedpg_lint/src/migration_oracle.rs`), recording the
+locks gained (`pg_locks`), rewrites and index builds (`relfilenode`) and scans
+(`pg_stat_xact_*`, `DEBUG1` "verifying table"). A message must match what PG did, and a
+write-blocking lock without `lock_timeout`, a rewrite, an index build or a scan under a
+write-blocking lock on an existing table must be reported. `scripts/run-migration-oracle.sh`
+runs its corpus (docs, the analyzer suite's migrations, generated `ALTER TABLE` & co.).
+
 **Declared constraints are trusted.** Nullability inference may rely on
 what the schema states — a foreign key's referenced row exists, a CHECK
 holds for every row — including `NOT VALID` and deferrable constraints;

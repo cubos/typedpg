@@ -52,12 +52,20 @@ check can be validated without blocking writes.
 
 ## Reported when
 
-`SET NOT NULL` on a table that existed before the migration file started,
+`SET NOT NULL` (or `ADD CONSTRAINT … NOT NULL column` without `NOT VALID`,
+or `ADD PRIMARY KEY USING INDEX`, which makes the index's columns NOT NULL)
+on a table that existed before the migration file started,
 for a column not yet `NOT NULL` and without a `CHECK` that is:
 
-- validated (not `NOT VALID`), enforced and not `NO INHERIT`;
+- validated (not `NOT VALID`) and enforced;
 - exactly `col IS NOT NULL`, or an `AND` with `col IS NOT NULL` as one of its
   terms. `NOT col IS NULL` or `col IS NOT NULL OR …` don't count.
+
+The children of an inheritance parent (unless the statement says `ONLY`)
+and the partitions of a partitioned table are checked the same way: a
+`NO INHERIT` check proves the column on its own table only, and a
+partitioned table whose partitions each have such a check is not
+reported.
 
 The help names every column of the statement that needs the check.
 
