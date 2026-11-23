@@ -345,3 +345,77 @@ async fn jsonb_through_domain_of_domain() {
     assert!(prefs.newsletter);
     assert_eq!(prefs.daily_digest_limit, 9);
 }
+
+/// Record fields whose values carry an OID of the database's own (an
+/// array of an enum, of a composite or of a domain, a domain over an array,
+/// a user range and an array of it, an array of a mapped `json` domain, an
+/// unmapped `jsonb` domain, which decoded as JSON text without its version
+/// byte stripped):
+/// the inline OID resolves to no built-in type, and decoding an array as
+/// `record` panicked in `tokio_postgres` ("expected array type").
+#[tokio::test]
+async fn record_fields_of_arrays_and_ranges_of_user_types() {
+    use std::ops::Bound;
+    use typedpg::types::Range;
+
+    let pool = common::setup().await;
+    let id = sql!(
+        &pool,
+        "INSERT INTO exotic_rows (e) VALUES (ROW(
+             ARRAY['draft', 'archived']::post_status[],
+             ARRAY[ROW('1 Main St', 'Paris', NULL)::address],
+             ARRAY[1, 2]::positive_int[],
+             ARRAY[3, 4],
+             '[1.5,2.5)',
+             ARRAY['[0,1]'::floatrange, 'empty'],
+             ARRAY['{\"a\": 1}'::json_note, '[ 2 ]'],
+             '{\"b\": true}'
+         )) RETURNING id"
+    )
+    .fetch_value()
+    .await
+    .expect("insert");
+
+    let e = sql!(&pool, "SELECT e FROM exotic_rows WHERE id = $id")
+        .fetch_value()
+        .await
+        .expect("select a record of user-typed arrays");
+    assert_eq!(
+        e.statuses,
+        Some(vec![PostStatus::Draft, PostStatus::Archived])
+    );
+    let addrs = e.addrs.expect("addrs");
+    assert_eq!(addrs.len(), 1);
+    assert_eq!(addrs[0].city.as_deref(), Some("Paris"));
+    assert_eq!(addrs[0].zip, None);
+    assert_eq!(e.nums, Some(vec![1, 2]));
+    assert_eq!(e.list, Some(vec![3, 4]));
+    assert_eq!(
+        e.span,
+        Some(Range::new(Bound::Included(1.5), Bound::Excluded(2.5)))
+    );
+    assert_eq!(
+        e.spans,
+        Some(vec![
+            Range::new(Bound::Included(0.0), Bound::Included(1.0)),
+            Range::Empty
+        ])
+    );
+    assert_eq!(
+        e.notes,
+        Some(vec![serde_json::json!({"a": 1}), serde_json::json!([2])])
+    );
+    assert_eq!(e.doc, Some(serde_json::json!({"b": true})));
+
+    // An anonymous record holding them.
+    let r = sql!(
+        &pool,
+        "SELECT ROW(ARRAY['published']::post_status[], (e).spans) AS r \
+         FROM exotic_rows WHERE id = $id"
+    )
+    .fetch_value()
+    .await
+    .expect("select an anonymous record of user-typed arrays");
+    assert_eq!(r.f1, vec![PostStatus::Published]);
+    assert_eq!(r.f2.map(|spans| spans.len()), Some(2));
+}

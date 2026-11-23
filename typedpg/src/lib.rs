@@ -23,7 +23,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! typedpg = "0.1"
+//! typedpg = "0.8"
 //! deadpool-postgres = "0.14"
 //! tokio-postgres = "0.7"
 //! tokio = { version = "1", features = ["full"] }
@@ -32,8 +32,9 @@
 //! migrations = "./migrations"
 //! ```
 //!
-//! Add a `build.rs` next to your `Cargo.toml` so the `sql!` macro is
-//! re-checked whenever a migration file changes (see the [`build`] module):
+//! Optionally, add a `build.rs` next to your `Cargo.toml` so that *adding*
+//! a migration file re-checks the `sql!` macros too (see [Rebuilding when
+//! migrations change](#rebuilding-when-migrations-change)):
 //!
 //! ```ignore
 //! // build.rs
@@ -44,7 +45,7 @@
 //!
 //! ```toml
 //! [build-dependencies]
-//! typedpg = "0.1"
+//! typedpg = "0.8"
 //! ```
 //!
 //! Create `migrations/0001_create_users.sql`:
@@ -76,12 +77,11 @@
 //!
 //! # Configuration
 //!
-//! The only required configuration is the migrations path. All other settings
-//! have sensible defaults:
+//! Every setting has a default; migrations are read from `./migrations`:
 //!
 //! ```toml
 //! [package.metadata.typedpg.database]
-//! migrations = "./migrations"             # required
+//! migrations = "./migrations"             # optional, the default
 //! extra_migrations = ["../shared/migrations"]  # optional, compile-time only
 //!
 //! [package.metadata.typedpg.migrations]
@@ -107,15 +107,16 @@
 //!
 //! # Rebuilding when migrations change
 //!
-//! The `sql!` macro reads your migration files at compile time, but a proc
-//! macro cannot, on stable Rust, declare those files as build inputs. Without
-//! help, editing or adding a migration would not trigger a rebuild and `sql!`
-//! would keep producing types from a stale schema.
+//! The `sql!` macro reads your migration files at compile time and records
+//! the ones it read as dependencies of the generated code (the way
+//! `include_str!` does): editing or deleting a migration recompiles the
+//! crate, re-running every `sql!`.
 //!
-//! The fix is a one-line `build.rs` calling [`build::track_migrations`]. It
-//! tells Cargo to watch every migration directory (recursively, so future
-//! files count too) and to recompile — re-running every `sql!` — when their
-//! contents change. See the [`build`] module for details.
+//! A file dependency can't see a file *added* to the directory. A one-line
+//! `build.rs` calling [`build::track_migrations`] tells Cargo to watch every
+//! migration directory (recursively, so future files count too) and to
+//! recompile when their contents change. See the [`build`] module for
+//! details.
 //!
 //! # The `sql!` macro
 //!
@@ -355,7 +356,7 @@
 //! ## With `bb8-postgres` (feature: `bb8`)
 //!
 //! ```toml
-//! typedpg = { version = "0.1", default-features = false, features = ["bb8"] }
+//! typedpg = { version = "0.8", default-features = false, features = ["bb8"] }
 //! bb8-postgres = "0.9"
 //! ```
 //!
@@ -443,7 +444,8 @@ pub use stream::{QueryStream, RowStream};
 /// Build-script helpers — re-exported from `typedpg_core`.
 ///
 /// Call [`build::track_migrations`] from your crate's `build.rs` so the `sql!`
-/// macro is re-checked whenever a migration file changes.
+/// macro is re-checked whenever a migration file is added (edits are tracked
+/// without it).
 pub use typedpg_core::build;
 
 pub use typedpg_macros::FromRow;
@@ -473,7 +475,9 @@ pub mod __private {
     pub use crate::executor::{
         ParamType, UnspecifiedKind, run_execute, run_query, run_query_stream,
     };
-    pub use crate::spread::{ARRAY_THRESHOLD, SqlPiece, ValuesItem, spread_sql, uses_arrays};
+    pub use crate::spread::{
+        ARRAY_THRESHOLD, MAX_PARAMS, SqlPiece, ValuesItem, spread_budget, spread_sql, uses_arrays,
+    };
     pub use bytes;
     pub use tokio_postgres;
 

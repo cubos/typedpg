@@ -48,6 +48,8 @@
 //! must rethrow the driver error it replied to the machine with (the
 //! original error object, not a message).
 
+use std::ops::Range;
+
 use super::{HASH_VERSION, drift_message, hash, locate_position, split_statements};
 use crate::config::validate_table_name;
 
@@ -138,6 +140,10 @@ pub struct DbError {
     pub internal_position: Option<u32>,
     /// That internally generated query.
     pub internal_query: Option<String>,
+    /// The server's CONTEXT field (`where`): the call stack of a failure
+    /// inside a function, a `DO` block or a trigger — which line of the
+    /// body failed.
+    pub context: Option<String>,
 }
 
 /// The driver's answer to the step the machine emitted.
@@ -241,6 +247,10 @@ pub struct Migrator {
     status_rows: Vec<StatusRow>,
     /// The tracking table's rows, as `Status` reads them.
     status_applied: Vec<(String, StatusInfo)>,
+    /// The statements of the file run without the machine's transaction,
+    /// as byte ranges of its text: split once, not once per statement (a
+    /// data migration can hold many thousands).
+    statements: Vec<Range<usize>>,
 }
 
 /// What a tracking-table row says about drift.
@@ -293,6 +303,10 @@ enum Stage {
     /// The backoff sleep; `next_delay_ms` is the delay of the next attempt.
     LockSleep {
         next_delay_ms: u64,
+        then: Then,
+    },
+    /// Whether the tracking table and each of its later columns exist.
+    TableColumns {
         then: Then,
     },
     /// The tracking-table script.
@@ -424,7 +438,20 @@ impl Migrator {
             apply_index: 0,
             status_rows: Vec::new(),
             status_applied: Vec::new(),
+            statements: Vec::new(),
         }
+    }
+
+    /// Statement `stmt` of `sql`, the file whose [`Self::statements`] were
+    /// split.
+    fn statement_sql(&self, sql: &str, stmt: usize) -> Option<String> {
+        let range = self.statements.get(stmt)?;
+        Some(sql[range.clone()].to_string())
+    }
+
+    /// The byte offset of statement `stmt` in its file.
+    fn statement_offset(&self, stmt: usize) -> usize {
+        self.statements.get(stmt).map_or(0, |range| range.start)
     }
 
     /// Advance the machine: answer the step it emitted (starting with
@@ -436,7 +463,11 @@ impl Migrator {
 
             (Stage::TryLock { delay_ms, then }, Reply::Rows(rows)) => {
                 if is_true(first_value(&rows)) {
-                    self.ensure_table(then)
+                    self.stage = Stage::TableColumns { then };
+                    Step::Query {
+                        sql: self.status_columns_sql(),
+                        params: vec![Some(self.config.table.clone())],
+                    }
                 } else {
                     self.stage = Stage::LockSleep {
                         next_delay_ms: (delay_ms * 2).min(500),
@@ -454,20 +485,27 @@ impl Migrator {
                 _,
             ) => self.try_lock(next_delay_ms, then),
 
-            (Stage::EnsureTable { then }, Reply::Done) => match then {
-                Then::Up => self.backfill_select(then),
-                Then::Revert => self.read_applied(then),
-                // An accept of a name no file has runs no query, as the
-                // runners already do.
-                Then::Accept => match &self.action {
-                    Action::Accept { name } if !self.migrations.iter().any(|m| &m.name == name) => {
-                        self.fail_locked(Failure::Message(format!(
-                            "no migration file named '{name}'"
-                        )))
+            (Stage::TableColumns { then }, Reply::Rows(rows)) => {
+                let row = rows.first().cloned().unwrap_or_default();
+                let has = |i: usize| is_true(row.get(i).and_then(|v| v.as_deref()));
+                if !has(0) {
+                    self.ensure_table(then, None)
+                } else {
+                    let missing: Vec<&str> = [(1, "sql_source"), (2, "hash"), (3, "hash_version")]
+                        .into_iter()
+                        .filter(|&(i, _)| !has(i))
+                        .map(|(_, column)| column)
+                        .collect();
+                    if missing.is_empty() {
+                        self.table_ready(then)
+                    } else {
+                        self.ensure_table(then, Some(&missing))
                     }
-                    _ => self.read_applied(then),
-                },
-            },
+                }
+            }
+            (Stage::TableColumns { .. }, _) => self.fail_locked(Failure::Db),
+
+            (Stage::EnsureTable { then }, Reply::Done) => self.table_ready(then),
             (Stage::EnsureTable { .. }, _) => self.fail_locked(Failure::Db),
 
             (Stage::BackfillSelect { then }, Reply::Rows(rows)) => {
@@ -580,25 +618,19 @@ impl Migrator {
             (Stage::UpCommit { .. }, _) => self.up_rollback(Failure::Db),
 
             (Stage::UpStatement { index, stmt }, Reply::Done) => {
-                let statements = split_statements(&self.migrations[index].sql);
-                if let Some(statement) = statements.get(stmt + 1) {
+                if let Some(sql) = self.statement_sql(&self.migrations[index].sql, stmt + 1) {
                     self.stage = Stage::UpStatement {
                         index,
                         stmt: stmt + 1,
                     };
-                    Step::Execute {
-                        sql: (*statement).to_string(),
-                    }
+                    Step::Execute { sql }
                 } else {
                     self.probe(index, false, None)
                 }
             }
             (Stage::UpStatement { index, stmt }, Reply::DbError(error)) => {
                 let migration = &self.migrations[index];
-                let statements = split_statements(&migration.sql);
-                let statement = statements.get(stmt).copied().unwrap_or_default();
-                // `split_statements` returns slices of the migration.
-                let base = statement.as_ptr() as usize - migration.sql.as_ptr() as usize;
+                let base = self.statement_offset(stmt);
                 let message = format!(
                     "failed to apply migration {} (statement {}): {}",
                     migration.name,
@@ -658,31 +690,29 @@ impl Migrator {
             (Stage::RevertCommit { .. }, _) => self.revert_rollback(Failure::Db),
 
             (Stage::RevertStatement { index, stmt }, Reply::Done) => {
-                let down = self.migrations[index].down_sql.clone().unwrap_or_default();
-                let statements = split_statements(&down);
-                if let Some(statement) = statements.get(stmt + 1) {
+                let down = self.migrations[index]
+                    .down_sql
+                    .as_deref()
+                    .unwrap_or_default();
+                if let Some(sql) = self.statement_sql(down, stmt + 1) {
                     self.stage = Stage::RevertStatement {
                         index,
                         stmt: stmt + 1,
                     };
-                    Step::Execute {
-                        sql: (*statement).to_string(),
-                    }
+                    Step::Execute { sql }
                 } else {
                     self.probe(index, true, None)
                 }
             }
             (Stage::RevertStatement { index, stmt }, Reply::DbError(error)) => {
                 let migration = &self.migrations[index];
-                let down = migration.down_sql.clone().unwrap_or_default();
-                let statements = split_statements(&down);
-                let statement = statements.get(stmt).copied().unwrap_or_default();
-                let base = statement.as_ptr() as usize - down.as_ptr() as usize;
+                let down = migration.down_sql.as_deref().unwrap_or_default();
+                let base = self.statement_offset(stmt);
                 let message = format!(
                     "failed to revert migration {} (statement {}): {}",
                     migration.name,
                     stmt + 1,
-                    format_db_error(&error, &down, base)
+                    format_db_error(&error, down, base)
                 );
                 self.probe(index, true, Some(message))
             }
@@ -909,25 +939,60 @@ impl Migrator {
         }
     }
 
-    /// Create or upgrade the tracking table. Under the lock: two runners
-    /// racing on a fresh database would otherwise both find it missing, and
-    /// one `CREATE TABLE IF NOT EXISTS` fails on the other's catalog rows.
-    fn ensure_table(&mut self, then: Then) -> Step {
+    /// Create the tracking table (`missing` is `None`), or add the columns
+    /// of it that are `missing`. Under the lock: two runners racing on a
+    /// fresh database would otherwise both find it missing, and one `CREATE
+    /// TABLE IF NOT EXISTS` fails on the other's catalog rows.
+    ///
+    /// A complete table gets no DDL at all ([`Self::table_ready`]): `ALTER
+    /// TABLE` needs its ownership even when the column exists, and a role
+    /// granted the table's privileges must still be able to run migrations.
+    fn ensure_table(&mut self, then: Then, missing: Option<&[&str]>) -> Step {
         self.stage = Stage::EnsureTable { then };
-        Step::Execute {
-            sql: format!(
-                "CREATE TABLE IF NOT EXISTS {} (
+        let table = &self.config.table;
+        let sql = match missing {
+            None => format!(
+                "CREATE TABLE IF NOT EXISTS {table} (
             name         TEXT PRIMARY KEY,
             applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
             sql_source   TEXT,
             hash         TEXT,
             hash_version INTEGER
         );
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS sql_source TEXT;
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS hash TEXT;
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS hash_version INTEGER;",
-                self.config.table
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS sql_source TEXT;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash TEXT;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash_version INTEGER;"
             ),
+            Some(missing) => missing
+                .iter()
+                .map(|&column| {
+                    let ty = if column == "hash_version" {
+                        "INTEGER"
+                    } else {
+                        "TEXT"
+                    };
+                    format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        Step::Execute { sql }
+    }
+
+    /// What follows a complete tracking table.
+    fn table_ready(&mut self, then: Then) -> Step {
+        match then {
+            Then::Up => self.backfill_select(then),
+            Then::Revert => self.read_applied(then),
+            // An accept of a name no file has runs no query, as the
+            // runners already do.
+            Then::Accept => match &self.action {
+                Action::Accept { name } if !self.migrations.iter().any(|m| &m.name == name) => self
+                    .fail_locked(Failure::Message(format!(
+                        "no migration file named '{name}'"
+                    ))),
+                _ => self.read_applied(then),
+            },
         }
     }
 
@@ -1052,14 +1117,11 @@ impl Migrator {
             };
         }
 
-        let sql = migration.sql.clone();
-        let statements = split_statements(&sql);
-        match statements.first() {
-            Some(statement) => {
+        self.statements = statement_ranges(&migration.sql);
+        match self.statement_sql(&self.migrations[index].sql, 0) {
+            Some(sql) => {
                 self.stage = Stage::UpStatement { index, stmt: 0 };
-                Step::Execute {
-                    sql: (*statement).to_string(),
-                }
+                Step::Execute { sql }
             }
             None => self.up_no_transaction_insert(index),
         }
@@ -1179,12 +1241,11 @@ impl Migrator {
                         sql: "BEGIN".to_string(),
                     };
                 }
-                match split_statements(&down).first() {
-                    Some(statement) => {
+                self.statements = statement_ranges(&down);
+                match self.statement_sql(&down, 0) {
+                    Some(sql) => {
                         self.stage = Stage::RevertStatement { index, stmt: 0 };
-                        Step::Execute {
-                            sql: (*statement).to_string(),
-                        }
+                        Step::Execute { sql }
                     }
                     None => {
                         self.stage = Stage::RevertNoTransactionDelete { index };
@@ -1451,6 +1512,18 @@ pub const LEFT_TRANSACTION_OPEN: &str = "left a transaction block open (a BEGIN 
 /// What to do about [`LEFT_TRANSACTION_OPEN`].
 pub const LEFT_TRANSACTION_OPEN_HINT: &str = "Add a COMMIT at the end of the transaction block.";
 
+/// The statements [`split_statements`] finds in `sql`, as byte ranges.
+fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
+    split_statements(sql)
+        .into_iter()
+        .map(|statement| {
+            // `split_statements` returns slices of `sql`.
+            let start = statement.as_ptr() as usize - sql.as_ptr() as usize;
+            start..start + statement.len()
+        })
+        .collect()
+}
+
 /// The first cell of the first row.
 fn first_value(rows: &[Vec<Option<String>>]) -> Option<&str> {
     rows.first()
@@ -1464,8 +1537,8 @@ fn is_true(value: Option<&str>) -> bool {
 }
 
 /// Format a database error the way both runners report it: severity and
-/// message, DETAIL and HINT, and PG's position as a line of the migration
-/// with a caret. `sql` is the migration's text and `base` the byte offset in
+/// message, DETAIL and HINT, PG's position as a line of the migration with
+/// a caret, and CONTEXT. `sql` is the migration's text and `base` the byte offset in
 /// it of the text that was sent (0 when the whole migration was).
 fn format_db_error(error: &DbError, sql: &str, base: usize) -> String {
     let mut out = match &error.severity {
@@ -1487,6 +1560,12 @@ fn format_db_error(error: &DbError, sql: &str, base: usize) -> String {
             "\nINTERNAL POSITION: {position}\nQUERY: {}",
             error.internal_query.as_deref().unwrap_or_default()
         ));
+    }
+    // As psql shows it: where in a function, a `DO` block or a trigger the
+    // error was raised.
+    if let Some(context) = &error.context {
+        out.push_str("\nCONTEXT: ");
+        out.push_str(context);
     }
     out
 }
@@ -1549,6 +1628,7 @@ mod tests {
             position,
             internal_position: None,
             internal_query: None,
+            context: None,
         })
     }
 
@@ -1668,6 +1748,7 @@ mod tests {
         ];
         let (steps, result) = drive(input(Action::Up, migrations, config()), |step| match step {
             Step::Execute { sql } if is_ensure(sql) => done(),
+            Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
             Step::Execute { sql } if sql == "BEGIN" || sql == "COMMIT" => done(),
             Step::Execute { sql } if sql.starts_with("CREATE TABLE") => done(),
             Step::Query { sql, .. } if is_lock(sql) => locked(),
@@ -1714,6 +1795,7 @@ mod tests {
         let mut attempts = 0;
         let (steps, result) = drive(input(Action::Up, vec![], config()), |step| match step {
             Step::Execute { sql } if is_ensure(sql) => done(),
+            Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
             Step::Query { sql, .. } if is_lock(sql) => {
                 attempts += 1;
                 if attempts <= 2 {
@@ -1758,6 +1840,7 @@ mod tests {
             input(Action::Up, migrations, config()),
             move |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![vec![
@@ -1825,6 +1908,7 @@ mod tests {
             ),
             move |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
@@ -1862,6 +1946,7 @@ mod tests {
             input(Action::Up, vec![migration("0001_bad", sql, None)], config()),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { sql } if sql == "BEGIN" => done(),
                 Step::Execute { sql: executed } if executed == sql => {
                     error("syntax error at or near \"TABL\"", Some(35))
@@ -1913,6 +1998,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { sql } if sql.contains("CREATE TABLE ok2") => done(),
                 Step::Execute { sql } if sql.contains("CREATE TABL bad") => {
                     error("syntax error at or near \"TABL\"", Some(9))
@@ -1948,6 +2034,115 @@ mod tests {
         assert!(!queries(&steps).any(is_insert));
     }
 
+    /// A complete tracking table gets no DDL: `ALTER TABLE ... ADD COLUMN IF
+    /// NOT EXISTS` needs the table's ownership even when the column exists,
+    /// which made a role granted the table's privileges unable to run any
+    /// action. A table missing later columns gets only those.
+    #[test]
+    fn only_a_missing_table_or_column_is_created() {
+        for (columns, ddl) in [
+            (["true", "true", "true", "true"], None),
+            (
+                ["true", "true", "true", "false"],
+                Some(
+                    "ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS hash_version INTEGER;",
+                ),
+            ),
+            (
+                ["true", "false", "false", "true"],
+                Some(
+                    "ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS sql_source TEXT;\n\
+                     ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS hash TEXT;",
+                ),
+            ),
+        ] {
+            let row: Vec<Option<String>> = columns.iter().map(|c| Some(c.to_string())).collect();
+            let (steps, result) = drive(input(Action::Up, vec![], config()), |step| match step {
+                Step::Query { sql, params } if is_status_columns(sql) => {
+                    assert_eq!(params, &[Some("public._migrations".to_string())]);
+                    rows(vec![row.clone()])
+                }
+                Step::Execute { sql } if sql.starts_with("ALTER TABLE") => done(),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { .. } => rows(vec![]),
+                other => panic!("unexpected step: {other:?}"),
+            });
+            assert_eq!(result, Ok(Outcome::Applied(vec![])));
+            let executed: Vec<&str> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Execute { sql } => Some(sql.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(executed, ddl.into_iter().collect::<Vec<_>>(), "{columns:?}");
+        }
+    }
+
+    /// A data migration of many statements, run without a transaction:
+    /// every statement is sent once, in order, and the file is split once —
+    /// re-splitting it per statement took minutes for this one (quadratic
+    /// in its size).
+    #[test]
+    fn a_no_transaction_file_of_many_statements_is_split_once() {
+        const COUNT: usize = 50_000;
+        let body: String = (0..COUNT)
+            .map(|i| format!("INSERT INTO t VALUES ({i}, 'row; {i}');\n"))
+            .collect();
+        let up = format!("-- no-transaction\n{body}");
+        let down = format!("-- no-transaction\n{body}");
+        let answer = |step: &Step| match step {
+            Step::Execute { .. } => done(),
+            Step::Query { sql, .. } if is_lock(sql) => locked(),
+            Step::Query { sql, .. } if is_probe_read(sql) => closed(),
+            Step::Query { sql, .. } if is_applied_select(sql) => {
+                rows(vec![vec![Some("0001_data".to_string()), None, None]])
+            }
+            Step::Query { .. } => rows(vec![]),
+            other => panic!("unexpected step: {other:?}"),
+        };
+        let started = std::time::Instant::now();
+        for action in [
+            Action::Up,
+            Action::Revert {
+                name: None,
+                force: false,
+            },
+        ] {
+            let pending = matches!(action, Action::Up);
+            let migrations = vec![migration("0001_data", &up, Some(&down))];
+            let (steps, result) = drive(input(action, migrations, config()), |step| {
+                match step {
+                    // The up finds nothing applied, the revert its row.
+                    Step::Query { sql, .. } if pending && is_applied_select(sql) => rows(vec![]),
+                    _ => answer(step),
+                }
+            });
+            assert!(result.is_ok(), "{result:?}");
+            let sent: Vec<&str> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Execute { sql } if sql.contains("INSERT INTO t") => Some(sql.trim()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), COUNT);
+            assert_eq!(
+                sent[0],
+                "-- no-transaction\nINSERT INTO t VALUES (0, 'row; 0');"
+            );
+            assert_eq!(
+                sent[COUNT - 1],
+                "INSERT INTO t VALUES (49999, 'row; 49999');"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A session, as far as transaction blocks go: the files' `BEGIN`,
     /// `COMMIT` and `ROLLBACK`, a failing statement (`CREATE TABL`) aborting
     /// the block it runs in, and the probe's setting: transaction-local for
@@ -1980,6 +2175,7 @@ mod tests {
                 position: None,
                 internal_position: None,
                 internal_query: None,
+                context: None,
             })
         }
 
@@ -1987,6 +2183,7 @@ mod tests {
             let aborted = self.block == Some(true);
             match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { sql } if !aborted && sql.contains("AND CHAIN") => {
                     self.block = Some(false);
                     self.probe = None;
@@ -2247,6 +2444,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![vec![
                     Some("0001_a".to_string()),
@@ -2410,6 +2608,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
                 other => panic!("unexpected step: {other:?}"),
@@ -2433,6 +2632,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
@@ -2470,6 +2670,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
                     rows(vec![vec![one("0001_a")[0].clone(), None, None]])
@@ -2500,6 +2701,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
                     rows(vec![vec![one("0001_a")[0].clone(), None, None]])
@@ -2524,6 +2726,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
@@ -2577,6 +2780,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
@@ -2612,6 +2816,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![
@@ -2637,6 +2842,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),

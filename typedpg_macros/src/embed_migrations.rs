@@ -98,11 +98,11 @@ pub fn expand(input: EmbedInput) -> syn::Result<TokenStream> {
         let down_tokens = match down {
             Some(d) => {
                 let d_lit = LitStr::new(&d.to_string_lossy(), span);
-                quote! { ::core::option::Option::Some(include_str!(#d_lit)) }
+                quote! { ::core::option::Option::Some(::core::include_str!(#d_lit)) }
             }
             None => quote! { ::core::option::Option::None },
         };
-        quote! { ( #stem_lit, include_str!(#up_lit), #down_tokens ) }
+        quote! { ( #stem_lit, ::core::include_str!(#up_lit), #down_tokens ) }
     });
 
     Ok(quote! {

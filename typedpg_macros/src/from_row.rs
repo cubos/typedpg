@@ -105,8 +105,8 @@ pub fn expand(input: DeriveInput) -> Result<TokenStream, syn::Error> {
     }
 
     Ok(quote! {
-        impl #impl_generics typedpg::FromRow for #name #ty_generics where #from_row_bounds {
-            fn from_row(__row: &::typedpg::__private::tokio_postgres::Row) -> ::std::result::Result<Self, typedpg::Error> {
+        impl #impl_generics ::typedpg::FromRow for #name #ty_generics where #from_row_bounds {
+            fn from_row(__row: &::typedpg::__private::tokio_postgres::Row) -> ::std::result::Result<Self, ::typedpg::Error> {
                 ::std::result::Result::Ok(Self {
                     #(#field_extractions),*
                 })

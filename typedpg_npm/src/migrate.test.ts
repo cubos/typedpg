@@ -72,6 +72,7 @@ test("a version of any length is compared as a number", () => {
 function stepLabel(sql: string): string {
   if (sql.includes("pg_try_advisory_lock")) return "lock";
   if (sql.includes("pg_advisory_unlock")) return "unlock";
+  if (sql.includes("c.oid IS NOT NULL")) return "table columns";
   if (sql.includes("CREATE TABLE IF NOT EXISTS")) return "ensure table";
   if (sql.includes("hash_version IS DISTINCT FROM")) return "backfill";
   if (sql.startsWith("SELECT name::pg_catalog.text, hash::pg_catalog.text")) return "applied";
@@ -115,6 +116,7 @@ test("a fresh run applies each pending migration in its own transaction", async 
   assert.deepEqual(await migrate(driver, set), ["0001_a", "0002_b"]);
   assert.deepEqual(driver.log, [
     "lock",
+    "table columns",
     "ensure table",
     "backfill",
     "applied",
@@ -180,6 +182,33 @@ test("a database error in a migration is rethrown with its line and as the cause
         "               ^",
     );
     assert.equal(e.cause, original);
+    return true;
+  });
+});
+
+// node-postgres and postgres.js both expose the CONTEXT field as `where`:
+// the line of a `DO` block that failed, as psql shows it.
+test("a database error's context is part of the failure", async () => {
+  const sql = "DO $$ BEGIN RAISE EXCEPTION 'boom'; END $$;";
+  const set = embedMigrations([["0001_do", sql, null]]);
+  const original = Object.assign(new Error("boom"), {
+    code: "P0001",
+    severity: "ERROR",
+    where: "PL/pgSQL function inline_code_block line 1 at RAISE",
+  });
+  const driver = new ScriptedDriver(
+    (query) => (query.includes("advisory") ? [["t"]] : []),
+    (executed) => {
+      if (executed === sql) throw original;
+    },
+  );
+
+  await assert.rejects(migrate(driver, set), (e: unknown) => {
+    assert.ok(e instanceof MigrationError);
+    assert.equal(
+      e.message,
+      "failed to apply migration 0001_do: ERROR: boom\nCONTEXT: PL/pgSQL function inline_code_block line 1 at RAISE",
+    );
     return true;
   });
 });

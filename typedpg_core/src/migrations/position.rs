@@ -17,14 +17,20 @@ pub fn locate_position(sql: &str, base: usize, position: u32) -> String {
             .char_indices()
             .nth(chars)
             .map_or(sent.len(), |(i, _)| i);
-    let line_start = sql[..at].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = sql[at..].find('\n').map_or(sql.len(), |i| at + i);
-    let line_no = sql[..at].matches('\n').count() + 1;
+    // libpq's `reportErrorPosition`: a CR or an LF ends a line, a CRLF
+    // being one line break, and a tab shows as one space so that the caret
+    // stays under the column.
+    let breaks = ['\n', '\r'];
+    let line_start = sql[..at].rfind(breaks).map_or(0, |i| i + 1);
+    let line_end = sql[at..].find(breaks).map_or(sql.len(), |i| at + i);
+    let line_no = sql[..at].matches('\r').count() + sql[..at].matches('\n').count()
+        - sql[..at].matches("\r\n").count()
+        + 1;
     let column = sql[line_start..at].chars().count();
     let prefix = format!("LINE {line_no}: ");
     format!(
         "\n{prefix}{}\n{}^",
-        &sql[line_start..line_end],
+        sql[line_start..line_end].replace('\t', " "),
         " ".repeat(prefix.len() + column)
     )
 }
@@ -52,6 +58,28 @@ mod tests {
         assert_eq!(
             locate_position("SELECT 'é' x y", 0, 14),
             "\nLINE 1: SELECT 'é' x y\n                     ^"
+        );
+    }
+
+    // What psql (libpq's `reportErrorPosition`) prints for the same errors:
+    // a file saved with CRLF line breaks shows no stray CR, a lone CR ends
+    // a line too, and a tab shows as a space so the caret stays under it.
+    #[test]
+    fn line_breaks_and_tabs_are_shown_as_psql_does() {
+        let crlf = "CREATE TABLE a (id int);\r\nCREATE TABL b (id int);\r\n";
+        assert_eq!(
+            locate_position(crlf, 0, 34),
+            "\nLINE 2: CREATE TABL b (id int);\n               ^"
+        );
+        let cr = "CREATE TABLE a (id int);\rCREATE TABL b (id int);\r";
+        assert_eq!(
+            locate_position(cr, 0, 33),
+            "\nLINE 2: CREATE TABL b (id int);\n               ^"
+        );
+        let tab = "CREATE TABLE a (\n\tid int,\n\tx nosuchtype\n);";
+        assert_eq!(
+            locate_position(tab, 0, 30),
+            "\nLINE 3:  x nosuchtype\n           ^"
         );
     }
 }

@@ -461,6 +461,102 @@ async fn no_transaction_migration_with_several_statements() {
     assert!(table_exists(&client, "\"idx;email\"").await);
 }
 
+/// A role granted the tracking table's privileges, but not its owner, runs
+/// migrations: a complete table gets no `ALTER TABLE`, which needs the
+/// table's ownership even to `ADD COLUMN IF NOT EXISTS` an existing column
+/// ("must be owner of table _migrations" failed every action before).
+#[tokio::test]
+async fn a_role_that_does_not_own_the_tracking_table_runs_migrations() {
+    let (mut client, db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "0001_a.sql", "CREATE TABLE a (id INT);");
+    let config = MigrationsConfig::default();
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    migrate::run(&mut client, &source, &config).await.unwrap();
+
+    let role = format!("{db}_deployer");
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE \"{role}\";
+             GRANT CREATE ON SCHEMA public TO \"{role}\";
+             GRANT ALL ON public._migrations TO \"{role}\";
+             SET ROLE \"{role}\";"
+        ))
+        .await
+        .unwrap();
+    write(dir.path(), "0002_b.sql", "CREATE TABLE b (id INT);");
+    write(dir.path(), "0002_b.down.sql", "DROP TABLE b;");
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    assert_eq!(
+        migrate::run(&mut client, &source, &config).await.unwrap(),
+        ["0002_b"]
+    );
+    migrate::accept(&mut client, &source, &config, "0002_b")
+        .await
+        .unwrap();
+    assert_eq!(
+        migrate::revert_last(&mut client, &source, false, &config)
+            .await
+            .unwrap(),
+        "0002_b"
+    );
+    assert_eq!(recorded(&client, "public._migrations").await, ["0001_a"]);
+}
+
+/// A failure inside a `DO` block (or a function, a trigger) says where, as
+/// psql's CONTEXT line does: the message alone did not tell which line of
+/// the body raised it.
+#[tokio::test]
+async fn a_failure_inside_a_do_block_reports_its_context() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_do.sql",
+        "DO $$\nBEGIN\n  PERFORM 1;\n  RAISE EXCEPTION 'boom';\nEND $$;",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let err = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.ends_with(
+            "failed to apply migration 0001_do: ERROR: boom\n\
+             CONTEXT: PL/pgSQL function inline_code_block line 4 at RAISE"
+        ),
+        "{err}"
+    );
+}
+
+/// An unterminated dollar quote swallows the rest of the file, as psql
+/// sends it: PG rejects that text whole, and the `DROP TABLE` inside it
+/// never runs (split at its `;`, it ran before the error).
+#[tokio::test]
+async fn an_unterminated_dollar_quote_runs_nothing_after_it() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_typo.sql",
+        "-- no-transaction\n\
+         CREATE TABLE keep (id INT);\n\
+         SELECT $body$ oops;\n\
+         DROP TABLE keep;\n",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+
+    let err = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("(statement 2): ERROR: unterminated dollar-quoted string"),
+        "{err}"
+    );
+    assert!(table_exists(&client, "keep").await);
+}
+
 /// With `use_transaction = false` every migration runs outside a
 /// transaction: statements PG refuses in a transaction block work, and a
 /// failure keeps what the statements before it did.

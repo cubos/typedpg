@@ -281,19 +281,11 @@ impl Module<'_> {
                 let _ = writeln!(out, "  [{}, {}, {down}],", js_string(name), js_string(sql));
             }
             let r = m.runner;
-            // A number past 2^53 would round to another lock than the Rust
-            // runner's: such an id is a bigint.
-            const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
-            let lock_id = if r.lock_id.unsigned_abs() > MAX_SAFE_INTEGER {
-                format!("{}n", r.lock_id)
-            } else {
-                r.lock_id.to_string()
-            };
             let _ = writeln!(
                 out,
                 "], {{ table: {}, lockId: {}, useTransaction: {}, failOnDrift: {} }});",
                 js_string(&r.table),
-                lock_id,
+                js_lock_id(r.lock_id),
                 r.use_transaction,
                 r.fail_on_drift
             );
@@ -301,8 +293,31 @@ impl Module<'_> {
     }
 }
 
+/// The advisory lock's id as JavaScript: a number, or a BigInt literal past
+/// the integers a number holds exactly (2^53 - 1) — rounded, the npm runner
+/// would take another lock than `typedpg migrate`, and the two would no
+/// longer keep each other out.
+fn js_lock_id(lock_id: i64) -> String {
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    if lock_id.unsigned_abs() > MAX_SAFE_INTEGER {
+        format!("{lock_id}n")
+    } else {
+        lock_id.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lock_id_past_a_javascript_number_is_a_bigint() {
+        use super::js_lock_id;
+        assert_eq!(js_lock_id(713705), "713705");
+        assert_eq!(js_lock_id(-713705), "-713705");
+        assert_eq!(js_lock_id(9_007_199_254_740_991), "9007199254740991");
+        assert_eq!(js_lock_id(9_007_199_254_740_993), "9007199254740993n");
+        assert_eq!(js_lock_id(i64::MIN), "-9223372036854775808n");
+    }
+
     use super::*;
 
     fn generated(types: &str) -> Result<Generated, GenError> {

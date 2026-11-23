@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { type Driver, createCopyIn, createQuery, embedMigrations, MigrationError } from "./index.js";
+import {
+  type Driver,
+  createCopyIn,
+  createQuery,
+  embedMigrations,
+  MigrationError,
+  type QuerySpec,
+  type RawResult,
+} from "./index.js";
 
 test("the migrations table is a qualified identifier", () => {
   // The same names the Rust runner accepts (`MigrationsConfig::validate`):
@@ -104,4 +112,36 @@ test("a COPY row's value that can't be encoded names the row and column", async 
     message: "row 1, column `on`: typedpg: a bool parameter must be a boolean, not number",
   });
   assert.equal(sent, "");
+});
+
+// At most 1000 items, but more placeholders than a query can bind (1000
+// rows of 70 fields): bound as arrays, as above the threshold, instead of
+// failing to send.
+test("a spread past its share of the 65535 parameters is bound as arrays", async () => {
+  const fields = Array.from({ length: 70 }, (_, i) => [`f${i}`, "number", "::int4"] as const);
+  const spec: QuerySpec = {
+    sql: ["INSERT INTO t ", ["values", [["rows", 0]], "SELECT WHERE false", fields.map(() => "::int4[]")]],
+    params: [],
+    spreads: [["rows", fields, "rows"]],
+    columns: [],
+  };
+  const sent: { text: string; params: number }[] = [];
+  const executor = {
+    async typedpgQuery(text: string, params: (string | null)[]): Promise<RawResult> {
+      sent.push({ text, params: params.length });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const query = createQuery<{ params: { rows: Record<string, number>[] }; row: never }>(
+    "INSERT INTO t VALUES $..rows { … }",
+    JSON.stringify(spec),
+  );
+  const rows = (n: number) => Array.from({ length: n }, (_, r) => Object.fromEntries(fields.map(([f]) => [f, r])));
+  await query.execute(executor, { rows: rows(1000) });
+  assert.match(sent[0]!.text, /^INSERT INTO t SELECT \* FROM unnest\(\$1::int4\[\], /);
+  assert.equal(sent[0]!.params, 70);
+  // Within the share: a placeholder per value.
+  await query.execute(executor, { rows: rows(900) });
+  assert.match(sent[1]!.text, /^INSERT INTO t VALUES \(\$1::int4, /);
+  assert.equal(sent[1]!.params, 63_000);
 });

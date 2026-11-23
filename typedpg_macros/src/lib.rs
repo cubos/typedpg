@@ -135,9 +135,10 @@ mod refinement_doc;
 ///
 /// # Bulk insert with `$..spread`
 ///
-/// The `$..var { field1, field2 }` syntax expands an iterable into multiple
-/// `VALUES` rows for bulk inserts. Field mapping is mandatory so the macro
-/// knows which struct fields map to which columns.
+/// The `$..var { field1, field2 }` syntax expands a slice of items (a `Vec`,
+/// an array or a slice; the spread borrows it) into multiple `VALUES` rows
+/// for bulk inserts. Field mapping is mandatory so the macro knows which
+/// struct fields map to which columns.
 ///
 /// ```text
 /// let new_users = vec![
@@ -180,8 +181,9 @@ mod refinement_doc;
 ///
 /// # Lists with `IN $..list`
 ///
-/// A spread without fields, right after `IN`, expands an iterable of values
-/// into the parenthesized list, each element typed by the `IN`'s left side:
+/// A spread without fields, right after `IN`, expands a slice of values (a
+/// `Vec`, an array or a slice) into the parenthesized list, each element
+/// typed by the `IN`'s left side:
 ///
 /// ```text
 /// let ids: Vec<i64> = vec![1, 2, 3];
@@ -240,7 +242,8 @@ mod refinement_doc;
 /// ```
 ///
 /// The Rust struct must implement `serde::Serialize` (for parameters) and/or
-/// `serde::Deserialize` (for output columns).
+/// `serde::Deserialize`, `Debug` and `Clone` (for output columns: the row
+/// struct derives `Debug` and `Clone`).
 ///
 /// # Executor types
 ///
@@ -289,7 +292,7 @@ mod refinement_doc;
 /// // Type mismatch: `age` is an INT column, so `$age` binds an `i32`
 /// let age: &str = "not a number";
 /// sql!(pool, "SELECT id FROM users WHERE age > $age").fetch_all().await?;
-/// // error[E0277]: the trait bound `i32: From<&str>` is not satisfied
+/// // error[E0277]: `$age` expects a value for SQL type integer NOT NULL, not `&str`
 ///
 /// // A spread without fields is a list, which goes after IN
 /// sql!(pool, "INSERT INTO users (name, email) VALUES $..items");
@@ -344,57 +347,57 @@ fn error_placeholder(e: syn::Error) -> proc_macro2::TokenStream {
             struct __sql_output;
 
             #[allow(non_camel_case_types)]
-            struct __typedpg_query<__E: typedpg::Executor>(
+            struct __typedpg_query<__E: ::typedpg::Executor>(
                 ::std::marker::PhantomData<__E>,
             );
 
             #[allow(dead_code, unused_variables, clippy::unused_async)]
-            impl<__E: typedpg::Executor> __typedpg_query<__E> {
+            impl<__E: ::typedpg::Executor> __typedpg_query<__E> {
                 async fn fetch_all(
                     self,
-                ) -> ::std::result::Result<::std::vec::Vec<__sql_output>, typedpg::Error> {
+                ) -> ::std::result::Result<::std::vec::Vec<__sql_output>, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_one(
                     self,
-                ) -> ::std::result::Result<__sql_output, typedpg::Error> {
+                ) -> ::std::result::Result<__sql_output, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_optional(
                     self,
-                ) -> ::std::result::Result<::std::option::Option<__sql_output>, typedpg::Error>
+                ) -> ::std::result::Result<::std::option::Option<__sql_output>, ::typedpg::Error>
                 {
                     ::std::unreachable!()
                 }
-                async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
+                async fn execute(self) -> ::std::result::Result<u64, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_stream(
                     self,
-                ) -> ::std::result::Result<typedpg::QueryStream<__sql_output>, typedpg::Error> {
+                ) -> ::std::result::Result<::typedpg::QueryStream<__sql_output>, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_stream_as<__T>(
                     self,
-                ) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
+                ) -> ::std::result::Result<::typedpg::QueryStream<__T>, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
-                async fn fetch_value<__T>(self) -> ::std::result::Result<__T, typedpg::Error> {
+                async fn fetch_value<__T>(self) -> ::std::result::Result<__T, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_all_as<__T>(
                     self,
-                ) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
+                ) -> ::std::result::Result<::std::vec::Vec<__T>, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_one_as<__T>(
                     self,
-                ) -> ::std::result::Result<__T, typedpg::Error> {
+                ) -> ::std::result::Result<__T, ::typedpg::Error> {
                     ::std::unreachable!()
                 }
                 async fn fetch_optional_as<__T>(
                     self,
-                ) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error>
+                ) -> ::std::result::Result<::std::option::Option<__T>, ::typedpg::Error>
                 {
                     ::std::unreachable!()
                 }
@@ -405,19 +408,6 @@ fn error_placeholder(e: syn::Error) -> proc_macro2::TokenStream {
     }
 }
 
-/// Derive macro for `typedpg::FromRow`.
-///
-/// Generates an implementation that constructs the struct from a
-/// `tokio_postgres::Row` by extracting each field by column name.
-///
-/// ```rust,ignore
-/// #[derive(typedpg::FromRow)]
-/// struct User {
-///     id: i64,
-///     name: String,
-///     email: Option<String>,
-/// }
-/// ```
 /// Bake a `typedpg::migrate::MigrationSource` from a directory of
 /// `NNNN_description.sql` files into the binary at compile time.
 ///
@@ -478,7 +468,7 @@ pub fn copy_in(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
             quote::quote! {
                 {
                     #err;
-                    async { ::std::result::Result::<u64, typedpg::Error>::Ok(::std::unreachable!()) }
+                    async { ::std::result::Result::<u64, ::typedpg::Error>::Ok(::std::unreachable!()) }
                 }
             }
             .into()
@@ -486,6 +476,19 @@ pub fn copy_in(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     }
 }
 
+/// Derive macro for `typedpg::FromRow`.
+///
+/// Generates an implementation that constructs the struct from a
+/// `tokio_postgres::Row` by extracting each field by column name.
+///
+/// ```rust,ignore
+/// #[derive(typedpg::FromRow)]
+/// struct User {
+///     id: i64,
+///     name: String,
+///     email: Option<String>,
+/// }
+/// ```
 #[proc_macro_derive(FromRow)]
 pub fn derive_from_row(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);

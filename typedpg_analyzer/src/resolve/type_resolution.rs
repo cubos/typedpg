@@ -15,17 +15,7 @@ pub(crate) fn build_column(
         rc.record_fields.as_deref(),
         snapshot,
     )?;
-    // A domain over an array has its elements too.
-    let mut array = &mut pg_type;
-    while let Type::Domain { base, .. } = array {
-        array = base;
-    }
-    if let Type::Array {
-        element_nullable, ..
-    } = array
-    {
-        *element_nullable = rc.elem_nullable;
-    }
+    set_elem_nullable(&mut pg_type, rc.elem_nullable);
 
     // The `!` / `?` nullability annotation belongs to the alias the user
     // wrote, not to the column's real name: a column named `col!` in the
@@ -41,6 +31,21 @@ pub(crate) fn build_column(
         refinement: enumerated(rc.refine).normalized(rc.type_oid, snapshot),
         elem_refinement: elems_normalized(enumerated(rc.elem_refine), rc.type_oid, snapshot),
     })
+}
+
+/// Record in `ty`, an array (or a domain over one, which has its elements
+/// too), whether its elements can be NULL.
+fn set_elem_nullable(ty: &mut Type, elem_nullable: Option<bool>) {
+    let mut array = ty;
+    while let Type::Domain { base, .. } = array {
+        array = base;
+    }
+    if let Type::Array {
+        element_nullable, ..
+    } = array
+    {
+        *element_nullable = elem_nullable;
+    }
 }
 
 /// `refine`, a range of a few integers listing them.
@@ -80,15 +85,18 @@ fn resolve_type_with_shape(
     {
         let mut out = Vec::with_capacity(fields.len());
         for f in fields {
+            let mut ty = resolve_type_with_shape(
+                f.ty.type_oid,
+                f.ty.typmod,
+                f.ty.collation,
+                f.ty.record_fields.as_deref(),
+                snapshot,
+            )?;
+            // A field's elements are known as a column's are.
+            set_elem_nullable(&mut ty, f.ty.elem_nullable);
             out.push(crate::types::RecordField {
                 name: f.name.clone(),
-                ty: resolve_type_with_shape(
-                    f.ty.type_oid,
-                    f.ty.typmod,
-                    f.ty.collation,
-                    f.ty.record_fields.as_deref(),
-                    snapshot,
-                )?,
+                ty,
                 nullable: f.ty.nullable,
                 refinement: enumerated(f.ty.refine.clone()).normalized(f.ty.type_oid, snapshot),
                 elem_refinement: elems_normalized(
@@ -109,6 +117,7 @@ fn resolve_type_with_shape(
             let known = shape.iter().find(|f| f.name == field.name);
             field.nullable = known.is_none_or(|f| f.ty.nullable);
             if let Some(f) = known {
+                set_elem_nullable(&mut field.ty, f.ty.elem_nullable);
                 field.refinement = enumerated(field.refinement.and(&f.ty.refine));
                 field.elem_refinement = enumerated(field.elem_refinement.and(&f.ty.elem_refine));
             }

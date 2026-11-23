@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-typedpg = "0.7"
+typedpg = "0.8"
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -83,16 +83,16 @@ sql!(pool, "SELECT nonexistent FROM users").fetch_all().await?;
 
 // Wrong type in WHERE → compile error
 sql!(pool, "SELECT id FROM users WHERE name").fetch_all().await?;
-//  error: type mismatch: text cannot be coerced to bool
+//  error: argument of WHERE must be type boolean, not type text
 
 // Wrong type in LIMIT → compile error
 sql!(pool, "SELECT id FROM users LIMIT true").fetch_all().await?;
-//  error: type mismatch: bool cannot be coerced to int8
+//  error: argument of LIMIT must be type bigint, not type boolean
 
 // Parameter type mismatch → compile error (expects i32 for age column)
 let flag: bool = true;
 sql!(pool, "UPDATE users SET age = $flag").execute().await?;
-//  error: type mismatch: bool cannot be coerced to int4
+//  error[E0277]: `$flag` expects a value for SQL type integer, not `bool`
 ```
 
 ## Linting
@@ -705,7 +705,7 @@ sql!(pool, "SELECT name FROM users WHERE id IN $..ids")   // WHERE id IN ($1, $2
 
 An empty list is written `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no syntax for one — and the query runs: `x IN` it is false, `x NOT IN` it true.
 
-Above 1000 items, a spread is bound as arrays where that is provably the same query — the analyzer analyzes the array form and offers it only if the columns and parameters come out identical: `x IN $..ids` is written `(x = ANY($1::type[]))` (`NOT IN`: `<> ALL`), and a `VALUES` made of one rows spread `SELECT * FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)`. Large lists and batches then take a parameter per field instead of one per value — faster, and past PostgreSQL's 65535-parameter limit. Not offered where the form would differ: a field that is an array (unnest would flatten it) or a composite, a `VALUES` with written rows, a column whose nullability the array would change, an enum or JSON-domain field whose values may be `None`.
+Above 1000 items — or fewer, when their placeholders would pass the spread's share of the 65535 parameters a query can bind — a spread is bound as arrays where that is provably the same query — the analyzer analyzes the array form and offers it only if the columns and parameters come out identical: `x IN $..ids` is written `(x = ANY($1::type[]))` (`NOT IN`: `<> ALL`), and a `VALUES` made of one rows spread `SELECT * FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)`. Large lists and batches then take a parameter per field instead of one per value — faster, and past PostgreSQL's 65535-parameter limit. Not offered where the form would differ: a field that is an array (unnest would flatten it) or a composite, a `VALUES` with written rows, a column whose nullability the array would change, an enum or JSON-domain field whose values may be `None`.
 
 `id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. `sql!` prepares each query anew, never reusing a statement, so PostgreSQL plans it with the values and the two plan alike. They differ only under a generic plan — a statement prepared once and executed repeatedly, as an executor of your own might — where PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
 
@@ -760,7 +760,9 @@ To get type-safe enum values instead of raw strings, map them in `Cargo.toml`:
 user_role = "crate::UserRole"
 ```
 
-The macro will use your Rust type for serialization/deserialization. Your type must convert to/from `String`.
+The macro will use your Rust type for serialization/deserialization: it binds a value as its `Display` text and reads one with `FromStr`, so both must spell the labels exactly as PostgreSQL does.
+
+A type read in a row (a mapped enum, JSONB domain or composite) must also implement `Debug` and `Clone`: the row struct `sql!` generates derives both.
 
 ## Domain types (JSONB)
 
@@ -791,7 +793,7 @@ user_preferences = "crate::domains::UserPreferences"
 ```
 
 ```rust
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserPreferences { theme: String, lang: String }
 
 // preferences: Option<UserPreferences> -- automatic deserialization
@@ -1092,7 +1094,8 @@ use typedpg::migrate::{MigrationsConfig, run};
 
 // Path is resolved relative to the invoking crate's CARGO_MANIFEST_DIR,
 // like `include_str!`. The SQL contents land in the final binary as &'static str;
-// editing a migration file re-triggers a rebuild automatically.
+// editing a migration file re-triggers a rebuild automatically (adding one
+// needs the `build.rs` above, or the new file is not embedded).
 let source = typedpg::embed_migrations!("./migrations");
 let config = MigrationsConfig::default();
 let applied = run(&mut client, &source, &config).await?;
@@ -1106,7 +1109,8 @@ All configuration lives in your `Cargo.toml`:
 
 ```toml
 [package.metadata.typedpg.database]
-migrations = "./migrations"        # required — path to migration files
+migrations = "./migrations"        # optional — path to migration files
+                                   # (the default)
 extra_migrations = ["../shared/migrations"]  # optional — extra migration dirs
                                              # included in the compile-time
                                              # schema only (NOT applied at

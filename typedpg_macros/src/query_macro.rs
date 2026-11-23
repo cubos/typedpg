@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
@@ -26,10 +27,29 @@ struct CachedPgCatalog {
     migration_hash: String,
     /// Cache key: the runner's `use_transaction` setting.
     use_transaction: bool,
+    /// The catalog with each set of analysis settings applied, shared by
+    /// the queries analyzed with them: cloning a catalog costs far more
+    /// than analyzing a query (the seed's thousands of rows).
+    configured: Vec<(AnalysisSettings, Rc<PgCatalog>)>,
 }
 
+/// The settings of a database that the analysis reads from its catalog.
+#[derive(PartialEq)]
+struct AnalysisSettings {
+    /// The types whose parameters are finite.
+    finite: Vec<typedpg_core::QualifiedName>,
+    simplify: typedpg_analyzer::SimplifyOptions,
+}
+
+/// How many catalogs [`CACHED_PG_CATALOG`] keeps: a crate whose `sql!`s use
+/// several databases (`db = …`) analyzes each against its own, in any
+/// order, and a long-lived macro server (an IDE's) serves several crates.
+/// The least recently used one goes first.
+const CACHED_CATALOGS: usize = 4;
+
 thread_local! {
-    static CACHED_PG_CATALOG: RefCell<Option<CachedPgCatalog>> = const { RefCell::new(None) };
+    /// The catalogs built, the most recently used last.
+    static CACHED_PG_CATALOG: RefCell<Vec<CachedPgCatalog>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A migration the catalog could not be built past.
@@ -44,9 +64,9 @@ struct CatalogFailure {
     filename: String,
 }
 
-/// Build (or retrieve from cache) a [`PgCatalog`] from migration files.
-/// `use_transaction` is the migration runner's setting: whether it wraps
-/// each migration in a transaction.
+/// Build (or retrieve from cache) a [`PgCatalog`] from migration files,
+/// with `settings` applied. `use_transaction` is the migration runner's
+/// setting: whether it wraps each migration in a transaction.
 ///
 /// A migration that fails fails every `sql!` of the crate. The first one
 /// to build the catalog reports the full diagnostic; the cached failure
@@ -56,58 +76,97 @@ fn get_or_build_pg_catalog(
     migrations_dirs: &[&Path],
     migration_hash: &str,
     use_transaction: bool,
-) -> Result<PgCatalog, syn::Error> {
+    settings: AnalysisSettings,
+) -> Result<Rc<PgCatalog>, syn::Error> {
     CACHED_PG_CATALOG.with(|cell| {
-        let borrow = cell.borrow();
-        if let Some(cached) = borrow.as_ref()
-            && cached.migration_hash == migration_hash
-            && cached.use_transaction == use_transaction
-        {
-            return match &cached.catalog {
-                Ok(catalog) => Ok(catalog.clone()),
-                Err(failure) => Err(syn::Error::new(
-                    Span::call_site(),
-                    format!(
-                        "migration {} failed: {} (reported in full at the first sql! of this \
-                         crate)",
-                        failure.filename, failure.summary
-                    ),
-                )),
-            };
-        }
-        drop(borrow);
-
-        let migrations = collect_migration_files(migrations_dirs)?;
-        let mut catalog = PgCatalog::new().map_err(|e| {
-            syn::Error::new(
-                Span::call_site(),
-                format!("failed to load embedded PG catalog seed: {e}"),
-            )
-        })?;
-        catalog.set_migrations_use_transaction(use_transaction);
-        let mut result = Ok(());
-        for (filename, sql) in &migrations {
-            if let Err(e) = catalog.apply_migration(filename, sql) {
-                let full = e.to_string();
-                let summary = full.lines().next().unwrap_or_default().to_owned();
-                result = Err(CatalogFailure {
-                    full,
-                    summary,
-                    filename: filename.clone(),
-                });
-                break;
-            }
-        }
-        let built = result.map(|()| catalog);
-
-        cell.borrow_mut().replace(CachedPgCatalog {
-            catalog: built.clone(),
-            migration_hash: migration_hash.to_string(),
-            use_transaction,
+        let mut cache = cell.borrow_mut();
+        let found = cache.iter().position(|c| {
+            c.migration_hash == migration_hash && c.use_transaction == use_transaction
         });
-
-        built.map_err(|failure| syn::Error::new(Span::call_site(), failure.full))
+        let mut cached = match found {
+            Some(i) => {
+                let cached = cache.remove(i);
+                if let Err(failure) = &cached.catalog {
+                    let error = syn::Error::new(
+                        Span::call_site(),
+                        format!(
+                            "migration {} failed: {} (reported in full at the first sql! of \
+                             this crate)",
+                            failure.filename, failure.summary
+                        ),
+                    );
+                    cache.push(cached);
+                    return Err(error);
+                }
+                cached
+            }
+            None => {
+                let catalog = build_pg_catalog(migrations_dirs, use_transaction)?;
+                let failure = catalog.as_ref().err().map(|f| f.full.clone());
+                if cache.len() >= CACHED_CATALOGS {
+                    cache.remove(0);
+                }
+                cache.push(CachedPgCatalog {
+                    catalog,
+                    migration_hash: migration_hash.to_string(),
+                    use_transaction,
+                    configured: Vec::new(),
+                });
+                if let Some(full) = failure {
+                    return Err(syn::Error::new(Span::call_site(), full));
+                }
+                cache.pop().expect("just pushed")
+            }
+        };
+        let result = match cached.configured.iter().find(|(s, _)| *s == settings) {
+            Some((_, catalog)) => Ok(Rc::clone(catalog)),
+            None => {
+                let Ok(base) = &cached.catalog else {
+                    unreachable!("a failed build returned above")
+                };
+                let mut catalog = base.clone();
+                match catalog.assume_finite_parameters(&settings.finite) {
+                    Ok(()) => {
+                        catalog.set_simplify_options(settings.simplify.clone());
+                        let catalog = Rc::new(catalog);
+                        cached.configured.push((settings, Rc::clone(&catalog)));
+                        Ok(catalog)
+                    }
+                    Err(e) => Err(syn::Error::new(Span::call_site(), e)),
+                }
+            }
+        };
+        cache.push(cached);
+        result
     })
+}
+
+/// The catalog the migrations in `migrations_dirs` build, or the failure of
+/// the first one that fails.
+fn build_pg_catalog(
+    migrations_dirs: &[&Path],
+    use_transaction: bool,
+) -> Result<Result<PgCatalog, CatalogFailure>, syn::Error> {
+    let migrations = collect_migration_files(migrations_dirs)?;
+    let mut catalog = PgCatalog::new().map_err(|e| {
+        syn::Error::new(
+            Span::call_site(),
+            format!("failed to load embedded PG catalog seed: {e}"),
+        )
+    })?;
+    catalog.set_migrations_use_transaction(use_transaction);
+    for (filename, sql) in &migrations {
+        if let Err(e) = catalog.apply_migration(filename, sql) {
+            let full = e.to_string();
+            let summary = full.lines().next().unwrap_or_default().to_owned();
+            return Ok(Err(CatalogFailure {
+                full,
+                summary,
+                filename: filename.clone(),
+            }));
+        }
+    }
+    Ok(Ok(catalog))
 }
 
 /// Collect all migration SQL files from the given directories.
@@ -296,6 +355,11 @@ impl Parse for QueryInput {
 /// real `\n`) and let the leading whitespace flow through, so the snippet
 /// renders the SQL the way it was written.
 ///
+/// This text is for diagnostics only: the statement analyzed and sent is
+/// the literal's value, as Rust defines it. A continuation inside a SQL
+/// string or comment, or between two tokens it joins, changes what the SQL
+/// means (`'a\<newline>  b'` is `'ab'`).
+///
 /// All other Rust escapes (`\n`, `\t`, `\x{..}`, `\u{..}`, …) follow the
 /// usual rules. Raw strings (`r"…"`, `r#"…"#`) pass through unchanged
 /// because they have no escapes to begin with.
@@ -365,7 +429,6 @@ fn parse_sql_literal_preserving_linebreaks(lit: &LitStr) -> String {
     out
 }
 
-/// Execute the full `sql!` pipeline and return the generated `TokenStream`.
 /// The project's `[package.metadata.typedpg]` config.
 pub(crate) fn load_config() -> Result<typedpg_core::config::Config, syn::Error> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|_| {
@@ -382,7 +445,9 @@ pub(crate) fn load_config() -> Result<typedpg_core::config::Config, syn::Error> 
 /// The catalog a database's migrations build, and what to tell the user
 /// about how it was built.
 pub(crate) struct BuiltCatalog<'c> {
-    pub catalog: PgCatalog,
+    /// Shared with the other queries of the database (see
+    /// [`get_or_build_pg_catalog`]).
+    pub catalog: Rc<PgCatalog>,
     pub resolved: typedpg_core::config::ResolvedConfig<'c>,
     /// Set when a configured migrations directory does not exist — a
     /// missing directory counts as no migrations, so a typo in the path
@@ -430,24 +495,22 @@ pub(crate) fn catalog_for<'c>(
         syn::Error::new(Span::call_site(), format!("failed to hash migrations: {e}"))
     })?;
 
-    // The selected database's runner setting, not the top-level one.
-    let mut catalog = get_or_build_pg_catalog(
-        &all_dirs,
-        &migration_hash,
-        resolved.migrations_use_transaction(),
-    )?;
     // A parameter bound from a chrono date or timestamp is never infinite.
     let finite: Vec<typedpg_core::QualifiedName> = typedpg_core::config::FINITE_PARAMETER_TYPES
         .iter()
         .map(|t| typedpg_core::QualifiedName::new("pg_catalog", *t))
         .filter(|q| !resolved.types.contains_key(q))
         .collect();
-    catalog
-        .assume_finite_parameters(&finite)
-        .map_err(|e| syn::Error::new(Span::call_site(), e))?;
-    catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
-        &resolved.simplify,
-    ));
+    // The selected database's runner setting, not the top-level one.
+    let catalog = get_or_build_pg_catalog(
+        &all_dirs,
+        &migration_hash,
+        resolved.migrations_use_transaction(),
+        AnalysisSettings {
+            finite,
+            simplify: typedpg_analyzer::SimplifyOptions::from_config(&resolved.simplify),
+        },
+    )?;
     let missing: Vec<String> = all_dirs
         .iter()
         .filter(|d| !d.is_dir())
@@ -534,17 +597,18 @@ fn items(paths: &[PathBuf]) -> Vec<TokenStream> {
             // the file.
             let path = path.to_str()?;
             let path = syn::LitStr::new(path, Span::call_site());
-            Some(quote::quote! { const _: &str = include_str!(#path); })
+            Some(quote::quote! { const _: &str = ::core::include_str!(#path); })
         })
         .collect()
 }
 
-pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
-    let sql_str = parse_sql_literal_preserving_linebreaks(&input.sql);
-    let config = load_config()?;
-    let built = catalog_for(&config, input.db_name.as_ref())?;
-
-    // 3. Analyze the SQL (lex + type inference in one pass).
+/// Analyze `sql_str`, the statement of `input`, as the roles it runs as.
+fn analyze_statement(
+    built: &BuiltCatalog<'_>,
+    input: &QueryInput,
+    sql_str: &str,
+) -> Result<typedpg_analyzer::AnalyzedQuery, syn::Error> {
+    // Analyze the SQL (lex + type inference in one pass).
     //
     // The role the statement runs as, or the database's configured ones. A
     // call-site role replaces them for this statement. The generated code is
@@ -557,15 +621,15 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
         Some(role) => vec![role.value()],
         None => resolved.roles().to_vec(),
     };
-    let analyzed = if roles.is_empty() {
+    if roles.is_empty() {
         built
             .catalog
-            .analyze(&sql_str)
-            .map_err(|e| syn::Error::new(input.sql.span(), built.annotate(e.to_string())))?
+            .analyze(sql_str)
+            .map_err(|e| syn::Error::new(input.sql.span(), built.annotate(e.to_string())))
     } else {
         let mut analyses = Vec::with_capacity(roles.len());
         for role in &roles {
-            match built.catalog.analyze_as(&sql_str, role) {
+            match built.catalog.analyze_as(sql_str, role) {
                 Ok(analysis) => analyses.push((role.clone(), analysis)),
                 // A role the call site names and the migrations don't create
                 // is reported at the role literal: it is the token that names
@@ -591,7 +655,44 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
                 ));
             }
         }
-        analyses.remove(0).1
+        Ok(analyses.remove(0).1)
+    }
+}
+
+/// `error`, the analysis error of `sql`, with its snippet laid out the way
+/// the literal is written: a literal continued across lines (`\` at the
+/// end of a line) is analyzed again with its line breaks kept, and that
+/// rendering is reported when it is the same error.
+fn with_source_layout(
+    error: syn::Error,
+    built: &BuiltCatalog<'_>,
+    input: &QueryInput,
+    sql: &str,
+) -> syn::Error {
+    let layout = parse_sql_literal_preserving_linebreaks(&input.sql);
+    if layout == sql {
+        return error;
+    }
+    let message = error.to_string();
+    match analyze_statement(built, input, &layout) {
+        Err(laid_out) if laid_out.to_string().lines().next() == message.lines().next() => {
+            syn::Error::new(error.span(), laid_out.to_string())
+        }
+        _ => error,
+    }
+}
+
+/// Execute the full `sql!` pipeline and return the generated `TokenStream`.
+pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error> {
+    // The statement is the literal's value, as Rust defines it.
+    let sql_str = input.sql.value();
+    let config = load_config()?;
+    let built = catalog_for(&config, input.db_name.as_ref())?;
+    let resolved = &built.resolved;
+
+    let analyzed = match analyze_statement(&built, &input, &sql_str) {
+        Ok(analyzed) => analyzed,
+        Err(error) => return Err(with_source_layout(error, &built, &input, &sql_str)),
     };
 
     // A native `$1` placeholder is a valid PG parameter, but it has no name
@@ -609,6 +710,28 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
                 p.name
             ),
         ));
+    }
+
+    // An argument binds its parameter once: a second one would be ignored.
+    for (i, (assignment, span)) in input
+        .assignments
+        .iter()
+        .zip(&input.assignment_spans)
+        .enumerate()
+    {
+        if input.assignments[..i]
+            .iter()
+            .any(|a| a.name == assignment.name)
+        {
+            return Err(syn::Error::new(
+                *span,
+                format!(
+                    "parameter `{}` is bound more than once: an argument binds its parameter \
+                     once",
+                    assignment.name
+                ),
+            ));
+        }
     }
 
     // 4. Validate that all assignments match SQL params/spreads.
@@ -694,7 +817,45 @@ pub fn expand(input: QueryInput) -> Result<proc_macro2::TokenStream, syn::Error>
 
 #[cfg(test)]
 mod catalog_tests {
-    use super::get_or_build_pg_catalog;
+    use std::rc::Rc;
+
+    use super::{AnalysisSettings, get_or_build_pg_catalog};
+
+    fn settings() -> AnalysisSettings {
+        AnalysisSettings {
+            finite: Vec::new(),
+            simplify: typedpg_analyzer::SimplifyOptions::default(),
+        }
+    }
+
+    /// Every query of a database shares one catalog, even when the queries
+    /// of two databases alternate: cloning or rebuilding the catalog per
+    /// query cost more than analyzing it.
+    #[test]
+    fn queries_share_the_catalog_across_databases() {
+        let a = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("0001_a.sql"), "CREATE TABLE a ();").unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(b.path().join("0001_b.sql"), "CREATE TABLE b ();").unwrap();
+        let first_a = get_or_build_pg_catalog(&[a.path()], "share-a", true, settings()).unwrap();
+        let first_b = get_or_build_pg_catalog(&[b.path()], "share-b", true, settings()).unwrap();
+        let again_a = get_or_build_pg_catalog(&[a.path()], "share-a", true, settings()).unwrap();
+        let again_b = get_or_build_pg_catalog(&[b.path()], "share-b", true, settings()).unwrap();
+        assert!(Rc::ptr_eq(&first_a, &again_a));
+        assert!(Rc::ptr_eq(&first_b, &again_b));
+        assert!(!Rc::ptr_eq(&first_a, &first_b));
+
+        // Other settings: the same migrations, configured apart.
+        let no_simplify = AnalysisSettings {
+            simplify: typedpg_analyzer::SimplifyOptions {
+                enabled: false,
+                ..typedpg_analyzer::SimplifyOptions::default()
+            },
+            ..settings()
+        };
+        let other = get_or_build_pg_catalog(&[a.path()], "share-a", true, no_simplify).unwrap();
+        assert!(!Rc::ptr_eq(&first_a, &other));
+    }
 
     /// The macro reads the migrations at expansion time, so Cargo must
     /// learn the crate depends on them: without that, a change to one
@@ -739,11 +900,11 @@ mod catalog_tests {
             "CREATE VIEW v AS\n    SELECT idd FROM t;\n",
         )
         .unwrap();
-        let first = get_or_build_pg_catalog(&[dir.as_path()], "failing", true)
+        let first = get_or_build_pg_catalog(&[dir.as_path()], "failing", true, settings())
             .err()
             .expect("the migration fails")
             .to_string();
-        let second = get_or_build_pg_catalog(&[dir.as_path()], "failing", true)
+        let second = get_or_build_pg_catalog(&[dir.as_path()], "failing", true, settings())
             .err()
             .expect("the failure is cached")
             .to_string();

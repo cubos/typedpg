@@ -294,6 +294,7 @@ function dbErrorOf(e: unknown): MachineDbError {
     position?: unknown;
     internalPosition?: unknown;
     internalQuery?: unknown;
+    where?: unknown;
     code?: unknown;
   };
   return {
@@ -305,6 +306,7 @@ function dbErrorOf(e: unknown): MachineDbError {
     position: optionalInteger(error.position),
     internalPosition: optionalInteger(error.internalPosition),
     internalQuery: typeof error.internalQuery === "string" ? error.internalQuery : null,
+    context: typeof error.where === "string" ? error.where : null,
   };
 }
 

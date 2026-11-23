@@ -89,3 +89,23 @@ async fn a_subscripted_array_parameter_reads_its_element() {
         assert_eq!(rows.len(), found, "{label}");
     }
 }
+
+/// An array field of a record reads its NULL elements as an array column
+/// does.
+#[tokio::test]
+async fn an_array_field_of_a_record_reads_null_elements() {
+    let pool = common::setup().await;
+    let row = sql!(
+        &pool,
+        "SELECT ROW(ARRAY[1, NULL], ARRAY['a']) AS r, ROW(ARRAY[NULL::text]::text[]) AS c"
+    )
+    .fetch_one()
+    .await
+    .expect("record with array fields");
+    let elems: Vec<Option<i32>> = row.r.f1;
+    assert_eq!(elems, [Some(1), None]);
+    let texts: Vec<String> = row.r.f2;
+    assert_eq!(texts, ["a"]);
+    let casted: Vec<Option<String>> = row.c.f1;
+    assert_eq!(casted, [None]);
+}

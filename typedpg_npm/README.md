@@ -522,7 +522,8 @@ const rows = await sql("SELECT name FROM users WHERE id IN $..ids").fetchAll(poo
 // $ids: readonly number[]
 ```
 
-An empty spread or list still runs as SQL would; above 1000 items a list is
+An empty spread or list still runs as SQL would; above 1000 items (or fewer,
+when their placeholders would pass 65535 parameters) a list is
 bound as one array and a rows spread as one array per field. The
 [Queries](#queries) section has both.
 
@@ -754,7 +755,8 @@ The SQL can be anything PostgreSQL accepts: CTEs, window functions,
   generic plan — a `Driver` of your own reusing a prepared statement —
   where PostgreSQL prunes partitions only for it and estimates its rows
   from its length instead of assuming 10 elements.
-- **Large spreads**: above 1000 items, a list is bound as one array —
+- **Large spreads**: above 1000 items (or fewer, when their placeholders
+  would pass 65535 parameters), a list is bound as one array —
   `(id = ANY($1::type[]))` — and a `VALUES` of one rows spread as `SELECT *
   FROM unnest($1::type1[], …)`, a parameter per field: faster, and past
   PostgreSQL's 65535-parameter limit. Only where the analyzer proves it the

@@ -31,7 +31,7 @@
 //! ```toml
 //! # Cargo.toml
 //! [build-dependencies]
-//! typedpg = "0.1"
+//! typedpg = "0.8"
 //! ```
 
 use std::path::{Path, PathBuf};

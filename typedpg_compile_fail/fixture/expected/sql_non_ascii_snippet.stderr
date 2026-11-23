@@ -1,0 +1,13 @@
+error: column "nme" does not exist
+         ╭────
+       1 │ SELECT 'ação' AS rótulo, nme FROM users
+         ·                          ─┬─
+         ·                           ╰─ column does not exist
+         ╰────
+         help: Perhaps you meant to reference the column "users.name".
+       
+ --> src/bin/sql_non_ascii_snippet.rs:5:23
+  |
+5 |     typedpg::sql!(db, "SELECT 'ação' AS rótulo, nme FROM users")
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+

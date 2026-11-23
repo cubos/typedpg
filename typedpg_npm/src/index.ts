@@ -177,9 +177,13 @@ export type ValuesItem = readonly ["row", readonly SqlPiece[]] | readonly ["rows
  * one rows spread) is written in it — `(x = ANY($1::type[]))`, `SELECT *
  * FROM unnest($1::type[], …) AS __typedpg_rows (column1, …)`: a parameter
  * per field, whatever the number of items. The analysis offers the form
- * only where it is the same query.
+ * only where it is the same query. At or below it too when its
+ * placeholders would pass the spread's share of {@link MAX_PARAMS}.
  */
 const ARRAY_THRESHOLD = 1000;
+
+/** The most parameters a query can bind: the Bind message counts them in 16 bits. */
+const MAX_PARAMS = 65535;
 
 /** What the generator writes for each query: the SQL to run and the codecs. */
 export interface QuerySpec {
@@ -352,6 +356,11 @@ class QueryImpl {
       }
       return list as readonly unknown[];
     };
+    // Each spread's share of the parameters: within it, the spreads with an
+    // array form never make the query pass the limit (the Rust runtime's
+    // `spread_budget`).
+    const budget = Math.floor(Math.max(0, MAX_PARAMS - spec.params.length) / Math.max(1, spec.spreads?.length ?? 0));
+    const asArrays = (length: number, width: number) => length > ARRAY_THRESHOLD || length * width > budget;
     const write = (pieces: readonly SqlPiece[]): string =>
       pieces
         .map((piece) => {
@@ -360,7 +369,7 @@ class QueryImpl {
             const [, i, cast, empty, lead = "", keyword = "", op, arrayCast] = piece;
             const codec = spec.spreads![i]![1][0]![1];
             const list = items(i);
-            if (op !== undefined && arrayCast !== undefined && list.length > ARRAY_THRESHOLD) {
+            if (op !== undefined && arrayCast !== undefined && asArrays(list.length, 1)) {
               return `(${lead}${op}(${placeholder(() => spread(i), ["array", codec], list, arrayCast)}))`;
             }
             const written =
@@ -369,7 +378,7 @@ class QueryImpl {
           }
           const [, rows, empty, unnest] = piece;
           const only = rows.length === 1 && rows[0]![0] === "rows" ? rows[0]![1] : undefined;
-          if (unnest !== undefined && only !== undefined && items(only).length > ARRAY_THRESHOLD) {
+          if (unnest !== undefined && only !== undefined && asArrays(items(only).length, unnest.length)) {
             const values = items(only) as readonly Record<string, unknown>[];
             const arrays = spec.spreads![only]![1].map(([field, codec], c) =>
               placeholder(
