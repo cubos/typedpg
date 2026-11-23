@@ -58,6 +58,9 @@ pub(crate) struct Transaction {
     /// A statement that takes a snapshot ran (`FirstSnapshotSet`): the
     /// transaction can no longer become read-write.
     queried: bool,
+    /// `XactIsoLevel`, as its GUC spells it; `None` is the default
+    /// (`read committed`).
+    isolation: Option<String>,
 }
 
 impl Transaction {
@@ -84,6 +87,7 @@ impl Transaction {
             savepoints: Vec::new(),
             read_only: false,
             queried: false,
+            isolation: None,
         }
     }
 
@@ -142,8 +146,20 @@ impl Transaction {
                 if let Some(read_only) = read_only_setting(v) {
                     self.read_only = read_only;
                 }
+                if let Some(level) = isolation_setting(v) {
+                    self.isolation = Some(level);
+                }
             }
-            ast::Node::TransactionStmt(_) | ast::Node::VariableShowStmt(_) => {}
+            // PlannedStmtRequiresSnapshot: these run without a snapshot.
+            ast::Node::TransactionStmt(_)
+            | ast::Node::VariableShowStmt(_)
+            | ast::Node::LockStmt(_)
+            | ast::Node::ConstraintsSetStmt(_)
+            | ast::Node::FetchStmt(_)
+            | ast::Node::ListenStmt(_)
+            | ast::Node::NotifyStmt(_)
+            | ast::Node::UnlistenStmt(_)
+            | ast::Node::CheckPointStmt(_) => {}
             _ => self.queried = true,
         }
     }
@@ -151,14 +167,72 @@ impl Transaction {
     /// `SET TRANSACTION READ WRITE` / `SET transaction_read_only = off`
     /// after the transaction took its snapshot (check_transaction_read_only).
     pub(crate) fn check_setting(&self, stmt: &ast::Node) -> Result<(), DdlError> {
-        if let ast::Node::VariableSetStmt(v) = stmt
-            && read_only_setting(v) == Some(false)
-            && self.read_only
-            && self.queried
+        let ast::Node::VariableSetStmt(v) = stmt else {
+            return Ok(());
+        };
+        // `SET TRANSACTION` applies its options in order, each through its
+        // GUC's check hook.
+        let multi =
+            v.kind == VariableSetKind::VarSetMulti && v.name.eq_ignore_ascii_case("TRANSACTION");
+        let options: Vec<&ast::DefElem> = v
+            .args
+            .iter()
+            .filter(|_| multi)
+            .filter_map(|arg| match arg.as_ref() {
+                Some(ast::Node::DefElem(de)) => Some(&**de),
+                _ => None,
+            })
+            .collect();
+        let named =
+            |guc: &str| v.kind == VariableSetKind::VarSetValue && v.name.eq_ignore_ascii_case(guc);
+        let mut isolation_changes: Vec<String> = options
+            .iter()
+            .filter(|de| de.defname == "transaction_isolation")
+            .filter_map(|de| isolation_value(de.arg.as_ref()))
+            .collect();
+        if named("transaction_isolation")
+            && let [arg] = v.args.as_slice()
+            && let Some(level) = isolation_value(arg.as_ref())
         {
+            isolation_changes.push(level);
+        }
+        let deferrable = options
+            .iter()
+            .any(|de| de.defname == "transaction_deferrable")
+            || named("transaction_deferrable");
+        let subtransaction = !self.savepoints.is_empty();
+        let current = self.isolation.as_deref().unwrap_or("read committed");
+        // check_transaction_isolation: only a change is checked.
+        if isolation_changes.iter().any(|level| level != current) {
+            if self.queried {
+                return Err(DdlError::UnsupportedDdl(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query".into(),
+                ));
+            }
+            if subtransaction {
+                return Err(DdlError::UnsupportedDdl(
+                    "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction".into(),
+                ));
+            }
+        }
+        if read_only_setting(v) == Some(false) && self.read_only && self.queried {
             return Err(DdlError::UnsupportedDdl(
                 "transaction read-write mode must be set before any query".into(),
             ));
+        }
+        // check_transaction_deferrable: whatever the value.
+        if deferrable {
+            if subtransaction {
+                return Err(DdlError::UnsupportedDdl(
+                    "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction"
+                        .into(),
+                ));
+            }
+            if self.queried {
+                return Err(DdlError::UnsupportedDdl(
+                    "SET TRANSACTION [NOT] DEFERRABLE must be called before any query".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -178,10 +252,12 @@ impl Transaction {
                 // implicit block becomes an explicit one.
                 self.block = Block::Explicit;
                 for option in &stmt.options {
-                    if let Some(ast::Node::DefElem(de)) = option.as_ref()
-                        && de.defname == "transaction_read_only"
-                    {
-                        self.read_only = def_elem_true(de);
+                    if let Some(ast::Node::DefElem(de)) = option.as_ref() {
+                        if de.defname == "transaction_read_only" {
+                            self.read_only = def_elem_true(de);
+                        } else if de.defname == "transaction_isolation" {
+                            self.isolation = isolation_value(de.arg.as_ref());
+                        }
                     }
                 }
             }
@@ -273,6 +349,7 @@ impl Transaction {
             self.block = Block::Explicit;
         } else {
             self.read_only = false;
+            self.isolation = None;
             self.block = if self.multi {
                 Block::Implicit
             } else {
@@ -325,6 +402,40 @@ fn def_elem_true(de: &typedpg_pg_query::ast::DefElem) -> bool {
         Some(ast::Node::Integer(i)) => i.ival != 0,
         _ => true,
     }
+}
+
+/// An isolation level as `transaction_isolation` spells it.
+fn isolation_value(arg: Option<&ast::Node>) -> Option<String> {
+    match arg? {
+        ast::Node::AConst(c) => match c.val.as_ref()? {
+            ast::AConstValue::String(s) => Some(s.sval.to_ascii_lowercase()),
+            _ => None,
+        },
+        ast::Node::String(s) => Some(s.sval.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// What a `SET` does to `transaction_isolation`: `SET TRANSACTION
+/// ISOLATION LEVEL ...` or `SET transaction_isolation = ...`.
+fn isolation_setting(v: &typedpg_pg_query::ast::VariableSetStmt) -> Option<String> {
+    if v.kind == VariableSetKind::VarSetMulti && v.name.eq_ignore_ascii_case("TRANSACTION") {
+        return v.args.iter().rev().find_map(|arg| match arg.as_ref() {
+            Some(ast::Node::DefElem(de)) if de.defname == "transaction_isolation" => {
+                isolation_value(de.arg.as_ref())
+            }
+            _ => None,
+        });
+    }
+    if v.kind == VariableSetKind::VarSetValue
+        && v.name.eq_ignore_ascii_case("transaction_isolation")
+    {
+        let [arg] = v.args.as_slice() else {
+            return None;
+        };
+        return isolation_value(arg.as_ref());
+    }
+    None
 }
 
 /// What a `SET` does to `transaction_read_only`: `SET TRANSACTION [READ

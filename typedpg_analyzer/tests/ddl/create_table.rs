@@ -2835,3 +2835,57 @@ fn rows_route_by_the_key_types_values() {
         "got: {err}"
     );
 }
+
+#[test]
+fn stored_expressions_and_columns_reject_what_ddl_cannot_hold() {
+    // PG 19: BuildDescForRelation / ATExecAddColumn refuse a SETOF column
+    // (42P16); transformParamRef has no hook in DDL (42P02).
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE TABLE e (c SETOF int);",
+            "column \"c\" cannot be declared SETOF",
+        ),
+        (
+            "CREATE TABLE e (c int);",
+            "ALTER TABLE e ADD COLUMN s SETOF int;",
+            "column \"s\" cannot be declared SETOF",
+        ),
+        (
+            "",
+            "CREATE TYPE c AS (x SETOF int);",
+            "column \"x\" cannot be declared SETOF",
+        ),
+        (
+            "",
+            "CREATE TABLE e (c int DEFAULT $1);",
+            "there is no parameter $1",
+        ),
+        (
+            "",
+            "CREATE TABLE e (c int CHECK (c > $2));",
+            "there is no parameter $2",
+        ),
+        (
+            "",
+            "CREATE DOMAIN d AS int DEFAULT $1;",
+            "there is no parameter $1",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(a int, b int DEFAULT $1) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "there is no parameter $1",
+        ),
+        (
+            "CREATE TABLE e (c int);",
+            "CREATE INDEX ON e ((c + $1));",
+            "there is no parameter $1",
+        ),
+    ]);
+    // ALTER COLUMN TYPE and a domain take a SETOF type name as the type.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE e (c int); ALTER TABLE e ALTER COLUMN c TYPE SETOF int;
+         CREATE DOMAIN d AS SETOF int;",
+    )]);
+}

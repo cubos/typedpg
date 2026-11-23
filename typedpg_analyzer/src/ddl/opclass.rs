@@ -1164,10 +1164,16 @@ pub(crate) fn resolve_opclass(
         };
         return Ok(found.oid);
     }
+    // ResolveOpClass: LookupExplicitNamespace, then the class, named as
+    // written (NameListToString).
     let (schema, name) = split_name(opclass);
+    if let Some(schema) = &schema {
+        super::util::existing_namespace(interp, schema)?;
+    }
     let Some(found) = find_opclass(interp, schema.as_deref(), &name, am) else {
         return Err(DdlError::TypeNotFound(format!(
-            "operator class \"{name}\" does not exist for access method \"{am}\""
+            "operator class \"{}\" does not exist for access method \"{am}\"",
+            written(opclass)
         )));
     };
     check_opclass_accepts(interp, found, typ)?;

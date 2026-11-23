@@ -61,6 +61,11 @@ for a column not yet `NOT NULL` and without a `CHECK` that is:
 - exactly `col IS NOT NULL`, or an `AND` with `col IS NOT NULL` as one of its
   terms. `NOT col IS NULL` or `col IS NOT NULL OR …` don't count.
 
+`ADD COLUMN … GENERATED ALWAYS AS (…) VIRTUAL NOT NULL` on such a table is
+reported too: nothing stores the column, so PostgreSQL computes it for every
+row to check it, under the same lock. Add the column without `NOT NULL`,
+then follow the three migrations above.
+
 The children of an inheritance parent (unless the statement says `ONLY`)
 and the partitions of a partitioned table are checked the same way: a
 `NO INHERIT` check proves the column on its own table only, and a

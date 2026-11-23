@@ -284,29 +284,38 @@ async function drive(d: Driver, set: MigrationSet, action: MachineAction): Promi
   }
 }
 
-/** The details `formatPgError` used to read, as the machine's `DbError`. */
+/**
+ * The details `formatPgError` used to read, as the machine's `DbError`.
+ * node-postgres names the fields in camelCase; postgres.js after the
+ * protocol (`internal_position`, `internal_query`), with the localized
+ * severity — the one psql shows — as `severity_local`.
+ */
 function dbErrorOf(e: unknown): MachineDbError {
   const error = e as {
     message?: unknown;
     severity?: unknown;
+    severity_local?: unknown;
     detail?: unknown;
     hint?: unknown;
     position?: unknown;
     internalPosition?: unknown;
+    internal_position?: unknown;
     internalQuery?: unknown;
+    internal_query?: unknown;
     where?: unknown;
     code?: unknown;
   };
+  const text = (...values: unknown[]) => (values.find((v) => typeof v === "string") as string | undefined) ?? null;
   return {
-    code: typeof error.code === "string" ? error.code : null,
+    code: text(error.code),
     message: typeof error.message === "string" ? error.message : String(e),
-    severity: typeof error.severity === "string" ? error.severity : null,
-    detail: typeof error.detail === "string" ? error.detail : null,
-    hint: typeof error.hint === "string" ? error.hint : null,
+    severity: text(error.severity_local, error.severity),
+    detail: text(error.detail),
+    hint: text(error.hint),
     position: optionalInteger(error.position),
-    internalPosition: optionalInteger(error.internalPosition),
-    internalQuery: typeof error.internalQuery === "string" ? error.internalQuery : null,
-    context: typeof error.where === "string" ? error.where : null,
+    internalPosition: optionalInteger(error.internalPosition) ?? optionalInteger(error.internal_position),
+    internalQuery: text(error.internalQuery, error.internal_query),
+    context: text(error.where),
   };
 }
 

@@ -243,6 +243,7 @@ pub(crate) enum AclObjectKind {
     Schema,
     Type,
     Language,
+    LargeObject,
 }
 
 impl AclObjectKind {
@@ -254,6 +255,7 @@ impl AclObjectKind {
             AclObjectKind::Schema => bits::SCHEMA,
             AclObjectKind::Type => bits::TYPE,
             AclObjectKind::Language => bits::LANGUAGE,
+            AclObjectKind::LargeObject => bits::LARGEOBJECT,
         }
     }
 
@@ -267,6 +269,7 @@ impl AclObjectKind {
             AclObjectKind::Schema => (0, bits::SCHEMA),
             AclObjectKind::Type => (bits::USAGE, bits::TYPE),
             AclObjectKind::Language => (bits::USAGE, bits::LANGUAGE),
+            AclObjectKind::LargeObject => (0, bits::LARGEOBJECT),
         }
     }
 }
@@ -282,6 +285,7 @@ pub(crate) enum DefaultAclClass {
     Function,
     Type,
     Schema,
+    LargeObject,
 }
 
 impl DefaultAclClass {
@@ -294,6 +298,7 @@ impl DefaultAclClass {
             | ObjectType::ObjectRoutine => DefaultAclClass::Function,
             ObjectType::ObjectType | ObjectType::ObjectDomain => DefaultAclClass::Type,
             ObjectType::ObjectSchema => DefaultAclClass::Schema,
+            ObjectType::ObjectLargeobject => DefaultAclClass::LargeObject,
             _ => return None,
         })
     }
@@ -305,6 +310,7 @@ impl DefaultAclClass {
             DefaultAclClass::Function => AclObjectKind::Function,
             DefaultAclClass::Type => AclObjectKind::Type,
             DefaultAclClass::Schema => AclObjectKind::Schema,
+            DefaultAclClass::LargeObject => AclObjectKind::LargeObject,
         }
     }
 
@@ -317,6 +323,7 @@ impl DefaultAclClass {
             DefaultAclClass::Function => 'f',
             DefaultAclClass::Type => 'T',
             DefaultAclClass::Schema => 'n',
+            DefaultAclClass::LargeObject => 'L',
         }
     }
 }
@@ -1255,7 +1262,11 @@ pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
     for target in &targets {
         check_target(interp, objtype, target, &privileges)?;
     }
-    check_grant_option(stmt, &grantees)?;
+    // merge_acl_with_grant checks the grant option per object: `ALL … IN
+    // SCHEMA` finding none checks nothing.
+    if !(targtype == GrantTargetType::AclTargetAllInSchema && targets.is_empty()) {
+        check_grant_option(stmt, &grantees)?;
+    }
     let behavior = stmt.behavior;
     let current = current_role(interp);
     // select_best_grantor (PostgreSQL 19): `GRANTED BY` names the grantor,
@@ -2481,6 +2492,7 @@ fn default_acl_noun(class: DefaultAclClass) -> &'static str {
         DefaultAclClass::Function => "functions",
         DefaultAclClass::Type => "types",
         DefaultAclClass::Schema => "schemas",
+        DefaultAclClass::LargeObject => "large objects",
     }
 }
 

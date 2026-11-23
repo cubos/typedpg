@@ -1188,10 +1188,26 @@ impl MigrationLinter<'_> {
         };
         let mut columns = Vec::new();
         let mut set_not_null = false;
+        let mut virtual_columns = Vec::new();
         for command in &alter.cmds {
             let Some(command) = alter_command(command.as_ref()) else {
                 continue;
             };
+            // A new virtual generated column declared NOT NULL has its
+            // expression checked over every row (ATExecAddColumn sets
+            // verify_new_notnull): no rewrite, but a scan. Nothing proves a
+            // new column NOT NULL beforehand.
+            if command.subtype == AlterTableType::AtAddColumn
+                && let Some(N::ColumnDef(column)) = command.def.as_ref()
+                && virtual_not_null(column)
+                && !catalog
+                    .attributes_of(relid)
+                    .iter()
+                    .any(|attribute| attribute.attname == column.colname)
+            {
+                virtual_columns.push(quote_identifier(&column.colname));
+                continue;
+            }
             // `ADD [CONSTRAINT name] NOT NULL column` is SET NOT NULL with a
             // name: it scans the same way, unless NOT VALID.
             let named: Vec<&str> = match (command.subtype, command.def.as_ref()) {
@@ -1226,6 +1242,22 @@ impl MigrationLinter<'_> {
                 }
             }
         }
+        let mut out = Vec::new();
+        if !virtual_columns.is_empty() {
+            out.push(RawFinding {
+                span: 0..0,
+                message: format!(
+                    "adding a NOT NULL virtual generated column scans every row of {table} under \
+                     a lock"
+                ),
+                help: Some(format!(
+                    "add the column without NOT NULL, then CHECK ({} IS NOT NULL) NOT VALID, \
+                     VALIDATE it, then SET NOT NULL",
+                    virtual_columns.join(" IS NOT NULL AND ")
+                )),
+                fix: Vec::new(),
+            });
+        }
         if !columns.is_empty() {
             let primary_key = alter.cmds.iter().any(|command| {
                 alter_command(command.as_ref()).is_some_and(|command| {
@@ -1243,7 +1275,7 @@ impl MigrationLinter<'_> {
             } else {
                 "adding a NOT NULL constraint"
             };
-            vec![RawFinding {
+            out.push(RawFinding {
                 span: 0..0,
                 message: format!("{what} scans every row of {table} under a lock"),
                 help: Some(format!(
@@ -1251,10 +1283,9 @@ impl MigrationLinter<'_> {
                     columns.join(" IS NOT NULL AND ")
                 )),
                 fix: Vec::new(),
-            }]
-        } else {
-            Vec::new()
+            });
         }
+        out
     }
 
     fn table_rewrite(
@@ -3521,6 +3552,22 @@ fn column_has_raw_default(column: &typedpg_pg_query::ast::ColumnDef) -> bool {
                     if constraint.contype == ConstrType::ConstrGenerated
             )
         })
+}
+
+/// A column definition generated VIRTUAL (the default without STORED) and
+/// declared NOT NULL.
+fn virtual_not_null(column: &typedpg_pg_query::ast::ColumnDef) -> bool {
+    let constraints = || {
+        column
+            .constraints
+            .iter()
+            .filter_map(|node| match node.as_ref() {
+                Some(N::Constraint(constraint)) => Some(constraint),
+                _ => None,
+            })
+    };
+    constraints().any(|c| c.contype == ConstrType::ConstrGenerated && c.generated_kind != "s")
+        && constraints().any(|c| c.contype == ConstrType::ConstrNotnull)
 }
 
 fn alter_command(node: Option<&Node>) -> Option<&typedpg_pg_query::ast::AlterTableCmd> {
@@ -8563,6 +8610,27 @@ mod tests {
         );
         let findings = oracle_second("ALTER TABLE t ADD CONSTRAINT t_v_nn NOT NULL v NOT VALID;");
         assert!(only(&findings, Rule::SetNotNullScan).is_empty());
+    }
+
+    #[test]
+    fn set_not_null_scan_reports_a_not_null_virtual_column() {
+        // PostgreSQL 19 checks a new virtual generated column's NOT NULL
+        // over every row (no rewrite); a stored one is computed by the
+        // rewrite, and a nullable virtual one needs nothing.
+        let findings = oracle_second(
+            "ALTER TABLE t ADD COLUMN x integer GENERATED ALWAYS AS (id + 1) VIRTUAL NOT NULL;",
+        );
+        assert_eq!(
+            messages(&findings, Rule::SetNotNullScan),
+            ["adding a NOT NULL virtual generated column scans every row of public.t under a lock"]
+        );
+        for sql in [
+            "ALTER TABLE t ADD COLUMN x integer GENERATED ALWAYS AS (id + 1) VIRTUAL;",
+            "ALTER TABLE t ADD COLUMN x integer GENERATED ALWAYS AS (id + 1) STORED NOT NULL;",
+        ] {
+            let findings = oracle_second(sql);
+            assert!(only(&findings, Rule::SetNotNullScan).is_empty(), "{sql}");
+        }
     }
 
     #[test]

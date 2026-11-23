@@ -1653,3 +1653,13 @@ fn a_view_selecting_a_field_of_a_row_depends_on_that_column() {
     }
     db.apply_sql("ALTER TABLE t DROP COLUMN b;").unwrap();
 }
+
+#[test]
+fn unlogged_materialized_view_is_rejected() {
+    // PG 19 transformCreateTableAsStmt: 0A000.
+    assert_ddl_rejections(&[(
+        "CREATE TABLE t (a int);",
+        "CREATE UNLOGGED MATERIALIZED VIEW mv AS SELECT a FROM t;",
+        "materialized views cannot be unlogged",
+    )]);
+}

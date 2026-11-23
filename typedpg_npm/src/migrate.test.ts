@@ -158,6 +158,75 @@ test("a drifted migration fails with the diff and how to accept it", async () =>
   assert.equal(driver.log.at(-1), "unlock");
 });
 
+// The same text psql 19 prints, and the Rust runner reports (its
+// `errors_are_reported_as_psql_reports_them` integration test), whichever
+// driver's field names the error carries.
+test("a database error is reported as psql reports it", async () => {
+  const failing = async (sql: string, error: object) => {
+    const driver = new ScriptedDriver(
+      (query) => (query.includes("advisory") ? [["t"]] : []),
+      (executed) => {
+        if (executed === sql) throw Object.assign(new Error("failed"), error);
+      },
+    );
+    try {
+      await migrate(driver, embedMigrations([["0002_bad", sql, null]]));
+    } catch (e) {
+      assert.ok(e instanceof MigrationError);
+      return e.message;
+    }
+    assert.fail("the migration did not fail");
+  };
+
+  const internal = {
+    message: 'column "nosuch" does not exist',
+    code: "42703",
+    where: "PL/pgSQL function f() line 3 at RETURN",
+  };
+  const expected =
+    'failed to apply migration 0002_bad: ERROR:  column "nosuch" does not exist\n' +
+    "LINE 1: (SELECT nosuch FROM t2)\n" +
+    "                ^\n" +
+    "QUERY:  (SELECT nosuch FROM t2)\n" +
+    "CONTEXT:  PL/pgSQL function f() line 3 at RETURN";
+  // node-postgres
+  assert.equal(
+    await failing("SELECT f();", {
+      ...internal,
+      severity: "ERROR",
+      internalPosition: "9",
+      internalQuery: "(SELECT nosuch FROM t2)",
+    }),
+    expected,
+  );
+  // postgres.js
+  assert.equal(
+    await failing("SELECT f();", {
+      ...internal,
+      severity: "ERROR",
+      severity_local: "ERROR",
+      internal_position: "9",
+      internal_query: "(SELECT nosuch FROM t2)",
+    }),
+    expected,
+  );
+
+  assert.equal(
+    await failing("DO $$ BEGIN RAISE EXCEPTION 'boom %', 42; END $$;", {
+      message: "boom 42",
+      code: "P0001",
+      severity: "ERROR",
+      detail: "the detail",
+      hint: "the hint",
+      where: "PL/pgSQL function inline_code_block line 3 at RAISE",
+    }),
+    "failed to apply migration 0002_bad: ERROR:  boom 42\n" +
+      "DETAIL:  the detail\n" +
+      "HINT:  the hint\n" +
+      "CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE",
+  );
+});
+
 const LF_FUNCTION = "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
 const CRLF_FUNCTION = LF_FUNCTION.replaceAll("\n", "\r\n");
 // LF_FUNCTION's hash as typedpg 0.6 to 0.8 stored it (`hash_version` 1).
@@ -221,7 +290,7 @@ test("a database error in a migration is rethrown with its line and as the cause
     assert.ok(e instanceof MigrationError);
     assert.equal(
       e.message,
-      'failed to apply migration 0001_bad: ERROR: syntax error at or near "TABL"\n' +
+      'failed to apply migration 0001_bad: ERROR:  syntax error at or near "TABL"\n' +
         "LINE 2: CREATE TABL bad (a int);\n" +
         "               ^",
     );
@@ -251,7 +320,7 @@ test("a database error's context is part of the failure", async () => {
     assert.ok(e instanceof MigrationError);
     assert.equal(
       e.message,
-      "failed to apply migration 0001_do: ERROR: boom\nCONTEXT: PL/pgSQL function inline_code_block line 1 at RAISE",
+      "failed to apply migration 0001_do: ERROR:  boom\nCONTEXT:  PL/pgSQL function inline_code_block line 1 at RAISE",
     );
     return true;
   });

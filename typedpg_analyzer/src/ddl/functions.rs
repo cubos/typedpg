@@ -306,7 +306,7 @@ fn interpret_func_support(interp: &PgCatalog, de: &DefElem) -> Result<PgProcOid,
         _ => Vec::new(),
     };
     let written = names.join(".");
-    let found = lookup_func_name(interp, &names, Some(&[INTERNAL]))?;
+    let found = lookup_func_name(interp, &names, Some(&[INTERNAL]), true)?;
     let Some(oid) = found else {
         return Err(DdlError::TypeNotFound(format!(
             "function {written}(internal) does not exist"
@@ -352,6 +352,51 @@ fn check_set_item(interp: &PgCatalog, item: &ast::Node) -> Result<(), DdlError> 
         };
         if let Some(value) = value {
             super::guc::check_value(interp, &setting, &value)?;
+            // The check hooks run too, in the statement's own transaction,
+            // which already took a snapshot: check_transaction_isolation
+            // refuses a change of level, check_transaction_deferrable any
+            // value.
+            let name = set.name.to_ascii_lowercase();
+            if name == "transaction_isolation" && !value.eq_ignore_ascii_case("read committed") {
+                return Err(DdlError::UnsupportedDdl(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query".into(),
+                ));
+            }
+            if name == "transaction_deferrable" {
+                return Err(DdlError::UnsupportedDdl(
+                    "SET TRANSACTION [NOT] DEFERRABLE must be called before any query".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// ProcedureCreate applies the routine's settings for its validator (when
+/// `check_function_bodies` is on) with GUC_ACTION_SAVE, which the
+/// GUC_NO_RESET parameters refuse.
+fn check_settings_apply(interp: &PgCatalog, set_items: &[&ast::Node]) -> Result<(), DdlError> {
+    if !interp.check_function_bodies.get() {
+        return Ok(());
+    }
+    for item in set_items {
+        let ast::Node::VariableSetStmt(set) = item else {
+            continue;
+        };
+        if !matches!(
+            set.kind,
+            VariableSetKind::VarSetValue | VariableSetKind::VarSetCurrent
+        ) {
+            continue;
+        }
+        let name = set.name.to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "transaction_isolation" | "transaction_read_only" | "transaction_deferrable"
+        ) {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "parameter \"{name}\" cannot be set locally in functions"
+            )));
         }
     }
     Ok(())
@@ -776,6 +821,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     } else {
         interp.procs_with_config.insert(proc.oid);
     }
+    check_settings_apply(interp, &attrs.common.set_items)?;
     // The language's validator, with the routine already in the catalog (a
     // recursive SQL function resolves).
     if language == "internal" {
@@ -1295,13 +1341,15 @@ fn funcname_get_candidates(
 }
 
 /// `LookupFuncName` with an exact argument list (`None` for "any"): the
-/// unique match, `None` when there's none.
+/// unique match, `None` when there's none. Without `missing_ok`, a
+/// qualified name's schema must exist (FuncnameGetCandidates).
 pub(crate) fn lookup_func_name(
     interp: &PgCatalog,
     names: &[String],
     args: Option<&[PgTypeOid]>,
+    missing_ok: bool,
 ) -> Result<Option<PgProcOid>, DdlError> {
-    let candidates = funcname_get_candidates(interp, names, false, true)?;
+    let candidates = funcname_get_candidates(interp, names, false, missing_ok)?;
     let mut found = candidates
         .iter()
         .filter(|c| args.is_none_or(|a| c.args == a));

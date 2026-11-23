@@ -737,18 +737,7 @@ fn compute_key_column(
         .filter(|n| !n.is_empty())
     {
         // get_collation_oid(attribute->collation, false).
-        collation = Some(
-            super::tables::partbound::collation_clause(db, names).ok_or_else(|| {
-                let written: Vec<&str> = names
-                    .iter()
-                    .filter_map(|n| super::util::node_string(n.as_ref()))
-                    .collect();
-                DdlError::TypeNotFound(format!(
-                    "collation \"{}\" for encoding \"UTF8\" does not exist",
-                    written.join(".")
-                ))
-            })?,
-        );
+        collation = Some(super::collations::collation_of_clause(db, names)?);
         let collatable = |t: crate::oid::PgTypeOid| {
             db.pg_type
                 .get(&db.unwrap_domain(t))
@@ -772,6 +761,24 @@ fn compute_key_column(
         )?),
         None => None,
     };
+    // The btree pattern operator classes compare bytes, which a
+    // nondeterministic collation can't (PostgreSQL 19's ComputeIndexAttrs).
+    if let Some(opc) = opclass.and_then(|o| db.pg_opclass.iter().find(|c| c.oid == o))
+        && opc.opcmethod == "btree"
+        && db.namespace_oid("pg_catalog") == Some(opc.opcnamespace)
+        && matches!(
+            opc.opcname.as_str(),
+            "text_pattern_ops" | "varchar_pattern_ops" | "bpchar_pattern_ops"
+        )
+        && collation
+            .and_then(|c| db.pg_collation.get(&c))
+            .is_some_and(|c| !c.collisdeterministic)
+    {
+        return Err(DdlError::UnsupportedDdl(format!(
+            "nondeterministic collations are not supported for operator class \"{}\"",
+            opc.opcname
+        )));
+    }
     let exclusion_op: Option<Vec<String>> = exclusion_op.map(|names| {
         names
             .iter()

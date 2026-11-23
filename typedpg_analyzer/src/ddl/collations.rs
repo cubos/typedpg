@@ -2,8 +2,9 @@
 //!
 //! Two PG variants:
 //! 1. `CREATE COLLATION name (LOCALE = '…' [, PROVIDER = 'libc'|'icu' …])` —
-//!    a fresh collation built from locale parameters. We don't model the
-//!    parameters; only the name + namespace round-trip.
+//!    a fresh collation built from locale parameters. The parameters are
+//!    checked as DefineCollation checks them, but for the locales a libc or
+//!    ICU provider would look up on the server.
 //! 2. `CREATE COLLATION name FROM existing_collation` — clones an existing
 //!    collation. We resolve the source name to confirm it exists; the new
 //!    row inherits its encoding.
@@ -26,66 +27,7 @@ const DATABASE_ENCODING: i32 = 6;
 pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError> {
     let (nsoid, name) = ensure_qualified_name(interp, &stmt.defnames)?;
 
-    // `CREATE COLLATION x FROM y` parses as a `DefElem { defname = "from",
-    // arg = List([String("y")]) }`; we use it to resolve the source and
-    // inherit its encoding. Option-style `(LOCALE = …, PROVIDER = …)`:
-    // a libc collation is for the database encoding, an ICU or builtin
-    // one for any (DefineCollation). `FROM` copies the source's
-    // `collisdeterministic`; an explicit `deterministic` overrides it.
-    let mut collencoding: i32 = DATABASE_ENCODING;
-    let mut deterministic = true;
-    for opt in &stmt.definition {
-        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
-            continue;
-        };
-        if de.defname.eq_ignore_ascii_case("deterministic") {
-            deterministic = super::session::def_get_boolean(de)?;
-        }
-        if de.defname.eq_ignore_ascii_case("provider") {
-            // defGetString: a bare word arrives as a type name.
-            let provider = match de.arg.as_ref() {
-                Some(ast::Node::String(s)) => Some(s.sval.as_str()),
-                Some(ast::Node::TypeName(tn)) => tn
-                    .names
-                    .last()
-                    .and_then(|n| super::util::node_string(n.as_ref())),
-                _ => None,
-            };
-            if provider.is_some_and(|p| !p.eq_ignore_ascii_case("libc")) {
-                collencoding = -1;
-            }
-        }
-        if de.defname.eq_ignore_ascii_case("from")
-            && let Some(arg) = de.arg.as_ref()
-        {
-            let parts: Vec<&str> = match arg {
-                ast::Node::List(list) => list
-                    .items
-                    .iter()
-                    .filter_map(|n| match n.as_ref()? {
-                        ast::Node::String(s) => Some(s.sval.as_str()),
-                        _ => None,
-                    })
-                    .collect(),
-                ast::Node::String(s) => vec![s.sval.as_str()],
-                _ => Vec::new(),
-            };
-            let (schema, src_name) = match parts.as_slice() {
-                [n] => (None, *n),
-                [s, n] => (Some(*s), *n),
-                _ => {
-                    return Err(DdlError::Parse("malformed collation source name".into()));
-                }
-            };
-            let source = interp.resolve_collation(schema, src_name).ok_or_else(|| {
-                DdlError::DependencyError(format!(
-                    "collation \"{src_name}\" for encoding \"UTF8\" does not exist"
-                ))
-            })?;
-            collencoding = source.collencoding;
-            deterministic = source.collisdeterministic;
-        }
-    }
+    let (collencoding, deterministic) = collation_parameters(interp, &stmt.definition)?;
 
     // CollationCreate: names are unique per schema — under the database
     // encoding, a name for any encoding clashes with one for this one.
@@ -116,6 +58,235 @@ pub fn define_collation(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(),
     });
     Ok(())
 }
+
+/// DefineCollation's reading of the attributes: the new collation's
+/// `(collencoding, collisdeterministic)`. `FROM y` copies the source's; a
+/// libc collation is for the database encoding, an ICU one for any, a
+/// builtin one for any (`C`) or UTF8 (`builtin_locale_encoding`). Locale
+/// names a libc or ICU provider would check against the server's locales
+/// are taken to exist.
+fn collation_parameters(
+    interp: &PgCatalog,
+    definition: &[Option<ast::Node>],
+) -> Result<(i32, bool), DdlError> {
+    const KNOWN: [&str; 8] = [
+        "from",
+        "locale",
+        "lc_collate",
+        "lc_ctype",
+        "provider",
+        "deterministic",
+        "rules",
+        "version",
+    ];
+    // Each attribute once; LOCALE apart from LC_COLLATE / LC_CTYPE; FROM
+    // alone.
+    let mut given: Vec<&ast::DefElem> = Vec::new();
+    for opt in definition {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        if !KNOWN.contains(&de.defname.as_str()) {
+            return Err(DdlError::Parse(format!(
+                "collation attribute \"{}\" not recognized",
+                de.defname
+            )));
+        }
+        if given.iter().any(|g| g.defname == de.defname) {
+            return Err(DdlError::Parse("conflicting or redundant options".into()));
+        }
+        given.push(de);
+    }
+    let get = |name: &str| given.iter().copied().find(|de| de.defname == name);
+    if get("locale").is_some() && (get("lc_collate").is_some() || get("lc_ctype").is_some()) {
+        return Err(DdlError::Parse(
+            "conflicting or redundant options (LOCALE cannot be specified together with \
+             LC_COLLATE or LC_CTYPE.)"
+                .into(),
+        ));
+    }
+    if get("from").is_some() && given.len() != 1 {
+        return Err(DdlError::Parse(
+            "conflicting or redundant options (FROM cannot be specified together with any \
+             other options.)"
+                .into(),
+        ));
+    }
+    if let Some(de) = get("from") {
+        // `CREATE COLLATION x FROM y` parses as a `DefElem { defname =
+        // "from", arg = List([String("y")]) }`.
+        let parts: Vec<&str> = match de.arg.as_ref() {
+            Some(ast::Node::List(list)) => list
+                .items
+                .iter()
+                .filter_map(|n| match n.as_ref()? {
+                    ast::Node::String(s) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            Some(ast::Node::String(s)) => vec![s.sval.as_str()],
+            _ => Vec::new(),
+        };
+        let (schema, src_name) = match parts.as_slice() {
+            [n] => (None, *n),
+            [s, n] => (Some(*s), *n),
+            _ => {
+                return Err(DdlError::Parse("malformed collation source name".into()));
+            }
+        };
+        let source = interp.resolve_collation(schema, src_name).ok_or_else(|| {
+            DdlError::DependencyError(format!(
+                "collation \"{src_name}\" for encoding \"UTF8\" does not exist"
+            ))
+        })?;
+        // The database's default collation (provider `d`) has nothing to
+        // copy.
+        if source.oid.get() == DEFAULT_COLLATION_OID {
+            return Err(DdlError::Parse(
+                "collation \"default\" cannot be copied".into(),
+            ));
+        }
+        return Ok((source.collencoding, source.collisdeterministic));
+    }
+    // defGetString: a value is required (a bare word arrives as a type
+    // name).
+    let string = |de: &ast::DefElem| -> Result<String, DdlError> {
+        match de.arg.as_ref() {
+            Some(ast::Node::String(s)) => Ok(s.sval.clone()),
+            Some(ast::Node::Integer(i)) => Ok(i.ival.to_string()),
+            Some(ast::Node::Float(f)) => Ok(f.fval.clone()),
+            Some(ast::Node::Boolean(b)) => Ok(b.boolval.to_string()),
+            Some(ast::Node::TypeName(tn)) => Ok(tn
+                .names
+                .iter()
+                .filter_map(|n| super::util::node_string(n.as_ref()))
+                .collect::<Vec<_>>()
+                .join(".")),
+            _ => Err(DdlError::Parse(format!(
+                "{} requires a parameter",
+                de.defname
+            ))),
+        }
+    };
+    let provider = get("provider").map(string).transpose()?;
+    let deterministic = get("deterministic")
+        .map(super::session::def_get_boolean)
+        .transpose()?
+        .unwrap_or(true);
+    let rules = get("rules").map(string).transpose()?;
+    if let Some(de) = get("version") {
+        string(de)?;
+    }
+    #[derive(PartialEq)]
+    enum Provider {
+        Builtin,
+        Icu,
+        Libc,
+    }
+    let provider = match provider.as_deref() {
+        None => Provider::Libc,
+        Some(p) if p.eq_ignore_ascii_case("builtin") => Provider::Builtin,
+        Some(p) if p.eq_ignore_ascii_case("icu") => Provider::Icu,
+        Some(p) if p.eq_ignore_ascii_case("libc") => Provider::Libc,
+        Some(p) => {
+            return Err(DdlError::Parse(format!(
+                "unrecognized collation provider: {p}"
+            )));
+        }
+    };
+    let locale = get("locale").map(string).transpose()?;
+    let lc_collate = get("lc_collate").map(string).transpose()?;
+    let lc_ctype = get("lc_ctype").map(string).transpose()?;
+    let missing = |name: &str| DdlError::Parse(format!("parameter \"{name}\" must be specified"));
+    let encoding = match provider {
+        Provider::Builtin => {
+            // builtin_validate_locale, then builtin_locale_encoding.
+            let locale = locale.ok_or_else(|| missing("locale"))?;
+            match locale.as_str() {
+                "C" => -1,
+                "C.UTF-8" | "C.UTF8" | "PG_UNICODE_FAST" => DATABASE_ENCODING,
+                _ => {
+                    return Err(DdlError::Parse(format!(
+                        "invalid locale name \"{locale}\" for builtin provider"
+                    )));
+                }
+            }
+        }
+        Provider::Libc => {
+            if locale.is_none() {
+                lc_collate.ok_or_else(|| missing("lc_collate"))?;
+                lc_ctype.ok_or_else(|| missing("lc_ctype"))?;
+            }
+            DATABASE_ENCODING
+        }
+        Provider::Icu => {
+            locale.ok_or_else(|| missing("locale"))?;
+            -1
+        }
+    };
+    if !deterministic && provider != Provider::Icu {
+        return Err(DdlError::UnsupportedDdl(
+            "nondeterministic collations not supported with this provider".into(),
+        ));
+    }
+    if rules.is_some() && provider != Provider::Icu {
+        return Err(DdlError::UnsupportedDdl(
+            "ICU rules cannot be specified unless locale provider is ICU".into(),
+        ));
+    }
+    Ok((encoding, deterministic))
+}
+
+/// A `COLLATE` clause's collation (get_collation_oid with missing_ok =
+/// false): `[catalog.][schema.]name` — the catalog taken to be the current
+/// database —, a missing schema reported as such (LookupExplicitNamespace),
+/// then a missing collation named as written (NameListToString).
+pub(crate) fn collation_of_clause(
+    interp: &PgCatalog,
+    names: &[Option<ast::Node>],
+) -> Result<PgCollationOid, DdlError> {
+    let parts: Vec<&str> = names
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    collation_of_parts(interp, &parts)
+}
+
+/// [`collation_of_clause`] for a name already split into its parts.
+pub(crate) fn collation_of_parts(
+    interp: &PgCatalog,
+    parts: &[&str],
+) -> Result<PgCollationOid, DdlError> {
+    let (schema, name) = match parts {
+        [n] => (None, *n),
+        [s, n] | [_, s, n] => (Some(*s), *n),
+        _ => {
+            return Err(DdlError::Parse(format!(
+                "improper qualified name (too many dotted names): {}",
+                parts.join(".")
+            )));
+        }
+    };
+    if let Some(s) = schema
+        && interp.namespace_oid(s).is_none()
+    {
+        return Err(DdlError::TableNotFound(format!(
+            "schema \"{s}\" does not exist"
+        )));
+    }
+    interp
+        .resolve_collation(schema, name)
+        .map(|c| c.oid)
+        .ok_or_else(|| {
+            DdlError::TypeNotFound(format!(
+                "collation \"{}\" for encoding \"UTF8\" does not exist",
+                parts.join(".")
+            ))
+        })
+}
+
+/// The database's default collation, `pg_collation.oid` 100.
+const DEFAULT_COLLATION_OID: u32 = 100;
 
 /// The collation a statement names (get_collation_oid): a missing schema
 /// is reported as such (LookupExplicitNamespace), then a missing

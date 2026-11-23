@@ -433,6 +433,9 @@ pub(crate) fn infer_type_cast(
         .and_then(|oid| snapshot.pg_cast.get(oid))
         .and_then(|c| c.castfunc);
     ctx.note_proc(cast_func);
+    if cast_func.is_none() {
+        ctx.note_io_coercion(inner_type.type_oid, target_oid);
+    }
     // A cast function is a FuncExpr in the plan: ExecInitFunc checks its
     // EXECUTE (`SELECT 1::mytype` fails when the cast's function is
     // revoked).

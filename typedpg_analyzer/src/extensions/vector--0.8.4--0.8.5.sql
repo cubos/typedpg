@@ -1,0 +1,1 @@
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION

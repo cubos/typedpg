@@ -249,6 +249,17 @@ fn drop_relation(
         _ => "table",
     };
 
+    // makeRangeVarFromNameList: at most `catalog.schema.relation`.
+    if names.len() > 3 {
+        return Err(DdlError::Parse(format!(
+            "improper relation name (too many dotted names): {}",
+            names
+                .iter()
+                .filter_map(|n| super::util::node_string(n.as_ref()))
+                .collect::<Vec<_>>()
+                .join(".")
+        )));
+    }
     let (schema, name) = extract_names(names, interp);
     let Some(nsoid) = interp.namespace_oid(&schema) else {
         if missing_ok {

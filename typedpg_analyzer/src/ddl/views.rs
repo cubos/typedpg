@@ -415,6 +415,11 @@ fn create_relation_as(
                  temporary {object}.)"
             )));
         }
+        if rv.relpersistence == "u" {
+            return Err(DdlError::UnsupportedDdl(
+                "materialized views cannot be unlogged".into(),
+            ));
+        }
     }
     if aliases.len() > resolved.columns.len() {
         return Err(DdlError::Parse(
@@ -709,20 +714,11 @@ pub fn refresh_materialized_view(
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let (schema, name) = super::util::range_var_names(rv, interp);
-    let class = interp
-        .namespace_oid(&schema)
-        .and_then(|ns| interp.class_by_qname.get(&(ns, name.clone())))
-        .and_then(|oid| interp.pg_class.get(oid));
-    match class {
-        None => Err(DdlError::TableNotFound(format!(
-            "relation \"{}\" does not exist",
-            if rv.schemaname.is_empty() {
-                name
-            } else {
-                crate::qualified_name::QualifiedName::new(&schema, &name).to_string()
-            }
-        ))),
+    // RangeVarGetRelidExtended: a missing schema, then a missing relation
+    // named as written.
+    let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    match interp.pg_class.get(&relid) {
+        None => Err(DdlError::Internal(format!("relation oid {relid} missing"))),
         Some(c) if c.relkind != RelKind::MaterializedView => Err(DdlError::Parse(format!(
             "\"{}\" is not a materialized view",
             c.relname

@@ -883,3 +883,32 @@ fn planning_an_expression_folds_its_constants() {
              c int2 GENERATED ALWAYS AS (40000) STORED);",
     )]);
 }
+
+#[test]
+fn generation_and_index_expressions_count_io_conversions() {
+    // PG 19 CheckMutability: a CoerceViaIO runs the source type's output
+    // function and the target's input function (timestamptz_out, date_out,
+    // timestamptz_in are STABLE).
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE TABLE e (c timestamptz, g text GENERATED ALWAYS AS (c::text) STORED);",
+            "generation expression is not immutable",
+        ),
+        (
+            "",
+            "CREATE TABLE e (c date, g text GENERATED ALWAYS AS (c::text) VIRTUAL);",
+            "generation expression is not immutable",
+        ),
+        (
+            "CREATE TABLE e (c text);",
+            "CREATE INDEX ON e ((c::timestamptz));",
+            "functions in index expression must be marked IMMUTABLE",
+        ),
+    ]);
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE e (c int, t text, g text GENERATED ALWAYS AS (c::text) STORED);
+         CREATE INDEX ON e ((t::int));",
+    )]);
+}

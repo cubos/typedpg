@@ -3323,6 +3323,29 @@ fn transaction_control_follows_the_transaction_block() {
             "BEGIN READ ONLY; SELECT 1; SET TRANSACTION READ WRITE; COMMIT;",
             "transaction read-write mode must be set before any query",
         ),
+        // check_transaction_isolation (a change only) and
+        // check_transaction_deferrable.
+        (
+            "CREATE TABLE u (a int); SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+        ),
+        (
+            "BEGIN; SAVEPOINT s; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ; COMMIT;",
+            "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1; \
+             SET transaction_isolation = 'read committed'; COMMIT;",
+            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+        ),
+        (
+            "SELECT 1; SET TRANSACTION DEFERRABLE;",
+            "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+        ),
+        (
+            "BEGIN; SAVEPOINT s; SET TRANSACTION NOT DEFERRABLE; COMMIT;",
+            "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction",
+        ),
         (
             "SET CONSTRAINTS nosuch IMMEDIATE;",
             "constraint \"nosuch\" does not exist",
@@ -3364,6 +3387,10 @@ fn transaction_control_follows_the_transaction_block() {
         "SET TRANSACTION READ ONLY;",
         "PREPARE TRANSACTION 'x';",
         "BEGIN; CREATE TABLE u (a int); COMMIT AND CHAIN; CREATE TABLE w (a int); COMMIT;",
+        "CREATE TABLE u (a int); SET TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1; \
+         SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; COMMIT;",
+        "BEGIN; LOCK TABLE t; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE DEFERRABLE; COMMIT;",
     ] {
         build_db(&[("0001.sql", setup), ("0002.sql", ok)]);
     }
@@ -10053,4 +10080,189 @@ fn plpgsql_cannot_copy_to_or_from_the_client() {
             msg,
         ),
     ]);
+}
+
+#[test]
+fn create_collation_checks_its_attributes_and_encoding() {
+    // PG 19 DefineCollation: a builtin collation is for any encoding (`C`)
+    // or UTF8 (6), an ICU one for any, a libc one for the database's.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE COLLATION b1 (provider = builtin, locale = 'C.UTF-8');
+         CREATE COLLATION b2 (provider = builtin, locale = 'C');
+         CREATE COLLATION b3 (provider = builtin, locale = 'PG_UNICODE_FAST');
+         CREATE COLLATION i1 (provider = icu, locale = 'und', rules = '&a<b');
+         CREATE COLLATION l1 (lc_collate = 'C', lc_ctype = 'C');
+         CREATE COLLATION f1 FROM b1;",
+    )]);
+    let encoding = |name: &str| db.resolve_collation(None, name).unwrap().collencoding;
+    assert_eq!([encoding("b1"), encoding("b2"), encoding("b3")], [6, -1, 6]);
+    assert_eq!([encoding("i1"), encoding("l1"), encoding("f1")], [-1, 6, 6]);
+    for (stmt, msg) in [
+        (
+            "CREATE COLLATION x (nope = 'a');",
+            "collation attribute \"nope\" not recognized",
+        ),
+        (
+            "CREATE COLLATION x (locale = 'C', locale = 'C');",
+            "conflicting or redundant options",
+        ),
+        (
+            "CREATE COLLATION x (locale = 'C', lc_collate = 'C');",
+            "conflicting or redundant options",
+        ),
+        (
+            "CREATE COLLATION x (provider = foo, locale = 'C');",
+            "unrecognized collation provider: foo",
+        ),
+        (
+            "CREATE COLLATION x (provider = builtin);",
+            "parameter \"locale\" must be specified",
+        ),
+        (
+            "CREATE COLLATION x (provider = icu);",
+            "parameter \"locale\" must be specified",
+        ),
+        (
+            "CREATE COLLATION x (lc_collate = 'C');",
+            "parameter \"lc_ctype\" must be specified",
+        ),
+        (
+            "CREATE COLLATION x (lc_ctype = 'C');",
+            "parameter \"lc_collate\" must be specified",
+        ),
+        (
+            "CREATE COLLATION x (provider = builtin, locale = 'c.utf-8');",
+            "invalid locale name \"c.utf-8\" for builtin provider",
+        ),
+        (
+            "CREATE COLLATION x (locale = 'C', deterministic = false);",
+            "nondeterministic collations not supported with this provider",
+        ),
+        (
+            "CREATE COLLATION x (locale = 'C', rules = '&a<b');",
+            "ICU rules cannot be specified unless locale provider is ICU",
+        ),
+        (
+            "CREATE COLLATION x FROM \"default\";",
+            "collation \"default\" cannot be copied",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+}
+
+#[test]
+fn btree_pattern_ops_refuse_a_nondeterministic_collation() {
+    // PG 19 ComputeIndexAttrs: 0A000 for the btree *_pattern_ops classes;
+    // hash ones and partition keys take the collation.
+    let setup =
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                 CREATE TABLE t (t text COLLATE ci, v varchar COLLATE ci, d text);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "CREATE INDEX ON t (t text_pattern_ops);",
+            "nondeterministic collations are not supported for operator class \"text_pattern_ops\"",
+        ),
+        (
+            setup,
+            "CREATE INDEX ON t (v varchar_pattern_ops);",
+            "nondeterministic collations are not supported for operator class \"varchar_pattern_ops\"",
+        ),
+        (
+            setup,
+            "CREATE INDEX ON t (d COLLATE ci text_pattern_ops);",
+            "nondeterministic collations are not supported for operator class \"text_pattern_ops\"",
+        ),
+        (
+            setup,
+            "CREATE INDEX ON t (lower(t) text_pattern_ops);",
+            "nondeterministic collations are not supported for operator class \"text_pattern_ops\"",
+        ),
+    ]);
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             CREATE INDEX ON t USING hash (t text_pattern_ops);
+             CREATE INDEX ON t (t COLLATE \"C\" text_pattern_ops);
+             CREATE INDEX ON t (t);
+             CREATE TABLE p (t text COLLATE ci) PARTITION BY RANGE (t text_pattern_ops);"
+        ),
+    )]);
+}
+
+#[test]
+fn publication_membership_goes_with_its_table_and_pins_its_columns() {
+    // PG 19 publication_add_relation: AUTO on the table, NORMAL on the
+    // column list's columns; RememberAllDependentForRebuilding refuses to
+    // retype a column a publication names (0A000).
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (id int PRIMARY KEY, a int, b int);
+         CREATE PUBLICATION p FOR TABLE t (id, a) WHERE (b > 0);
+         DROP TABLE t;",
+    )]);
+    let setup = "CREATE TABLE t (id int PRIMARY KEY, a int, b int);
+                 CREATE PUBLICATION p FOR TABLE t (id, a);
+                 CREATE PUBLICATION q FOR TABLE t WHERE (b > 0);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "ALTER TABLE t ALTER COLUMN a TYPE bigint;",
+            "cannot alter type of a column used by a publication WHERE clause",
+        ),
+        (
+            setup,
+            "ALTER TABLE t ALTER COLUMN b TYPE bigint;",
+            "cannot alter type of a column used by a publication WHERE clause",
+        ),
+        (
+            setup,
+            "ALTER TABLE t DROP COLUMN a;",
+            "cannot drop column a of table t because other objects depend on it",
+        ),
+    ]);
+}
+
+#[test]
+fn alter_column_type_transforms_using_first() {
+    // PG 19 transformAlterTableStmt transforms USING before
+    // ATPrepAlterColumnType checks the column.
+    assert_ddl_rejections(&[
+        (
+            "CREATE TABLE t (a int);",
+            "ALTER TABLE t ALTER COLUMN b TYPE text USING b::text;",
+            "column \"b\" does not exist",
+        ),
+        (
+            "CREATE TABLE p (a daterange); CREATE TABLE c () INHERITS (p);",
+            "ALTER TABLE c ALTER COLUMN a TYPE numeric USING a::numeric;",
+            "cannot cast type daterange to numeric",
+        ),
+        (
+            "CREATE TABLE t (a int);",
+            "ALTER TABLE t ALTER COLUMN b TYPE text;",
+            "column \"b\" of relation \"t\" does not exist",
+        ),
+    ]);
+}
+
+#[test]
+fn retyping_a_without_overlaps_column_adds_the_key_again() {
+    // PG 19 ATPostAlterTypeParse → transformIndexConstraint: 42804.
+    assert_ddl_rejections(&[(
+        "CREATE EXTENSION btree_gist;
+         CREATE TABLE r (id int, valid_at daterange, PRIMARY KEY (id, valid_at WITHOUT OVERLAPS));",
+        "ALTER TABLE r ALTER COLUMN valid_at TYPE text;",
+        "column \"valid_at\" in WITHOUT OVERLAPS is not a range or multirange type",
+    )]);
+    build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION btree_gist;
+         CREATE TABLE r (id int, valid_at daterange, PRIMARY KEY (id, valid_at WITHOUT OVERLAPS));
+         ALTER TABLE r ALTER COLUMN id TYPE bigint;",
+    )]);
 }

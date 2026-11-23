@@ -163,6 +163,7 @@ fn check_columns(
             };
             let name = match selections.iter().find(|(r, _)| std::ptr::eq(*r, cr)) {
                 Some((_, field)) => Some(*field),
+                None if whole_row_reference(interp, relid, cr) => Some(""),
                 None => cr
                     .fields
                     .last()
@@ -176,13 +177,35 @@ fn check_columns(
     refs.sort_by_key(|&(location, _)| location);
     let mut columns: Vec<(String, i16)> = Vec::new();
     for (_, name) in refs {
-        if let Some(attnum) = check_column_attnum(interp, relid, name)
+        // A whole-row reference is a Var of attno 0.
+        let attnum = if name.is_empty() {
+            Some(0)
+        } else {
+            check_column_attnum(interp, relid, name)
+        };
+        if let Some(attnum) = attnum
             && !columns.iter().any(|(_, a)| *a == attnum)
         {
             columns.push((name.to_owned(), attnum));
         }
     }
     columns
+}
+
+/// Whether a column reference of a CHECK expression of `relid` is the
+/// relation's whole row: `t` (no column of that name) or `t.*`.
+fn whole_row_reference(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    cr: &typedpg_pg_query::ast::ColumnRef,
+) -> bool {
+    let relname = relname_of(interp, relid);
+    match cr.fields.as_slice() {
+        [only] => super::util::node_string(only.as_ref())
+            .is_some_and(|n| n == relname && interp.attribute_by_name(relid, n).is_none()),
+        [.., star] => matches!(star, Some(typedpg_pg_query::ast::Node::AStar(_))),
+        [] => false,
+    }
 }
 
 /// The attnum of the column `name` a CHECK expression of `relid` reads: a
@@ -207,8 +230,9 @@ fn check_name_addition(
     relid: PgClassOid,
     expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> String {
+    // A whole-row reference has no name (get_attname of attno 0).
     match check_columns(interp, relid, expr).as_slice() {
-        [(one, _)] => one.clone(),
+        [(one, attnum)] if *attnum != 0 => one.clone(),
         _ => String::new(),
     }
 }
@@ -2244,7 +2268,9 @@ pub(crate) mod partidx;
 pub(crate) mod typed;
 
 use columns::*;
-pub(crate) use columns::{column_collation, domain_has_constraints, drop_column, type_collation};
+pub(crate) use columns::{
+    check_not_setof, column_collation, domain_has_constraints, drop_column, type_collation,
+};
 use constraints::*;
 pub(crate) use constraints::{check_unique_covers_partition_key, fold_constraint_attrs};
 

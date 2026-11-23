@@ -116,7 +116,9 @@ pub fn extract_names(names: &[Option<Node>], snapshot: &PgCatalog) -> (String, S
         .collect();
 
     match parts.as_slice() {
-        [schema, name] => ((*schema).to_owned(), (*name).to_owned()),
+        // `catalog.schema.name`: the catalog is taken to be the current
+        // database, which the analyzer has no name for.
+        [schema, name] | [_, schema, name] => ((*schema).to_owned(), (*name).to_owned()),
         [name] => {
             let found = snapshot
                 .resolve_table(None, name)
@@ -133,12 +135,6 @@ pub fn extract_names(names: &[Option<Node>], snapshot: &PgCatalog) -> (String, S
         }
         _ => ("public".to_owned(), String::new()),
     }
-}
-
-/// Extract a schema-qualified key from name nodes.
-pub fn names_key(names: &[Option<Node>], snapshot: &PgCatalog) -> QualifiedName {
-    let (schema, name) = extract_names(names, snapshot);
-    QualifiedName::new(schema, name)
 }
 
 /// Look up (or implicitly create) the OID of the named namespace.

@@ -13,7 +13,7 @@ use crate::pg_catalog::{
 };
 
 use super::DdlError;
-use super::util::{ensure_qualified_name, names_key, node_string};
+use super::util::{ensure_qualified_name, node_string};
 use crate::pg_catalog::PgCatalog;
 
 // ─── CREATE DOMAIN ──────────────────────────────────────────────────────────
@@ -43,26 +43,14 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .and_then(|t| t.typcollation);
     let domain_collation = match stmt.coll_clause.as_deref() {
         Some(coll) => {
-            let parts: Vec<&str> = coll
-                .collname
-                .iter()
-                .filter_map(|n| node_string(n.as_ref()))
-                .collect();
-            let (schema, cname) = match parts.as_slice() {
-                [n] => (None, *n),
-                [s, n] => (Some(*s), *n),
-                _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
-            };
-            let resolved = interp
-                .resolve_collation(schema, cname)
-                .ok_or_else(|| DdlError::Parse(format!("collation \"{cname}\" does not exist")))?;
+            let resolved = super::collations::collation_of_clause(interp, &coll.collname)?;
             if base_collation.is_none() {
                 return Err(DdlError::UnsupportedDdl(format!(
                     "collations are not supported by type {}",
                     super::util::format_type_for_message(interp, base_type_oid)
                 )));
             }
-            Some(resolved.oid)
+            Some(resolved)
         }
         None => base_collation,
     };
@@ -614,8 +602,22 @@ pub fn alter_domain(
             };
             if !found && !stmt.missing_ok {
                 return Err(DdlError::TypeNotFound(format!(
-                    "constraint \"{}\" of domain \"{name}\" does not exist",
-                    stmt.name
+                    "constraint \"{}\" of domain \"{}\" does not exist",
+                    stmt.name,
+                    parts.join("."),
+                )));
+            }
+            // AlterDomainValidateConstraint: only a CHECK has rows to verify.
+            // Both messages name the domain as written (TypeNameToString).
+            if stmt.subtype == AlterDomainType::AdValidateConstraint
+                && constraints
+                    .iter()
+                    .any(|c| c.name == stmt.name && c.kind != DomainConstraintKind::Check)
+            {
+                return Err(DdlError::Parse(format!(
+                    "constraint \"{}\" of domain \"{}\" is not a check constraint",
+                    stmt.name,
+                    parts.join("."),
                 )));
             }
         }
@@ -835,6 +837,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
             let typmod = crate::typmod::encode(interp, type_oid, tn)?;
             let collation = super::tables::column_collation(interp, cd, type_oid)?
                 .or_else(|| super::tables::type_collation(interp, type_oid));
+            super::tables::check_not_setof(cd)?;
             field_defs.push((
                 cd.colname.clone(),
                 type_oid,
@@ -994,17 +997,8 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
                 "range collation specified but subtype does not support collation".into(),
             ));
         }
-        let (schema, cname) = match coll {
-            [s, n] => (Some(s.as_str()), n.as_str()),
-            [n] => (None, n.as_str()),
-            _ => (None, ""),
-        };
-        let Some(c) = interp.resolve_collation(schema, cname) else {
-            return Err(DdlError::Parse(format!(
-                "collation \"{cname}\" for encoding \"UTF8\" does not exist"
-            )));
-        };
-        collation = Some(c.oid);
+        let parts: Vec<&str> = coll.iter().map(String::as_str).collect();
+        collation = Some(super::collations::collation_of_parts(interp, &parts)?);
     }
     // The subtype's btree operator class: the one named, else its default.
     let subtype_opclass = match subtype_opclass.as_deref() {
@@ -1275,7 +1269,7 @@ fn range_support_function(
     names: &[String],
     args: &[PgTypeOid],
 ) -> Result<PgProcOid, DdlError> {
-    super::functions::lookup_func_name(interp, names, Some(args))?.ok_or_else(|| {
+    super::functions::lookup_func_name(interp, names, Some(args), true)?.ok_or_else(|| {
         DdlError::TypeNotFound(format!(
             "function {} does not exist",
             super::functions::func_signature_string(interp, names, args)
@@ -1296,23 +1290,15 @@ fn make_multirange_type_name(range_name: &str) -> String {
 // ─── ALTER TYPE ... ADD VALUE (enum) ────────────────────────────────────────
 
 pub fn alter_enum(interp: &mut PgCatalog, stmt: &AlterEnumStmt) -> Result<(), DdlError> {
-    let key = names_key(&stmt.type_name, interp);
-    let nsoid = match interp.namespace_oid(&key.schema) {
-        Some(oid) => oid,
-        None => {
-            return Err(DdlError::TypeNotFound(format!(
-                "type \"{}\" does not exist",
-                key.name
-            )));
-        }
-    };
-
-    let Some(&oid) = interp.type_by_qname.get(&(nsoid, key.name.clone())) else {
-        return Err(DdlError::TypeNotFound(format!(
-            "type \"{}\" does not exist",
-            key.name
-        )));
-    };
+    // AlterEnum: typenameTypeId on the name as written — a missing schema,
+    // then a missing type, named as written.
+    let oid = super::util::lookup_type_name(
+        &ast::TypeName {
+            names: stmt.type_name.clone(),
+            ..Default::default()
+        },
+        interp,
+    )?;
 
     // checkEnumOwner.
     if !matches!(
@@ -1514,7 +1500,7 @@ fn find_type_support_function(
 ) -> Result<PgProcOid, DdlError> {
     let mut found = None;
     for args in signatures {
-        if let Some(oid) = super::functions::lookup_func_name(interp, names, Some(args))? {
+        if let Some(oid) = super::functions::lookup_func_name(interp, names, Some(args), true)? {
             if found.is_some() {
                 return Err(DdlError::Parse(format!(
                     "type {what} function {} has multiple matches",
@@ -2592,7 +2578,7 @@ fn alterable_type(
 /// `RenameTypeInternal` (pg_type.c): the new name must be free — an
 /// autogenerated array type in the way moves aside — and the array type
 /// follows with a name derived from the new one.
-fn rename_type_internal(
+pub(crate) fn rename_type_internal(
     interp: &mut PgCatalog,
     oid: PgTypeOid,
     new_name: &str,

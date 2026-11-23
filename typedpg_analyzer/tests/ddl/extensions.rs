@@ -220,6 +220,38 @@ fn extension_version_specific() {
 }
 
 #[test]
+fn comment_on_missing_extension() {
+    // PG 19: get_object_address → 42704.
+    assert_ddl_err!(
+        try_apply(&[("0001.sql", "COMMENT ON EXTENSION citext IS 'x';")]),
+        DdlError::TypeNotFound(_),
+        "extension \"citext\" does not exist",
+    );
+    build(&[(
+        "0001.sql",
+        "CREATE EXTENSION citext; COMMENT ON EXTENSION citext IS 'x';",
+    )]);
+}
+
+#[test]
+fn extension_vector_reaches_the_pg19_image_version() {
+    // pgvector/pgvector:pg19 ships 0.8.7: it is the default, and 0.8.2
+    // updates to it.
+    build(&[("0001.sql", "CREATE EXTENSION vector VERSION '0.8.7';")]);
+    build(&[
+        ("0001.sql", "CREATE EXTENSION vector VERSION '0.8.2';"),
+        ("0002.sql", "ALTER EXTENSION vector UPDATE TO '0.8.7';"),
+    ]);
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE EXTENSION vector; ALTER EXTENSION vector UPDATE TO '0.8.7';",
+    )])
+    .map(|()| String::new())
+    .unwrap_or_else(|e| e.to_string());
+    assert_eq!(err, "", "0.8.7 is the default: updating to it is a no-op");
+}
+
+#[test]
 fn extension_alter_update() {
     // Install at 1.4, then upgrade to 1.6.
     let snap = build(&[

@@ -252,6 +252,33 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record the I/O functions a cast from `from` to `to` runs when it is
+    /// an I/O conversion (CoerceViaIO): the source type's output function,
+    /// then the target's input function. The catalog keeps no type's I/O
+    /// functions, so they are named by kind of type (records, arrays,
+    /// ranges, multiranges and enums share theirs) and, for a built-in base
+    /// type, by name; an extension's base type is taken to have immutable
+    /// ones.
+    pub fn note_io_coercion(&self, from: PgTypeOid, to: PgTypeOid) {
+        if self.used_procs.is_none()
+            || !IO_FUNCTIONS.with(std::cell::Cell::get)
+            || crate::coerce::coercion_pathway(to, from, CoercionContext::Explicit, self.snapshot)
+                != Some(crate::coerce::CoercionPath::CoerceViaIo)
+        {
+            return;
+        }
+        let output = io_function_name(self.snapshot, from, false);
+        let input = io_function_name(self.snapshot, to, true);
+        for name in [output, input].into_iter().flatten() {
+            self.note_proc(
+                self.snapshot
+                    .find_functions(Some("pg_catalog"), name)
+                    .first()
+                    .map(|p| p.oid),
+            );
+        }
+    }
+
     /// Record the cast function an implicit coercion from `from` to `to`
     /// runs (an argument coerced to a function's / operator's declared
     /// type), if any.
@@ -270,6 +297,58 @@ impl<'a> Ctx<'a> {
                 .and_then(|oid| self.snapshot.pg_cast.get(oid))
                 .and_then(|c| c.castfunc),
         );
+    }
+}
+
+/// The `pg_catalog` input (`input`) or output function of `typ` (a domain
+/// reads its base type's), for the types whose I/O functions are not all
+/// immutable; `None` for the others.
+fn io_function_name(snapshot: &PgCatalog, typ: PgTypeOid, input: bool) -> Option<&'static str> {
+    // The first OID of an object created after initdb.
+    const FIRST_NORMAL_OBJECT_ID: u32 = 16_384;
+    let typ = snapshot.unwrap_domain(typ);
+    let t = snapshot.get_type(typ)?;
+    let pick = |i: &'static str, o: &'static str| Some(if input { i } else { o });
+    match t.typtype {
+        TypType::Composite => return pick("record_in", "record_out"),
+        TypType::Range => return pick("range_in", "range_out"),
+        TypType::Multirange => return pick("multirange_in", "multirange_out"),
+        TypType::Enum => return pick("enum_in", "enum_out"),
+        _ => {}
+    }
+    if t.typcategory == TypCategory::Array
+        && t.typelem.is_some()
+        && !matches!(t.typname.as_str(), "int2vector" | "oidvector")
+    {
+        return pick("array_in", "array_out");
+    }
+    if typ.get() >= FIRST_NORMAL_OBJECT_ID {
+        return None;
+    }
+    match t.typname.as_str() {
+        "record" => pick("record_in", "record_out"),
+        "date" => pick("date_in", "date_out"),
+        "time" => pick("time_in", "time_out"),
+        "timetz" => pick("timetz_in", "timetz_out"),
+        "timestamp" => pick("timestamp_in", "timestamp_out"),
+        "timestamptz" => pick("timestamptz_in", "timestamptz_out"),
+        "interval" => pick("interval_in", "interval_out"),
+        "money" => pick("cash_in", "cash_out"),
+        "xml" => pick("xml_in", "xml_out"),
+        "aclitem" => pick("aclitemin", "aclitemout"),
+        "regclass" => pick("regclassin", "regclassout"),
+        "regcollation" => pick("regcollationin", "regcollationout"),
+        "regconfig" => pick("regconfigin", "regconfigout"),
+        "regdatabase" => pick("regdatabasein", "regdatabaseout"),
+        "regdictionary" => pick("regdictionaryin", "regdictionaryout"),
+        "regnamespace" => pick("regnamespacein", "regnamespaceout"),
+        "regoper" => pick("regoperin", "regoperout"),
+        "regoperator" => pick("regoperatorin", "regoperatorout"),
+        "regproc" => pick("regprocin", "regprocout"),
+        "regprocedure" => pick("regprocedurein", "regprocedureout"),
+        "regrole" => pick("regrolein", "regroleout"),
+        "regtype" => pick("regtypein", "regtypeout"),
+        _ => None,
     }
 }
 
@@ -2604,6 +2683,15 @@ pub(crate) fn inconsistent_param_error(
 thread_local! {
     static PLAN_TIME_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REWRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IO_FUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` recording the I/O functions of I/O conversions too
+/// ([`Ctx::note_io_coercion`]): what CheckMutability judges, unlike the
+/// privilege checks (a CoerceViaIO needs no EXECUTE).
+pub(crate) fn with_io_functions_recorded<R>(f: impl FnOnce() -> R) -> R {
+    let _io = FlagGuard::set(&IO_FUNCTIONS, true);
+    f()
 }
 
 /// Sets a thread-local flag for its lifetime and restores the previous

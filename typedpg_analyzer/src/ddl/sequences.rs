@@ -192,6 +192,29 @@ pub(crate) fn create_owned_sequence(
             choose_relation_name(interp, class.relnamespace, &class.relname, &colname, "seq"),
         ),
     };
+    // generateSerialExtraStmts links the sequence with `OWNED BY
+    // <sequence schema>.<table name>.<column>`: a `SEQUENCE NAME` in
+    // another schema names a table of that schema, which process_owned_by
+    // looks up and links instead.
+    let mut owning = (relid, attnum);
+    if nsoid != class.relnamespace {
+        let schema = interp.namespace_name(nsoid).unwrap_or_default().to_owned();
+        let rv = typedpg_pg_query::ast::RangeVar {
+            schemaname: schema,
+            relname: class.relname.clone(),
+            inh: true,
+            relpersistence: "p".to_owned(),
+            ..Default::default()
+        };
+        let (_, other) = super::util::lookup_relation(interp, &rv)?;
+        let Some(other_attnum) = interp.attribute_by_name(other, &colname).map(|a| a.attnum) else {
+            return Err(DdlError::Parse(format!(
+                "column \"{colname}\" of relation \"{}\" does not exist",
+                class.relname
+            )));
+        };
+        owning = (other, other_attnum);
+    }
     let seq_oid = insert_sequence_relation(interp, nsoid, name, owner)?;
     // generateSerialExtraStmts: the sequence is as persistent as its table
     // (a temporary table's sequence is in the temporary schema), unless
@@ -209,7 +232,7 @@ pub(crate) fn create_owned_sequence(
     // owner's), and takes that role's sequence default privileges — both of
     // which `insert_sequence_relation` recorded.
     interp.sequence_params.insert(seq_oid, params);
-    record_ownership(interp, seq_oid, relid, attnum, deptype);
+    record_ownership(interp, seq_oid, owning.0, owning.1, deptype);
     if deptype == DepType::Auto {
         // serial's `DEFAULT nextval('<seq>')` depends on the sequence, and
         // filling the column runs its nextval.
@@ -332,16 +355,30 @@ fn apply_owned_by(
         let Some((col, rel)) = parts.split_last() else {
             return Ok(());
         };
+        // makeRangeVarFromNameList: `[catalog.]schema.relation` — the
+        // catalog is taken to be the current database, which the analyzer
+        // has no name for.
         let (schema, relname) = match rel {
-            [relname] => (None, relname.as_str()),
-            [schema, relname] => (Some(schema.as_str()), relname.as_str()),
+            [relname] => ("", relname.as_str()),
+            [schema, relname] | [_, schema, relname] => (schema.as_str(), relname.as_str()),
             _ => {
-                return Err(DdlError::Parse("invalid OWNED BY option".to_owned()));
+                return Err(DdlError::Parse(format!(
+                    "improper relation name (too many dotted names): {}",
+                    rel.join(".")
+                )));
             }
         };
-        let Some(table) = interp.resolve_table(schema, relname).cloned() else {
-            return Err(DdlError::TableNotFound(format!(
-                "relation \"{relname}\" does not exist"
+        let rv = typedpg_pg_query::ast::RangeVar {
+            schemaname: schema.to_owned(),
+            relname: relname.to_owned(),
+            inh: true,
+            relpersistence: "p".to_owned(),
+            ..Default::default()
+        };
+        let (_, table_oid) = super::util::lookup_relation(interp, &rv)?;
+        let Some(table) = interp.pg_class.get(&table_oid).cloned() else {
+            return Err(DdlError::Internal(format!(
+                "relation oid {table_oid} missing"
             )));
         };
         // A sequence belongs to a table, foreign table or view, in its own
@@ -463,19 +500,13 @@ pub fn alter_sequence(interp: &mut PgCatalog, stmt: &AlterSeqStmt) -> Result<(),
     let Some(rv) = stmt.sequence.as_ref() else {
         return Ok(());
     };
-    let (schema, name) = range_var_names(rv, interp);
-
-    let resolved = interp
-        .namespace_oid(&schema)
-        .and_then(|nsoid| interp.class_by_qname.get(&(nsoid, name.clone())).copied());
-
-    let Some(seq_oid) = resolved else {
-        if stmt.missing_ok {
-            return Ok(());
-        }
-        return Err(DdlError::TableNotFound(format!(
-            "relation \"{name}\" does not exist"
-        )));
+    let (_, name) = range_var_names(rv, interp);
+    // RangeVarGetRelidExtended: a missing schema, then a missing relation
+    // named as written.
+    let seq_oid = match super::util::lookup_relation(interp, rv) {
+        Ok((_, oid)) => oid,
+        Err(_) if stmt.missing_ok => return Ok(()),
+        Err(e) => return Err(e),
     };
     // validate_relation_as_sequence (sequence.c, PostgreSQL 19).
     let relkind = interp.pg_class.get(&seq_oid).map(|c| c.relkind);

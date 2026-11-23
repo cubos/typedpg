@@ -1547,36 +1547,42 @@ fn is_true(value: Option<&str>) -> bool {
     matches!(value, Some("true") | Some("t"))
 }
 
-/// Format a database error the way both runners report it: severity and
-/// message, DETAIL and HINT, PG's position as a line of the migration with
-/// a caret, and CONTEXT. `sql` is the migration's text and `base` the byte offset in
-/// it of the text that was sent (0 when the whole migration was).
+/// Format a database error the way both runners report it, which is psql's
+/// report at its default verbosity (libpq's `pqBuildErrorMessage3`,
+/// `PQERRORS_DEFAULT` with context shown for errors): `SEVERITY:  message`,
+/// the error's position as a line and a caret, then `DETAIL:  `, `HINT:  `,
+/// `QUERY:  ` and `CONTEXT:  `, in that order. The caret is under the sent
+/// text (`sql` from the byte offset `base`, its line counted in the whole
+/// migration) or, for an `INTERNAL POSITION`, under the internal query.
+/// libpq ends each line with a newline; the last one is left out here.
 fn format_db_error(error: &DbError, sql: &str, base: usize) -> String {
     let mut out = match &error.severity {
-        Some(severity) => format!("{severity}: {}", error.message),
+        Some(severity) => format!("{severity}:  {}", error.message),
         None => error.message.clone(),
     };
-    if let Some(detail) = &error.detail {
-        out.push_str("\nDETAIL: ");
-        out.push_str(detail);
-    }
-    if let Some(hint) = &error.hint {
-        out.push_str("\nHINT: ");
-        out.push_str(hint);
-    }
-    if let Some(position) = error.position {
-        out.push_str(&locate_position(sql, base, position));
-    } else if let Some(position) = error.internal_position {
-        out.push_str(&format!(
-            "\nINTERNAL POSITION: {position}\nQUERY: {}",
-            error.internal_query.as_deref().unwrap_or_default()
-        ));
-    }
-    // As psql shows it: where in a function, a `DO` block or a trigger the
-    // error was raised.
-    if let Some(context) = &error.context {
-        out.push_str("\nCONTEXT: ");
-        out.push_str(context);
+    // libpq: the statement's position wins; an internal one points into the
+    // internal query, or is spelled out when there is no query to show.
+    let caret = match (error.position, error.internal_position) {
+        (Some(position), _) => locate_position(sql, base, position),
+        (None, Some(position)) => match &error.internal_query {
+            Some(query) => locate_position(query, 0, position),
+            None => {
+                out.push_str(&format!(" at character {position}"));
+                String::new()
+            }
+        },
+        (None, None) => String::new(),
+    };
+    out.push_str(&caret);
+    for (label, field) in [
+        ("DETAIL", &error.detail),
+        ("HINT", &error.hint),
+        ("QUERY", &error.internal_query),
+        ("CONTEXT", &error.context),
+    ] {
+        if let Some(text) = field {
+            out.push_str(&format!("\n{label}:  {text}"));
+        }
     }
     out
 }
@@ -1976,7 +1982,7 @@ mod tests {
         };
         assert_eq!(
             message,
-            "failed to apply migration 0001_bad: ERROR: syntax error at or near \"TABL\"\n\
+            "failed to apply migration 0001_bad: ERROR:  syntax error at or near \"TABL\"\n\
              LINE 2: CREATE TABL bad (a int);\n               ^"
         );
         let rollback = steps
@@ -2029,7 +2035,7 @@ mod tests {
         };
         assert!(
             message.starts_with(
-                "failed to apply migration 0001_partial (statement 2): ERROR: syntax error at or near \"TABL\"\nLINE 3: CREATE TABL bad;\n               ^"
+                "failed to apply migration 0001_partial (statement 2): ERROR:  syntax error at or near \"TABL\"\nLINE 3: CREATE TABL bad;\n               ^"
             ),
             "{message}"
         );
@@ -2386,7 +2392,7 @@ mod tests {
         };
         assert!(
             message.starts_with(
-                "failed to apply migration 0001_a (statement 3): ERROR: syntax error at or near \"TABL\""
+                "failed to apply migration 0001_a (statement 3): ERROR:  syntax error at or near \"TABL\""
             ),
             "{message}"
         );
@@ -3036,5 +3042,68 @@ mod tests {
              'x; DROP TABLE y' is not a valid PostgreSQL identifier"
         );
         assert!(matches!(steps.as_slice(), [Step::Fail(_)]));
+    }
+
+    fn pg_error(message: &str) -> DbError {
+        DbError {
+            code: Some("XX000".to_string()),
+            message: message.to_string(),
+            severity: Some("ERROR".to_string()),
+            detail: None,
+            hint: None,
+            position: None,
+            internal_position: None,
+            internal_query: None,
+            context: None,
+        }
+    }
+
+    /// psql's layout (libpq's `pqBuildErrorMessage3`): the caret right
+    /// after the message, then DETAIL, HINT, QUERY and CONTEXT, each label
+    /// followed by two spaces. The internal query's caret, not the sent
+    /// text's, for an internal position; a statement position wins.
+    #[test]
+    fn db_errors_follow_psqls_layout() {
+        let error = DbError {
+            detail: Some("the detail".to_string()),
+            hint: Some("the hint".to_string()),
+            internal_position: Some(9),
+            internal_query: Some("(SELECT nosuch FROM t2)".to_string()),
+            context: Some("PL/pgSQL function f() line 3 at RETURN".to_string()),
+            ..pg_error("column \"nosuch\" does not exist")
+        };
+        assert_eq!(
+            format_db_error(&error, "SELECT f();", 0),
+            "ERROR:  column \"nosuch\" does not exist\n\
+             LINE 1: (SELECT nosuch FROM t2)\n                ^\n\
+             DETAIL:  the detail\n\
+             HINT:  the hint\n\
+             QUERY:  (SELECT nosuch FROM t2)\n\
+             CONTEXT:  PL/pgSQL function f() line 3 at RETURN"
+        );
+        let statement = DbError {
+            position: Some(8),
+            ..error.clone()
+        };
+        assert!(
+            format_db_error(&statement, "SELECT f();", 0)
+                .starts_with("ERROR:  column \"nosuch\" does not exist\nLINE 1: SELECT f();\n               ^\nDETAIL:  ")
+        );
+        // An internal position without its query is spelled out, as libpq
+        // does when it has no query to show.
+        let bare = DbError {
+            internal_position: Some(9),
+            ..pg_error("boom")
+        };
+        assert_eq!(
+            format_db_error(&bare, "SELECT f();", 0),
+            "ERROR:  boom at character 9"
+        );
+        // A client-side failure has no severity.
+        let client = DbError {
+            severity: None,
+            ..pg_error("connection reset")
+        };
+        assert_eq!(format_db_error(&client, "SELECT 1;", 0), "connection reset");
     }
 }

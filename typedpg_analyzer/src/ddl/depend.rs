@@ -2348,6 +2348,14 @@ pub(crate) fn record_publication_rel(
             relid,
         },
     )?;
+    // The table itself is an automatic dependency: dropping the table drops
+    // its membership, whatever the columns the membership names.
+    record(
+        interp,
+        addr,
+        [ObjectAddress::relation(relid)],
+        DepType::Auto,
+    );
     // The table's own columns matter here (unlike a table's expressions).
     record_references(interp, addr, &refs, DepType::Normal);
     Ok(())

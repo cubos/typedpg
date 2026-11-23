@@ -2610,3 +2610,59 @@ fn new_partitioned_index_adopts_an_invalid_on_only_index() {
     )]);
     assert_eq!((count(&db, "t1"), count(&db, "t2")), (2, 1));
 }
+
+#[test]
+fn check_reading_the_whole_row_keys_attno_zero() {
+    // PG 19 StoreRelCheck: the whole-row Var is attno 0 in conkey, and
+    // names nothing (the constraint is `e_check`).
+    use typedpg_analyzer::ConType;
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE e (c int, CHECK (e IS NOT NULL), CHECK (c > 0 OR e.* IS NULL));",
+    )]);
+    let mut keys: Vec<(String, Vec<i16>)> = db
+        .constraints_of_table("e")
+        .into_iter()
+        .filter(|c| c.contype == ConType::Check)
+        .map(|c| (c.conname, c.conkey))
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            ("e_check".to_owned(), vec![0]),
+            ("e_check1".to_owned(), vec![1, 0]),
+        ]
+    );
+}
+
+#[test]
+fn foreign_key_collations_must_agree_when_one_is_nondeterministic() {
+    // PG 19 ATAddForeignKeyConstraint: 42P21.
+    let setup =
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                 CREATE TABLE v (k text COLLATE ci PRIMARY KEY);
+                 CREATE TABLE w (k text COLLATE \"C\" PRIMARY KEY);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "CREATE TABLE e (c text COLLATE \"C\" REFERENCES v);",
+            "foreign key constraint \"e_c_fkey\" cannot be implemented (Key columns \"c\" of the \
+             referencing table and \"k\" of the referenced table have incompatible collations: \
+             \"C\" and \"ci\".  If either collation is nondeterministic, then both collations \
+             have to be the same.)",
+        ),
+        (
+            setup,
+            "CREATE TABLE e (c text COLLATE ci REFERENCES w);",
+            "foreign key constraint \"e_c_fkey\" cannot be implemented",
+        ),
+    ]);
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             CREATE TABLE e (c text COLLATE ci REFERENCES v, d text COLLATE \"POSIX\" REFERENCES w);"
+        ),
+    )]);
+}

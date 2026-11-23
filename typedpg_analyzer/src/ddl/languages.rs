@@ -53,7 +53,7 @@ fn clause_function(
     if parts.is_empty() {
         return Ok(None);
     }
-    match super::functions::lookup_func_name(interp, &parts, Some(args))? {
+    match super::functions::lookup_func_name(interp, &parts, Some(args), false)? {
         Some(oid) => Ok(Some(oid)),
         None => Err(DdlError::TypeNotFound(format!(
             "function {} does not exist",
@@ -174,6 +174,9 @@ pub(crate) fn rename_language(
 /// CREATE [OR REPLACE] TRANSFORM FOR type LANGUAGE lang (...)
 /// (CreateTransform): the type and language must exist, and a transform
 /// for the pair is recorded.
+/// `internal`, the type of a transform function's argument.
+const TRANSFORM_INTERNAL: crate::oid::PgTypeOid = crate::oid::PgTypeOid::from_raw(2281);
+
 pub fn create_transform(
     interp: &mut PgCatalog,
     stmt: &CreateTransformStmt,
@@ -182,7 +185,68 @@ pub fn create_transform(
         return Ok(());
     };
     let typ = super::util::lookup_type_name(tn, interp)?;
+    // CreateTransform: a real data type, an existing language, then each
+    // function: FROM SQL returns internal, TO SQL the data type, and both
+    // are plain, non-volatile, non-set functions of one internal argument.
+    match interp.pg_type.get(&typ).map(|t| t.typtype) {
+        Some(crate::pg_catalog::TypType::Pseudo) => {
+            return Err(DdlError::Parse(format!(
+                "data type {} is a pseudo-type",
+                super::util::format_type_for_message(interp, typ)
+            )));
+        }
+        Some(crate::pg_catalog::TypType::Domain) => {
+            return Err(DdlError::Parse(format!(
+                "data type {} is a domain",
+                super::util::format_type_for_message(interp, typ)
+            )));
+        }
+        _ => {}
+    }
     check(interp, &stmt.lang)?;
+    for (function, to_sql) in [
+        (stmt.fromsql.as_deref(), false),
+        (stmt.tosql.as_deref(), true),
+    ] {
+        let Some(function) = function else {
+            continue;
+        };
+        let Some(oid) = super::functions::lookup_func_with_args(
+            interp,
+            typedpg_pg_query::ast::ObjectType::ObjectFunction,
+            function,
+            false,
+        )?
+        else {
+            continue;
+        };
+        let Some(proc) = interp.pg_proc.get(&oid) else {
+            continue;
+        };
+        let invalid = |message: &str| Err(DdlError::Parse(message.to_owned()));
+        if !to_sql && proc.prorettype != TRANSFORM_INTERNAL {
+            return invalid("return data type of FROM SQL function must be internal");
+        }
+        if to_sql && proc.prorettype != typ {
+            return invalid("return data type of TO SQL function must be the transform data type");
+        }
+        // check_transform_function.
+        if proc.provolatile == crate::pg_catalog::ProVolatile::Volatile {
+            return invalid("transform function must not be volatile");
+        }
+        if proc.prokind != crate::pg_catalog::ProKind::Function {
+            return invalid("transform function must be a normal function");
+        }
+        if proc.proretset {
+            return invalid("transform function must not return a set");
+        }
+        if proc.proargtypes.len() != 1 {
+            return invalid("transform function must take one argument");
+        }
+        if proc.proargtypes[0] != TRANSFORM_INTERNAL {
+            return invalid("first argument of transform function must be type internal");
+        }
+    }
     let exists = transform_exists(interp, typ, &stmt.lang);
     if exists && !stmt.replace {
         return Err(DdlError::DuplicateObject(format!(

@@ -498,3 +498,28 @@ fn an_expression_index_keeps_its_column_names_until_rebuilt() {
     db.apply_sql("ALTER TABLE i RENAME COLUMN inc2 TO k;")
         .unwrap();
 }
+
+#[test]
+fn renaming_a_table_over_an_array_type_moves_the_array_aside() {
+    // PG 19 RenameRelationInternal → RenameTypeInternal: the array type
+    // `_a` (of table a) in the way moves to `__a`, then b's own array type
+    // follows its new name: `__a` is taken, so `__a_1`.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE a (id int);
+         CREATE TABLE b (c int);
+         ALTER TABLE b RENAME TO _a;",
+    )]);
+    let a = db.resolve_type_by_name(Some("public"), "a").unwrap().oid;
+    let b = db.resolve_type_by_name(Some("public"), "_a").unwrap().oid;
+    assert_eq!(
+        db.resolve_type_by_name(Some("public"), "__a")
+            .and_then(|t| t.typelem),
+        Some(a)
+    );
+    assert_eq!(
+        db.resolve_type_by_name(Some("public"), "__a_1")
+            .and_then(|t| t.typelem),
+        Some(b)
+    );
+}

@@ -46,13 +46,19 @@ pub fn create_event_trigger(
         [schema, name] => (Some(*schema), *name),
         _ => return Ok(()),
     };
+    // LookupFuncName: a qualified name's schema must exist; the messages
+    // name the function as written (NameListToString).
+    if let Some(schema) = schema {
+        super::util::existing_namespace(interp, schema)?;
+    }
+    let written = parts.join(".");
     let Some(proc) = interp
         .find_functions(schema, name)
         .into_iter()
         .find(|p| p.proargtypes.is_empty())
     else {
         return Err(DdlError::TypeNotFound(format!(
-            "function {name}() does not exist"
+            "function {written}() does not exist"
         )));
     };
     if interp
@@ -62,7 +68,7 @@ pub fn create_event_trigger(
         != Some("event_trigger")
     {
         return Err(DdlError::Parse(format!(
-            "function {name} must return type event_trigger"
+            "function {written} must return type event_trigger"
         )));
     }
     let function = proc.oid;

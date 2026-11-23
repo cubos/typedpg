@@ -386,9 +386,15 @@ fetch "${BASE_URL}/src/pl/plpgsql/src/plpgsql--1.0.sql" "plpgsql--1.0.sql"
 # Third-party extensions
 # ═══════════════════════════════════════════════════════════════════════════
 
-echo -e "\n--- vector / pgvector (0.8.2) ---"
+# The 0.8.2 install script plus the upgrades to 0.8.7, the version the
+# pgvector/pgvector:pg19 image ships.
+echo -e "\n--- vector / pgvector (0.8.2 -> 0.8.7) ---"
 fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.2/sql/vector.sql" \
     "vector--0.8.2.sql"
+for step in 0.8.2--0.8.3 0.8.3--0.8.4 0.8.4--0.8.5 0.8.5--0.8.6 0.8.6--0.8.7; do
+    fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.7/sql/vector--${step}.sql" \
+        "vector--${step}.sql"
+done
 
 # ── Every download succeeded: replace the bundled files ────────────────────
 rm -f "${OUT_DIR}"/*.sql

@@ -192,7 +192,7 @@ describe("migrations", { skip }, () => {
         assert.ok(e instanceof MigrationError);
         assert.equal(
           e.message,
-          'failed to apply migration 0004_bad: ERROR: syntax error at or near "TABL"\n' +
+          'failed to apply migration 0004_bad: ERROR:  syntax error at or near "TABL"\n' +
             "LINE 2: CREATE TABL bad (a int);\n" +
             "               ^",
         );
@@ -204,11 +204,58 @@ describe("migrations", { skip }, () => {
       assert.equal((await migrationStatus(pool, bad)).at(-1)!.applied, false);
 
       const partial = withExtra(migrations, "0004_partial", "-- no-transaction\nCREATE TABLE ok2 (a int);\nCREATE TABL bad;\n");
-      await assert.rejects(migrate(pool, partial), /failed to apply migration 0004_partial \(statement 2\): ERROR: syntax error at or near "TABL"\nLINE 3: CREATE TABL bad;\n {15}\^/);
+      await assert.rejects(migrate(pool, partial), /failed to apply migration 0004_partial \(statement 2\): ERROR:  syntax error at or near "TABL"\nLINE 3: CREATE TABL bad;\n {15}\^/);
       assert.equal(await exists("ok2"), true);
       assert.equal((await migrationStatus(pool, partial)).at(-1)!.applied, false);
     });
   });
+
+  // Every driver reports PG's error as psql 19 prints it (and as the Rust
+  // runner does): an internal query's caret, QUERY and CONTEXT; RAISE's
+  // DETAIL and HINT.
+  for (const [driver, open] of migrationDrivers) {
+    test(`errors are reported as psql reports them (${driver})`, async () => {
+      const url = await freshDatabase(`typedpg_migrate_errors_${driver.replace(/\W/g, "")}`, false);
+      const { db, close } = open(url);
+      try {
+        const setup = withExtra(
+          embedMigrations([]),
+          "0001_setup",
+          "CREATE TABLE t2 (a int);\n" +
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n  RETURN (SELECT nosuch FROM t2);\nEND\n$$;",
+        );
+        await migrate(db, setup);
+        const failure = async (sql: string) => {
+          try {
+            await migrate(db, withExtra(setup, "0002_bad", sql));
+          } catch (e) {
+            assert.ok(e instanceof MigrationError);
+            return e.message;
+          }
+          assert.fail("the migration did not fail");
+        };
+        assert.equal(
+          await failure("SELECT f();"),
+          'failed to apply migration 0002_bad: ERROR:  column "nosuch" does not exist\n' +
+            "LINE 1: (SELECT nosuch FROM t2)\n" +
+            "                ^\n" +
+            "QUERY:  (SELECT nosuch FROM t2)\n" +
+            "CONTEXT:  PL/pgSQL function f() line 3 at RETURN",
+        );
+        assert.equal(
+          await failure(
+            "DO $$\nBEGIN\n  RAISE EXCEPTION 'boom %', 42\n    USING DETAIL = 'the detail', HINT = 'the hint';\nEND\n$$;",
+          ),
+          "failed to apply migration 0002_bad: ERROR:  boom 42\n" +
+            "DETAIL:  the detail\n" +
+            "HINT:  the hint\n" +
+            "CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE",
+        );
+      } finally {
+        await close();
+      }
+    });
+  }
 
   // A file the runner does not wrap (`-- no-transaction`, or
   // `useTransaction` off) whose BEGIN has no COMMIT: the tracking row, the

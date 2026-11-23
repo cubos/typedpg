@@ -232,7 +232,7 @@ fn collate_unknown_collation_should_error() {
     );
     assert_ddl_err!(
         result,
-        DdlError::Parse(_),
+        DdlError::TypeNotFound(_),
         "collation \"definitely_not_a_real_collation\" for encoding \"UTF8\" does not exist"
     );
 }

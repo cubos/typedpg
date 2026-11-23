@@ -911,6 +911,7 @@ pub(crate) fn parse_column_def(
     // and non-collatable types. The collation oid lands on pg_attribute.
     let collation =
         column_collation(interp, cd, type_oid)?.or_else(|| type_collation(interp, type_oid));
+    check_not_setof(cd)?;
 
     Ok(ParsedColumn {
         name: cd.colname.clone(),
@@ -1530,37 +1531,43 @@ pub(crate) fn drop_column(
     cmd: &AlterTableCmd,
     rec: inherit::Recursion,
 ) -> Result<(), DdlError> {
-    // ATExecDropColumn collects the column and the children's copies it
-    // drops along (a copy inherited from this parent only), and deletes
-    // them together: performMultipleDeletions reports a dependent of more
-    // than one object as one of "the desired objects".
-    let several = !rec.recursing
-        && rec.recurse
-        && inherit::children_of(interp, relid)
-            .into_iter()
-            .any(|child| {
-                interp
-                    .attribute_by_name(child, &cmd.name)
-                    .is_some_and(|a| a.attinhcount == 1 && !a.attislocal)
-            });
-    drop_column_and_copies(interp, relid, cmd, rec).map_err(|e| match e {
-        DdlError::DependencyError(msg) if several => {
-            const ONE: &str = " because other objects depend on it";
-            match (msg.strip_prefix("cannot drop "), msg.find(ONE)) {
-                (Some(_), Some(at)) => DdlError::DependencyError(format!(
-                    "cannot drop desired object(s) because other objects depend on them{}",
-                    &msg[at + ONE.len()..]
-                )),
-                _ => DdlError::DependencyError(msg),
+    // ATExecDropColumn collects the column and every child copy it takes
+    // along, then `performMultipleDeletions`: with more than one object,
+    // a blocked drop reports no original object (`reportDependentObjects`).
+    if rec.recursing {
+        return drop_column_and_children(interp, relid, cmd, rec);
+    }
+    // Deleted together, the copies' own objects (a copied serial default
+    // on the parent's sequence) block nothing either.
+    let mut copies = Vec::new();
+    if rec.recurse {
+        let mut pending = vec![relid];
+        while let Some(parent) = pending.pop() {
+            for child in inherit::children_of(interp, parent) {
+                if let Some(c) = interp.attribute_by_name(child, &cmd.name)
+                    && c.attinhcount == 1
+                    && !c.attislocal
+                {
+                    copies.push(ObjectAddress::column(child, c.attnum));
+                    pending.push(child);
+                }
             }
         }
-        e => e,
-    })
+    }
+    let several = !copies.is_empty();
+    let mut targets = crate::ddl::depend::drop_targets();
+    targets.extend(copies);
+    let result = crate::ddl::depend::with_drop_targets(targets, || {
+        drop_column_and_children(interp, relid, cmd, rec)
+    });
+    if several {
+        result.map_err(crate::ddl::depend::multiple_targets_message)
+    } else {
+        result
+    }
 }
 
-/// [`drop_column`] of `relid`'s column and, recursing, of the children's
-/// copies that go with it.
-fn drop_column_and_copies(
+fn drop_column_and_children(
     interp: &mut PgCatalog,
     relid: PgClassOid,
     cmd: &AlterTableCmd,
@@ -1663,7 +1670,7 @@ fn drop_column_and_copies(
             missing_ok: true,
             ..cmd.clone()
         };
-        drop_column_and_copies(interp, relid, &drop_dependent, rec)?;
+        drop_column(interp, relid, &drop_dependent, rec)?;
     }
     interp.generated_refs.remove(&(relid, target.attnum));
     crate::ddl::depend::drop_column_dependents(interp, relid, target.attnum, cascade)?;
@@ -1823,7 +1830,7 @@ fn drop_column_and_copies(
             continue;
         };
         if rec.recurse && child_col.attinhcount == 1 && !child_col.attislocal {
-            drop_column_and_copies(interp, child, cmd, rec.child())?;
+            drop_column(interp, child, cmd, rec.child())?;
         } else if let Some(attrs) = interp.pg_attribute.get_mut(&child)
             && let Some(a) = attrs.iter_mut().find(|a| a.attnum == child_col.attnum)
         {
@@ -2179,6 +2186,28 @@ pub(crate) fn alter_column_type(
             cmd.name
         )));
     }
+    // RememberAllDependentForRebuilding: a publication's column list or
+    // row filter naming the column isn't rebuilt either (PG words both as
+    // the WHERE clause).
+    let column = ObjectAddress::column(relid, attr.attnum);
+    if let Some(publication) = interp.iter_pg_depend().find(|d| {
+        d.classid == crate::ddl::depend::PG_PUBLICATION_REL_RELID
+            && d.refclassid == crate::pg_catalog::PG_CLASS_RELID
+            && d.refobjid == column.objid
+            && d.refobjsubid == column.objsubid
+    }) {
+        let publication = ObjectAddress {
+            classid: publication.classid,
+            objid: publication.objid,
+            objsubid: 0,
+        };
+        return Err(DdlError::UnsupportedDdl(format!(
+            "cannot alter type of a column used by a publication WHERE clause ({} depends on \
+             column \"{}\")",
+            crate::ddl::depend::describe(interp, publication),
+            cmd.name
+        )));
+    }
     let dependent_views = views::find_views_depending_on_column(interp, relid, &cmd.name);
     if !dependent_views.is_empty() {
         // Match PG (SQLSTATE 0A000): any dependent view blocks `ALTER COLUMN
@@ -2312,6 +2341,31 @@ fn recheck_dependents_of_retyped_column(
         Ok(())
     };
 
+    // AT_PASS_OLD_INDEX: a primary key or unique constraint WITHOUT
+    // OVERLAPS on the column is added again (transformIndexConstraint),
+    // which needs a range or multirange type there.
+    let new_type = interp
+        .attributes_of(relid)
+        .iter()
+        .find(|a| a.attnum == attr.attnum)
+        .map(|a| interp.unwrap_domain(a.atttypid));
+    let range_like = new_type
+        .and_then(|t| interp.pg_type.get(&t))
+        .is_some_and(|t| matches!(t.typtype, TypType::Range | TypType::Multirange));
+    if !range_like
+        && interp.pg_constraint.values().any(|c| {
+            c.conrelid == relid
+                && c.conperiod
+                && matches!(c.contype, ConType::PrimaryKey | ConType::Unique)
+                && c.conkey.last() == Some(&attr.attnum)
+        })
+    {
+        return Err(DdlError::Parse(format!(
+            "column \"{}\" in WITHOUT OVERLAPS is not a range or multirange type",
+            attr.attname
+        )));
+    }
+
     // AT_PASS_OLD_INDEX: the partial indexes' predicates.
     let mut indexes: Vec<&PgIndex> = interp
         .pg_index
@@ -2391,6 +2445,23 @@ fn recheck_dependents_of_retyped_column(
                             format_type_for_message(interp, pk.atttypid)
                         )));
                     }
+                    let collation = |c: Option<crate::oid::PgCollationOid>| {
+                        c.and_then(|c| interp.pg_collation.get(&c))
+                    };
+                    if let (Some(fkcoll), Some(pkcoll)) =
+                        (collation(fk.attcollation), collation(pk.attcollation))
+                        && fkcoll.oid != pkcoll.oid
+                        && (!fkcoll.collisdeterministic || !pkcoll.collisdeterministic)
+                    {
+                        return Err(DdlError::DependencyError(format!(
+                            "foreign key constraint \"{}\" cannot be implemented (Key columns \
+                             \"{}\" of the referencing table and \"{}\" of the referenced table \
+                             have incompatible collations: \"{}\" and \"{}\".  If either \
+                             collation is nondeterministic, then both collations have to be the \
+                             same.)",
+                            con.conname, fk.attname, pk.attname, fkcoll.collname, pkcoll.collname
+                        )));
+                    }
                 }
             }
             _ => {}
@@ -2425,6 +2496,10 @@ pub(crate) fn prep_alter_column_using(
     ) {
         return Ok(());
     }
+    // transformAlterTableStmt transforms USING before ATPrepAlterColumnType
+    // looks at the column (that it exists, isn't inherited, ...): its
+    // errors come first.
+    transform_using(interp, relid, using.as_ref())?;
     let Some(attr) = interp.attribute_by_name(relid, &cmd.name).cloned() else {
         return Ok(());
     };
@@ -2449,6 +2524,45 @@ pub(crate) fn prep_alter_column_using(
         new_type_oid,
         new_typmod,
     )
+}
+
+/// transformExpr of a USING expression in EXPR_KIND_ALTER_COL_TRANSFORM,
+/// over the table's row.
+fn transform_using(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&typedpg_pg_query::ast::Node>,
+) -> Result<(), DdlError> {
+    crate::ddl::expr_kind::check_expr_kind(
+        interp,
+        expr,
+        crate::ddl::expr_kind::ExprKind::AlterColTransform,
+    )?;
+    let relname = relname_of(interp, relid);
+    let nspname = interp
+        .pg_class
+        .get(&relid)
+        .and_then(|c| interp.namespace_name(c.relnamespace))
+        .unwrap_or("public")
+        .to_owned();
+    let attrs = interp.attributes_of(relid).to_vec();
+    let mut scope = crate::scope::Scope::default();
+    scope.add_dml_target(
+        interp,
+        &relname,
+        QualifiedName::new(nspname, relname.clone()),
+        &attrs,
+    );
+    let null_ctx = crate::nullability::NullabilityContext::default();
+    let mut params = crate::param_collector::ParamCollector::default();
+    crate::expr::infer_expr(
+        expr,
+        crate::expr::Ctx::new(&scope, &null_ctx, interp),
+        &mut params,
+        crate::expr::TypeGoal::NONE,
+    )
+    .map(|_| ())
+    .map_err(|e| DdlError::UnsupportedDdl(format!("{e}")))
 }
 
 /// The USING expression of ALTER COLUMN TYPE: evaluated over the table's
@@ -2554,6 +2668,17 @@ pub(crate) fn type_collation(
     interp.pg_type.get(&type_oid).and_then(|t| t.typcollation)
 }
 
+/// BuildDescForRelation / ATExecAddColumn: a column holds one value.
+pub(crate) fn check_not_setof(cd: &typedpg_pg_query::ast::ColumnDef) -> Result<(), DdlError> {
+    if cd.type_name.as_ref().is_some_and(|tn| tn.setof) {
+        return Err(DdlError::Parse(format!(
+            "column \"{}\" cannot be declared SETOF",
+            cd.colname
+        )));
+    }
+    Ok(())
+}
+
 /// A column's collation (`GetColumnDefCollation`, parse_type.c): the
 /// explicit `COLLATE` — which the type must support — or none, meaning the
 /// type's default.
@@ -2565,27 +2690,7 @@ pub(crate) fn column_collation(
     let Some(coll) = cd.coll_clause.as_deref() else {
         return Ok(None);
     };
-    let parts: Vec<&str> = coll
-        .collname
-        .iter()
-        .filter_map(|n| match n.as_ref()? {
-            ast::Node::String(s) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect();
-    let (schema, name) = match parts.as_slice() {
-        [name] => (None, *name),
-        [schema, name] => (Some(*schema), *name),
-        _ => return Err(DdlError::Parse("malformed COLLATE clause".into())),
-    };
-    let resolved = interp.resolve_collation(schema, name).ok_or_else(|| {
-        // PG includes the encoding in the message: `collation "X" for
-        // encoding "UTF8" does not exist`. We don't model encoding so
-        // we hardcode UTF8 (real PG uses the database's encoding).
-        DdlError::Parse(format!(
-            "collation \"{name}\" for encoding \"UTF8\" does not exist"
-        ))
-    })?;
+    let resolved = crate::ddl::collations::collation_of_clause(interp, &coll.collname)?;
     let collatable = interp
         .pg_type
         .get(&interp.unwrap_domain(type_oid))
@@ -2596,7 +2701,7 @@ pub(crate) fn column_collation(
             format_type_for_message(interp, type_oid)
         )));
     }
-    Ok(Some(resolved.oid))
+    Ok(Some(resolved))
 }
 
 /// The column `name` of `relid` for an ALTER COLUMN subcommand: PG's

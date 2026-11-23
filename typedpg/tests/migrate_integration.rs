@@ -523,11 +523,92 @@ async fn a_failure_inside_a_do_block_reports_its_context() {
         .to_string();
     assert!(
         err.ends_with(
-            "failed to apply migration 0001_do: ERROR: boom\n\
-             CONTEXT: PL/pgSQL function inline_code_block line 4 at RAISE"
+            "failed to apply migration 0001_do: ERROR:  boom\n\
+             CONTEXT:  PL/pgSQL function inline_code_block line 4 at RAISE"
         ),
         "{err}"
     );
+}
+
+/// A failed migration reports PG's error exactly as psql 19 prints it at
+/// its default verbosity: each expected text below is `psql -f` of the
+/// same file, its `psql:<file>:<line>: ` prefix left out.
+#[tokio::test]
+async fn errors_are_reported_as_psql_reports_them() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let setup = "CREATE TABLE t (ab int);\n\
+                 CREATE TABLE t2 (a int);\n\
+                 CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$\n\
+                 BEGIN\n  RETURN (SELECT nosuch FROM t2);\nEND\n$$;";
+    migrate::run(
+        &mut client,
+        &MigrationSource::from_embedded([("0001_setup", setup, None)]).unwrap(),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    let cases = [
+        // A position and a DETAIL.
+        (
+            "SELECT '{1,2'::int[];",
+            "ERROR:  malformed array literal: \"{1,2\"\n\
+             LINE 1: SELECT '{1,2'::int[];\n               ^\n\
+             DETAIL:  Unexpected end of input.",
+        ),
+        // A position and a HINT.
+        (
+            "SELECT aa FROM t;",
+            "ERROR:  column \"aa\" does not exist\n\
+             LINE 1: SELECT aa FROM t;\n               ^\n\
+             HINT:  Perhaps you meant to reference the column \"t.ab\".",
+        ),
+        // A syntax error.
+        (
+            "CREATE TABL b (id int);",
+            "ERROR:  syntax error at or near \"TABL\"\n\
+             LINE 1: CREATE TABL b (id int);\n               ^",
+        ),
+        // A position, a DETAIL and a CONTEXT.
+        (
+            "SELECT jsonb '{\"a\":}';",
+            "ERROR:  invalid input syntax for type json\n\
+             LINE 1: SELECT jsonb '{\"a\":}';\n                     ^\n\
+             DETAIL:  Expected JSON value, but found \"}\".\n\
+             CONTEXT:  JSON data, line 1: {\"a\":}",
+        ),
+        // An internal query: its caret, QUERY and CONTEXT.
+        (
+            "SELECT f();",
+            "ERROR:  column \"nosuch\" does not exist\n\
+             LINE 1: (SELECT nosuch FROM t2)\n                ^\n\
+             QUERY:  (SELECT nosuch FROM t2)\n\
+             CONTEXT:  PL/pgSQL function f() line 3 at RETURN",
+        ),
+        // RAISE with a DETAIL and a HINT.
+        (
+            "DO $$\nBEGIN\n  RAISE EXCEPTION 'boom %', 42\n    \
+             USING DETAIL = 'the detail', HINT = 'the hint';\nEND\n$$;",
+            "ERROR:  boom 42\n\
+             DETAIL:  the detail\n\
+             HINT:  the hint\n\
+             CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE",
+        ),
+    ];
+    for (sql, psql) in cases {
+        let source =
+            MigrationSource::from_embedded([("0001_setup", setup, None), ("0002_bad", sql, None)])
+                .unwrap();
+        let err = migrate::run(&mut client, &source, &config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.ends_with(&format!("failed to apply migration 0002_bad: {psql}")),
+            "{sql}:\n{err}"
+        );
+    }
 }
 
 /// An unterminated dollar quote swallows the rest of the file, as psql
@@ -552,7 +633,7 @@ async fn an_unterminated_dollar_quote_runs_nothing_after_it() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("(statement 2): ERROR: unterminated dollar-quoted string"),
+        err.contains("(statement 2): ERROR:  unterminated dollar-quoted string"),
         "{err}"
     );
     assert!(table_exists(&client, "keep").await);

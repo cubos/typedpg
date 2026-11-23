@@ -19,7 +19,9 @@
 //!   that lock, rewrite or scan tables (indexes, partitions, triggers,
 //!   policies, rules, domains, `VACUUM FULL`, `REINDEX`, …), each with and
 //!   without `lock_timeout`, in transactional and `-- no-transaction`
-//!   migrations.
+//!   migrations;
+//! - projects' migrations: every directory under `$MIGRATION_ORACLE_PROJECTS`
+//!   is one project, its `*.sql` files a migration set in file-name order.
 //!
 //! Findings go to `$MIGRATION_ORACLE_OUT` (default
 //! `target/migration-oracle-findings`), one file per distinct finding; the
@@ -62,6 +64,9 @@ fn migration_oracle_corpus() {
     let recorded = cases.len() - docs;
     cases.extend(generated_cases());
     let generated = cases.len() - docs - recorded;
+    if let Some(dir) = std::env::var_os("MIGRATION_ORACLE_PROJECTS") {
+        cases.extend(project_cases(std::path::Path::new(&dir)));
+    }
     if let Ok(filter) = std::env::var("MIGRATION_ORACLE_FILTER") {
         cases.retain(|case| case.origin.contains(&filter));
     }
@@ -281,6 +286,39 @@ fn docs_cases() -> Vec<Case> {
         }
     }
     out
+}
+
+// ── projects' migrations ───────────────────────────────────────────────────
+
+/// One set per directory of `root`: its `*.sql` files in file-name order.
+fn project_cases(root: &std::path::Path) -> Vec<Case> {
+    let mut projects: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    projects.sort();
+    projects
+        .into_iter()
+        .map(|project| {
+            let mut paths: Vec<_> = std::fs::read_dir(&project)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "sql"))
+                .collect();
+            paths.sort();
+            Case {
+                origin: format!("project {}", project.display()),
+                files: paths
+                    .iter()
+                    .map(|p| std::fs::read_to_string(p).unwrap())
+                    .collect(),
+                use_transaction: true,
+            }
+        })
+        .collect()
 }
 
 // ── the recorded analyzer corpus ───────────────────────────────────────────
@@ -847,6 +885,79 @@ fn generated_cases() -> Vec<Case> {
         "ALTER TABLE mv ADD COLUMN x integer",
         "ALTER FOREIGN TABLE IF EXISTS nothing ADD COLUMN x integer",
         "SELECT pg_advisory_xact_lock(1)",
+        // Concurrent index builds, and what refuses them.
+        "CREATE INDEX CONCURRENTLY ON t (i)",
+        "CREATE UNIQUE INDEX CONCURRENTLY ON t (b)",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS t_i_idx ON t (i)",
+        "CREATE INDEX CONCURRENTLY ON t (lower(tx)) WHERE tx IS NOT NULL",
+        "CREATE INDEX CONCURRENTLY ON parted (v)",
+        "CREATE INDEX CONCURRENTLY ON parted_1 (v)",
+        "DROP INDEX CONCURRENTLY IF EXISTS nothing",
+        "REINDEX INDEX CONCURRENTLY parted_v_idx",
+        "REINDEX TABLE CONCURRENTLY parted",
+        // Constraint enforceability, deferrability and inheritability.
+        "ALTER TABLE t ALTER CONSTRAINT t_i_fk NOT ENFORCED",
+        "ALTER TABLE t ALTER CONSTRAINT t_i_fk ENFORCED",
+        "ALTER TABLE t ALTER CONSTRAINT t_s_check NOT ENFORCED",
+        "ALTER TABLE t ALTER CONSTRAINT t_cn_nn NOT ENFORCED",
+        "ALTER TABLE t ALTER CONSTRAINT t_chk_check NOT ENFORCED",
+        "ALTER TABLE t ALTER CONSTRAINT t_nn_not_null NO INHERIT",
+        "ALTER TABLE fk_child ALTER CONSTRAINT fk_child_t_id_fkey DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE fk_child ALTER CONSTRAINT fk_child_t_id_fkey NOT ENFORCED",
+        "ALTER TABLE inh_parent ALTER CONSTRAINT inh_parent_id_not_null NO INHERIT",
+        "ALTER TABLE inh_parent ADD CONSTRAINT added CHECK (i > 0) NOT ENFORCED",
+        // Virtual generated columns.
+        "ALTER TABLE t ALTER COLUMN gv TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN g TYPE bigint",
+        "ALTER TABLE t ADD CONSTRAINT added CHECK (gv > 0)",
+        "ALTER TABLE t ADD CONSTRAINT added CHECK (gv > 0) NOT VALID",
+        "ALTER TABLE t ALTER COLUMN gv SET NOT NULL",
+        "ALTER TABLE t DROP COLUMN gv",
+        "ALTER TABLE t ADD COLUMN x integer GENERATED ALWAYS AS (i + 1) VIRTUAL NOT NULL",
+        "ALTER TABLE t ADD COLUMN x integer GENERATED ALWAYS AS (i + 1) VIRTUAL CHECK (x > 0)",
+        // Temporal keys (btree_gist for the scalar part).
+        "CREATE EXTENSION btree_gist; ALTER TABLE t ADD COLUMN r int4range, ADD CONSTRAINT \
+         added UNIQUE (id, r WITHOUT OVERLAPS)",
+        "CREATE EXTENSION btree_gist; ALTER TABLE t ADD COLUMN r int4range; ALTER TABLE t ADD \
+         CONSTRAINT added EXCLUDE USING gist (id WITH =, r WITH &&)",
+        // Retyping with a collation, a USING, an enum.
+        "ALTER TABLE t ALTER COLUMN tx SET DATA TYPE text COLLATE \"C\"",
+        "ALTER TABLE t ALTER COLUMN v TYPE varchar(10) COLLATE \"C\"",
+        "ALTER TABLE t ALTER COLUMN v TYPE varchar(20) COLLATE \"C\"",
+        "ALTER TABLE t ALTER COLUMN j TYPE jsonb USING j::jsonb",
+        "ALTER TABLE t ALTER COLUMN m TYPE text",
+        "ALTER TABLE t ALTER COLUMN nn DROP DEFAULT, ALTER COLUMN nn SET DEFAULT 5",
+        // Partitioned tables: keys, constraints and ONLY.
+        "ALTER TABLE parted ADD PRIMARY KEY (id, k)",
+        "ALTER TABLE parted ADD CONSTRAINT added UNIQUE (k)",
+        "ALTER TABLE ONLY parted ADD CONSTRAINT added UNIQUE (k)",
+        "ALTER TABLE ONLY parted ADD CONSTRAINT added CHECK (i > 0)",
+        "ALTER TABLE ONLY parted ADD CONSTRAINT added CHECK (i > 0) NOT VALID",
+        "CREATE UNIQUE INDEX added ON ONLY parted (k)",
+        "ALTER TABLE parted_1 ADD CONSTRAINT added CHECK (i > 0)",
+        "ALTER TABLE parted_1 ALTER COLUMN i SET NOT NULL",
+        "ALTER TABLE parted_1 ALTER COLUMN v TYPE text",
+        "ALTER TABLE parted ATTACH PARTITION loose DEFAULT",
+        "ALTER TABLE parted ADD CONSTRAINT added FOREIGN KEY (i) REFERENCES ref (id) NOT VALID, \
+         VALIDATE CONSTRAINT added",
+        "ALTER TABLE ref ADD COLUMN k integer, ADD CONSTRAINT added FOREIGN KEY (id) REFERENCES \
+         t (id)",
+        "CREATE TABLE added (id integer, k integer, FOREIGN KEY (id, k) REFERENCES parted (id, k))",
+        // Domains and types used by existing tables.
+        "ALTER DOMAIN posint SET NOT NULL",
+        "ALTER DOMAIN posint ADD CONSTRAINT added NOT NULL",
+        "ALTER DOMAIN plain_int ADD CONSTRAINT added CHECK (VALUE > 0) NOT VALID",
+        "ALTER TYPE pair RENAME ATTRIBUTE x TO z",
+        "ALTER TYPE pair DROP ATTRIBUTE y CASCADE",
+        "ALTER TABLE t SET (autovacuum_vacuum_scale_factor = 0.1)",
+        "ALTER TABLE t SET (fillfactor = 70), SET LOGGED",
+        "ALTER TABLE t SET ACCESS METHOD heap, ALTER COLUMN i TYPE bigint",
+        "ALTER TABLE t ALTER COLUMN i SET DEFAULT nextval('seq')",
+        "ALTER TABLE t ALTER COLUMN tx SET COMPRESSION lz4",
+        "ALTER MATERIALIZED VIEW mv SET ACCESS METHOD heap",
+        "ALTER MATERIALIZED VIEW mv CLUSTER ON mv_id",
+        "CREATE INDEX ON mv (i)",
+        "ALTER INDEX t_i_idx ALTER COLUMN 1 SET STATISTICS 100",
     ] {
         statements.push(statement.to_owned());
     }
@@ -936,6 +1047,110 @@ fn generated_cases() -> Vec<Case> {
             "CREATE TABLE added (id integer)",
             "ALTER TABLE parted ATTACH PARTITION added FOR VALUES FROM (40) TO (50)",
         ),
+        // lock_timeout: values that turn it off, settings that are not it,
+        // and one placed after the statement that needed it.
+        (
+            "SET lock_timeout = '0s'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout = '0ms'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout = 1000",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout = '1min'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout TO DEFAULT",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout = '1s'; RESET lock_timeout",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout = '1s'; RESET ALL",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET SESSION lock_timeout = '1s'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET LOCAL lock_timeout = '1s'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET statement_timeout = '1s'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "ALTER TABLE t ADD COLUMN y integer",
+            "SET lock_timeout = '1s'; ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET lock_timeout = '1s'",
+            "BEGIN; ALTER TABLE t ADD COLUMN x integer; COMMIT",
+        ),
+        (
+            "BEGIN; SET LOCAL lock_timeout = '1s'; COMMIT",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SAVEPOINT s; SET lock_timeout = '1s'; RELEASE s",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        // Validation after NOT VALID, on other kinds of table.
+        (
+            "ALTER TABLE parted ADD CONSTRAINT added FOREIGN KEY (i) REFERENCES ref (id) NOT VALID",
+            "ALTER TABLE parted VALIDATE CONSTRAINT added",
+        ),
+        (
+            "ALTER TABLE inh_parent ADD CONSTRAINT added CHECK (i > 0) NOT VALID",
+            "ALTER TABLE inh_parent VALIDATE CONSTRAINT added",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT added NOT NULL i NOT VALID",
+            "ALTER TABLE t VALIDATE CONSTRAINT added",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT added NOT NULL i NOT VALID",
+            "ALTER TABLE t ALTER COLUMN i SET NOT NULL",
+        ),
+        (
+            "ALTER TABLE t ALTER CONSTRAINT t_i_fk NOT ENFORCED",
+            "ALTER TABLE t ALTER CONSTRAINT t_i_fk ENFORCED",
+        ),
+        (
+            "ALTER TABLE fk_child ALTER CONSTRAINT fk_child_t_id_fkey NOT ENFORCED",
+            "ALTER TABLE fk_child ALTER CONSTRAINT fk_child_t_id_fkey ENFORCED",
+        ),
+        (
+            "ALTER TABLE t ALTER CONSTRAINT t_cn_nn NOT ENFORCED",
+            "ALTER TABLE t ALTER CONSTRAINT t_cn_nn ENFORCED",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT added CHECK (i > 0) NOT ENFORCED",
+            "ALTER TABLE t ALTER CONSTRAINT added ENFORCED",
+        ),
+        (
+            "CREATE UNIQUE INDEX added ON ONLY parted (k)",
+            "CREATE UNIQUE INDEX added_1 ON parted_1 (k); ALTER INDEX added ATTACH PARTITION \
+             added_1",
+        ),
+        (
+            "CREATE INDEX added ON t (i)",
+            "ALTER TABLE t ALTER COLUMN i TYPE bigint",
+        ),
+        (
+            "ALTER TABLE parted DETACH PARTITION parted_1",
+            "ALTER TABLE parted_1 ADD COLUMN x integer",
+        ),
     ] {
         for (use_transaction, marker) in [(true, ""), (false, ""), (true, "-- no-transaction\n")] {
             out.push(Case {
@@ -945,6 +1160,47 @@ fn generated_cases() -> Vec<Case> {
                     !marker.is_empty()
                 ),
                 files: vec![BASE.to_owned(), format!("{marker}{first};\n{second};\n")],
+                use_transaction,
+            });
+        }
+    }
+    // A setting one file leaves on the session, read by the next file.
+    for (first, second) in [
+        (
+            "SET lock_timeout = '1s'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SET LOCAL lock_timeout = '1s'",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "SELECT set_config('lock_timeout', '1s', false)",
+            "ALTER TABLE t ADD COLUMN x integer",
+        ),
+        (
+            "CREATE INDEX added ON t (i)",
+            "-- no-transaction\nDROP INDEX CONCURRENTLY added",
+        ),
+        (
+            "ALTER TABLE t ADD CONSTRAINT added CHECK (i > 0) NOT VALID",
+            "ALTER TABLE t VALIDATE CONSTRAINT added",
+        ),
+        (
+            "CREATE TABLE added (id integer PRIMARY KEY)",
+            "ALTER TABLE added ADD COLUMN x integer NOT NULL DEFAULT 1",
+        ),
+    ] {
+        for use_transaction in [true, false] {
+            out.push(Case {
+                origin: format!(
+                    "generated files (use_transaction = {use_transaction}): {first} | {second}"
+                ),
+                files: vec![
+                    BASE.to_owned(),
+                    format!("{first};\n"),
+                    format!("{second};\n"),
+                ],
                 use_transaction,
             });
         }

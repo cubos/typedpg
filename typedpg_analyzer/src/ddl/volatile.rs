@@ -233,8 +233,8 @@ pub(crate) fn trusted_over_relation(
 
 /// `CheckMutability` over the *typed* expression: analyze `expr` over the
 /// row of `relid`, recording every function it runs — called directly,
-/// through an operator or through an explicit cast — and fail on the first
-/// one that isn't IMMUTABLE. A simple SQL function counts by its inlined
+/// through an operator, through an explicit cast or as the I/O functions
+/// of an I/O conversion — and fail on the first one that isn't IMMUTABLE. A simple SQL function counts by its inlined
 /// body (checked with the name-based walk). Analysis errors are left to the
 /// expression's own validation, except the planner's.
 pub(crate) fn check_mutability(
@@ -248,7 +248,9 @@ pub(crate) fn check_mutability(
     // folding its constants: an error that adds (`40000::int2`) is the
     // statement's.
     match crate::expr::with_plan_time_checks(|| {
-        infer_over_relation(interp, relid, expr, Some(&used))
+        crate::expr::with_io_functions_recorded(|| {
+            infer_over_relation(interp, relid, expr, Some(&used))
+        })
     }) {
         Some(Ok(_)) => {}
         Some(Err(e)) if matches!(infer_over_relation(interp, relid, expr, None), Some(Ok(_))) => {

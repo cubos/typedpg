@@ -975,11 +975,38 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
     // ── vector (pgvector) ──────────────────────────────────────────────
     ExtensionDef {
         name: "vector",
-        default_version: "0.8.2",
-        versions: &[ExtensionVersion {
-            version: "0.8.2",
-            from: None,
-            sql: include_str!("../../extensions/vector--0.8.2.sql"),
-        }],
+        default_version: "0.8.7",
+        versions: &[
+            ExtensionVersion {
+                version: "0.8.2",
+                from: None,
+                sql: include_str!("../../extensions/vector--0.8.2.sql"),
+            },
+            ExtensionVersion {
+                version: "0.8.3",
+                from: Some("0.8.2"),
+                sql: include_str!("../../extensions/vector--0.8.2--0.8.3.sql"),
+            },
+            ExtensionVersion {
+                version: "0.8.4",
+                from: Some("0.8.3"),
+                sql: include_str!("../../extensions/vector--0.8.3--0.8.4.sql"),
+            },
+            ExtensionVersion {
+                version: "0.8.5",
+                from: Some("0.8.4"),
+                sql: include_str!("../../extensions/vector--0.8.4--0.8.5.sql"),
+            },
+            ExtensionVersion {
+                version: "0.8.6",
+                from: Some("0.8.5"),
+                sql: include_str!("../../extensions/vector--0.8.5--0.8.6.sql"),
+            },
+            ExtensionVersion {
+                version: "0.8.7",
+                from: Some("0.8.6"),
+                sql: include_str!("../../extensions/vector--0.8.6--0.8.7.sql"),
+            },
+        ],
     },
 ];

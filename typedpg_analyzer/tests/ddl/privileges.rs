@@ -1489,6 +1489,49 @@ fn default_privileges_are_role_dependencies() {
 }
 
 #[test]
+fn grant_option_to_public_is_checked_per_object() {
+    // PG 19 merge_acl_with_grant: `ALL … IN SCHEMA` naming no object
+    // grants nothing, and checks nothing.
+    build_db(&[(
+        "0001.sql",
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO PUBLIC WITH GRANT OPTION;",
+    )]);
+    assert_err_prefix!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO PUBLIC WITH GRANT OPTION;",
+        )]),
+        DdlError::Parse(_),
+        "grant options can only be granted to roles"
+    );
+}
+
+#[test]
+fn default_privileges_on_large_objects() {
+    // PG 19: ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS stores a
+    // `pg_default_acl` row (defaclobjtype 'L') its role depends on.
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_dp_lo;
+         ALTER DEFAULT PRIVILEGES FOR ROLE acl_dp_lo
+             GRANT SELECT ON LARGE OBJECTS TO PUBLIC;
+         DROP ROLE acl_dp_lo;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "role \"acl_dp_lo\" cannot be dropped because some objects depend on it (owner of \
+         default privileges on new large objects belonging to role acl_dp_lo)"
+    );
+    build_db(&[(
+        "0001.sql",
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT, UPDATE ON LARGE OBJECTS TO PUBLIC;
+         ALTER DEFAULT PRIVILEGES REVOKE UPDATE ON LARGE OBJECTS FROM PUBLIC;",
+    )]);
+}
+
+#[test]
 fn a_rolled_back_create_role_disappears() {
     let db = build_db(&[
         ("0001.sql", "CREATE TABLE acl_tx_role_t (id int);"),

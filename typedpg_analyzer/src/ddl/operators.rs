@@ -161,7 +161,7 @@ fn validate_restriction_estimator(
     names: &[String],
 ) -> Result<PgProcOid, DdlError> {
     let args = [INTERNAL, builtin::OID, INTERNAL, builtin::INT4];
-    let oid = lookup_func_name(interp, names, Some(&args))?.ok_or_else(|| {
+    let oid = lookup_func_name(interp, names, Some(&args), false)?.ok_or_else(|| {
         DdlError::TypeNotFound(format!(
             "function {} does not exist",
             func_signature_string(interp, names, &args)
@@ -181,8 +181,8 @@ fn validate_restriction_estimator(
 fn validate_join_estimator(interp: &PgCatalog, names: &[String]) -> Result<PgProcOid, DdlError> {
     let args5 = [INTERNAL, builtin::OID, INTERNAL, builtin::INT2, INTERNAL];
     let args4 = [INTERNAL, builtin::OID, INTERNAL, builtin::INT2];
-    let five = lookup_func_name(interp, names, Some(&args5))?;
-    let four = lookup_func_name(interp, names, Some(&args4))?;
+    let five = lookup_func_name(interp, names, Some(&args5), false)?;
+    let four = lookup_func_name(interp, names, Some(&args4), false)?;
     let oid = match (five, four) {
         (Some(_), Some(_)) => {
             return Err(DdlError::Parse(format!(
@@ -418,7 +418,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         }));
     };
     let args: Vec<PgTypeOid> = left.into_iter().chain([right]).collect();
-    let Some(proc_oid) = lookup_func_name(interp, &function, Some(&args))? else {
+    let Some(proc_oid) = lookup_func_name(interp, &function, Some(&args), false)? else {
         return Err(DdlError::TypeNotFound(format!(
             "function {} does not exist",
             func_signature_string(interp, &function, &args)

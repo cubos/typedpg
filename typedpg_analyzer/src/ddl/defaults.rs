@@ -192,7 +192,8 @@ fn check_default_kind(
 ) -> Result<(), DdlError> {
     check_default_kind_node(interp, expr, column_default)?;
     crate::resolve::check_no_srf_in_clause(expr, interp, "DEFAULT expressions")
-        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))
+        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
+    super::expr_kind::reject_parameters(expr)
 }
 
 fn check_default_kind_node(
