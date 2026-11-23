@@ -229,6 +229,10 @@ soundness bug in the analyzer: fix the inference, never the expectation.
 same scenarios (`typedpg_lint/src/rules/oracle.rs`): a `--fix` must keep rows, row
 count, table contents and SQLSTATE, and a claim (never NULL, always true, at most one
 row, …) runs as an assertion or equivalent query. A broken claim is a rule bug.
+It also runs `breaks_deployed_queries` against PG (`typedpg_lint/src/deployed_oracle.rs`,
+its own tests and the `deployed_oracle_corpus` test): deployed queries are called with
+sampled values before and after the new migrations, over seeded rows; a call that breaks
+with no finding, or that runs where a finding says it can't, is a rule bug.
 
 **Declared constraints are trusted.** Nullability inference may rely on
 what the schema states — a foreign key's referenced row exists, a CHECK

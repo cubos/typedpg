@@ -40,6 +40,32 @@ impl PgCatalog {
     /// Whether row-level security is enabled on `relid`
     /// (`pg_class.relrowsecurity`): its SELECT policies then restrict the
     /// rows a statement sees, `RETURNING` included.
+    /// Whether type `oid` is a NOT NULL domain (or a domain over one): a
+    /// column of it holds no NULL, whatever its own `attnotnull`.
+    pub fn lint_type_is_not_null(&self, oid: crate::oid::PgTypeOid) -> bool {
+        self.type_is_not_null(oid)
+    }
+
+    /// The name of the `NOT VALID` NOT NULL constraint of column `column`
+    /// of relation `relid`, if it has one: rows already stored may hold a
+    /// NULL there, which fails any UPDATE of them.
+    pub fn lint_not_valid_not_null(&self, relid: PgClassOid, column: &str) -> Option<&str> {
+        let attnum = self
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum > 0 && a.attname == column)?
+            .attnum;
+        self.pg_constraint
+            .values()
+            .find(|c| {
+                c.conrelid == relid
+                    && c.contype == super::ConType::NotNull
+                    && !c.convalidated
+                    && c.conkey == [attnum]
+            })
+            .map(|c| c.conname.as_str())
+    }
+
     pub fn lint_relation_has_row_security(&self, relid: PgClassOid) -> bool {
         self.row_security.contains(&relid)
     }

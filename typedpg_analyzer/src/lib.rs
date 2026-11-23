@@ -71,6 +71,9 @@ mod pgmsg;
 mod polymorphic;
 mod privileges;
 #[cfg(feature = "pg_sanity")]
+#[doc(hidden)]
+pub use pg_sanity::support as pg_sanity_support;
+#[cfg(feature = "pg_sanity")]
 pub use pg_sanity::{CLAIM_VIOLATED, Divergence, DivergenceKind, LintProbe, LintProbeResult};
 mod range_input;
 mod refine;
@@ -126,6 +129,7 @@ pub use pg_catalog::{
     NullifiedJoin, PgCatalog, QueryView, RelationRef, SublinkNullability, UserObjectCounts,
     ValueLimit,
 };
+pub use privileges::RowSecurityChecks;
 pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{

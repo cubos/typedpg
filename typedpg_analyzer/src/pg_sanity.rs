@@ -33,6 +33,18 @@
 
 mod soundness;
 
+/// What the `breaks_deployed_queries` oracle (`typedpg_lint`) reuses of
+/// the mirror: scratch databases, the seeder, text-format parameters, raw
+/// results and the nullability oracle's value checks.
+#[doc(hidden)]
+pub mod support {
+    pub use super::soundness::{Param, Raw, value_violation};
+    pub use super::{scratch_db_name, with_dbname};
+    pub use postgres;
+    /// The seeding helpers (`pg_temp.typedpg_seed`, …), see `seed.sql`.
+    pub const SEED_SQL: &str = super::soundness::SEED_SQL;
+}
+
 pub use soundness::lint::{CLAIM_VIOLATED, LintProbe, LintProbeResult};
 
 use std::collections::HashMap;
@@ -2640,7 +2652,7 @@ impl Drop for PgSanityServer {
 /// Build a unique-ish scratch database name: `pg_sanity_<pid>_<counter>_<nanos>`.
 /// Underscores-only so it doesn't need quoting; lowercase prefix dodges any
 /// PG identifier folding subtleties.
-fn scratch_db_name() -> String {
+pub fn scratch_db_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2655,7 +2667,7 @@ fn scratch_db_name() -> String {
 /// given name. Parse via `postgres::config::Config` to validate, then
 /// rebuild the keyword=value form manually — `Config` has accessors but
 /// no public `Display` for keyword form.
-fn with_dbname(conn_str: &str, dbname: &str) -> Result<String, String> {
+pub fn with_dbname(conn_str: &str, dbname: &str) -> Result<String, String> {
     let config: Config = conn_str
         .parse()
         .map_err(|e| format!("pg_sanity: invalid POSTGRES_URL ({conn_str:?}): {e}"))?;

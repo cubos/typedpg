@@ -5,7 +5,12 @@
 # the typedpg_lint suite with the oracle on (each rule's own tests), then
 # the corpus run (typedpg_lint/tests/lint_oracle.rs): the docs/lint
 # examples, the queries the analyzer's test suite analyzes, and generated
-# queries. Findings land in target/lint-oracle-findings.
+# queries. Findings land in target/lint-oracle-findings. The
+# breaks_deployed_queries oracle (typedpg_lint/src/deployed_oracle.rs) runs
+# with the same suite: the rule's own tests, then its corpus run
+# (typedpg_lint/tests/deployed_oracle.rs: generated migration changes x
+# deployed query shapes), whose findings land in
+# target/deployed-oracle-findings.
 #
 # The analyzer's queries are recorded once into target/lint-oracle-corpus
 # (its tests built with the `record_corpus` feature); LINT_ORACLE_RERECORD=1
@@ -14,6 +19,7 @@
 # Usage:
 #   scripts/run-lint-oracle.sh                     # everything
 #   scripts/run-lint-oracle.sh lint_oracle_corpus  # the corpus run only
+#   scripts/run-lint-oracle.sh deployed_oracle_corpus  # breaks_deployed_queries
 #   LINT_ORACLE_ITERS=20000 LINT_ORACLE_SEED=7 scripts/run-lint-oracle.sh lint_oracle_corpus
 #
 # Extra args are nextest filters / flags, as for scripts/run-pg-sanity.sh.

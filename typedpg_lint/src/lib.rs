@@ -22,6 +22,8 @@
 
 mod call_site;
 mod deployed;
+#[cfg(feature = "pg_sanity")]
+mod deployed_oracle;
 mod ignore;
 mod migrations;
 pub mod report;
@@ -31,6 +33,9 @@ mod rules;
 #[cfg(feature = "pg_sanity")]
 #[doc(hidden)]
 pub mod oracle {
+    pub use crate::deployed_oracle::{
+        Case as DeployedCase, Report as DeployedReport, run as run_deployed,
+    };
     pub use crate::rules::oracle::{collect, take_stats};
 }
 

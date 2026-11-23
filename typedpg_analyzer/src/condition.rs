@@ -828,6 +828,11 @@ pub struct WriteConstraint {
     pub allowed: Option<Refinement>,
     /// Its top-level AND conjuncts, each read for the column.
     pub parts: Vec<CheckPart>,
+    /// A relation's CHECK not validated (`NOT VALID`): rows already stored
+    /// may break it, and an UPDATE of one fails even when it doesn't write
+    /// the columns the constraint reads. (A domain's isn't checked again
+    /// on a value an UPDATE keeps.)
+    pub not_valid: bool,
 }
 
 /// One top-level AND conjunct of a [`WriteConstraint`].
@@ -1262,6 +1267,7 @@ impl PgCatalog {
                 columns,
                 allowed,
                 parts,
+                not_valid: !con.convalidated,
             });
         }
         for domain in self.domain_chain(attr.atttypid) {
@@ -1310,6 +1316,7 @@ impl PgCatalog {
                     columns: vec![column.to_owned()],
                     allowed: (r != Refinement::NONE).then_some(r),
                     parts,
+                    not_valid: false,
                 });
             }
         }
@@ -1679,6 +1686,22 @@ impl PgCatalog {
                     || a.attgenerated.is_some()
                     || self.domain_has_default(a.atttypid)
             })
+    }
+
+    /// For the lint: the value an INSERT (or a COPY) that leaves out column
+    /// `column` of relation `relid` stores — its DEFAULT expression, or
+    /// NULL without one; `None` when not known (an identity, serial or
+    /// generated column, a domain's default, a default that doesn't infer).
+    pub fn lint_column_default_value(
+        &self,
+        relid: crate::oid::PgClassOid,
+        column: &str,
+    ) -> Option<WrittenValue> {
+        let attr = self
+            .attributes_of(relid)
+            .iter()
+            .find(|a| a.attnum > 0 && a.attname == column)?;
+        crate::resolve::default_written_value(self, relid, attr)
     }
 
     /// What `r` allows column `column` of relation `relid`, in words (`one

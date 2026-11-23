@@ -82,7 +82,7 @@ use crate::resolve::AnalyzedQuery;
 use crate::types::Type;
 
 /// The PL/pgSQL helpers, created in the query session's `pg_temp`.
-const SEED_SQL: &str = include_str!("seed.sql");
+pub(crate) const SEED_SQL: &str = include_str!("seed.sql");
 
 /// Rows read per scenario: enough to see every seeded combination, bounded
 /// so a `generate_series` over millions stays cheap.
@@ -717,6 +717,25 @@ impl Soundness {
         {
             let _ = f.write_all(out.as_bytes());
         }
+    }
+}
+
+/// What the binary value `raw` (`None`: NULL) of result column `col`
+/// breaks of what the analysis says of the column: NULL where it isn't
+/// nullable (a NULL array element or record field included), or a value
+/// outside its refinement — worded as the nullability oracle reports it, a
+/// broken refinement ending in `(refinement: <what>)`. For the
+/// `breaks_deployed_queries` oracle (`typedpg_lint`), which checks what the
+/// deployed code's analysis promised against what the new schema returns.
+pub fn value_violation(col: &crate::resolve::AnalyzedColumn, raw: Option<&[u8]>) -> Option<String> {
+    match raw {
+        None if !col.nullable => Some("the value is NULL".to_owned()),
+        None => None,
+        Some(bytes) => inner_violation(&col.pg_type, bytes).or_else(|| {
+            refinement_violation(&col.pg_type, &col.refinement, bytes)
+                .or_else(|| elem_refinement_violation(&col.pg_type, &col.elem_refinement, bytes))
+                .or_else(|| field_refinement_violation(&col.pg_type, bytes))
+        }),
     }
 }
 
@@ -1548,7 +1567,7 @@ fn query_literals(sql: &str) -> Vec<String> {
 }
 
 /// A result value as raw binary bytes (`None` for NULL), whatever its type.
-struct Raw<'a>(Option<&'a [u8]>);
+pub struct Raw<'a>(pub Option<&'a [u8]>);
 
 impl<'a> FromSql<'a> for Raw<'a> {
     fn from_sql(
@@ -1569,7 +1588,7 @@ impl<'a> FromSql<'a> for Raw<'a> {
 
 /// A parameter bound in text format (`Some`), or NULL.
 #[derive(Debug)]
-struct Param(Option<String>);
+pub struct Param(pub Option<String>);
 
 impl ToSql for Param {
     fn to_sql(
