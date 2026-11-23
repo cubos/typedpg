@@ -2326,8 +2326,7 @@ pub(crate) fn srf_elements_nullable(
     if array_unnest {
         // What the argument's type says of its elements: `ARRAY[a, b]` over
         // NOT NULL values, `ARRAY(SELECT nn_col …)`, … (a multidimensional
-        // array's are unknown: its sub-arrays being there says nothing of
-        // their elements).
+        // array's are its sub-arrays' elements, every one unrolled).
         let elements_not_null = args
             .first()
             .map(|n| functions::call_arg_value(n.as_ref()))

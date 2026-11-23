@@ -748,7 +748,10 @@ fn builtin_array_elem_nullable(
         )
     };
     match resolved.signature.as_str() {
-        // (`array_agg(anyarray)` builds a multidimensional array.)
+        // `array_agg(anyarray)` builds a multidimensional array of its
+        // arguments' elements (a NULL argument fails, "cannot accumulate
+        // null arrays").
+        "array_agg(anyarray)" => elems(0),
         "array_agg(anynonarray)"
         | "array_fill(anyelement,_int4)"
         | "array_fill(anyelement,_int4,_int4)" => value(0),

@@ -673,9 +673,28 @@ pub(crate) fn transform_array_expr_typed(
     // Its elements are the listed values (unless it is multidimensional,
     // where they are the sub-arrays' elements), each converted to the
     // element type — which may map one to NULL (`int4(jsonb)` for a JSON
-    // null, a user's non-strict cast).
-    let elem_nullable = (!multidims).then(|| {
-        elems.iter().any(|t| {
+    // null, a user's non-strict cast). A multidimensional one's are known
+    // when every sub-array's are, converted element by element (a NULL
+    // sub-array adds none; it fails unless all are empty).
+    let elem_nullable = if multidims {
+        merge_elem_nullable(arr.elements.iter().zip(&elems).filter_map(|(e, t)| {
+            if matches!(e.as_ref(), Some(ast::Node::AConst(c)) if c.isnull) {
+                return None;
+            }
+            Some(
+                if t.type_oid == oid::UNKNOWN
+                    || super::literals::array_cast_runs_function(t.type_oid, coerce_type, snapshot)
+                {
+                    None
+                } else if super::coercion_can_null_elements(t.type_oid, coerce_type, snapshot) {
+                    Some(true)
+                } else {
+                    t.elem_nullable
+                },
+            )
+        }))
+    } else {
+        Some(elems.iter().any(|t| {
             t.nullable
                 || (t.type_oid != oid::UNKNOWN
                     && t.type_oid != coerce_type
@@ -684,8 +703,8 @@ pub(crate) fn transform_array_expr_typed(
                         coerce_type,
                         snapshot,
                     ))
-        })
-    });
+        }))
+    };
     // What its non-NULL elements are: each listed value's (a sub-array's
     // elements'), converted to the element type; a NULL constant is none.
     let parts: Vec<crate::refine::Refinement> = arr
@@ -1249,7 +1268,9 @@ pub(crate) fn transform_container_subscripts(
         Ok(
             ExprType::scalar_with_typmod(base, container.nullable || any_bound_nullable, typmod)
                 .with_collation(derive_collation([container], base, snapshot)?)
-                // Some of its elements.
+                // Some of its elements (the bounds are clipped to the
+                // array's: a slice adds no NULL element).
+                .with_elem_nullable(container.elem_nullable)
                 .with_elem_refine(container.elem_refine.clone()),
         )
     } else {

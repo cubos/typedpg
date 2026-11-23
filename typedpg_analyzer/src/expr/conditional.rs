@@ -433,7 +433,9 @@ fn grouping_present_columns(
 /// every branch that can be the (non-NULL) result says of its elements.
 /// A NULL constant is never a non-NULL array, an untyped array literal
 /// (`'{}'`) says by its content, a branch of the result's type by its own
-/// knowledge; a converted one says nothing.
+/// knowledge, and so does one converted element by element through casts
+/// that map no non-NULL element to NULL (`int[]` → `bigint[]`); any other
+/// converted one says nothing.
 pub(crate) fn branches_elem_nullable(
     branches: &[(Option<&ast::Node>, &ExprType)],
     common: PgTypeOid,
@@ -451,6 +453,12 @@ pub(crate) fn branches_elem_nullable(
                 _ => parts.push(None),
             },
             _ if snapshot.unwrap_domain(t.type_oid) == snapshot.unwrap_domain(common) => {
+                parts.push(t.elem_nullable)
+            }
+            _ if coerce::element_type(snapshot.unwrap_domain(t.type_oid), snapshot).is_some()
+                && !super::literals::array_cast_runs_function(t.type_oid, common, snapshot)
+                && !super::coercion_can_null_elements(t.type_oid, common, snapshot) =>
+            {
                 parts.push(t.elem_nullable)
             }
             _ => parts.push(None),

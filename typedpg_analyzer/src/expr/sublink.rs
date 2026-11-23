@@ -283,8 +283,13 @@ pub(crate) fn infer_sublink(
                 let elem = first.type_oid;
                 let elem_array = snapshot.array_type_of(elem);
                 // The elements are the column's values (or, for an array
-                // column, the multidimensional result's sub-arrays').
-                elem_nullable = elem_array.is_some().then_some(first.nullable);
+                // column, the multidimensional result's sub-arrays' elements:
+                // a NULL sub-array fails, "cannot accumulate null arrays").
+                elem_nullable = if elem_array.is_some() {
+                    Some(first.nullable)
+                } else {
+                    first.elem_nullable
+                };
                 elem_refine = if elem_array.is_some() {
                     first.refine.clone()
                 } else {

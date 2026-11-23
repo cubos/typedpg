@@ -722,6 +722,35 @@ mod tests {
         );
     }
 
+    /// An array cast element by element, and an aggregate of values proven
+    /// non-NULL, have non-NULL elements.
+    #[test]
+    fn proven_elements_are_not_nullable() {
+        let ddl = "CREATE TABLE cl (id int4 PRIMARY KEY, tz text NOT NULL);
+            CREATE TABLE ev (id uuid PRIMARY KEY, cid int4 NOT NULL REFERENCES cl,
+                             dates date[] NOT NULL CHECK (array_position(dates, NULL) IS NULL),
+                             fin timestamptz NOT NULL CHECK (isfinite(fin)));";
+        let g = run_with_ddl(
+            ddl,
+            Kind::Query,
+            r#"SELECT dates::text[] AS "dates!" FROM ev"#,
+            &[],
+        )
+        .unwrap();
+        assert!(g.types.contains("value: string[];"), "{}", g.types);
+        let g = run_with_ddl(
+            ddl,
+            Kind::Query,
+            r#"SELECT array_agg(DISTINCT extract(isodow FROM s.fin AT TIME ZONE c.tz)::int) AS "days!",
+                      array_agg(s.id) AS "ids!"
+               FROM ev s JOIN cl c ON c.id = s.cid"#,
+            &[],
+        )
+        .unwrap();
+        assert!(g.types.contains("days: number[];"), "{}", g.types);
+        assert!(g.types.contains("ids: string[];"), "{}", g.types);
+    }
+
     #[test]
     fn equal_to_any_of_an_array_is_one_of_its_elements() {
         let g = ok(

@@ -456,7 +456,11 @@ pub(crate) fn infer_type_cast(
     // says (`'{1,2}'::int[]` has no NULL element), an `ARRAY[…]` built
     // for the target or an array of the same type keeps its own (a
     // relabeling or typmod coercion maps no element to NULL); an element
-    // conversion (`jsonb[]` → `int[]`, …) may.
+    // conversion (`date[]` → `text[]`, an `ArrayCoerceExpr`) maps a NULL
+    // element to NULL and a non-NULL one to NULL only through a cast
+    // function that can return NULL (`jsonb[]` → `int[]`: `'null'::jsonb`).
+    // A cast function between the array types themselves says nothing of
+    // the elements it returns.
     // A domain whose CHECK keeps NULL elements out checks the value.
     let elem_nullable = if array_element_type(snapshot, target_base).is_none() {
         None
@@ -469,7 +473,12 @@ pub(crate) fn infer_type_cast(
             ),
             _ => None,
         }
-    } else if built_for_target || snapshot.unwrap_domain(inner_type.type_oid) == target_base {
+    } else if built_for_target
+        || snapshot.unwrap_domain(inner_type.type_oid) == target_base
+        || (array_element_type(snapshot, snapshot.unwrap_domain(inner_type.type_oid)).is_some()
+            && !array_cast_runs_function(inner_type.type_oid, target_oid, snapshot)
+            && !coercion_can_null_elements(inner_type.type_oid, target_oid, snapshot))
+    {
         inner_type.elem_nullable
     } else {
         None
@@ -676,6 +685,21 @@ pub(crate) fn coercion_can_null_elements(
         (Some(fe), Some(te)) => coercion_can_return_null(fe, te, snapshot),
         _ => false,
     }
+}
+
+/// Whether coercing `from` to `to` runs a cast function between the two
+/// types themselves (a `pg_cast` row with a function), not a relabeling
+/// nor an element-by-element conversion.
+pub(crate) fn array_cast_runs_function(
+    from: PgTypeOid,
+    to: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    snapshot
+        .cast_by_pair
+        .get(&(snapshot.unwrap_domain(from), snapshot.unwrap_domain(to)))
+        .and_then(|oid| snapshot.pg_cast.get(oid))
+        .is_some_and(|c| c.castmethod == crate::pg_catalog::CastMethod::Function)
 }
 
 /// A pseudo-type whose input function is PSEUDOTYPE_DUMMY_INPUT_FUNC

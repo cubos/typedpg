@@ -759,6 +759,11 @@ impl ExprType {
         }
         if literals::coercion_can_null_elements(self.type_oid, to, snapshot) {
             self.elem_nullable = Some(true);
+        } else if self.type_oid != to
+            && literals::array_cast_runs_function(self.type_oid, to, snapshot)
+        {
+            // A cast function between the array types returns any elements.
+            self.elem_nullable = None;
         }
         self.elem_refine = self.elem_refine_converted(to, snapshot);
         self.refine = self.refine.converted(self.type_oid, to, snapshot);
@@ -1933,6 +1938,12 @@ fn infer_expr_unlocated(
             Ok(
                 ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
                     .with_collation(derive_collation(&args, resolved_type, snapshot)?)
+                    // The result is one of the (coerced) arguments.
+                    .with_elem_nullable(conditional::branches_elem_nullable(
+                        &branches,
+                        resolved_type,
+                        snapshot,
+                    ))
                     .with_refine(refine),
             )
         }

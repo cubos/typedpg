@@ -1587,22 +1587,31 @@ fn arrays_coerce_element_wise() {
         "SELECT GREATEST(ARRAY[1], ARRAY[2.5]) AS a",
     ] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        // (Only the UNION's arms carry their elements' nullability.)
-        let element_nullable = sql.contains("UNION").then_some(false);
+        // An `integer` converted to `numeric` is never NULL: the elements
+        // stay known.
         let expected = Type::Array {
             element: Box::new(numeric()),
-            element_nullable,
+            element_nullable: Some(false),
             name: None,
         };
         assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }
-    for sql in [
-        "SELECT ARRAY[ARRAY[1], ARRAY[2.5]] AS a",
-        "SELECT ARRAY[[1], [2.5]] AS a",
-        "SELECT ARRAY[arr, ARRAY[1.5]] AS a FROM ta",
+    let known = |element| Type::Array {
+        element: Box::new(element),
+        element_nullable: Some(false),
+        name: None,
+    };
+    for (sql, expected) in [
+        ("SELECT ARRAY[ARRAY[1], ARRAY[2.5]] AS a", known(numeric())),
+        ("SELECT ARRAY[[1], [2.5]] AS a", known(numeric())),
+        // A table's array column says nothing of its elements.
+        (
+            "SELECT ARRAY[arr, ARRAY[1.5]] AS a FROM ta",
+            array_of(numeric()),
+        ),
     ] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(s.columns[0].pg_type, array_of(numeric()), "{sql}");
+        assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }
     let s = db
         .analyze("SELECT ARRAY[ARRAY[1]::int[], ARRAY[2]::bigint[]] AS a")
