@@ -536,31 +536,197 @@ fn unnest_in_select_list_int() {
     assert_cols(&s, vec![cn("n", int4())]);
 }
 
+/// `int2vector` / `oidvector`: true arrays of `int2` / `oid` (subscripted,
+/// read by the array functions) that keep their own type.
+fn vector(name: &str, element: Type) -> Type {
+    Type::Array {
+        element: Box::new(element),
+        element_nullable: None,
+        name: Some(QualifiedName::new("pg_catalog", name)),
+    }
+}
+
 #[test]
 fn unnest_of_an_array_of_int2vector() {
     // `int2vector` is itself a true array (of int2), but it has an array
     // type, so `ARRAY(SELECT int2vector)` is `int2vector[]`
     // (get_promoted_array_type), not a two-dimensional int2 array — and
-    // unnest yields int2vector values (which typedpg types as an int2
-    // array, as it does any int2vector), not their int2 elements.
+    // unnest yields int2vector values, not their int2 elements.
     let db = setup();
     let s = db
         .analyze("SELECT unnest(array(SELECT '11 22 33'::int2vector)) AS v")
         .unwrap();
-    assert_cols(&s, vec![c("v", array_of(int2()))]);
+    assert_cols(&s, vec![c("v", vector("int2vector", int2()))]);
     let s = db
         .analyze("SELECT array(SELECT '11 22 33'::int2vector) AS a")
         .unwrap();
-    assert_cols(&s, vec![c("a", array_of(array_of(int2())))]);
+    assert_cols(&s, vec![c("a", array_of(vector("int2vector", int2())))]);
     let s = db
         .analyze("SELECT unnest(array(SELECT '1 2'::oidvector)) AS v")
         .unwrap();
-    assert_cols(&s, vec![c("v", array_of(oid_ty()))]);
+    assert_cols(&s, vec![c("v", vector("oidvector", oid_ty()))]);
     // A real array column still makes a multidimensional array of itself.
     let s = db
         .analyze("SELECT array(SELECT nums FROM users) AS a")
         .unwrap();
     assert_cols(&s, vec![c("a", array_of(int4()))]);
+}
+
+#[test]
+fn int2vector_and_oidvector_keep_their_type() {
+    // PostgreSQL describes them as `int2vector` (22) / `oidvector` (30),
+    // never `int2[]` / `oid[]`: a parameter cast to `int2[]` can't be cast
+    // back (`cannot cast type smallint[] to int2vector`).
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE vecs (id int PRIMARY KEY, v int2vector NOT NULL, o oidvector);")
+        .unwrap();
+    let s = db.analyze("SELECT $1::int2vector AS v").unwrap();
+    assert_eq!(s.params[0].pg_type, vector("int2vector", int2()));
+    assert_eq!(
+        s.params[0].pg_type.cast_name().unwrap(),
+        "pg_catalog.int2vector"
+    );
+    assert_eq!(s.params[0].pg_type.describe(), "int2vector");
+    assert_cols(&s, vec![c("v", vector("int2vector", int2()))]);
+    let s = db.analyze("SELECT $1::oidvector AS o").unwrap();
+    assert_eq!(s.params[0].pg_type, vector("oidvector", oid_ty()));
+    let s = db.analyze("INSERT INTO vecs VALUES ($1, $2, $3)").unwrap();
+    assert_eq!(s.params[1].pg_type, vector("int2vector", int2()));
+    assert_eq!(s.params[2].pg_type, vector("oidvector", oid_ty()));
+    let s = db.analyze("SELECT v, o FROM vecs").unwrap();
+    assert_cols(
+        &s,
+        vec![
+            c("v", vector("int2vector", int2())),
+            cn("o", vector("oidvector", oid_ty())),
+        ],
+    );
+    // Never a NULL element: neither input function takes one (a literal
+    // isn't read as `{…}`, whose `NULL` would be one).
+    for sql in [
+        "SELECT v, o FROM vecs",
+        "SELECT '1 2'::oidvector AS o, ''::int2vector AS v",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        for col in &s.columns {
+            assert!(
+                matches!(
+                    col.pg_type,
+                    Type::Array {
+                        element_nullable: Some(false),
+                        ..
+                    }
+                ),
+                "`{sql}`: {:?}",
+                col.pg_type
+            );
+        }
+    }
+    let s = db.analyze("SELECT ARRAY[v] AS a FROM vecs").unwrap();
+    assert_cols(&s, vec![c("a", array_of(vector("int2vector", int2())))]);
+
+    // Where PG treats them as arrays of their elements: a subscript is an
+    // element; a slice, `||`, `array_append` and a common type with an
+    // `int2[]` are `int2[]` (transformContainerType's "domain over int2[]").
+    for (sql, ty) in [
+        ("SELECT v[0] AS x FROM vecs", int2()),
+        ("SELECT v[0:1] AS x FROM vecs", array_of(int2())),
+        ("SELECT o[0] AS x FROM vecs", oid_ty()),
+        ("SELECT array_length(v, 1) AS x FROM vecs", int4()),
+        ("SELECT v || 3::int2 AS x FROM vecs", array_of(int2())),
+        (
+            "SELECT array_append(v, 3::int2) AS x FROM vecs",
+            array_of(int2()),
+        ),
+        ("SELECT v::int2[] AS x FROM vecs", array_of(int2())),
+        ("SELECT o::oid[] AS x FROM vecs", array_of(oid_ty())),
+        ("SELECT unnest(v) AS x FROM vecs", int2()),
+        (
+            "SELECT COALESCE(v, '{1}'::int2[]) AS x FROM vecs",
+            array_of(int2()),
+        ),
+        (
+            "SELECT CASE WHEN id = 1 THEN v ELSE '{1}'::int2[] END AS x FROM vecs",
+            array_of(int2()),
+        ),
+        (
+            "SELECT COALESCE(v, v) AS x FROM vecs",
+            vector("int2vector", int2()),
+        ),
+        ("SELECT 1::int2 = ANY(v) AS x FROM vecs", bool_ty()),
+        ("SELECT v = v AS x FROM vecs", bool_ty()),
+        ("SELECT o = o AS x FROM vecs", bool_ty()),
+        ("SELECT o < $1 AS x FROM vecs", bool_ty()),
+        ("SELECT v::text AS x FROM vecs", text()),
+    ] {
+        let s = db
+            .analyze(sql)
+            .unwrap_or_else(|e| panic!("PG accepts `{sql}`: {e}"));
+        let col = &s.columns[0];
+        let got = match col.pg_type.clone() {
+            Type::Array { element, name, .. } => Type::Array {
+                element,
+                element_nullable: None,
+                name,
+            },
+            other => other,
+        };
+        assert_eq!(got, ty, "`{sql}`");
+    }
+    let s = db.analyze("SELECT o < $1 AS x FROM vecs").unwrap();
+    assert_eq!(s.params[0].pg_type, vector("oidvector", oid_ty()));
+    let s = db.analyze("SELECT v = $1 AS x FROM vecs").unwrap();
+    assert_eq!(s.params[0].pg_type, vector("int2vector", int2()));
+    let s = db.analyze("SELECT $1 = ANY(v) AS x FROM vecs").unwrap();
+    assert_eq!(s.params[0].pg_type, int2());
+    for sql in [
+        "SELECT v || $1 AS x FROM vecs",
+        "SELECT array_cat(v, $1) AS x FROM vecs",
+    ] {
+        let s = db.analyze(sql).unwrap();
+        assert_eq!(s.params[0].pg_type, array_of(int2()), "`{sql}`");
+    }
+
+    // No cast back from the element's array, and no `@>` across the two.
+    for (sql, msg) in [
+        (
+            "SELECT '{1,2}'::int2[]::int2vector",
+            "cannot cast type smallint[] to int2vector",
+        ),
+        (
+            "SELECT $1::int2[]::int2vector",
+            "cannot cast type smallint[] to int2vector",
+        ),
+        (
+            "SELECT v @> '{1}'::int2[] FROM vecs",
+            "operator does not exist: int2vector @> smallint[]",
+        ),
+        // An assignment to an element or slice assigns an `int2[]`
+        // (transformAssignmentSubscripts), which has no cast back.
+        (
+            "UPDATE vecs SET v[0] = 1",
+            "cannot cast type smallint[] to int2vector",
+        ),
+        (
+            "UPDATE vecs SET v[0:1] = '{1,2}'",
+            "cannot cast type smallint[] to int2vector",
+        ),
+        (
+            "INSERT INTO vecs (id, v[0]) VALUES (1, 2)",
+            "cannot cast type smallint[] to int2vector",
+        ),
+        (
+            "SELECT v[0:1]::int2vector FROM vecs",
+            "cannot cast type smallint[] to int2vector",
+        ),
+    ] {
+        let err = db
+            .analyze(sql)
+            .err()
+            .unwrap_or_else(|| panic!("PG rejects `{sql}`"))
+            .to_string();
+        assert!(err.starts_with(msg), "`{sql}`: {err}");
+    }
 }
 
 // ── Slice extras ─────────────────────────────────────────────────────────────

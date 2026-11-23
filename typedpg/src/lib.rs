@@ -482,7 +482,7 @@ pub mod __private {
     pub use tokio_postgres;
 
     use bytes::{Buf, BytesMut};
-    use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
+    use tokio_postgres::types::{Format, FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
     /// Reads (and binds) a value as `T` through the type its binary format
     /// is that of, where `T`'s `FromSql` / `ToSql` impl would refuse the
@@ -498,6 +498,11 @@ pub mod __private {
     ///
     /// Arrays of either are bound with their own element type OID in the
     /// array header, which `array_recv` checks.
+    ///
+    /// An `int2vector` / `oidvector` (read as a `Vec` of its elements) is
+    /// bound in its text form, `1 2 3`: its receive function refuses the
+    /// binary form of an empty one (`array_recv` makes it zero-dimensional,
+    /// and `int2vectorrecv` wants one dimension).
     #[doc(hidden)]
     #[derive(Debug)]
     pub struct BaseTyped<T>(pub T);
@@ -580,12 +585,78 @@ pub mod __private {
         }
     }
 
+    /// Whether `ty` is `int2vector` or `oidvector`, bound in text.
+    fn is_vector(ty: &Type) -> bool {
+        matches!(*ty, Type::INT2_VECTOR | Type::OID_VECTOR)
+    }
+
+    /// The text form (`1 2 3`) of the binary array `bytes` of `int2` or
+    /// `oid` elements (`ty`: `int2vector` or `oidvector`).
+    fn vector_text(
+        ty: &Type,
+        mut bytes: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        let malformed = || format!("typedpg: malformed {} array", ty.name());
+        if bytes.len() < 12 {
+            return Err(malformed().into());
+        }
+        let ndim = bytes.get_i32();
+        bytes.advance(8); // the NULL flag and the element type
+        let mut count = 1i64;
+        for _ in 0..ndim {
+            if bytes.len() < 8 {
+                return Err(malformed().into());
+            }
+            count *= i64::from(bytes.get_i32());
+            bytes.advance(4); // the lower bound
+        }
+        if ndim == 0 {
+            count = 0;
+        }
+        let mut text = String::new();
+        for i in 0..count {
+            if bytes.len() < 4 {
+                return Err(malformed().into());
+            }
+            let len = bytes.get_i32();
+            if len < 0 {
+                return Err(
+                    format!("typedpg: an element of an {} cannot be NULL", ty.name()).into(),
+                );
+            }
+            let len = len as usize;
+            if bytes.len() < len {
+                return Err(malformed().into());
+            }
+            let value = match (*ty == Type::INT2_VECTOR, len) {
+                (true, 2) => i64::from(bytes.get_i16()),
+                (false, 4) => i64::from(bytes.get_u32()),
+                _ => return Err(malformed().into()),
+            };
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push_str(&value.to_string());
+        }
+        out.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+
     impl<T: ToSql> ToSql for BaseTyped<T> {
         fn to_sql(
             &self,
             ty: &Type,
             out: &mut BytesMut,
         ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            if is_vector(ty) {
+                let mut binary = BytesMut::new();
+                let is_null = self.0.to_sql(ty, &mut binary)?;
+                if let IsNull::No = is_null {
+                    vector_text(ty, &binary, out)?;
+                }
+                return Ok(is_null);
+            }
             let Some(wire) = wire_type(ty) else {
                 return self.0.to_sql(ty, out);
             };
@@ -602,6 +673,14 @@ pub mod __private {
             match wire_type(ty) {
                 Some(wire) => T::accepts(&wire),
                 None => T::accepts(ty),
+            }
+        }
+
+        fn encode_format(&self, ty: &Type) -> Format {
+            if is_vector(ty) {
+                Format::Text
+            } else {
+                self.0.encode_format(ty)
             }
         }
 

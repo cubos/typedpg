@@ -1093,7 +1093,9 @@ const MAXDIM: usize = 6;
 /// fetches and assignments (`UPDATE … SET arr[1] = …`): the returned type is
 /// both the fetched value's type and the type an assigned value must have.
 ///
-/// - A domain subscripts as its base type (`transformContainerType`).
+/// - A domain subscripts as its base type (`transformContainerType`), and
+///   `int2vector` / `oidvector` as `int2[]` / `oid[]` (a slice of one is
+///   one of those: it may not have the vector's dimensions).
 /// - A type is subscriptable iff it has a subscript handler: every type with
 ///   a `typelem` (true arrays, `int2vector`, `name`, `point`, …) uses the
 ///   array handler, and `jsonb` its own. Anything else is `cannot subscript
@@ -1112,7 +1114,11 @@ pub(crate) fn transform_container_subscripts(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let base = snapshot.unwrap_domain(container.type_oid);
+    let base = match snapshot.unwrap_domain(container.type_oid) {
+        oid::INT2VECTOR => oid::INT2ARRAY,
+        oid::OIDVECTOR => oid::OIDARRAY,
+        base => base,
+    };
     let typmod = if base == container.type_oid {
         container.typmod
     } else {

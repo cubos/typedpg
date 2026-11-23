@@ -593,6 +593,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     // Array type for the composite (makeArrayTypeName: `_<name>`, unless
@@ -619,6 +620,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     // Default expressions carried over from parents / LIKE sources (a

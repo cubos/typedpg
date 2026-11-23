@@ -2424,20 +2424,13 @@ fn validate_bytea(content: &str) -> Result<(), String> {
 /// recursively through [`validate`] for non-NULL elements, and through the
 /// domain's NOT NULL constraint for NULL ones (`domain_in` is not strict).
 ///
-/// The element delimiter is the element type's `typdelim`: `;` for `box`,
-/// `,` for every other built-in. A base type defined outside `pg_catalog`
-/// (an extension's, with a `DELIMITER` we don't record) only gets the
-/// opening-shape check.
+/// The element delimiter is the element type's `typdelim` ([`array_delimiter`]).
 fn validate_array(content: &str, elem: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
     if snapshot.get_type(snapshot.unwrap_domain(elem)).is_none() {
         return Ok(());
     }
     let Some(delim) = array_delimiter(elem, snapshot) else {
-        let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if trimmed.starts_with('{') || (trimmed.starts_with('[') && trimmed.contains("={")) {
-            return Ok(());
-        }
-        return Err(format!("malformed array literal: \"{content}\""));
+        return Ok(());
     };
     crate::array_input::parse_array(content, delim, &mut |e| match e {
         Some(value) => {
@@ -2466,20 +2459,11 @@ fn check_domain_accepts_value(
     }
 }
 
-/// The `typdelim` `array_in` splits an array of `elem` on: `;` for `box`,
-/// `,` for every other built-in. `None` for a base type defined outside
-/// `pg_catalog` (an extension's, with a `DELIMITER` we don't record) — or
-/// one the catalog doesn't know.
+/// The `typdelim` `array_in` splits an array of `elem` on: `;` for `box`
+/// (and a domain over it), `,` for every other built-in, what a base type's
+/// `DELIMITER` says. `None` for a type the catalog doesn't know.
 pub(crate) fn array_delimiter(elem: PgTypeOid, snapshot: &PgCatalog) -> Option<u8> {
-    let base_type = snapshot.get_type(snapshot.unwrap_domain(elem))?;
-    let in_pg_catalog = snapshot.namespace_name(base_type.typnamespace) == Some("pg_catalog");
-    if in_pg_catalog && base_type.typname == "box" {
-        Some(b';')
-    } else if base_type.typtype == TypType::Base && !in_pg_catalog {
-        None
-    } else {
-        Some(b',')
-    }
+    snapshot.get_type(elem).map(|t| t.typdelim as u32 as u8)
 }
 
 /// `domain_check_input` on a NULL value: any NOT NULL constraint along the

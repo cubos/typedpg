@@ -164,14 +164,30 @@ for (const [name, connect] of drivers) {
       }));
     });
 
-    test("box arrays and int2vectors decode, and box arrays encode", async () => {
+    test("box arrays and int2vectors decode, and both encode", async () => {
       const boxes = ["(1,1),(0,0)", null, "(3,3),(2,2)"];
-      assert.deepEqual(await t.oddArrays.fetchOne(c.db, { boxes }), {
+      assert.deepEqual(await t.oddArrays.fetchOne(c.db, { boxes, frames: boxes, vec: [4, -5], oids: [26, 1259] }), {
         boxes,
         built: boxes,
+        frames: boxes,
         vec: [1, 2, -3],
         empty_vec: [],
+        vec_param: [4, -5],
+        oids: [26, 1259],
+        vecs: [[4, -5], []],
       });
+      const empty = await t.oddArrays.fetchOne(c.db, { boxes: [], frames: [], vec: [], oids: [] });
+      assert.deepEqual([empty.vec_param, empty.oids, empty.vecs], [[], [], [[], []]]);
+      assert.deepEqual(await t.vectorMatches.fetchOne(c.db, { key: [3, 1] }), { same: true, first: 3, len: 2 });
+      assert.equal((await t.vectorMatches.fetchOne(c.db, { key: [1, 3] })).same, false);
+    });
+
+    test("a box spread, item by item and as an array", async () => {
+      const boxes = Array.from({ length: 1001 }, (_, i) => `(${i + 1},${i + 1}),(0,0)`);
+      const wanted = ["(2,2),(0,0)", "(5,5),(0,0)"];
+      assert.deepEqual(await t.boxSpread.fetchAll(c.db, { boxes, wanted }), wanted.map((b) => ({ b })));
+      // Above the threshold, the spread is bound as one `box[]`.
+      assert.equal((await t.boxSpread.fetchAll(c.db, { boxes, wanted: boxes })).length, 1001);
     });
 
     test("a JSON parameter's null is SQL NULL, jsonNull the JSON null", async () => {

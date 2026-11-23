@@ -388,6 +388,7 @@ impl NarrowParam {
             Type::Array {
                 element,
                 element_nullable,
+                ..
             } if *element_nullable != Some(true) => Self::of(element, config),
             Type::Domain { .. } => match innermost_type(ty) {
                 Type::Array { element, .. } => Self::of(element, config),
@@ -462,6 +463,7 @@ fn resolve_type_mapping(
     if let Type::Array {
         element,
         element_nullable,
+        ..
     } = ty
     {
         return resolve_array_mapping(element, *element_nullable == Some(true), config, registry);
@@ -1221,6 +1223,9 @@ fn wire_type(catalog: &PgCatalog, ty: &Type) -> Option<PgTypeOid> {
             .resolve_type_by_name(Some(schema), name)
             .map(|t| t.oid),
         Type::Domain { base, .. } => wire_type(catalog, base),
+        Type::Array {
+            name: Some(name), ..
+        } => named_array(catalog, name),
         Type::Array { element, .. } => {
             let mut element = &**element;
             while let Type::Domain { base, .. } = element {
@@ -1229,12 +1234,20 @@ fn wire_type(catalog: &PgCatalog, ty: &Type) -> Option<PgTypeOid> {
             match element {
                 // `int4[][]` is `int4[]`: an array's dimensions are not
                 // part of its type.
-                Type::Array { .. } => wire_type(catalog, element),
+                Type::Array { name: None, .. } => wire_type(catalog, element),
                 _ => catalog.get_type(wire_type(catalog, element)?)?.typarray,
             }
         }
         Type::AnonymousRecord { .. } => None,
     }
+}
+
+/// The OID of an array type of its own ([`Type::Array`]'s `name`:
+/// `int2vector`, `oidvector`).
+fn named_array(catalog: &PgCatalog, name: &QualifiedName) -> Option<PgTypeOid> {
+    catalog
+        .resolve_type_by_name(Some(&name.schema), &name.name)
+        .map(|t| t.oid)
 }
 
 /// The OID of each result column as the server describes it, when every
@@ -1265,9 +1278,12 @@ fn described_type(catalog: &PgCatalog, ty: &Type) -> Option<PgTypeOid> {
         | Type::Range { schema, name, .. }
         | Type::Composite { schema, name, .. } => named(schema, name).map(|t| t.oid),
         Type::Domain { base, .. } => described_type(catalog, base),
+        Type::Array {
+            name: Some(name), ..
+        } => named_array(catalog, name),
         Type::Array { element, .. } => match &**element {
-            // `int4[][]` is `int4[]`.
-            Type::Array { .. } => described_type(catalog, element),
+            // `int4[][]` is `int4[]` (but `int2vector[]` is its own type).
+            Type::Array { name: None, .. } => described_type(catalog, element),
             Type::Domain { schema, name, .. } => named(schema, name)?.typarray,
             _ => {
                 catalog
@@ -2480,6 +2496,7 @@ fn sql_type_name(ty: &Type) -> String {
             };
             sql.to_string()
         }
+        Type::Array { name: Some(_), .. } => pg_type_label(ty),
         Type::Array { element, .. } => format!("{}[]", sql_type_name(element)),
         other => pg_type_label(other),
     }
@@ -2638,6 +2655,7 @@ fn array_of(field: &AnalyzedSpreadField) -> Type {
     Type::Array {
         element: Box::new(field.pg_type.clone()),
         element_nullable: Some(field.nullable),
+        name: None,
     }
 }
 
@@ -3282,6 +3300,15 @@ fn pg_type_label(ty: &Type) -> String {
                 name.clone()
             } else {
                 QualifiedName::new(schema.clone(), name.clone()).to_string()
+            }
+        }
+        Type::Array {
+            name: Some(name), ..
+        } => {
+            if name.schema == "pg_catalog" {
+                name.name.clone()
+            } else {
+                name.to_string()
             }
         }
         Type::Array { element, .. } => format!("{}[]", pg_type_label(element)),

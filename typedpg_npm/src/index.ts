@@ -193,13 +193,22 @@ export interface QuerySpec {
   params: readonly (readonly [string, Codec])[];
   /**
    * Each spread's name, fields (name, codec, the cast after its
-   * placeholder) and kind: `rows` of VALUES (`VALUES $..rows { a, b }`), or
-   * the `list` of an IN (`x IN $..ids`), whose one field is the element.
+   * placeholder and, when it isn't `,`, what separates its values in an
+   * array) and kind: `rows` of VALUES (`VALUES $..rows { a, b }`), or the
+   * `list` of an IN (`x IN $..ids`), whose one field is the element.
    */
-  spreads?: readonly (readonly [string, readonly (readonly [string, Codec, string])[], "rows" | "list"])[];
+  spreads?: readonly (readonly [string, readonly SpreadField[], "rows" | "list"])[];
   columns: readonly (readonly [string, Codec])[];
   /** Whether `fetchOne` / `fetchOptional` can wrap the SQL in `LIMIT 2`. */
   subquery?: boolean;
+}
+
+/** A spread's field: its name, codec, cast and array delimiter (when not `,`). */
+type SpreadField = readonly [string, Codec, string] | readonly [string, Codec, string, string];
+
+/** The codec of an array of `field`'s values. */
+function arrayOf(field: SpreadField): Codec {
+  return field[3] === undefined ? ["array", field[1]] : ["array", field[1], field[3]];
 }
 
 export class TypedpgError extends Error {
@@ -367,10 +376,11 @@ class QueryImpl {
           if (typeof piece === "string") return piece;
           if (piece[0] === "list") {
             const [, i, cast, empty, lead = "", keyword = "", op, arrayCast] = piece;
-            const codec = spec.spreads![i]![1][0]![1];
+            const field = spec.spreads![i]![1][0]!;
+            const codec = field[1];
             const list = items(i);
             if (op !== undefined && arrayCast !== undefined && asArrays(list.length, 1)) {
-              return `(${lead}${op}(${placeholder(() => spread(i), ["array", codec], list, arrayCast)}))`;
+              return `(${lead}${op}(${placeholder(() => spread(i), arrayOf(field), list, arrayCast)}))`;
             }
             const written =
               list.length === 0 ? empty : `(${list.map((v) => placeholder(() => spread(i), codec, v, cast)).join(", ")})`;
@@ -380,11 +390,11 @@ class QueryImpl {
           const only = rows.length === 1 && rows[0]![0] === "rows" ? rows[0]![1] : undefined;
           if (unnest !== undefined && only !== undefined && asArrays(items(only).length, unnest.length)) {
             const values = items(only) as readonly Record<string, unknown>[];
-            const arrays = spec.spreads![only]![1].map(([field, codec], c) =>
+            const arrays = spec.spreads![only]![1].map((field, c) =>
               placeholder(
-                () => `${spread(only)}, field \`${field}\``,
-                ["array", codec],
-                values.map((r) => r[field]),
+                () => `${spread(only)}, field \`${field[0]}\``,
+                arrayOf(field),
+                values.map((r) => r[field[0]]),
                 unnest[c]!,
               ),
             );

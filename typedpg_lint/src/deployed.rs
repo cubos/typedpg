@@ -2482,9 +2482,10 @@ fn shape(ty: &Type) -> Type {
             typmod: None,
             collation: None,
         },
-        Type::Array { element, .. } => Type::Array {
+        Type::Array { element, name, .. } => Type::Array {
             element: Box::new(shape(element)),
             element_nullable: None,
+            name: name.clone(),
         },
         Type::Enum {
             schema,
@@ -2565,6 +2566,7 @@ fn array_element(ty: &Type) -> Option<(&Type, Option<bool>)> {
         Type::Array {
             element,
             element_nullable,
+            ..
         } => Some((element, *element_nullable)),
         Type::Domain { base, .. } => array_element(base),
         _ => None,

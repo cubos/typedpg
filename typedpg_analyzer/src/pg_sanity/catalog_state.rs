@@ -650,6 +650,7 @@ pub(crate) fn normalize(seed: &PgCatalogSeed, model: &PgCatalog, aux: &Aux) -> D
                     n.proc_(oid(t.typsubscript.map(|x| x.get()))),
                 ),
                 ("typisdefined", b(t.typisdefined)),
+                ("typdelim", t.typdelim.to_string()),
             ]),
         );
     }

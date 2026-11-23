@@ -169,6 +169,12 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         .get(&base_type_oid)
         .map_or(TypStorage::Plain, |t| t.typstorage);
 
+    // DefineDomain: and separates them, in an array, like it.
+    let typdelim = interp
+        .pg_type
+        .get(&base_type_oid)
+        .map_or(',', |t| t.typdelim);
+
     let oid = new_type_oid(interp, shell)?;
     let phys = TypePhysical::of(interp, base_type_oid);
     interp.insert_pg_type(PgType {
@@ -191,6 +197,7 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim,
     });
 
     // GenerateTypeDependencies: a domain depends on its base type.
@@ -775,6 +782,7 @@ pub fn create_enum(interp: &mut PgCatalog, stmt: &CreateEnumStmt) -> Result<(), 
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
     for (i, label) in labels.into_iter().enumerate() {
         let enum_oid = PgEnumOid::from_nonzero(interp.alloc_oid()?);
@@ -895,6 +903,7 @@ pub fn create_composite(interp: &mut PgCatalog, stmt: &CompositeTypeStmt) -> Res
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     register_array_type(interp, nsoid, &name, type_oid)?;
@@ -1088,6 +1097,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
     let range_array = register_array_type(interp, nsoid, &name, oid)?;
 
@@ -1113,6 +1123,7 @@ pub fn create_range(interp: &mut PgCatalog, stmt: &CreateRangeStmt) -> Result<()
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
     register_array_type(interp, mr_nsoid, &mr_name, mr_oid)?;
     // The multirange type is part of the range type (DefineRange:
@@ -1630,6 +1641,19 @@ fn define_base_type(
         None => TypCategory::UserDefined,
     };
     let typispreferred = get("preferred").is_some_and(super::operators::def_bool);
+    // DELIMITER: its first byte (DefineType's `p[0]`), stored as `"char"`.
+    let first_byte = |d: &str| char::from(d.as_bytes().first().copied().unwrap_or(0));
+    let typdelim = match get("delimiter").and_then(|de| de.arg.as_ref()) {
+        Some(ast::Node::String(d)) => first_byte(&d.sval),
+        Some(ast::Node::TypeName(tn)) => first_byte(
+            tn.names
+                .last()
+                .and_then(|n| node_string(n.as_ref()))
+                .unwrap_or_default(),
+        ),
+        Some(ast::Node::Integer(i)) => first_byte(&i.ival.to_string()),
+        _ => ',',
+    };
     let mut element = None;
     if let Some(de) = get("element")
         && let Some(ast::Node::TypeName(tn)) = de.arg.as_ref()
@@ -1827,6 +1851,7 @@ fn define_base_type(
         t.typalign = phys.typalign;
         t.typstorage = storage;
         t.typsubscript = subscript;
+        t.typdelim = typdelim;
     }
     // GenerateTypeDependencies: the type depends on its support functions.
     super::depend::record(
@@ -2098,6 +2123,7 @@ pub(crate) fn create_base_type(
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: false,
+        typdelim: ',',
     });
     // TypeShellMake: the placeholder belongs to the current role; its typacl
     // stays NULL until the full CREATE TYPE.
@@ -2362,6 +2388,8 @@ fn register_array_type(
         .pg_type
         .get(&element_oid)
         .and_then(|t| t.typcollation);
+    // And their element's delimiter (`array_in` reads the element's).
+    let typdelim = interp.pg_type.get(&element_oid).map_or(',', |t| t.typdelim);
     interp.insert_pg_type(PgType {
         oid: array_oid,
         typname,
@@ -2382,6 +2410,7 @@ fn register_array_type(
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim,
     });
     if let Some(elem) = interp.pg_type.get_mut(&element_oid) {
         elem.typarray = Some(array_oid);

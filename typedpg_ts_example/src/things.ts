@@ -39,7 +39,8 @@ export const constructed = sql(`
 
 /**
  * Arrays whose text isn't `{a,b}`: a box array's elements are separated by
- * `;` (a box's own text holds commas), an int2vector's by spaces.
+ * `;` (a box's own text holds commas), as are those of a domain over box;
+ * an int2vector's and an oidvector's by spaces.
  */
 // A JSON parameter's `null` is SQL NULL (`?`: the parameter takes one); `jsonNull` is the JSON one.
 export const jsonKind = sql("SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text");
@@ -49,9 +50,21 @@ export const thingsWithMeta = sql("SELECT label FROM things WHERE (shape).meta @
 export const oddArrays = sql(`
   SELECT $boxes::box[] AS boxes,
          ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,
+         $frames::frame[] AS frames,
          '1 2 -3'::int2vector AS vec,
-         ''::int2vector AS empty_vec
+         ''::int2vector AS empty_vec,
+         $vec::int2vector AS vec_param,
+         $oids::oidvector AS oids,
+         ARRAY[$vec::int2vector, ''::int2vector] AS vecs
 `);
+
+/** An int2vector parameter compared with a column's value, and a `box` spread. */
+export const vectorMatches = sql(`
+  SELECT v.indkey = $key AS same, v.indkey[0] AS first, array_length(v.indkey, 1) AS len
+  FROM (SELECT '3 1'::int2vector AS indkey) v
+`);
+
+export const boxSpread = sql("SELECT b::text AS b FROM unnest($boxes::box[]) AS b WHERE b IN $..wanted");
 
 /** A Duration's fields share one sign: this interval's don't. */
 export const mixedInterval = sql("SELECT interval '1 mon -1 days' AS iv");

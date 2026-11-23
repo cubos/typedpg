@@ -162,18 +162,19 @@ test("the wasm cache recipe matches the hex the old implementation wrote", () =>
   const identity = cacheSchemaIdentity(config, databases);
   assert.equal(identity, "0c5150f3a5595a50853b2ee0e72de02671b22bf714ac5e86161ddadb89e4db0b");
   const content = readFileSync(join(root, "q/users.sql"), "utf8");
-  // The key holds the version, so a release changes it on purpose: the
-  // recorded key is the one at 0.5.0, and the old step rebuilds it for this
-  // package's version.
-  const oldKey = (version: string) => {
+  // The key holds the version and the format, so a release or a new format
+  // changes it on purpose: the recorded key is the one at 0.5.0 and
+  // `typedpg-cache-1`, and the old step rebuilds it for this package's
+  // version and the current format.
+  const oldKey = (version: string, format = "typedpg-cache-2") => {
     const h = createHash("sha256");
-    for (const part of ["typedpg-cache-1", version, identity, "q/users.sql", content]) {
+    for (const part of [format, version, identity, "q/users.sql", content]) {
       h.update(part);
       h.update("\n");
     }
     return h.digest("hex");
   };
-  assert.equal(oldKey("0.5.0"), "52cbab702fbc9a811464ba8661d29b45f6a85378c717c294a99e92e60f545d63");
+  assert.equal(oldKey("0.5.0", "typedpg-cache-1"), "52cbab702fbc9a811464ba8661d29b45f6a85378c717c294a99e92e60f545d63");
   const { version } = JSON.parse(readFileSync(join(import.meta.dirname, "../package.json"), "utf8"));
   assert.equal(cacheKey(identity, "q/users.sql", content), oldKey(version));
 });

@@ -1592,6 +1592,7 @@ fn arrays_coerce_element_wise() {
         let expected = Type::Array {
             element: Box::new(numeric()),
             element_nullable,
+            name: None,
         };
         assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }

@@ -140,6 +140,7 @@ pub fn array_with_elems(element: Type, element_nullable: bool) -> Type {
     Type::Array {
         element: Box::new(element),
         element_nullable: Some(element_nullable),
+        name: None,
     }
 }
 
@@ -147,6 +148,7 @@ pub fn array_of(element: Type) -> Type {
     Type::Array {
         element: Box::new(element),
         element_nullable: None,
+        name: None,
     }
 }
 
@@ -361,9 +363,10 @@ pub fn assert_cols(analyzed: &AnalyzedQuery, expected: Vec<ColSpec>) {
             // What is known of a record's field values is checked by
             // query/refinements.rs.
             ty: match without_field_refinements(c.pg_type.clone()) {
-                Type::Array { element, .. } => Type::Array {
+                Type::Array { element, name, .. } => Type::Array {
                     element,
                     element_nullable: None,
+                    name,
                 },
                 other => other,
             },

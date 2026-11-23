@@ -250,11 +250,18 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
                         .fields
                         .iter()
                         .map(|f| {
-                            json!([
-                                f.name,
+                            let mut field = vec![
+                                json!(f.name),
                                 mapper.map(&f.pg_type).codec.to_json(),
-                                cast_suffix(&f.pg_type)
-                            ])
+                                json!(cast_suffix(&f.pg_type)),
+                            ];
+                            // What separates the values in the spread's
+                            // array form, when it isn't `,`.
+                            let delimiter = mapper.delimiter(&f.pg_type);
+                            if delimiter != ',' {
+                                field.push(json!(delimiter.to_string()));
+                            }
+                            Value::Array(field)
                         })
                         .collect();
                     let kind = match s.kind {
@@ -559,6 +566,7 @@ mod tests {
         let mapper = TypeMapper {
             overrides: &overrides,
             used: Default::default(),
+            catalog: &c,
         };
         generate(&c, &mapper, kind, sql, roles)
     }
@@ -646,6 +654,44 @@ mod tests {
             g.types
         );
         assert!(g.runtime.contains("($1::public.address)"), "{}", g.runtime);
+    }
+
+    #[test]
+    fn int2vector_parameters_are_cast_to_int2vector() {
+        // Not `int2[]`, which has no cast to `int2vector`; written `1 2 3`.
+        let g = ok("SELECT $v::int2vector AS v, $o::oidvector AS o");
+        assert!(
+            g.runtime.contains(
+                "SELECT ($1::pg_catalog.int2vector)::int2vector AS v, \
+                 ($2::pg_catalog.oidvector)::oidvector AS o"
+            ),
+            "{}",
+            g.runtime
+        );
+        assert!(
+            g.runtime
+                .contains(r#""params":[["v",["spaced","number"]],["o",["spaced","number"]]]"#),
+            "{}",
+            g.runtime
+        );
+        assert!(g.types.contains("v: readonly number[];"), "{}", g.types);
+        assert!(g.types.contains("v: number[];"), "{}", g.types);
+    }
+
+    #[test]
+    fn a_box_spread_carries_its_delimiter() {
+        let g = ok("SELECT b FROM unnest($bs::box[]) AS b WHERE b IN $..wanted");
+        assert!(
+            g.runtime
+                .contains(r#"["wanted",[["wanted","text","::pg_catalog.box",";"]],"list"]"#),
+            "{}",
+            g.runtime
+        );
+        assert!(
+            g.runtime.contains(r#"["bs",["array","text",";"]]"#),
+            "{}",
+            g.runtime
+        );
     }
 
     #[test]

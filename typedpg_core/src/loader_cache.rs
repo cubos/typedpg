@@ -34,7 +34,7 @@ use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use sha2::{Digest, Sha256};
 
 /// The key recipe's version, part of every key.
-pub const FORMAT: &str = "typedpg-cache-1";
+pub const FORMAT: &str = "typedpg-cache-2";
 
 /// The identity recipe's version, part of every schema identity.
 const SCHEMA_FORMAT: &str = "typedpg-schema-1";

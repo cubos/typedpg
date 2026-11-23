@@ -41,10 +41,18 @@ fn set_elem_nullable(ty: &mut Type, elem_nullable: Option<bool>) {
         array = base;
     }
     if let Type::Array {
-        element_nullable, ..
+        element_nullable,
+        name,
+        ..
     } = array
     {
-        *element_nullable = elem_nullable;
+        // An `int2vector` / `oidvector` never holds a NULL: neither its
+        // input nor its receive function takes one, and nothing makes one
+        // of an array that has (a slice or `||` of one is an `int2[]`).
+        let vector = name.as_ref().is_some_and(|n| {
+            n.schema == "pg_catalog" && matches!(n.name.as_str(), "int2vector" | "oidvector")
+        });
+        *element_nullable = if vector { Some(false) } else { elem_nullable };
     }
 }
 
@@ -209,9 +217,13 @@ fn resolve_type(
             // Collation propagates through to the element — PG attaches it
             // to the element type, not the array wrapper.
             let element = resolve_type(elem, typmod, collation, snapshot)?;
+            // `int2vector` / `oidvector`: arrays, but not their element's.
+            let name = (snapshot.array_type_of(elem) != Some(type_oid))
+                .then(|| QualifiedName::new(schema, name));
             return Ok(Type::Array {
                 element: Box::new(element),
                 element_nullable: None,
+                name,
             });
         }
 

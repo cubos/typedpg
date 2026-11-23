@@ -3842,6 +3842,12 @@ pub(super) fn type_oid(ctx: &Ctx<'_>, t: &Type) -> Option<PgTypeOid> {
             .catalog
             .resolve_type_by_name(Some(schema), name)
             .map(|t| t.oid),
+        Type::Array {
+            name: Some(name), ..
+        } => ctx
+            .catalog
+            .resolve_type_by_name(Some(&name.schema), &name.name)
+            .map(|t| t.oid),
         Type::Array { element, .. } => ctx.catalog.array_type_of(type_oid(ctx, element)?),
         Type::AnonymousRecord { .. } => None,
     }

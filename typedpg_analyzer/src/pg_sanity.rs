@@ -2295,7 +2295,7 @@ impl PgSanityServer {
     /// Resolve a PG type OID to its qualified name (`schema.type_name`) by
     /// querying `pg_catalog.pg_type`. Array types are flipped from their PG
     /// `_int4` underscore form into the bracketed `pg_catalog.int4[]` form
-    /// so they line up with [`Type::Array`]. Inlines the OID as a literal
+    /// so they line up with [`Type::Array`] (`int2vector` keeps its name). Inlines the OID as a literal
     /// (non-injectable: it's a u32 from PG itself) to dodge `to_sql` for
     /// the `oid` type.
     fn qualified_type_name(&mut self, oid: u32) -> Result<String, postgres::Error> {
@@ -2306,7 +2306,8 @@ impl PgSanityServer {
             &format!(
                 "SELECT n.nspname, t.typname, \
                  t.typsubscript = 'pg_catalog.array_subscript_handler'::pg_catalog.regproc, \
-                 t.typelem::int8 \
+                 t.typelem::int8, \
+                 (SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem) \
                  FROM pg_catalog.pg_type t \
                  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid \
                  WHERE t.oid = {oid}"
@@ -2317,9 +2318,12 @@ impl PgSanityServer {
         let name: String = row.get(1);
         let true_array: bool = row.get(2);
         let typelem: u32 = row.get::<_, i64>(3) as u32;
+        let elements_array: Option<bool> = row.get(4);
 
-        // PG's IsTrueArrayType: `_record` (a pseudo-type) included.
-        let qualified = if true_array && typelem != 0 {
+        // PG's IsTrueArrayType: `_record` (a pseudo-type) included. But
+        // `int2vector` / `oidvector`, true arrays that aren't their
+        // element's array type, keep their own name, as `Type::Array` does.
+        let qualified = if true_array && typelem != 0 && elements_array == Some(true) {
             // Array — recurse to get the element's qname, then bracket.
             let elem_qname = self.qualified_type_name(typelem)?;
             format!("{elem_qname}[]")
@@ -3110,6 +3114,9 @@ fn check_error_prefix(
 fn qualified_type_name_for_compare(ty: &Type) -> String {
     match ty {
         Type::Domain { base, .. } => qualified_type_name_for_compare(base),
+        Type::Array {
+            name: Some(name), ..
+        } => name.to_string(),
         Type::Array { element, .. } => {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }
@@ -3130,6 +3137,9 @@ fn qualified_param_type_name_for_compare(ty: &Type) -> String {
         | Type::Range { schema, name, .. }
         | Type::Composite { schema, name, .. }
         | Type::Domain { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
+        Type::Array {
+            name: Some(name), ..
+        } => name.to_string(),
         Type::Array { element, .. } => {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }

@@ -835,6 +835,7 @@ impl Project {
         let mapper = TypeMapper {
             overrides: &db.overrides,
             used: Default::default(),
+            catalog,
         };
         // Drop what no source uses anymore.
         db.cache.retain(|(kind, text), _| {
@@ -1067,6 +1068,7 @@ impl Project {
         let mapper = TypeMapper {
             overrides: &db.overrides,
             used: Default::default(),
+            catalog,
         };
         for q in &file.queries {
             if let Entry::Vacant(e) = db.cache.entry((Kind::Query, q.text.clone())) {

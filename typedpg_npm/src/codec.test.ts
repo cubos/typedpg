@@ -92,8 +92,17 @@ test("arrays", () => {
   assert.throws(() => decode(["array", "number"], "{{1},{2}}"), /multidimensional/);
 });
 
-test("a box array separates its elements with semicolons", () => {
+test("an array codec carries its elements' delimiter when it isn't a comma", () => {
   // `box`'s typdelim is `;`: its own text holds commas.
+  const boxes = ["array", "text", ";"] as const;
+  assert.deepEqual(decode(boxes, "{(1,1),(0,0);(3,3),(2,2);NULL}"), ["(1,1),(0,0)", "(3,3),(2,2)", null]);
+  assert.equal(encode(boxes, ["(1,1),(0,0)", null, "(3,3),(2,2)"]), '{"(1,1),(0,0)";NULL;"(3,3),(2,2)"}');
+  // Any delimiter a type was created with.
+  assert.deepEqual(decode(["array", "number", "|"], "{1|2|NULL}"), [1, 2, null]);
+  assert.equal(encode(["array", "number", "|"], [1, null]), '{"1"|NULL}');
+});
+
+test("older modules' box codec still reads and writes box arrays", () => {
   assert.deepEqual(decode(["array", "box"], "{(1,1),(0,0);(3,3),(2,2);NULL}"), [
     "(1,1),(0,0)",
     "(3,3),(2,2)",
@@ -103,7 +112,16 @@ test("a box array separates its elements with semicolons", () => {
   assert.equal(decode("box", "(1,1),(0,0)"), "(1,1),(0,0)");
 });
 
-test("int2vector and oidvector print their elements space-separated", () => {
+test("int2vector and oidvector are spaced arrays", () => {
+  assert.deepEqual(decode(["spaced", "number"], "1 2 -3"), [1, 2, -3]);
+  assert.deepEqual(decode(["spaced", "number"], ""), []);
+  assert.equal(encode(["spaced", "number"], [1, 2, -3]), "1 2 -3");
+  assert.equal(encode(["spaced", "number"], []), "");
+  assert.throws(() => encode(["spaced", "number"], [1, null]), /cannot be null/);
+  // An array of them: each element quoted, as `array_in` reads it.
+  assert.deepEqual(decode(["array", ["spaced", "number"]], '{"1 2",3,""}'), [[1, 2], [3], []]);
+  assert.equal(encode(["array", ["spaced", "number"]], [[1, 2], []]), '{"1 2",""}');
+  // As older modules describe them: an array of numbers.
   assert.deepEqual(decode(["array", "number"], "1 2 -3"), [1, 2, -3]);
   assert.deepEqual(decode(["array", "number"], ""), []);
 });

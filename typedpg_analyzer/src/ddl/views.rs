@@ -937,6 +937,7 @@ fn install_relation(
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
     let phys = super::types::TypePhysical::array(interp, composite_oid);
     let array_name = super::types::make_array_type_name(interp, nsoid, &name);
@@ -960,6 +961,7 @@ fn install_relation(
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     // CREATE TABLE AS stores the query's rows, not the query: the table

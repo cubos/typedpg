@@ -15,7 +15,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 
-use typedpg_analyzer::{RecordField, Refinement, Type};
+use typedpg_analyzer::{PgCatalog, RecordField, Refinement, Type};
 use typedpg_core::QualifiedName;
 
 /// The namespace the generated module imports the runtime's types under.
@@ -27,10 +27,6 @@ pub const RUNTIME_NS: &str = "typedpg";
 pub enum Codec {
     /// The text as is.
     Text,
-    /// `box`: its text as is, like [`Codec::Text`] — but an array of it
-    /// separates its elements with `;` (`pg_type.typdelim`), as a box's
-    /// own text holds commas.
-    Box,
     /// `t` / `f` ↔ `boolean`.
     Bool,
     /// Integers and floats that fit a JS `number` (`NaN` and the
@@ -59,8 +55,16 @@ pub enum Codec {
     Hstore,
     /// `void`: no value.
     Void,
-    /// A PG array of the element codec.
-    Array(Box<Codec>),
+    /// A PG array of the element codec, whose text form separates the
+    /// elements with `delimiter` (the element type's `pg_type.typdelim`:
+    /// `;` for `box`, as a box's own text holds commas).
+    Array {
+        element: Box<Codec>,
+        delimiter: char,
+    },
+    /// `int2vector` / `oidvector`: the elements separated by spaces, with
+    /// no braces (`1 2 3`), never NULL.
+    Spaced(Box<Codec>),
     /// A composite or anonymous record, field by field.
     Record(Vec<(String, Codec)>),
     /// A range over the subtype's codec.
@@ -76,7 +80,6 @@ impl Codec {
         use serde_json::{Value, json};
         match self {
             Codec::Text => json!("text"),
-            Codec::Box => json!("box"),
             Codec::Bool => json!("bool"),
             Codec::Number => json!("number"),
             Codec::BigInt => json!("bigint"),
@@ -90,7 +93,14 @@ impl Codec {
             Codec::Vector => json!("vector"),
             Codec::Hstore => json!("hstore"),
             Codec::Void => json!("void"),
-            Codec::Array(inner) => json!(["array", inner.to_json()]),
+            // The delimiter only when it isn't `,`.
+            Codec::Array { element, delimiter } if *delimiter == ',' => {
+                json!(["array", element.to_json()])
+            }
+            Codec::Array { element, delimiter } => {
+                json!(["array", element.to_json(), delimiter.to_string()])
+            }
+            Codec::Spaced(inner) => json!(["spaced", inner.to_json()]),
             Codec::Range(inner) => json!(["range", inner.to_json()]),
             Codec::Multirange(inner) => json!(["multirange", inner.to_json()]),
             Codec::Record(fields) => json!([
@@ -110,7 +120,7 @@ impl Codec {
     /// TS type says. Any type fits JSON.
     pub fn fits(&self) -> String {
         match self {
-            Codec::Text | Codec::Box => "string".into(),
+            Codec::Text => "string".into(),
             Codec::Bool => "boolean".into(),
             Codec::Number => "number".into(),
             Codec::BigInt => "bigint".into(),
@@ -124,7 +134,8 @@ impl Codec {
             Codec::Vector => "readonly number[]".into(),
             Codec::Hstore => "Readonly<Record<string, string | null>>".into(),
             Codec::Void => "undefined".into(),
-            Codec::Array(c) => format!("readonly ({} | null)[]", c.fits()),
+            Codec::Array { element, .. } => format!("readonly ({} | null)[]", element.fits()),
+            Codec::Spaced(c) => format!("readonly {}[]", c.fits()),
             Codec::Record(fields) => {
                 let members: Vec<String> = fields
                     .iter()
@@ -158,6 +169,9 @@ pub struct TypeMapper<'a> {
     pub overrides: &'a HashMap<QualifiedName, String>,
     /// The overrides' TS names mapped since this was last taken.
     pub used: RefCell<BTreeSet<String>>,
+    /// The schema the types are of: what separates an array's elements
+    /// (`pg_type.typdelim`) is in its rows.
+    pub catalog: &'a PgCatalog,
 }
 
 impl TypeMapper<'_> {
@@ -234,6 +248,7 @@ impl TypeMapper<'_> {
         let Type::Array {
             element,
             element_nullable,
+            name: None,
         } = array
         else {
             return self.map_refined(ty, refinement);
@@ -341,7 +356,28 @@ impl TypeMapper<'_> {
             }
             Type::Array {
                 element,
+                name: Some(name),
+                ..
+            } => {
+                let elem = self.map(element);
+                if name.schema == "pg_catalog"
+                    && matches!(name.name.as_str(), "int2vector" | "oidvector")
+                {
+                    TsType {
+                        output: array_of(&elem.output),
+                        input: format!("readonly {}", array_of(&elem.input)),
+                        codec: Codec::Spaced(Box::new(elem.codec)),
+                    }
+                } else {
+                    // An array type of an extension's own: its text form is
+                    // its own too.
+                    same("string".to_owned(), Codec::Text)
+                }
+            }
+            Type::Array {
+                element,
                 element_nullable,
+                name: None,
             } => {
                 let elem = self.map(element);
                 // An element is nullable unless the analysis proved it isn't.
@@ -353,7 +389,10 @@ impl TypeMapper<'_> {
                 TsType {
                     output: array_of(&out_elem),
                     input: format!("readonly {}", array_of(&format!("{} | null", elem.input))),
-                    codec: Codec::Array(Box::new(elem.codec)),
+                    codec: Codec::Array {
+                        element: Box::new(elem.codec),
+                        delimiter: self.delimiter(element),
+                    },
                 }
             }
             Type::Composite {
@@ -369,6 +408,29 @@ impl TypeMapper<'_> {
                 }
             }
             Type::AnonymousRecord { fields } => self.record(fields),
+        }
+    }
+
+    /// What separates the elements of an array of `element` in its text
+    /// form: the type's `pg_type.typdelim` (a domain's is its base type's),
+    /// the innermost element's for a multidimensional array.
+    pub fn delimiter(&self, element: &Type) -> char {
+        let named = |schema: &str, name: &str| {
+            self.catalog
+                .resolve_type_by_name(Some(schema), name)
+                .map_or(',', |t| t.typdelim)
+        };
+        match element {
+            Type::Basic { schema, name, .. }
+            | Type::Domain { schema, name, .. }
+            | Type::Enum { schema, name, .. }
+            | Type::Range { schema, name, .. }
+            | Type::Composite { schema, name, .. } => named(schema, name),
+            Type::Array {
+                name: Some(name), ..
+            } => named(&name.schema, &name.name),
+            Type::Array { element, .. } => self.delimiter(element),
+            Type::AnonymousRecord { .. } => ',',
         }
     }
 
@@ -486,8 +548,6 @@ impl TypeMapper<'_> {
                 codec: Codec::Bytea,
             },
             "void" => same("undefined".into(), Codec::Void),
-            // The only built-in type whose arrays aren't comma-separated.
-            "box" => same("string".into(), Codec::Box),
             _ => text(),
         }
     }
@@ -567,9 +627,11 @@ mod tests {
 
     fn with<R>(f: impl FnOnce(&TypeMapper) -> R) -> R {
         let overrides = HashMap::new();
+        let catalog = PgCatalog::new().unwrap();
         f(&TypeMapper {
             overrides: &overrides,
             used: Default::default(),
+            catalog: &catalog,
         })
     }
 
@@ -617,7 +679,13 @@ mod tests {
     fn what_codecs_read_values_as() {
         let record = Codec::Record(vec![
             ("x".into(), Codec::Number),
-            ("a b".into(), Codec::Array(Box::new(Codec::Json))),
+            (
+                "a b".into(),
+                Codec::Array {
+                    element: Box::new(Codec::Json),
+                    delimiter: ',',
+                },
+            ),
         ]);
         assert_eq!(
             record.fits(),
@@ -625,24 +693,111 @@ mod tests {
         );
         assert_eq!(Codec::Vector.fits(), "readonly number[]");
         assert_eq!(
+            Codec::Spaced(Box::new(Codec::Number)).fits(),
+            "readonly number[]"
+        );
+        assert_eq!(
             Codec::Multirange(Box::new(Codec::Timestamptz)).fits(),
             "readonly typedpg.Range<Temporal.Instant>[]"
         );
     }
 
-    /// A `box[]` separates its elements with `;`: the runtime must know an
-    /// element is a box to split (and write) its arrays.
+    /// A `box[]` separates its elements with `;` (its `typdelim`), as does
+    /// an array of a domain over box, or of a type created with another
+    /// `DELIMITER`: the array's codec says so.
     #[test]
-    fn a_box_has_its_own_codec() {
+    fn an_array_codec_carries_its_delimiter() {
+        let overrides = HashMap::new();
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE DOMAIN frame AS box;
+                 CREATE TYPE semi;
+                 CREATE FUNCTION semi_in(cstring) RETURNS semi
+                     LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+                 CREATE FUNCTION semi_out(semi) RETURNS cstring
+                     LANGUAGE internal IMMUTABLE STRICT AS 'textout';
+                 CREATE TYPE semi (INPUT = semi_in, OUTPUT = semi_out, DELIMITER = '|');",
+            )
+            .unwrap();
+        let m = TypeMapper {
+            overrides: &overrides,
+            used: Default::default(),
+            catalog: &catalog,
+        };
+        let array = |element: Type| Type::Array {
+            element: Box::new(element),
+            element_nullable: None,
+            name: None,
+        };
+        let mapped = m.map(&array(basic_ty("box")));
+        assert_eq!(mapped.output, "(string | null)[]");
+        assert_eq!(
+            mapped.codec.to_json(),
+            serde_json::json!(["array", "text", ";"])
+        );
+        let frame = Type::Domain {
+            schema: "public".into(),
+            name: "frame".into(),
+            base: Box::new(basic_ty("box")),
+            extension: None,
+            typmod: None,
+            collation: None,
+        };
+        assert_eq!(
+            m.map(&array(frame)).codec.to_json(),
+            serde_json::json!(["array", "text", ";"])
+        );
+        let semi = Type::Basic {
+            schema: "public".into(),
+            name: "semi".into(),
+            extension: None,
+            typmod: None,
+            collation: None,
+        };
+        assert_eq!(
+            m.map(&array(semi)).codec.to_json(),
+            serde_json::json!(["array", "text", "|"])
+        );
+        // The default `,` is left out; a box alone is text.
+        assert_eq!(
+            m.map(&array(basic_ty("point"))).codec.to_json(),
+            serde_json::json!(["array", "text"])
+        );
+        assert_eq!(m.map(&basic_ty("box")).codec, Codec::Text);
+    }
+
+    /// `int2vector` / `oidvector` are arrays of numbers, written `1 2 3`.
+    #[test]
+    fn int2vector_and_oidvector_are_spaced_arrays() {
         with(|m| {
-            let boxes = Type::Array {
-                element: Box::new(basic_ty("box")),
+            let vector = |name: &str, element: &str| Type::Array {
+                element: Box::new(basic_ty(element)),
                 element_nullable: None,
+                name: Some(QualifiedName::new("pg_catalog", name)),
             };
-            let mapped = m.map(&boxes);
-            assert_eq!(mapped.output, "(string | null)[]");
-            assert_eq!(mapped.codec.to_json(), serde_json::json!(["array", "box"]));
-            assert_eq!(m.map(&basic_ty("point")).codec, Codec::Text);
+            let mapped = m.map(&vector("int2vector", "int2"));
+            assert_eq!(mapped.output, "number[]");
+            assert_eq!(mapped.input, "readonly number[]");
+            assert_eq!(
+                mapped.codec.to_json(),
+                serde_json::json!(["spaced", "number"])
+            );
+            assert_eq!(
+                m.map(&vector("oidvector", "oid")).codec.to_json(),
+                serde_json::json!(["spaced", "number"])
+            );
+            // An array of them is a plain array of spaced arrays.
+            let arrays = Type::Array {
+                element: Box::new(vector("int2vector", "int2")),
+                element_nullable: None,
+                name: None,
+            };
+            assert_eq!(
+                m.map(&arrays).codec.to_json(),
+                serde_json::json!(["array", ["spaced", "number"]])
+            );
+            assert_eq!(m.map(&arrays).output, "(number[] | null)[]");
         });
     }
 
@@ -652,6 +807,7 @@ mod tests {
             let arr = |n| Type::Array {
                 element: Box::new(basic_ty("text")),
                 element_nullable: n,
+                name: None,
             };
             assert_eq!(m.map(&arr(Some(false))).output, "string[]");
             assert_eq!(m.map(&arr(None)).output, "(string | null)[]");
@@ -767,6 +923,7 @@ mod tests {
         let arr = |name: &str, n| Type::Array {
             element: Box::new(basic_ty(name)),
             element_nullable: n,
+            name: None,
         };
         with(|m| {
             let out =
@@ -812,9 +969,11 @@ mod tests {
             (QualifiedName::new("pg_catalog", "text"), "Name".to_owned()),
             (QualifiedName::new("public", "tags"), "Tags".to_owned()),
         ]);
+        let catalog = PgCatalog::new().unwrap();
         let m = TypeMapper {
             overrides: &overrides,
             used: RefCell::default(),
+            catalog: &catalog,
         };
         assert_eq!(
             m.map_column(
@@ -866,6 +1025,7 @@ mod tests {
                         ty: Type::Array {
                             element: Box::new(inner),
                             element_nullable: Some(false),
+                            name: None,
                         },
                         nullable: false,
                         refinement: Refinement::NONE,
@@ -880,6 +1040,7 @@ mod tests {
             let nullable_records = Type::Array {
                 element: Box::new(ty.clone()),
                 element_nullable: None,
+                name: None,
             };
             assert_eq!(
                 m.map(&nullable_records).output,
@@ -921,6 +1082,7 @@ mod tests {
                     Type::Array {
                         element: Box::new(basic_ty("text")),
                         element_nullable: Some(false),
+                        name: None,
                     },
                     false,
                     &[],
@@ -948,6 +1110,7 @@ mod tests {
                     fields: vec![field("r", ty.clone(), false, &[], &[])],
                 }),
                 element_nullable: Some(false),
+                name: None,
             };
             assert_eq!(
                 m.map(&outer).output,
@@ -980,9 +1143,11 @@ mod tests {
             QualifiedName::new("public", "prefs"),
             "UserPreferences".to_owned(),
         );
+        let catalog = PgCatalog::new().unwrap();
         let m = TypeMapper {
             overrides: &o,
             used: Default::default(),
+            catalog: &catalog,
         };
         let ty = Type::Domain {
             schema: "public".into(),
@@ -1000,6 +1165,7 @@ mod tests {
         let arr = Type::Array {
             element: Box::new(ty),
             element_nullable: None,
+            name: None,
         };
         assert_eq!(m.map(&arr).output, "(UserPreferences | null)[]");
     }

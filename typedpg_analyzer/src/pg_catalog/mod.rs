@@ -40,12 +40,16 @@ pub(crate) mod oid {
     pub const NAME: PgTypeOid = PgTypeOid::from_raw(19);
     pub const INT8: PgTypeOid = PgTypeOid::from_raw(20);
     pub const INT2: PgTypeOid = PgTypeOid::from_raw(21);
+    pub const INT2VECTOR: PgTypeOid = PgTypeOid::from_raw(22);
     pub const INT4: PgTypeOid = PgTypeOid::from_raw(23);
     pub const TEXT: PgTypeOid = PgTypeOid::from_raw(25);
     pub const OID: PgTypeOid = PgTypeOid::from_raw(26);
     pub const TID: PgTypeOid = PgTypeOid::from_raw(27);
     pub const XID: PgTypeOid = PgTypeOid::from_raw(28);
     pub const CID: PgTypeOid = PgTypeOid::from_raw(29);
+    pub const OIDVECTOR: PgTypeOid = PgTypeOid::from_raw(30);
+    pub const INT2ARRAY: PgTypeOid = PgTypeOid::from_raw(1005);
+    pub const OIDARRAY: PgTypeOid = PgTypeOid::from_raw(1028);
     pub const FLOAT4: PgTypeOid = PgTypeOid::from_raw(700);
     pub const FLOAT8: PgTypeOid = PgTypeOid::from_raw(701);
     pub const UNKNOWN: PgTypeOid = PgTypeOid::from_raw(705);

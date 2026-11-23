@@ -942,6 +942,7 @@ as it describes a statement before binding it.
 | domain | its base type, or the type `types` maps it to |
 | composite, `ROW(...)` | an object with a property per field, each with its nullability |
 | array | `T[]`, or `(T \| null)[]` unless the elements are known not null |
+| `int2vector`, `oidvector` | `number[]` |
 | range, multirange | `Range<T>`, `Range<T>[]` (`range(1, 10)`, `emptyRange` build them) |
 | `vector`, `halfvec` (pgvector) | `number[]` |
 | `hstore` | `Record<string, string \| null>` |

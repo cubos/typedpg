@@ -1116,6 +1116,7 @@ fn has_inner_promise(ty: &Type) -> bool {
         Type::Array {
             element,
             element_nullable,
+            ..
         } => *element_nullable == Some(false) || has_inner_promise(element),
         Type::Composite { fields, .. } | Type::AnonymousRecord { fields } => {
             fields.iter().any(|f| {
@@ -1354,6 +1355,7 @@ fn inner_violation(ty: &Type, bytes: &[u8]) -> Option<String> {
         Type::Array {
             element,
             element_nullable,
+            ..
         } => {
             for (k, elem) in array_elements(bytes)?.into_iter().enumerate() {
                 let found = match elem {
