@@ -124,6 +124,14 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record that the binary operator call at `location` resolved to
+    /// `op` (see [`crate::nonnull::StrictLog::note_operator`]).
+    pub fn note_resolved_operator(&self, location: i32, op: crate::nonnull::ResolvedOp) {
+        if let Some(log) = self.strict_log {
+            log.note_operator(location, op);
+        }
+    }
+
     /// Record that `expr` resolved to operator `op` (for [`crate::ddl::cooked`]).
     pub fn note_cooked_operator(&self, expr: &ast::AExpr, op: crate::oid::PgOperatorOid) {
         if let Some(log) = self.cook_log {

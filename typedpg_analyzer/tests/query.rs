@@ -54,6 +54,8 @@ mod expressions;
 mod fact_soundness;
 #[path = "query/foreign_tables.rs"]
 mod foreign_tables;
+#[path = "query/full_join_plans.rs"]
+mod full_join_plans;
 #[path = "query/function_aggregate_narrowing.rs"]
 mod function_aggregate_narrowing;
 #[path = "query/function_soundness.rs"]

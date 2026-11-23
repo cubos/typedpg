@@ -102,6 +102,28 @@ pub(super) fn sure_row_violation(
         .map(|v| v.error)
 }
 
+/// Whether the INSERT's SELECT `sel` (`with`, the INSERT's WITH) yields a
+/// row on every execution (see the module docs).
+pub(super) fn surely_yields_row(
+    sel: &ast::SelectStmt,
+    with: Option<&ast::WithClause>,
+    snapshot: &PgCatalog,
+) -> bool {
+    let ctes: Vec<&ast::CommonTableExpr> = match with {
+        Some(w) if !w.recursive => w
+            .ctes
+            .iter()
+            .filter_map(|c| match c.as_ref() {
+                Some(ast::Node::CommonTableExpr(c)) => Some(&**c),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => return false,
+        None => Vec::new(),
+    };
+    sure_row(sel, snapshot, &ctes, 0).is_some()
+}
+
 /// The row `sel` yields on every execution (see the module docs), as
 /// [`Outputs`]; `None` when it may yield none. `ctes` are the CTEs its
 /// table names may mean.

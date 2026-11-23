@@ -984,6 +984,12 @@ pub struct PgOperator {
     /// (`get_op_index_interpretation`).
     #[serde(with = "crate::oid::oid_or_zero")]
     pub oprnegate: Option<PgOperatorOid>,
+    /// `oprcanmerge`: the operator can drive a merge join (`MERGES`),
+    /// which the planner reads through `op_mergejoinable`.
+    pub oprcanmerge: bool,
+    /// `oprcanhash`: the operator can drive a hash join (`HASHES`),
+    /// which the planner reads through `op_hashjoinable`.
+    pub oprcanhash: bool,
 }
 
 /// `pg_cast`: a cast rule between two types.

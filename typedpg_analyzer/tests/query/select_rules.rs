@@ -301,6 +301,120 @@ fn locking_clause_through_views_and_subqueries() {
     }
 }
 
+/// The rewriter marks only a view's relations and subqueries for locking
+/// (`markQueryForLocking`), and the planner checks the view's query
+/// (`CheckSelectLocking` in `preprocess_rowmarks`) only when it has a row
+/// mark: a view reading functions or CTEs alone, or a set operation (whose
+/// arms are no part of its jointree), is locked through without error.
+#[test]
+fn a_view_without_row_marks_is_not_checked() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW vu AS SELECT id FROM t UNION SELECT id FROM u;
+         CREATE VIEW vf AS SELECT bool_or(v) AS c FROM unnest(ARRAY[true]) g(v) GROUP BY v;
+         CREATE VIEW vc AS WITH c AS (SELECT 1 AS v) SELECT count(*) FROM c;
+         CREATE VIEW vs AS SELECT bool_or(v) AS c FROM (SELECT * FROM unnest(ARRAY[true]) g(v)) s
+             GROUP BY v;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vu FOR UPDATE",
+        "SELECT * FROM vf FOR UPDATE",
+        "SELECT * FROM vc FOR UPDATE",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_err_prefix(
+        &db,
+        "SELECT * FROM vs FOR UPDATE",
+        "FOR UPDATE is not allowed with GROUP BY clause",
+    );
+}
+
+/// `reduce_outer_joins` reads the quals `eval_const_expressions` folded: a
+/// CASE with a constant WHEN is its branch, a COALESCE its one argument
+/// left past the NULL constants, an AND / OR loses its TRUE / FALSE
+/// arguments — so a qual strict in the nullable side only once folded
+/// reduces the join, and its rows can be locked.
+#[test]
+fn locking_the_nullable_side_sees_the_folded_quals() {
+    let db = setup();
+    let join = "SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id";
+    for qual in [
+        "CASE WHEN true THEN u.x END = 'a'",
+        "CASE WHEN 1 = 1 THEN u.x ELSE 'b' END = 'a'",
+        "CASE WHEN false THEN 'b' ELSE u.x END = 'a'",
+        "CASE WHEN NULL THEN 'b' WHEN true THEN u.x END = 'a'",
+        "COALESCE(NULL, u.x) = 'a'",
+        "u.x = 'a' OR false",
+        "u.x = 'a' OR NULL",
+        "NOT (u.x = 'a' AND true)",
+        // `x IS DISTINCT FROM NULL` is the NullTest `x IS NOT NULL`, the
+        // NULL once folded too.
+        "u.x IS DISTINCT FROM NULL::text",
+        "u.x IS DISTINCT FROM CASE t.a WHEN NULL THEN 'b' END",
+        // A custom plan's parameters are constants: a NULL `$1` folds
+        // these to `u.x = 'a'`.
+        "COALESCE($1, u.x) = 'a'",
+        "u.x = 'a' OR $1",
+    ] {
+        let sql = format!("{join} WHERE {qual} FOR UPDATE");
+        db.analyze(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for qual in [
+        "CASE WHEN t.a > 0 THEN u.x END = 'a'",
+        "u.x = 'a' OR true",
+        "u.x = 'a' OR t.a = 1",
+    ] {
+        let sql = format!("{join} WHERE {qual} FOR UPDATE");
+        assert_err_prefix(
+            &db,
+            &sql,
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        );
+    }
+}
+
+/// A view or subquery the planner doesn't pull up (a LIMIT, its own
+/// locking clause) is planned on its own — unless the planner proves it
+/// empty first (`relation_excluded_by_constraints`: a constant FALSE
+/// qual, or a custom plan's qual over a NULL parameter): then its
+/// nullable side is never refused. A view's query is only planned where a
+/// statement reads it: CREATE VIEW stores one that locks a nullable side.
+#[test]
+fn a_view_planned_alone_and_proven_empty_is_never_planned() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE VIEW vl AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id;
+         CREATE VIEW vlim AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id LIMIT 10;
+         CREATE VIEW vlock AS SELECT t.id, u.x FROM t LEFT JOIN u ON u.t_id = t.id FOR UPDATE OF u;",
+    )
+    .unwrap();
+    for sql in [
+        "SELECT * FROM vlim WHERE false FOR UPDATE",
+        "SELECT * FROM vlim WHERE $1 FOR UPDATE",
+        "SELECT * FROM (SELECT t.id FROM t LEFT JOIN u ON u.t_id = t.id LIMIT 3) q \
+         WHERE false FOR UPDATE",
+        "SELECT * FROM vlock WHERE false",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    for sql in [
+        // Pulled up, the view's join is this level's: planned whatever the
+        // WHERE folds to.
+        "SELECT * FROM vl WHERE false FOR UPDATE",
+        "SELECT * FROM vlim FOR UPDATE",
+        "SELECT * FROM vlim, t WHERE false FOR UPDATE OF vlim",
+        "SELECT * FROM vlock",
+    ] {
+        assert_err_prefix(
+            &db,
+            sql,
+            "FOR UPDATE cannot be applied to the nullable side of an outer join",
+        );
+    }
+}
+
 // ── Set-operation ORDER BY / LIMIT ───────────────────────────────────────────
 
 fn setup_wide() -> PgCatalog {

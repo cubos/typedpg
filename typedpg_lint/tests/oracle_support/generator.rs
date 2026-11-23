@@ -513,7 +513,11 @@ impl Gen {
                     uniques.push(format!("UNIQUE NULLS NOT DISTINCT ({c})"));
                     conflict.push(format!("({c})"));
                 }
-                1 => uniques.push(format!("CONSTRAINT {name}_{c}_d UNIQUE ({c}) DEFERRABLE")),
+                1 => {
+                    // An arbiter ExecCheckIndexConstraints refuses.
+                    uniques.push(format!("CONSTRAINT {name}_{c}_d UNIQUE ({c}) DEFERRABLE"));
+                    conflict.push(format!("ON CONSTRAINT {name}_{c}_d"));
+                }
                 2 => {
                     uniques.push(format!("CONSTRAINT {name}_{c}_k UNIQUE ({c})"));
                     conflict.push(format!("ON CONSTRAINT {name}_{c}_k"));
@@ -1915,7 +1919,7 @@ impl Gen {
                 {
                     conds.push(format!("{alias}.{} = {l}", c.name));
                 }
-                if conds.is_empty() || (kind != "FULL JOIN" && self.rng.chance(25)) {
+                if conds.is_empty() || self.rng.chance(25) {
                     let mut both = left.clone();
                     both.items.extend(right.items);
                     conds.push(self.pred(&both, 2));

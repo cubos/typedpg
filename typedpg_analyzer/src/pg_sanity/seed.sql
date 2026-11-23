@@ -216,9 +216,13 @@ BEGIN
                 v := 'NULL';
             ELSE
                 pos := array_position(fk.conkey, a.attnum);
-                SELECT format('(SELECT %I FROM %s ORDER BY %s LIMIT 1)',
+                -- A foreign key references the table's own rows (the RI
+                -- check reads ONLY it), but a partitioned table's partitions'.
+                SELECT format('(SELECT %I FROM %s%s ORDER BY %s LIMIT 1)',
                               (SELECT attname FROM pg_attribute
                                WHERE attrelid = fk.confrelid AND attnum = fk.confkey[pos]),
+                              CASE WHEN (SELECT relkind FROM pg_class WHERE oid = fk.confrelid) = 'p'
+                                   THEN '' ELSE 'ONLY ' END,
                               fk.confrelid::regclass,
                               string_agg(quote_ident(r.attname), ', ' ORDER BY k.ord))
                 INTO v
@@ -288,9 +292,13 @@ BEGIN
             ) INTO is_unique;
             IF FOUND AND fk.conkey IS NOT NULL THEN
                 pos := array_position(fk.conkey, a.attnum);
-                SELECT format('(SELECT %I FROM %s ORDER BY %s LIMIT 1)',
+                -- A foreign key references the table's own rows (the RI
+                -- check reads ONLY it), but a partitioned table's partitions'.
+                SELECT format('(SELECT %I FROM %s%s ORDER BY %s LIMIT 1)',
                               (SELECT attname FROM pg_attribute
                                WHERE attrelid = fk.confrelid AND attnum = fk.confkey[pos]),
+                              CASE WHEN (SELECT relkind FROM pg_class WHERE oid = fk.confrelid) = 'p'
+                                   THEN '' ELSE 'ONLY ' END,
                               fk.confrelid::regclass,
                               string_agg(quote_ident(r.attname), ', ' ORDER BY k.ord))
                 INTO v

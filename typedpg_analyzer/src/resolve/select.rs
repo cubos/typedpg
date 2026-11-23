@@ -776,6 +776,8 @@ fn analyze_select_here(
     // Aggregate ownership and parseCheckAggregates — which PG runs after
     // everything above.
     grouping::finish_select_level(sel, &scope, &targets, snapshot)?;
+    // The planner's: a FULL JOIN no merge or hash join implements.
+    check_full_joins(&null_ctx, Some(sel), snapshot)?;
 
     // Every row comes from one WHERE passed — unless an aggregate query
     // without GROUP BY (or with an empty grouping set) makes a row of an
@@ -2879,6 +2881,55 @@ fn from_subselect<'a>(from: &'a [Option<ast::Node>], alias: &str) -> Option<&'a 
     from.iter().find_map(|n| find(n.as_ref(), alias))
 }
 
+/// `populate_joinrel_with_paths`: a FULL JOIN of the level (still one
+/// once `reduce_outer_joins` ran) whose join clauses no merge join nor
+/// hash join can use fails every execution (see `full_join`). A SELECT
+/// `sel` whose one FROM item is a join puts its WHERE in that join's
+/// restrictions (`distribute_qual_to_rels`: a constant qual goes to the
+/// join of the whole `qualscope`): one that may fold to FALSE — over a
+/// parameter, a custom plan's NULL — makes it a dummy join, never built.
+pub(crate) fn check_full_joins(
+    null_ctx: &NullabilityContext,
+    sel: Option<&ast::SelectStmt>,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    let gated = sel.and_then(|sel| {
+        let top_join = matches!(sel.from_clause.as_slice(), [Some(ast::Node::JoinExpr(_))]);
+        let may_be_false = sel.where_clause.as_ref().is_some_and(|w| {
+            !matches!(
+                expr::plan_fold::fold_qual(Some(w), snapshot),
+                expr::plan_fold::Folded::Var | expr::plan_fold::Folded::Bool(true)
+            ) || w
+                .nodes()
+                .any(|(n, _)| matches!(n, typedpg_pg_query::NodeRef::ParamRef(_)))
+        });
+        (top_join && may_be_false).then(|| null_ctx.joins_recorded().checked_sub(1))?
+    });
+    // A qual of the level around may reduce the join first.
+    if expr::plan_time_checks()
+        && !expr::plan_fold::outer_quals_may_reduce()
+        && let Some(location) = null_ctx.unplannable_full_join(gated)
+        && let Some(e) = expr::plan_time_error(location, full_join_unplannable_error())
+    {
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// PG's `FULL JOIN is only supported with merge-joinable or hash-joinable
+/// join conditions` (0A000, no position).
+pub(crate) fn full_join_unplannable_error() -> AnalyzeError {
+    crate::error::RawError::new(
+        AnalyzeError::FeatureNotSupported(
+            "FULL JOIN is only supported with merge-joinable or hash-joinable join conditions"
+                .into(),
+        ),
+        None,
+        None,
+    )
+    .finalize_implicit()
+}
+
 /// Validate a SELECT's locking clauses like PG: `CheckSelectLocking` (the
 /// query may not use DISTINCT / GROUP BY / HAVING / aggregates / window
 /// functions / target-list SRFs), then `transformLockingClause` — each
@@ -2990,10 +3041,23 @@ fn check_locking_clause(
                     .is_none_or(|s| super::from::pushed_lock_marks_rows(s, snapshot)),
                 _ => false,
             };
-            if marks_rows && null_ctx.is_nullable(&source.alias, "", true) {
-                return Err(unsupported(format!(
-                    "{clause} cannot be applied to the nullable side of an outer join"
-                )));
+            // `make_outerjoininfo`, as the statement is planned: a
+            // custom plan may fold a qual over parameters into one that
+            // reduces the join (`COALESCE($1, t.x) = 1` with `$1` NULL).
+            if marks_rows
+                && expr::plan_time_checks()
+                && null_ctx.is_nullable(&source.alias, "", true)
+                && !level_quals(sel)
+                    .iter()
+                    .any(|q| param_fold_may_name(q, &source.alias))
+                && let Some(e) = expr::plan_time_error(
+                    first_from_location(sel),
+                    unsupported(format!(
+                        "{clause} cannot be applied to the nullable side of an outer join"
+                    )),
+                )
+            {
+                return Err(e);
             }
         }
         // Below a locked view or subquery: its own query's blockers and
@@ -3011,16 +3075,104 @@ fn check_locking_clause(
                     if level_quals(sel)
                         .iter()
                         .any(|q| super::from::qual_may_name(q, &source.alias)) => {}
+                // Planned on its own, the view or subquery is never planned
+                // when the planner proves it empty first
+                // (`relation_excluded_by_constraints`: `WHERE false`, or a
+                // custom plan's `WHERE $1` with `$1` NULL); nor is a query
+                // only stored (a view's).
+                Some(crate::scope::LockBlock::NullableSide)
+                    if !expr::plan_time_checks()
+                        || (planned_alone(sel, source, snapshot)
+                            && (expr::plan_fold::level_may_exclude(&source.alias)
+                                || params_may_exclude(sel))) => {}
                 Some(crate::scope::LockBlock::NullableSide) => {
-                    return Err(unsupported(format!(
-                        "{clause} cannot be applied to the nullable side of an outer join"
-                    )));
+                    if let Some(e) = expr::plan_time_error(
+                        first_from_location(sel),
+                        unsupported(format!(
+                            "{clause} cannot be applied to the nullable side of an outer join"
+                        )),
+                    ) {
+                        return Err(e);
+                    }
                 }
                 None => {}
             }
         }
     }
     Ok(())
+}
+
+/// A location in `sel`'s FROM clause: where a planner error about its
+/// joins is placed among the statement's (see `deferred::split`).
+fn first_from_location(sel: &ast::SelectStmt) -> Option<i32> {
+    sel.from_clause.iter().flatten().find_map(|n| {
+        n.nodes().find_map(|(r, _)| match r {
+            typedpg_pg_query::NodeRef::RangeVar(rv) if rv.location >= 0 => Some(rv.location),
+            _ => None,
+        })
+    })
+}
+
+/// Whether qual `q` holds a CASE, COALESCE or AND / OR over a parameter
+/// that reads FROM entry `alias`: a custom plan may fold it into a qual
+/// strict in `alias` (`CASE WHEN $1 THEN t.x END = 1`), which reduces an
+/// outer join `alias` is on the nullable side of.
+fn param_fold_may_name(q: &ast::Node, alias: &str) -> bool {
+    use typedpg_pg_query::NodeRef;
+    fn has(n: NodeRef<'_>, pred: &dyn Fn(NodeRef<'_>) -> bool) -> bool {
+        pred(n) || n.children().any(|c| has(c, pred))
+    }
+    q.nodes().any(|(n, _)| {
+        matches!(
+            n,
+            NodeRef::CaseExpr(_) | NodeRef::CoalesceExpr(_) | NodeRef::BoolExpr(_)
+        ) && has(n, &|m| matches!(m, NodeRef::ParamRef(_)))
+            && has(n, &|m| match m {
+                NodeRef::ColumnRef(c) => {
+                    let fields = expr::extract_string_fields(&c.fields);
+                    fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
+                }
+                _ => false,
+            })
+    })
+}
+
+/// Whether FROM entry `source` of `sel`, a view or subquery, is planned on
+/// its own rather than pulled up (`is_simple_subquery`, see
+/// [`super::deferred::pulled_up_in`]).
+fn planned_alone(
+    sel: &ast::SelectStmt,
+    source: &crate::scope::TableSource,
+    snapshot: &PgCatalog,
+) -> bool {
+    if let crate::scope::SourceKind::Subquery { .. } = source.kind {
+        return from_subselect(&sel.from_clause, &source.alias)
+            .is_none_or(|s| !super::deferred::pulled_up_in(s, snapshot));
+    }
+    match source
+        .relid
+        .and_then(|relid| crate::ddl::views::view_query(snapshot, relid))
+    {
+        Some(ast::Node::SelectStmt(s)) => !super::deferred::pulled_up_in(&s, snapshot),
+        _ => true,
+    }
+}
+
+/// Whether a custom plan may fold `sel`'s WHERE to a constant FALSE over
+/// its one FROM entry (a top-level AND argument over a parameter: strict,
+/// it is NULL for a NULL one), which proves that entry empty
+/// (`relation_excluded_by_constraints`).
+fn params_may_exclude(sel: &ast::SelectStmt) -> bool {
+    use typedpg_pg_query::NodeRef;
+    let single = matches!(
+        sel.from_clause.as_slice(),
+        [Some(ast::Node::RangeVar(_) | ast::Node::RangeSubselect(_))]
+    );
+    single
+        && sel
+            .where_clause
+            .as_ref()
+            .is_some_and(|w| w.nodes().any(|(n, _)| matches!(n, NodeRef::ParamRef(_))))
 }
 
 /// LIMIT / OFFSET: coerced to bigint through the shared clause walker, then

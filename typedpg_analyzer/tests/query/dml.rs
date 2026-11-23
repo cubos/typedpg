@@ -1448,6 +1448,54 @@ fn on_conflict_on_non_unique_column_should_error() {
     );
 }
 
+/// ExecCheckIndexConstraints refuses a deferrable unique (or exclusion)
+/// index as an ON CONFLICT arbiter as soon as a row's check reaches it
+/// (55000): every execution fails when the INSERT surely stores a row no
+/// BEFORE ROW trigger may drop — and no immediate arbiter checked before
+/// (by OID) may find the conflict first.
+#[test]
+fn on_conflict_refuses_a_deferrable_arbiter() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE d (id int, k int, CONSTRAINT d_k UNIQUE (k) DEFERRABLE);
+         CREATE TABLE dpk (id int PRIMARY KEY, k int, CONSTRAINT dpk_k UNIQUE (k) DEFERRABLE);
+         CREATE TABLE dlate (k int, id int,
+             CONSTRAINT dlate_k UNIQUE (k) DEFERRABLE INITIALLY DEFERRED, PRIMARY KEY (id));
+         CREATE TABLE dtrig (id int, k int, CONSTRAINT dtrig_k UNIQUE (k) DEFERRABLE);
+         CREATE FUNCTION skip() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+         CREATE TRIGGER dtrig_skip BEFORE INSERT ON dtrig FOR EACH ROW EXECUTE FUNCTION skip();
+         CREATE TABLE src (id int, k int);",
+    )
+    .unwrap();
+    for sql in [
+        "INSERT INTO d VALUES (1, 1) ON CONFLICT (k) DO NOTHING",
+        "INSERT INTO d VALUES (1, 1) ON CONFLICT ON CONSTRAINT d_k DO NOTHING",
+        "INSERT INTO d VALUES (1, 1) ON CONFLICT (k) DO UPDATE SET id = 2",
+        "INSERT INTO d VALUES (1, 1) ON CONFLICT DO NOTHING",
+        "INSERT INTO d SELECT 1, 2 ON CONFLICT (k) DO NOTHING",
+        "INSERT INTO dpk VALUES (1, 1) ON CONFLICT (k) DO NOTHING",
+        // Its deferrable index was created first: checked first.
+        "INSERT INTO dlate VALUES (1, 1) ON CONFLICT DO NOTHING",
+    ] {
+        assert_analyze_err!(
+            db.analyze(sql),
+            AnalyzeError::ObjectNotInPrerequisiteState(_),
+            "ON CONFLICT does not support deferrable unique constraints/exclusion constraints \
+             as arbiters",
+        );
+    }
+    for sql in [
+        // The SELECT may yield no row.
+        "INSERT INTO d SELECT id, k FROM src ON CONFLICT (k) DO NOTHING",
+        // The primary key, checked first, may find the conflict.
+        "INSERT INTO dpk VALUES (1, 1) ON CONFLICT DO NOTHING",
+        // The trigger drops every row.
+        "INSERT INTO dtrig VALUES (1, 1) ON CONFLICT (k) DO NOTHING",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
 #[test]
 fn on_conflict_on_nonexistent_constraint_name_should_error() {
     let mut db = PgCatalog::new().unwrap();

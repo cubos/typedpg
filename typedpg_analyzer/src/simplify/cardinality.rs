@@ -4765,7 +4765,6 @@ mod tests {
         db.apply_sql(
             "CREATE TABLE dup_keys (id integer PRIMARY KEY, v text);
              CREATE TABLE dup_nulls (k integer UNIQUE, v text);
-             CREATE TABLE dup_deferred (k integer UNIQUE DEFERRABLE, v text);
              CREATE TABLE dup_partial (k integer, v text);
              CREATE UNIQUE INDEX ON dup_partial (k) WHERE v IS NOT NULL;
              CREATE TABLE dup_trigger (k integer PRIMARY KEY);
@@ -4813,9 +4812,8 @@ mod tests {
             // NULLs never conflict under a unique index.
             "INSERT INTO dup_nulls (k, v) VALUES (NULL, 'a'), (NULL, 'b') \
              ON CONFLICT DO NOTHING RETURNING k",
-            // A deferrable key is checked at commit, not by `DO NOTHING`.
-            "INSERT INTO dup_deferred (k, v) VALUES (1, 'a'), (1, 'b') \
-             ON CONFLICT DO NOTHING RETURNING k",
+            // (A deferrable key can't arbitrate `DO NOTHING`: the executor
+            // refuses it, so such a statement never runs.)
             // A partial index does not cover both rows.
             "INSERT INTO dup_partial (k, v) VALUES (1, 'a'), (1, 'b') \
              ON CONFLICT DO NOTHING RETURNING k",

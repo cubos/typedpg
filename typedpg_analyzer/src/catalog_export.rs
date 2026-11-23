@@ -466,7 +466,7 @@ fn export_operators(
     // resolution skips them at lookup time.
     let rows = client.query(
         "SELECT oid, oprname, oprnamespace, oprleft, oprright, oprresult, oprcode::oid, oprcom, \
-                oprnegate \
+                oprnegate, oprcanmerge, oprcanhash \
          FROM pg_catalog.pg_operator \
          WHERE oid >= $1 \
          ORDER BY oid",
@@ -493,6 +493,8 @@ fn export_operators(
                 oprcode: PgProcOid::new(oprcode),
                 oprcom: PgOperatorOid::new(oprcom),
                 oprnegate: PgOperatorOid::new(oprnegate),
+                oprcanmerge: r.get(9),
+                oprcanhash: r.get(10),
             }
         })
         .collect())

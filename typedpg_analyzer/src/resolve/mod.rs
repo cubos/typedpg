@@ -1428,16 +1428,19 @@ fn infer_collation_opclass_match(
 /// are the inference elements, and — when partial — whose predicate the
 /// ON CONFLICT WHERE implies (`predicate_implied_by`, see [`predtest`]).
 /// 42P10 otherwise.
+///
+/// Returns the arbiter indexes, with the table they are on (the base
+/// relation of an updatable view), when told.
 fn validate_on_conflict_target(
     on_conflict: &ast::OnConflictClause,
     arbiter: &Arbiter,
     snapshot: &PgCatalog,
     table_oid: crate::oid::PgClassOid,
     table_relname: &str,
-) -> Result<(), AnalyzeError> {
+) -> Result<Option<Arbiters>, AnalyzeError> {
     let Some(infer) = on_conflict.infer.as_deref() else {
         // `ON CONFLICT DO NOTHING` without a target matches any conflict.
-        return Ok(());
+        return Ok(None);
     };
 
     if arbiter.whole_row {
@@ -1445,6 +1448,12 @@ fn validate_on_conflict_target(
             "whole row unique index inference specifications are not supported".into(),
         ));
     }
+    let as_arbiters = |found: Vec<crate::oid::PgClassOid>, table: crate::oid::PgClassOid| {
+        (!found.is_empty()).then_some(Arbiters {
+            table,
+            indexes: found,
+        })
+    };
 
     // `ON CONFLICT ON CONSTRAINT <name>` (its existence was checked during
     // parse analysis).
@@ -1453,7 +1462,7 @@ fn validate_on_conflict_target(
             .pg_constraint_values()
             .find(|c| c.conrelid == table_oid && c.conname == infer.conname)
         else {
-            return Ok(());
+            return Ok(None);
         };
         // The constraint must be backed by an index (PRIMARY KEY / UNIQUE /
         // EXCLUDE), not a CHECK, FOREIGN KEY or NOT NULL one.
@@ -1479,7 +1488,18 @@ fn validate_on_conflict_target(
                 "{action} not supported with exclusion constraints"
             )));
         }
-        return Ok(());
+        // The constraint's index, named after it.
+        let index = snapshot.pg_index.values().find(|idx| {
+            idx.indrelid == table_oid
+                && snapshot
+                    .pg_class
+                    .get(&idx.indexrelid)
+                    .is_some_and(|c| c.relname == found.conname)
+        });
+        return Ok(as_arbiters(
+            index.map(|i| i.indexrelid).into_iter().collect(),
+            table_oid,
+        ));
     }
 
     let mut target_cols = arbiter.cols.clone();
@@ -1494,7 +1514,7 @@ fn validate_on_conflict_target(
     let mut table_oid = table_oid;
     while let Some(upd) = snapshot.view_updatability.get(&table_oid) {
         let Some(base) = upd.base else {
-            return Ok(());
+            return Ok(None);
         };
         let view_attrs = snapshot.attributes_of(table_oid);
         let base_attrs = snapshot.attributes_of(base);
@@ -1544,37 +1564,43 @@ fn validate_on_conflict_target(
         snapshot,
         table: table_oid,
     };
-    let index_matches = snapshot.pg_index.values().any(|idx| {
-        // A WITHOUT OVERLAPS key is unique but really an exclusion
-        // constraint: inference skips it, and invalid indexes too.
-        if idx.indrelid != table_oid
-            || !idx.indisunique
-            || idx.indisexclusion
-            || snapshot.invalid_indexes.contains(&idx.indexrelid)
-        {
-            return false;
-        }
-        let key = &idx.indkey[..usize::try_from(idx.indnkeyatts)
-            .unwrap_or(0)
-            .min(idx.indkey.len())];
-        let cols: std::collections::BTreeSet<i16> =
-            key.iter().copied().filter(|&a| a != 0).collect();
-        let idx_exprs: Vec<Option<&ast::Node>> = idx.indexprs.iter().map(decode).collect();
-        let mut exprs: Vec<String> = idx_exprs.iter().map(|n| node_fingerprint(*n)).collect();
-        exprs.sort();
-        exprs.dedup();
-        if cols != target_cols || exprs != target_exprs {
-            return false;
-        }
-        if !qualified
-            .iter()
-            .all(|q| infer_collation_opclass_match(snapshot, q, idx, &idx_exprs))
-        {
-            return false;
-        }
-        let pred = idx.indpred.as_ref().and_then(decode);
-        predtest::predicate_implied_by(pred, where_clause.as_ref(), &types)
-    });
+    let matched: Vec<crate::oid::PgClassOid> = snapshot
+        .pg_index
+        .values()
+        .filter(|idx| {
+            // A WITHOUT OVERLAPS key is unique but really an exclusion
+            // constraint: inference skips it, and invalid indexes too.
+            if idx.indrelid != table_oid
+                || !idx.indisunique
+                || idx.indisexclusion
+                || snapshot.invalid_indexes.contains(&idx.indexrelid)
+            {
+                return false;
+            }
+            let key = &idx.indkey[..usize::try_from(idx.indnkeyatts)
+                .unwrap_or(0)
+                .min(idx.indkey.len())];
+            let cols: std::collections::BTreeSet<i16> =
+                key.iter().copied().filter(|&a| a != 0).collect();
+            let idx_exprs: Vec<Option<&ast::Node>> = idx.indexprs.iter().map(decode).collect();
+            let mut exprs: Vec<String> = idx_exprs.iter().map(|n| node_fingerprint(*n)).collect();
+            exprs.sort();
+            exprs.dedup();
+            if cols != target_cols || exprs != target_exprs {
+                return false;
+            }
+            if !qualified
+                .iter()
+                .all(|q| infer_collation_opclass_match(snapshot, q, idx, &idx_exprs))
+            {
+                return false;
+            }
+            let pred = idx.indpred.as_ref().and_then(decode);
+            predtest::predicate_implied_by(pred, where_clause.as_ref(), &types)
+        })
+        .map(|idx| idx.indexrelid)
+        .collect();
+    let index_matches = !matched.is_empty();
     // Constraint-backed keys, for catalogs whose constraints carry no
     // pg_index row (and so no collations or operator classes to match).
     let constraint_matches = target_exprs.is_empty()
@@ -1592,7 +1618,14 @@ fn validate_on_conflict_target(
     if !index_matches && !constraint_matches {
         return Err(crate::pgmsg::no_on_conflict_arbiter(table_relname).finalize_implicit());
     }
-    Ok(())
+    Ok(as_arbiters(matched, table_oid))
+}
+
+/// The arbiter indexes `infer_arbiter_indexes` found for an ON CONFLICT
+/// target, on `table`.
+pub(crate) struct Arbiters {
+    pub table: crate::oid::PgClassOid,
+    pub indexes: Vec<crate::oid::PgClassOid>,
 }
 
 /// `node` with every column reference's column name mapped through
@@ -1873,6 +1906,7 @@ mod dml;
 pub(crate) use dml::assignment_violation;
 mod failing_rows;
 mod from;
+mod full_join;
 mod merge;
 mod predtest;
 mod returning;

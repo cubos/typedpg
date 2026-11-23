@@ -232,6 +232,8 @@ fn operator_shell_make(
         oprcode: None,
         oprcom: None,
         oprnegate: None,
+        oprcanmerge: false,
+        oprcanhash: false,
     });
     Ok(oid)
 }
@@ -554,6 +556,8 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         oprcode: Some(proc_oid),
         oprcom,
         oprnegate,
+        oprcanmerge: can_merge,
+        oprcanhash: can_hash,
     });
     // UpdateOperatorLinks: the commutator and the negator point back at
     // the new operator.
@@ -613,6 +617,7 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
     };
     let (mut restrict, mut join, mut commutator, mut negator) = (None, None, None, None);
     let (mut can_merge, mut can_hash) = (false, false);
+    let (mut update_merges, mut update_hashes) = (false, false);
     for opt in &stmt.options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
@@ -624,8 +629,14 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
             "join" => join = value,
             "commutator" => commutator = value,
             "negator" => negator = value,
-            "merges" => can_merge = def_bool(de),
-            "hashes" => can_hash = def_bool(de),
+            "merges" => {
+                can_merge = def_bool(de);
+                update_merges = true;
+            }
+            "hashes" => {
+                can_hash = def_bool(de);
+                update_hashes = true;
+            }
             "leftarg" | "rightarg" | "function" | "procedure" => {
                 return Err(DdlError::Parse(format!(
                     "operator attribute \"{}\" cannot be changed",
@@ -689,6 +700,18 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         }
         negator_oid = Some(other);
     }
+    // AlterOperator: MERGES / HASHES, once set, can't be turned off (plans
+    // may depend on them).
+    for (update, was, now, what) in [
+        (update_merges, op.oprcanmerge, can_merge, "merges"),
+        (update_hashes, op.oprcanhash, can_hash, "hashes"),
+    ] {
+        if update && was && !now {
+            return Err(DdlError::Parse(format!(
+                "operator attribute \"{what}\" cannot be changed if it has already been set"
+            )));
+        }
+    }
     operator_validate_params(
         op.oprleft,
         op.oprresult,
@@ -706,6 +729,12 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         }
         if negator_oid.is_some() {
             row.oprnegate = negator_oid;
+        }
+        if update_merges {
+            row.oprcanmerge = can_merge;
+        }
+        if update_hashes {
+            row.oprcanhash = can_hash;
         }
     }
     operator_upd(
