@@ -24,15 +24,26 @@ use super::{leftmost_start, location, scan_until};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    // The CASEs that are an output column's whole expression with no
-    // alias: they name the column.
+    // The CASEs that are an output column's expression with no alias —
+    // under casts and `COLLATE` too, which take their operand's name or
+    // fall back to the type's: they name the column.
     let mut naming = HashSet::new();
     for (node, _) in ctx.tree.nodes() {
         if let NodeRef::ResTarget(target) = node
             && target.name.is_empty()
-            && let Some(N::CaseExpr(case)) = target.val.as_ref()
         {
-            naming.insert(case.location);
+            let mut value = target.val.as_ref();
+            loop {
+                match value {
+                    Some(N::TypeCast(cast)) => value = cast.arg.as_ref(),
+                    Some(N::CollateClause(collate)) => value = collate.arg.as_ref(),
+                    Some(N::CaseExpr(case)) => {
+                        naming.insert(case.location);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
         }
     }
     let mut out = Vec::new();
@@ -73,6 +84,25 @@ fn simplifiable(ctx: &Ctx<'_>, case: &CaseExpr, names_column: bool, out: &mut Ve
         return;
     };
     let end = ctx.tokens[end_index].end;
+    // The condition is the text between `WHEN` and `THEN`, the result the
+    // text between `THEN` and `ELSE`, parentheses around them included.
+    let Some(when_index) = location(when.location)
+        .and_then(|at| ctx.tokens.iter().position(|token| token.start == at))
+    else {
+        return;
+    };
+    let Some(cond_start) = ctx.tokens.get(when_index + 1).map(|token| token.start) else {
+        return;
+    };
+    let (cond_end, then_index) =
+        scan_until(ctx, cond_start, |text| text.eq_ignore_ascii_case("THEN"));
+    let Some(result_start) = then_index
+        .and_then(|index| ctx.tokens.get(index + 1))
+        .map(|token| token.start)
+    else {
+        return;
+    };
+    let (result_end, _) = scan_until(ctx, result_start, |text| text.eq_ignore_ascii_case("ELSE"));
     if let N::NullTest(test) = condition
         && test.nulltesttype == NullTestType::IsNull
         && let Some(tested) = test.arg.as_ref()
@@ -82,18 +112,25 @@ fn simplifiable(ctx: &Ctx<'_>, case: &CaseExpr, names_column: bool, out: &mut Ve
             end,
             names_column,
         };
-        coalesce(ctx, case, test.location, tested, result, default, out);
+        let result_text = result_start..result_end.max(result_start);
+        coalesce(ctx, case, test.location, tested, result_text, default, out);
         return;
     }
     if is_boolean(result, true) && is_boolean(default, false) {
-        let Some(cond_start) = leftmost_start(condition) else {
-            return;
-        };
-        let (cond_end, _) = scan_until(ctx, cond_start, |text| text.eq_ignore_ascii_case("THEN"));
         let written = ctx.written(cond_start..cond_end);
         let not_null = ctx.view.case_condition_not_null(when.location) == Some(true);
         let fix = if not_null && !names_column && cond_end > cond_start {
-            let text = if matches!(condition, N::ColumnRef(_) | N::FuncCall(_) | N::AConst(_)) {
+            // Already in parentheses of its own: `WHEN (a > b) THEN`.
+            let wrapped = ctx
+                .tokens
+                .iter()
+                .position(|token| token.start == cond_start)
+                .filter(|&index| &ctx.sql[ctx.tokens[index].start..ctx.tokens[index].end] == "(")
+                .and_then(|index| scan_until(ctx, ctx.tokens[index].end, |_| false).1)
+                .is_some_and(|close| ctx.tokens[close].end == cond_end);
+            let text = if wrapped
+                || matches!(condition, N::ColumnRef(_) | N::FuncCall(_) | N::AConst(_))
+            {
                 written.to_owned()
             } else {
                 format!("({written})")
@@ -132,7 +169,7 @@ fn coalesce(
     case: CaseParts,
     test_location: i32,
     tested: &Node,
-    result: &Node,
+    result_text: std::ops::Range<usize>,
     default: &Node,
     out: &mut Vec<RawFinding>,
 ) {
@@ -145,11 +182,9 @@ fn coalesce(
     if !plain {
         return;
     }
-    let (Some(tested_start), Some(default_start), Some(result_start)) = (
-        leftmost_start(tested),
-        leftmost_start(default),
-        leftmost_start(result),
-    ) else {
+    let (Some(tested_start), Some(default_start)) =
+        (leftmost_start(tested), leftmost_start(default))
+    else {
         return;
     };
     let tested_text = text_until(ctx, tested_start, "IS");
@@ -174,7 +209,6 @@ fn coalesce(
             return;
         }
     }
-    let result_text = text_until(ctx, result_start, "ELSE");
     let x = ctx.written(tested_text);
     let y = ctx.written(result_text);
     let fix = if case.names_column {
@@ -243,6 +277,12 @@ mod tests {
                 "SELECT CASE WHEN $v::text IS NULL THEN $d::text ELSE $v::text END AS v",
                 "SELECT COALESCE($v::text, $d::text) AS v",
             ),
+            // A result starting with a parenthesis is quoted whole.
+            (
+                "SELECT CASE WHEN name IS NULL THEN (email || 'a') || 'b' ELSE name END AS n \
+                 FROM users",
+                "SELECT COALESCE(name, (email || 'a') || 'b') AS n FROM users",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -268,6 +308,15 @@ mod tests {
                  WHERE name IS NOT NULL",
                 "SELECT (name = 'x') AS b FROM users WHERE name IS NOT NULL",
             ),
+            // A condition starting with a parenthesis is quoted whole.
+            (
+                "SELECT CASE WHEN (id) > 1 THEN true ELSE false END AS big FROM users",
+                "SELECT ((id) > 1) AS big FROM users",
+            ),
+            (
+                "SELECT CASE WHEN (id > 1) THEN true ELSE false END AS big FROM users",
+                "SELECT (id > 1) AS big FROM users",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
@@ -285,6 +334,9 @@ mod tests {
             // The CASE names the column.
             "SELECT CASE WHEN id > 1 THEN true ELSE false END FROM users",
             "SELECT CASE WHEN name IS NULL THEN 'none' ELSE name END FROM users",
+            // Under a cast, which names it after the CASE or its type.
+            "SELECT (CASE WHEN name IS NULL THEN 'none' ELSE name END)::varchar FROM users",
+            "SELECT CASE WHEN id > 1 THEN true ELSE false END::text FROM users",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");

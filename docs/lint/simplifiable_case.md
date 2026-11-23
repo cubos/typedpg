@@ -64,8 +64,9 @@ A `CASE` with one `WHEN` and an `ELSE`, of either shape:
 ## Fix not offered
 
 - The condition may be NULL.
-- The `CASE` is a whole output column without an alias: its column is named
-  `case`, and the rewrite would rename it. Add `AS` and the fix applies.
+- The `CASE` is a whole output column without an alias, also under a
+  cast: its column is named after it, and the rewrite would rename it. Add
+  `AS` and the fix applies.
 
 ## Configuration
 

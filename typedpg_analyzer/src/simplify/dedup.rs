@@ -4331,7 +4331,8 @@ pub enum OrderTies {
     Unique,
     /// Two rows the schema allows may share every key: the FROM items
     /// whose row the keys don't determine, each with its primary key's
-    /// columns (empty when it has none).
+    /// columns that neither the keys nor an equality fix (empty when it has
+    /// none).
     Ties(Vec<(String, Vec<String>)>),
     /// The proof can't tell (a FROM item it can't see through, a key that
     /// is an expression index, a set-returning call, …).
@@ -4341,8 +4342,10 @@ pub enum OrderTies {
 /// [`OrderTies`] of `s`'s `ORDER BY` over the rows its FROM, WHERE and
 /// grouping make — before `LIMIT` / `OFFSET` / `DISTINCT ON` pick some.
 ///
-/// The keys determine a row when, with the columns `WHERE` equates to
-/// constants or parameters, they cover a unique key of every relation, or
+/// The keys determine a row when, with the columns `WHERE` (or the `ON` of
+/// an inner join no outer join null-extends) equates to constants,
+/// parameters or columns of determined relations, they cover a unique key
+/// of every relation, or
 /// of the relations the others then determine through equalities to a key
 /// (the `DISTINCT` proof's closure, see the module docs). A grouped query
 /// (`GROUP BY` of plain columns, or a plain `DISTINCT` of them) yields one
@@ -4522,9 +4525,24 @@ pub(super) fn order_ties(
             _ => {}
         }
     }
+    // The equalities every row satisfies: the WHERE's, and those of the
+    // inner joins no outer join null-extends (their ON filters every row as
+    // a WHERE would).
+    let mut level_facts = where_facts.clone();
+    for join in &scope.joins {
+        if join.kind != JoinType::JoinInner || join.nullable {
+            continue;
+        }
+        for c in conjuncts(join.quals) {
+            level_facts.extend(scope.equality_facts(ctx, c, outer));
+        }
+        for name in &join.using {
+            level_facts.extend(scope.using_facts(ctx, name, join.left, join.right));
+        }
+    }
     let covered = |r: usize, attnum: i16, known: u64| {
         cols.contains(&(r, attnum))
-            || scope.column_fixed_by_facts(ctx, r, attnum, &where_facts, known)
+            || scope.column_fixed_by_facts(ctx, r, attnum, &level_facts, known)
     };
     // The columns WHERE and the joins' conditions read.
     let mut read: HashSet<(usize, i16)> = HashSet::new();
@@ -4618,8 +4636,16 @@ pub(super) fn order_ties(
             let rel = &scope.rels[r];
             (
                 rel.refname.clone(),
+                // The primary key's columns the keys and the equalities
+                // don't already fix: the tiebreaker to add.
                 rel.oid
-                    .map(|oid| primary_key_columns(ctx, oid))
+                    .map(|oid| {
+                        primary_key_columns(ctx, oid)
+                            .into_iter()
+                            .filter(|&(attnum, _)| !covered(r, attnum, known))
+                            .map(|(_, name)| name)
+                            .collect()
+                    })
                     .unwrap_or_default(),
             )
         })
@@ -4750,8 +4776,9 @@ fn has_aggregate(ctx: &Ctx<'_>, s: &ast::SelectStmt) -> bool {
     false
 }
 
-/// The names of relation `relid`'s primary key columns, in key order.
-fn primary_key_columns(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<String> {
+/// The attnums and names of relation `relid`'s primary key columns, in key
+/// order.
+fn primary_key_columns(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<(i16, String)> {
     let attrs = ctx.catalog.attributes_of(relid);
     ctx.catalog
         .pg_constraint
@@ -4761,7 +4788,7 @@ fn primary_key_columns(ctx: &Ctx<'_>, relid: PgClassOid) -> Vec<String> {
             c.conkey
                 .iter()
                 .filter_map(|k| attrs.iter().find(|a| a.attnum == *k))
-                .map(|a| a.attname.clone())
+                .map(|a| (a.attnum, a.attname.clone()))
                 .collect()
         })
         .unwrap_or_default()

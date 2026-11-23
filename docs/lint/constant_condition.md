@@ -104,6 +104,9 @@ reported.
 - `ON` and `FILTER` conditions.
 - Never-true conditions, and anything decided by constraints or other
   conditions rather than constants alone.
+- A condition that reads a parameter, as in a branch folded away
+  (`CASE WHEN 1 = 1 THEN true ELSE name = $name END`): removing it would
+  change the query's parameters.
 
 ## Configuration
 

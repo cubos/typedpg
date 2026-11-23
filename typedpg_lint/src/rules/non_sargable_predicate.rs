@@ -679,7 +679,7 @@ fn wrapped_column<'a>(ctx: &Ctx<'_>, level: &Level, side: &'a Node) -> Option<Wr
     })
 }
 
-/// The name of a non-partial btree index of `table` led by column
+/// The name of the first non-partial btree index of `table` led by column
 /// `attnum`, and its leading column's operator class, when the table has no
 /// expression index (which might match the wrapped expression).
 fn leading_btree_index(
@@ -698,11 +698,16 @@ fn leading_btree_index(
     {
         return None;
     }
-    let index = indexes.iter().find(|index| {
-        index.indpred.is_none()
-            && index.indkey.first() == Some(&attnum)
-            && ctx.catalog.index_access_method(index.indexrelid) == "btree"
-    })?;
+    // The first such index created (the catalog's iteration order is
+    // arbitrary): the same one every run.
+    let index = indexes
+        .iter()
+        .filter(|index| {
+            index.indpred.is_none()
+                && index.indkey.first() == Some(&attnum)
+                && ctx.catalog.index_access_method(index.indexrelid) == "btree"
+        })
+        .min_by_key(|index| index.indexrelid)?;
     ctx.catalog.class_row(index.indexrelid).map(|class| {
         (
             class.relname.clone(),
@@ -1026,6 +1031,32 @@ mod tests {
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
             let help = findings[0].help.as_deref().unwrap();
             assert!(!help.contains('`'), "{sql}: {help}");
+        }
+    }
+
+    #[test]
+    fn the_index_named_is_the_first_one_created() {
+        // Several btree indexes lead with the column: the message names the
+        // same one every run, whatever order the catalog keeps them in.
+        for _ in 0..20 {
+            let mut db = PgCatalog::new().unwrap();
+            db.apply_sql(
+                "CREATE TABLE codes (id bigint, code text NOT NULL, extra int);
+                 CREATE INDEX codes_a ON codes (code);
+                 CREATE INDEX codes_b ON codes (code, extra);
+                 CREATE INDEX codes_c ON codes (code, id);",
+            )
+            .unwrap();
+            let findings = lint_rule(
+                &db,
+                "SELECT id FROM codes WHERE lower(code) = $1",
+                Rule::NonSargablePredicate,
+            );
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(
+                findings[0].message.contains("index codes_a "),
+                "{findings:?}"
+            );
         }
     }
 

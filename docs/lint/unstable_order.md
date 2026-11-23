@@ -42,10 +42,10 @@ the data, so tests rarely catch it. End the `ORDER BY` with a unique column.
 
 ## Reported when
 
-The `ORDER BY` keys, together with the columns `WHERE` equates to constants,
-parameters or columns of an enclosing query (one value per evaluation of a
-correlated or `LATERAL` subquery), don't cover a unique key of every table in
-`FROM`:
+The `ORDER BY` keys, together with the columns `WHERE` (or an inner join's
+`ON`) equates to constants, parameters, columns of an enclosing query (one
+value per evaluation of a correlated or `LATERAL` subquery) or columns of a
+table the keys determine, don't cover a unique key of every table in `FROM`:
 
 - a table joined on its primary key needs no key of its own;
 - in a grouped query, the `GROUP BY` columns count;
@@ -56,7 +56,8 @@ correlated or `LATERAL` subquery), don't cover a unique key of every table in
   nondeterministic one, distinct values can compare equal.
 
 A `DISTINCT ON` whose keys `WHERE` fixes returns one row, still picked
-among ties. The help names each undetermined table's primary key.
+among ties. The help names each undetermined table's primary key columns
+that nothing above fixes.
 
 ## Not reported
 

@@ -23,16 +23,39 @@ use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let mut out = Vec::new();
-    // A `COALESCE` directly under an unnamed `ResTarget` names its output
-    // column `coalesce`; removing the call renames it, so its fix is
-    // withheld. Collect them first: a node visited later needs to know.
+    // A `COALESCE` that is an unnamed `ResTarget`'s expression — under
+    // casts and `COLLATE` too, which take their operand's name
+    // (`FigureColname`) — names its output column `coalesce`; removing the
+    // call renames it, so its fix is withheld. Collect them first: a node
+    // visited later needs to know.
     let mut unaliased = HashSet::new();
     for (node, _) in ctx.tree.nodes() {
+        // A `COALESCE` in FROM (`FROM coalesce(1, 2)`) is a function item:
+        // without the call, it is no FROM item at all.
+        if let NodeRef::RangeFunction(function) = node {
+            for item in function.functions.iter().flatten() {
+                if let N::List(list) = item
+                    && let Some(Some(N::CoalesceExpr(expr))) = list.items.first()
+                {
+                    unaliased.insert(expr.location);
+                }
+            }
+        }
         if let NodeRef::ResTarget(target) = node
             && target.name.is_empty()
-            && let Some(N::CoalesceExpr(expr)) = target.val.as_ref()
         {
-            unaliased.insert(expr.location);
+            let mut value = target.val.as_ref();
+            loop {
+                match value {
+                    Some(N::TypeCast(cast)) => value = cast.arg.as_ref(),
+                    Some(N::CollateClause(collate)) => value = collate.arg.as_ref(),
+                    Some(N::CoalesceExpr(expr)) => {
+                        unaliased.insert(expr.location);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
         }
     }
     let conjuncts = condition_conjuncts(ctx);
@@ -101,7 +124,15 @@ fn null_test(ctx: &Ctx<'_>, test: &NullTest, conjunct: bool, out: &mut Vec<RawFi
         Some(true) if conjunct && ctx.view.null_test_settled(test.location) == Some(true) => true,
         _ => return,
     };
-    let Some(start) = argument_start(arg.as_ref()).or_else(|| location(test.location)) else {
+    // From the test's first token: a parenthesis opening its argument,
+    // `(t.c) IS NULL`, included.
+    let start = argument_start(arg.as_ref()).or_else(|| location(test.location));
+    let Some(start) = node_span(ctx, typedpg_pg_query::NodeRef::NullTest(test))
+        .map(|span| span.start)
+        .into_iter()
+        .chain(start)
+        .min()
+    else {
         return;
     };
     let Some(end) = null_keyword_end(ctx, test.location).filter(|end| *end > start) else {
@@ -582,6 +613,17 @@ mod tests {
         let sql = "SELECT nn IS NOT NULL FROM checks";
         let findings = lint(&db, sql);
         assert_eq!(&sql[only(&findings).span.clone()], "nn IS NOT NULL");
+        // A parenthesized argument: from its opening parenthesis.
+        for (sql, span) in [
+            ("SELECT (nn) IS NOT NULL FROM checks", "(nn) IS NOT NULL"),
+            (
+                "SELECT ((nn)::text) IS NULL FROM checks",
+                "((nn)::text) IS NULL",
+            ),
+        ] {
+            let findings = lint(&db, sql);
+            assert_eq!(&sql[only(&findings).span.clone()], span, "{sql}");
+        }
     }
 
     #[test]
@@ -914,6 +956,12 @@ mod tests {
             "SELECT COALESCE(nn, 0) FROM checks",
             "SELECT COALESCE(nullable, nn, 0) FROM checks",
             "SELECT * FROM (SELECT COALESCE(nn, 0) FROM checks) s",
+            // A FROM item.
+            "SELECT * FROM coalesce(1, 2)",
+            // A cast or COLLATE takes its operand's name: still `coalesce`.
+            "SELECT COALESCE(nn, 0)::bigint FROM checks",
+            "SELECT (COALESCE(name, 'x'))::varchar FROM checks",
+            "SELECT COALESCE(name, 'x') COLLATE \"C\" FROM checks",
         ] {
             let findings = lint(&db, sql);
             let finding = only(&findings);

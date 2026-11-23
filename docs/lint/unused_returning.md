@@ -64,6 +64,8 @@ is visible:
 - An exported `sql(…)` binding, and every `.sql` file query (each is an
   export usable anywhere).
 - A `RETURNING` inside a data-modifying CTE (the statement reads it).
+- `INSERT … ON CONFLICT … DO SELECT`, which can't be written without
+  `RETURNING`.
 
 ## Fix not offered
 

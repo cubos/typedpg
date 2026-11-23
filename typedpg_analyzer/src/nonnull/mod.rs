@@ -1390,8 +1390,8 @@ fn nonnullable_node(
                     .union(walk_opt(e.rexpr.as_ref(), false))
                     .union(comparison_facts(e, scope, log, snapshot)),
                 K::AexprOpAll if top_level => comparison_facts(e, scope, log, snapshot)
-                    .union(nonempty_array_facts(e, scope, snapshot)),
-                K::AexprOpAny | K::AexprOpAll => nonempty_array_facts(e, scope, snapshot),
+                    .union(nonempty_array_facts(e, scope, log, snapshot)),
+                K::AexprOpAny | K::AexprOpAll => nonempty_array_facts(e, scope, log, snapshot),
                 _ => Facts::default(),
             }
         }
@@ -2074,14 +2074,32 @@ fn element_preds(
 }
 
 /// `x op ANY / ALL (arr)` non-NULL over an array that surely has an
-/// element (of a non-array `x`): `x op e` is strict, so `x` is non-NULL —
-/// `is_strict_saop` over a non-empty array constant. (Over an empty array
+/// element (of a non-array `x`, or a strict cast of one): `x op e` is
+/// strict, so `x` is non-NULL — `is_strict_saop` over a non-empty array
+/// constant. (Over an empty array
 /// ANY is FALSE and ALL TRUE even for a NULL `x`.)
-fn nonempty_array_facts(e: &ast::AExpr, scope: &Scope, snapshot: &PgCatalog) -> Facts {
-    let Some((c, t)) = e.lexpr.as_ref().and_then(|l| plain_column(l, scope)) else {
+fn nonempty_array_facts(
+    e: &ast::AExpr,
+    scope: &Scope,
+    log: &StrictLog,
+    snapshot: &PgCatalog,
+) -> Facts {
+    // The column, or a strict cast of it to a scalar type (`x::numeric`):
+    // NULL when the column is.
+    let column = |n: &ast::Node| match n {
+        ast::Node::TypeCast(tc) if log.is_strict(tc.location, StrictNode::Cast) => {
+            let (c, _) = plain_column(tc.arg.as_ref()?, scope)?;
+            let target = crate::ddl::util::resolve_type_name(tc.type_name.as_ref()?, snapshot)?;
+            Some((c, target))
+        }
+        n => plain_column(n, scope),
+    };
+    let Some((c, t)) = e.lexpr.as_ref().and_then(column) else {
         return Facts::default();
     };
-    if crate::expr::array_element_type(snapshot, t).is_some() || !array_nonempty(e.rexpr.as_ref()) {
+    if crate::expr::array_element_type(snapshot, t).is_some()
+        || !array_nonempty(e.rexpr.as_ref(), scope, snapshot)
+    {
         return Facts::default();
     }
     Facts::column(&c.0, &c.1)
@@ -2090,12 +2108,21 @@ fn nonempty_array_facts(e: &ast::AExpr, scope: &Scope, snapshot: &PgCatalog) -> 
 /// Whether the array of scalars `n` (an `ARRAY[…]` or an array literal,
 /// cast or not) surely has an element. `ARRAY[ARRAY[]::int[]]` has none,
 /// nor may `ARRAY[a]` over an array `a`: only constants that are no
-/// arrays count as elements of a constructor.
-fn array_nonempty(n: Option<&ast::Node>) -> bool {
+/// arrays (cast to a scalar type or not) and columns of a scalar type count
+/// as elements of a constructor.
+fn array_nonempty(n: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> bool {
     use typedpg_pg_query::ast::AConstValue;
     match n {
         Some(ast::Node::AArrayExpr(a)) => {
             let scalar = |i: &Option<ast::Node>| match i {
+                // A constant cast to a scalar type (`'2024-01-01'::date`):
+                // an element, folded to a constant.
+                Some(ast::Node::TypeCast(tc)) if matches!(tc.arg.as_ref(), Some(ast::Node::AConst(c)) if !c.isnull) => {
+                    tc.type_name
+                        .as_ref()
+                        .and_then(|name| crate::ddl::util::resolve_type_name(name, snapshot))
+                        .is_some_and(|t| crate::expr::array_element_type(snapshot, t).is_none())
+                }
                 Some(ast::Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
                     Some(
                         AConstValue::Integer(_) | AConstValue::Float(_) | AConstValue::Boolean(_),
@@ -2108,12 +2135,20 @@ fn array_nonempty(n: Option<&ast::Node>) -> bool {
                         .all(|i| matches!(i, Some(ast::Node::AConst(_)))),
                     _ => false,
                 },
-                Some(n @ ast::Node::AArrayExpr(_)) => array_nonempty(Some(n)),
+                Some(n @ ast::Node::AArrayExpr(_)) => array_nonempty(Some(n), scope, snapshot),
+                // A column of a scalar type: an element (with one, the
+                // constructor isn't a multidimensional one, whose elements
+                // are all arrays).
+                Some(n @ (ast::Node::ColumnRef(_) | ast::Node::AIndirection(_))) => {
+                    plain_column(n, scope).is_some_and(|(_, t)| {
+                        crate::expr::array_element_type(snapshot, t).is_none()
+                    })
+                }
                 _ => false,
             };
             a.elements.iter().any(scalar)
         }
-        Some(ast::Node::TypeCast(tc)) => array_nonempty(tc.arg.as_ref()),
+        Some(ast::Node::TypeCast(tc)) => array_nonempty(tc.arg.as_ref(), scope, snapshot),
         Some(ast::Node::AConst(c)) if !c.isnull => match c.val.as_ref() {
             Some(AConstValue::String(s)) => {
                 crate::array_input::array_dimensions(&s.sval, b',').is_some_and(|d| !d.is_empty())

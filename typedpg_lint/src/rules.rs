@@ -553,7 +553,14 @@ pub(super) fn condition_span(
     let start = expression_start(ctx, node)?;
     let or = matches!(node, N::BoolExpr(b) if b.boolop == BoolExprType::OrExpr);
     let mut between = false;
+    // `IS [NOT] DISTINCT FROM`: its `FROM` starts no clause.
+    let mut distinct = false;
     let (end, _) = scan_until(ctx, start, |text| {
+        let after_distinct =
+            std::mem::replace(&mut distinct, text.eq_ignore_ascii_case("DISTINCT"));
+        if after_distinct && text.eq_ignore_ascii_case("FROM") {
+            return false;
+        }
         if text.eq_ignore_ascii_case("BETWEEN") {
             between = true;
             return false;
@@ -580,13 +587,38 @@ pub(super) fn clause_item_spans(
     items
         .iter()
         .map(|item| {
-            let start = node_span(ctx, (*item)?.to_ref())?.start;
+            // An item wrapped whole in parentheses, `(id)`, is a list item
+            // with them.
+            let start = wrapping_parens(ctx, node_span(ctx, (*item)?.to_ref())?).start;
             let (end, _) = scan_until(ctx, start, |text| {
                 text == "," || (starts_clause(text) && !text.eq_ignore_ascii_case("USING"))
             });
             Some(start..end.max(start + 1))
         })
         .collect()
+}
+
+/// `span` widened over the parentheses wrapping it whole: `(x)` and `((x))`
+/// for `x`. Only for a span no call or other syntax can enclose in
+/// parentheses of its own (a list item of a clause, a `WHEN` condition).
+pub(super) fn wrapping_parens(
+    ctx: &Ctx<'_>,
+    span: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let mut span = span;
+    loop {
+        let before = ctx.tokens.iter().rfind(|token| token.end <= span.start);
+        let after = ctx.tokens.iter().find(|token| token.start >= span.end);
+        match (before, after) {
+            (Some(open), Some(close))
+                if &ctx.sql[open.start..open.end] == "("
+                    && &ctx.sql[close.start..close.end] == ")" =>
+            {
+                span = open.start..close.end;
+            }
+            _ => return span,
+        }
+    }
 }
 
 /// The edit removing item `index` of a comma-separated list whose items

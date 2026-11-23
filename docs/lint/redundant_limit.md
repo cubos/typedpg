@@ -56,7 +56,10 @@ The query is known to return at most one row through:
 
 When a filter or output expression can raise an error on some rows, e.g.
 `WHERE id = $id AND 100 / views > 1 LIMIT 1`: the `LIMIT` can stop the
-scan before a row that would divide by zero.
+scan before a row that would divide by zero. For the `LIMIT` of a subquery,
+also when an expression of the query around it can raise: without the
+`LIMIT` the subquery is merged into it, and a value it outputs folded into
+those expressions before any row is read.
 
 ## Configuration
 

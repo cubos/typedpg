@@ -88,7 +88,11 @@ at most one row before it), when it belongs to an `EXISTS`, `IN`/`= ANY` or
 For a key that is not a plain column, an output column's alias or an ordinal
 (`ORDER BY 1`): `lower(name)`, `1 / (tenant - 1)` and `random()` may raise
 an error or have side effects. A whole-clause finding is fixed only when
-every key in it is removable.
+every key in it is removable, and not under `FETCH … WITH TIES`, which
+needs an `ORDER BY`. Nor is a key the clause sorts an untyped literal by
+removed in a set operation's branch or an `INSERT`'s `SELECT`
+(`(SELECT 'y' AS c ORDER BY 1) UNION …`): the `ORDER BY` types the literal
+`text` there.
 
 ## Configuration
 

@@ -61,13 +61,51 @@ impl QueryView {
         dedup::distinct_candidates_with_select(&ctx)
             .into_iter()
             .flat_map(|(select, candidate)| {
-                let error_free = select_is_error_free_in(&ctx, select);
+                // DISTINCT also resolves an untyped literal output to
+                // `text`, which a set operation's branch otherwise leaves
+                // to the set operation.
+                let error_free = select_is_error_free_in(&ctx, select)
+                    && !self.clauses_type_unknown_outputs(select);
                 candidate
                     .edits
                     .into_iter()
                     .map(move |edit| (edit.range, error_free))
             })
             .collect()
+    }
+}
+
+impl QueryView {
+    /// Whether `select` — a node of this view at any nesting depth — leaves
+    /// an untyped literal output (`'x'`, `NULL`) `unknown` for its context
+    /// to type, so that its `DISTINCT`, `ORDER BY` or `GROUP BY` resolving
+    /// it to `text` is what types it: a branch of a set operation, whose
+    /// column types the set operation resolves across its branches, or the
+    /// `SELECT` of an `INSERT`, whose values are coerced to the target
+    /// columns (PG's `p_resolve_unknowns`). Removing such a clause there can
+    /// change the type of the statement's column or value.
+    pub fn clauses_type_unknown_outputs(&self, select: &SelectStmt) -> bool {
+        let pointer: *const SelectStmt = select;
+        let is = |node: Option<&Node>| matches!(node, Some(Node::SelectStmt(s)) if std::ptr::eq(&**s, pointer));
+        let unresolved = self.tree.nodes().any(|(node, _)| match node {
+            NodeRef::SelectStmt(s) if s.op != SetOperation::SetopNone => {
+                s.larg.as_deref().is_some_and(|l| std::ptr::eq(l, pointer))
+                    || s.rarg.as_deref().is_some_and(|r| std::ptr::eq(r, pointer))
+            }
+            NodeRef::InsertStmt(insert) => is(insert.select_stmt.as_ref()),
+            _ => false,
+        });
+        unresolved
+            && select.target_list.iter().any(|target| {
+                matches!(
+                    target,
+                    Some(Node::ResTarget(rt)) if matches!(
+                        rt.val.as_ref(),
+                        Some(Node::AConst(c))
+                            if c.isnull || matches!(c.val, Some(AConstValue::String(_)))
+                    )
+                )
+            })
     }
 }
 

@@ -79,7 +79,8 @@ the first, the call goes: `COALESCE(views + 1, 0) * 2` becomes
 - a dropped argument contains a parameter (`COALESCE(id, $fallback)`), a
   column reference, a `COLLATE`, or a function call outside a subquery;
 - the `COALESCE` is a whole output column without an alias, named
-  `coalesce`: `SELECT id, COALESCE(title, 'untitled') FROM posts`.
+  `coalesce`: `SELECT id, COALESCE(title, 'untitled') FROM posts`, also
+  under a cast: `COALESCE(title, 'untitled')::varchar`.
 
 ## Configuration
 

@@ -5,9 +5,10 @@
 //! repeat or skip rows on the next page, `LIMIT 1` may return either row,
 //! and `DISTINCT ON` may keep either row of a group.
 //!
-//! The keys are unique when, with the columns `WHERE` equates to
-//! constants, parameters or columns of an enclosing query level (one value
-//! per evaluation), they cover a unique key (NOT NULL, or `NULLS NOT
+//! The keys are unique when, with the columns `WHERE` (or the `ON` of an
+//! inner join no outer join null-extends) equates to constants, parameters,
+//! columns of an enclosing query level (one value per evaluation) or
+//! columns of a table the keys determine, they cover a unique key (NOT NULL, or `NULLS NOT
 //! DISTINCT`; `col COLLATE c` counts as `col` under a deterministic `c`)
 //! of every table — or of the tables the others determine
 //! through equalities to a key (a join on a primary key) — or, for a
@@ -365,6 +366,51 @@ mod tests {
         // A nondeterministic collation compares distinct names equal.
         let sql = "SELECT name FROM mig ORDER BY name COLLATE ci LIMIT 10";
         assert_eq!(lint_rule(&db, sql, RULE).len(), 1, "{sql}");
+    }
+
+    #[test]
+    fn inner_join_equalities_fix_key_columns() {
+        let db = catalog();
+        for sql in [
+            // The ON pins `v.source_id` to a parameter, as a WHERE would.
+            "SELECT v.digest FROM src s JOIN ver v ON v.source_id = $1 AND s.id = v.source_id \
+             ORDER BY v.version LIMIT 10",
+            // `v.source_id` equals the determined `s.id`, the key's other
+            // column is an ORDER BY key.
+            "SELECT v.digest FROM src s JOIN ver v ON v.source_id = s.id \
+             ORDER BY s.id, v.version LIMIT 10",
+            "SELECT DISTINCT ON (s.id) v.digest FROM src s JOIN ver v ON v.source_id = s.id \
+             ORDER BY s.id, v.version DESC",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn the_help_leaves_out_key_columns_already_fixed() {
+        let db = catalog();
+        // `source_id` is pinned: the tiebreaker is `version` alone.
+        let sql = "SELECT digest FROM ver WHERE source_id = $1 ORDER BY digest LIMIT 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some(
+                "add a unique tiebreaker as the last ORDER BY key, such as the primary key: \
+                  ver.version"
+            )
+        );
+        // Already an ORDER BY key: the tiebreaker is `version` alone.
+        let sql = "SELECT digest FROM ver ORDER BY source_id, digest LIMIT 10";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some(
+                "add a unique tiebreaker as the last ORDER BY key, such as the primary key: \
+                  ver.version"
+            )
+        );
     }
 
     #[test]

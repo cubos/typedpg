@@ -9,7 +9,7 @@
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{Node as N, ResTarget};
 
-use super::{leftmost_start, scan_until, starts_clause};
+use super::{leftmost_start, location, scan_until, starts_clause};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
@@ -57,7 +57,14 @@ fn alias(ctx: &Ctx<'_>, target: &ResTarget, out: &mut Vec<RawFinding>) {
     {
         return;
     }
-    let Some(start) = leftmost_start(value) else {
+    // The item's first token: the target's own location is before any
+    // parenthesis opening it (`(t.c)::int AS c`), the expression's
+    // leftmost operand inside it.
+    let Some(start) = [location(target.location), leftmost_start(value)]
+        .into_iter()
+        .flatten()
+        .min()
+    else {
         return;
     };
     // The alias is the last token of the item; `AS` may precede it.
@@ -169,6 +176,15 @@ mod tests {
             (
                 "UPDATE users SET name = 'x' WHERE id = 1 RETURNING id AS id",
                 "UPDATE users SET name = 'x' WHERE id = 1 RETURNING id",
+            ),
+            // A parenthesized operand: the alias, not the column inside.
+            (
+                "SELECT (u.id)::int AS id FROM users u",
+                "SELECT (u.id)::int FROM users u",
+            ),
+            (
+                "SELECT ((name))::text AS name, id FROM users",
+                "SELECT ((name))::text, id FROM users",
             ),
         ] {
             let findings = lint_rule(&db, sql, RULE);

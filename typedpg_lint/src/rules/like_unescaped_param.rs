@@ -16,7 +16,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let NodeRef::AExpr(expr) = node else {
             continue;
         };
-        let Some((start, end)) = pattern(ctx, expr) else {
+        let Some((start, end, param)) = pattern(ctx, expr) else {
             continue;
         };
         out.push(RawFinding {
@@ -24,33 +24,37 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             message: "the pattern concatenates a parameter unescaped: a `%` or `_` in it matches \
                       any characters"
                 .to_owned(),
-            help: Some(
-                "escape \\, % and _ in the parameter (replace(replace(replace($q, '\\', '\\\\'), \
-                 '%', '\\%'), '_', '\\_')), or use starts_with / strpos"
-                    .to_owned(),
-            ),
+            help: Some(format!(
+                "escape \\, % and _ in the parameter (replace(replace(replace({param}, '\\', \
+                 '\\\\'), '%', '\\%'), '_', '\\_')), or use starts_with / strpos"
+            )),
             fix: Vec::new(),
         });
     }
     out
 }
 
-/// The pattern's byte range, when `expr` is a `LIKE` / `ILIKE` whose pattern
-/// concatenates an unescaped parameter and a wildcard.
-fn pattern(ctx: &Ctx<'_>, expr: &AExpr) -> Option<(usize, usize)> {
+/// The pattern's byte range and its first unescaped parameter as written,
+/// when `expr` is a `LIKE` / `ILIKE` whose pattern concatenates an
+/// unescaped parameter and a wildcard.
+fn pattern(ctx: &Ctx<'_>, expr: &AExpr) -> Option<(usize, usize, String)> {
     if !is_like(expr) {
         return None;
     }
     let pattern = expr.rexpr.as_ref()?;
-    let mut bare_param = false;
+    let mut bare_param = None;
     let mut wildcard = false;
     classify(ctx, pattern, &mut bare_param, &mut wildcard);
-    if !bare_param || !wildcard {
+    let param = bare_param?;
+    if !wildcard {
         return None;
     }
+    let param_start = usize::try_from(param).ok()?;
+    let token = ctx.tokens.iter().find(|token| token.start == param_start)?;
+    let param = ctx.written(token.start..token.end).to_owned();
     let start = pattern_start(pattern)?;
     let end = pattern_end(ctx, pattern)?.max(start + 1);
-    Some((start, end))
+    Some((start, end, param))
 }
 
 fn is_like(expr: &AExpr) -> bool {
@@ -68,11 +72,13 @@ fn is_like(expr: &AExpr) -> bool {
 /// What the pattern concatenates: a bare parameter (possibly cast), a string
 /// constant with a wildcard, or a nested `||` / `concat(...)`. Anything else
 /// (a function call's arguments above all) is assumed to escape the value.
-fn classify(ctx: &Ctx<'_>, node: &Node, bare_param: &mut bool, wildcard: &mut bool) {
+///
+/// `bare_param` is set to the location of the first bare parameter.
+fn classify(ctx: &Ctx<'_>, node: &Node, bare_param: &mut Option<i32>, wildcard: &mut bool) {
     match node {
         N::ParamRef(param) => {
-            if param_carries_wildcards(ctx, param) {
-                *bare_param = true;
+            if param_carries_wildcards(ctx, param) && bare_param.is_none() {
+                *bare_param = Some(param.location);
             }
         }
         N::TypeCast(cast) => {
@@ -268,6 +274,35 @@ mod tests {
                 )
             );
             assert!(finding.fix.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_help_names_the_reported_parameter() {
+        let db = catalog();
+        for (sql, param) in [
+            (
+                "SELECT id FROM users WHERE name LIKE concat($p::text, '%')",
+                "$p",
+            ),
+            ("SELECT id FROM users WHERE name LIKE $1 || '%'", "$1"),
+            (
+                "SELECT id FROM users WHERE name LIKE $prefix || '%' || $q",
+                "$prefix",
+            ),
+        ] {
+            let findings = lint(&db, sql);
+            assert_eq!(
+                only(&findings).help.as_deref(),
+                Some(
+                    format!(
+                        "escape \\, % and _ in the parameter (replace(replace(replace({param}, \
+                         '\\', '\\\\'), '%', '\\%'), '_', '\\_')), or use starts_with / strpos"
+                    )
+                    .as_str()
+                ),
+                "{sql}"
+            );
         }
     }
 

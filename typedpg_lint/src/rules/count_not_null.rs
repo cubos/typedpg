@@ -25,7 +25,11 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let NodeRef::FuncCall(call) = node else {
             continue;
         };
-        if call.agg_star || call.agg_distinct || call.args.len() != 1 || !call.agg_order.is_empty()
+        if call.agg_star
+            || call.agg_distinct
+            || call.args.len() != 1
+            || !call.agg_order.is_empty()
+            || !is_count(call)
         {
             continue;
         }
@@ -55,6 +59,21 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         });
     }
     out
+}
+
+/// Whether the call is spelled `count` or `pg_catalog.count`. The
+/// analyzer's facts are keyed by location, and a view or function body it
+/// read may hold a `count` at the offset of another call of the query.
+fn is_count(call: &FuncCall) -> bool {
+    let names: Vec<&str> = call
+        .funcname
+        .iter()
+        .filter_map(|name| match name {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    matches!(names.as_slice(), ["count"] | ["pg_catalog", "count"])
 }
 
 /// Whether an aggregate over `argument` belongs to the query level it is
@@ -188,6 +207,21 @@ mod tests {
             "SELECT count(u.id) FROM users u LEFT JOIN posts p ON p.user_id = u.id",
             "SELECT count(*) FROM users u LEFT JOIN posts p ON p.user_id = u.id",
         );
+    }
+
+    #[test]
+    fn another_call_where_a_view_body_has_a_count_is_not_reported() {
+        let mut db = catalog();
+        // The view's `count(id)` is at the offset (in its `CREATE VIEW`) of
+        // the query's `max(n)`: the analyzer's fact there is the view's.
+        let view = "CREATE VIEW counts AS SELECT count(id) AS n FROM users";
+        db.apply_sql(view).unwrap();
+        let at = view.find("count(").unwrap();
+        let alias = "a".repeat(at - "SELECT n AS , ".len());
+        let sql = format!("SELECT n AS {alias}, max(n) AS m FROM counts GROUP BY n");
+        assert_eq!(sql.find("max"), Some(at));
+        let findings = lint_rule(&db, &sql, RULE);
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]

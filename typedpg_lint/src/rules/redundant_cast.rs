@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{Node as N, TypeCast};
 
-use super::{leftmost_start, location};
+use super::{leftmost_start, location, node_span};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 /// The words that continue a multi-word type name: `double precision`,
@@ -57,10 +57,15 @@ fn redundant(ctx: &Ctx<'_>, cast: &TypeCast, names_column: bool, out: &mut Vec<R
     };
     let postfix = ctx.sql.get(at..).is_some_and(|rest| rest.starts_with("::"));
     let type_end = type_name_end(ctx, type_start);
+    // From the operand's first token, a parenthesis opening it included
+    // (`(a)::int`).
     let start = cast
         .arg
         .as_ref()
         .and_then(leftmost_start)
+        .into_iter()
+        .chain(node_span(ctx, NodeRef::TypeCast(cast)).map(|span| span.start))
+        .min()
         .filter(|start| *start <= at)
         .unwrap_or(at);
     let written = &ctx.sql[type_start..type_end.max(type_start)];
@@ -222,6 +227,16 @@ mod tests {
     }
 
     #[test]
+    fn the_span_starts_at_a_parenthesis_opening_the_operand() {
+        let db = catalog();
+        let sql = "SELECT (id)::bigint AS i FROM users";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(&sql[findings[0].span.clone()], "(id)::bigint");
+        assert_eq!(fixed(sql, &findings), "SELECT (id) AS i FROM users");
+    }
+
+    #[test]
     fn what_has_no_fix() {
         let db = catalog();
         for sql in [
@@ -255,6 +270,10 @@ mod tests {
             // without it.
             "SELECT ARRAY[ROW(id, name, email, code)::users] FROM users",
             "SELECT ARRAY[id::int]::bigint[] FROM users",
+            // A whole-row reference to a subquery is a `record`: the cast
+            // rebuilds it as the composite.
+            "SELECT s::users AS u FROM (SELECT id, name, email, code FROM users) s",
+            "SELECT (s.*)::users AS u FROM (SELECT id, name, email, code FROM users) s",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");

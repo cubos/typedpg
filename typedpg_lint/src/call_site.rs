@@ -127,6 +127,16 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     let Some(returning) = returning else {
         return Vec::new();
     };
+    // `ON CONFLICT DO SELECT` requires a `RETURNING`: the statement can't
+    // be written without one, and executing it still locks (`FOR UPDATE`)
+    // the conflicting rows.
+    if let Node::InsertStmt(stmt) = statement
+        && stmt.on_conflict_clause.as_ref().is_some_and(|clause| {
+            clause.action == typedpg_pg_query::ast::OnConflictAction::OnconflictSelect
+        })
+    {
+        return Vec::new();
+    }
     let Some((keyword, end)) = returning_span(ctx, raw) else {
         return Vec::new();
     };
@@ -1080,6 +1090,21 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn on_conflict_do_select_needs_its_returning() {
+        let db = catalog();
+        // `DO SELECT` without `RETURNING` is a syntax error: nothing to
+        // remove, and executing it still locks the conflicting row.
+        for sql in [
+            "INSERT INTO users (id, name) VALUES (1, 'x') ON CONFLICT (id) DO SELECT RETURNING id",
+            "INSERT INTO users (id, name) VALUES (1, 'x') \
+             ON CONFLICT (id) DO SELECT FOR UPDATE RETURNING *",
+        ] {
+            let findings = lint(&db, sql, &[rust(CallMethod::Execute, "execute")]);
+            assert!(only(findings, Rule::UnusedReturning).is_empty(), "{sql}");
+        }
     }
 
     #[test]

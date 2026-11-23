@@ -120,6 +120,15 @@ fn a_reduced_or_empty_full_join_is_never_built() {
         // inner) join, which a nested loop implements.
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x = 1",
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x = 1 AND b.y = 2",
+        // `x op ALL` over a non-empty array (`is_strict_saop`), below a NOT
+        // too, of the column or a strict cast of it, the array's elements
+        // constants cast or not.
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x >= ALL(ARRAY[1])",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x::numeric <> ALL(ARRAY[0.5]::numeric[])",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y \
+         WHERE NOT ((a.x)::numeric <> ALL(ARRAY[0.5]::numeric[]))",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.s >= ALL(ARRAY['m'::text])",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.s = ALL(ARRAY[b.s, a.s, NULL])",
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y JOIN a a2 ON a2.id = a.id",
         // A qual of the query a FROM subquery is pulled up into, the ON of
         // the join a MERGE's source is on the nullable side of.
@@ -128,6 +137,10 @@ fn a_reduced_or_empty_full_join_is_never_built() {
          ON a.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE",
         // PostgreSQL 19 folds `a.id IS NULL` over the primary key to FALSE.
         "SELECT 1 FROM a FULL JOIN b ON CASE WHEN a.id IS NULL THEN false ELSE a.x = b.y END",
+        // ... and `a.id IS NOT NULL` to TRUE: no clause is left.
+        "SELECT 1 FROM a FULL JOIN b ON a.id IS NOT NULL",
+        "MERGE INTO a USING b ON a.id IS NOT NULL \
+         WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED THEN INSERT (id) VALUES (1)",
         // A constant FALSE qual over the join (`restriction_is_constant_false`),
         // both sides proven empty (`is_dummy_rel`).
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE false",

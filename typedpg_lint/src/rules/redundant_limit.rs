@@ -16,6 +16,44 @@ use super::limit_without_order::implicit_fetch;
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
+    // The statement's own SELECT, and whether it can raise nothing: a
+    // subquery's LIMIT keeps the planner from pulling it up into the
+    // query around it, where a constant it outputs is folded into that
+    // query's expressions at plan time (`SELECT x::int2 FROM (SELECT 40000
+    // AS x LIMIT 1) s WHERE false` succeeds, and fails without the LIMIT).
+    let root = match ctx.tree.stmts.first().and_then(|raw| raw.stmt.as_ref()) {
+        Some(ast::Node::SelectStmt(select)) => Some(&**select),
+        _ => None,
+    };
+    // Computed once, and only for a merged subquery's LIMIT.
+    let root_error_free = std::cell::OnceCell::new();
+    let root_error_free = || {
+        *root_error_free.get_or_init(|| {
+            root.is_some_and(|select| ctx.view.select_is_error_free(ctx.catalog, select))
+        })
+    };
+    // The selects the planner may merge into the query around them: a FROM
+    // subquery, a CTE, an `EXISTS` / `IN` subquery (a scalar subquery is
+    // never merged).
+    let mut mergeable: Vec<*const ast::SelectStmt> = Vec::new();
+    for (node, _) in ctx.tree.nodes() {
+        let inner = match node {
+            NodeRef::RangeSubselect(sub) => sub.subquery.as_ref(),
+            NodeRef::CommonTableExpr(cte) => cte.ctequery.as_ref(),
+            NodeRef::SubLink(link)
+                if matches!(
+                    link.sub_link_type,
+                    ast::SubLinkType::ExistsSublink | ast::SubLinkType::AnySublink
+                ) =>
+            {
+                link.subselect.as_ref()
+            }
+            _ => None,
+        };
+        if let Some(ast::Node::SelectStmt(select)) = inner {
+            mergeable.push(&**select);
+        }
+    }
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         let NodeRef::SelectStmt(select) = node else {
@@ -39,7 +77,9 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         // Removing LIMIT lets PG evaluate the rest of the query on rows the
         // scan previously stopped before, so withhold the fix when an
         // expression of the select could raise on one of them.
-        let error_free = ctx.view.select_is_error_free(ctx.catalog, select);
+        let merged = mergeable.contains(&std::ptr::from_ref(select));
+        let error_free =
+            ctx.view.select_is_error_free(ctx.catalog, select) && (!merged || root_error_free());
         let message = match (clause.fetch, clause.count.clone()) {
             (None, Some(count)) => format!(
                 "LIMIT {} has no effect: the query returns at most one row",
@@ -403,6 +443,20 @@ mod tests {
         let findings = lint(&db, sql);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, Rule::RedundantLimit);
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_nested_limit_under_a_query_that_may_raise_keeps_its_fix_withheld() {
+        let db = catalog();
+        // Without the LIMIT the subquery is pulled up and `40000::int2`
+        // folded at plan time: an error, even with no row to return.
+        let sql = "SELECT x::int2 AS y FROM (SELECT 40000 AS x LIMIT 1) s WHERE false";
+        let findings: Vec<_> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::RedundantLimit)
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].fix.is_empty(), "{findings:?}");
     }
 

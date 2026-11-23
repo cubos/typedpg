@@ -68,6 +68,10 @@ When an output expression can raise an error on some rows, e.g.
 returned, without it a `LIMIT` or a client that stops fetching may skip the
 row that would divide by zero.
 
+Nor when the output has an untyped literal in a set operation's branch or an
+`INSERT`'s `SELECT`: `(SELECT DISTINCT 'y' AS c) UNION (SELECT 'a'::varchar)`
+is `text` because `DISTINCT` types `'y'`, `varchar` without it.
+
 ## Configuration
 
 ```toml

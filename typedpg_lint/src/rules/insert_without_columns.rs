@@ -10,7 +10,7 @@
 //! them — generated and identity columns included, which then only accept
 //! `DEFAULT`, as they do when listed. So the list is the table's first N
 //! columns. It is withheld when the number of values isn't plain from the
-//! text (a `*` or a `(row).*` in the select list) or the table isn't
+//! text (a `*` or a `(row).*` in the select list or a `VALUES` row) or the table isn't
 //! resolved. `INSERT … DEFAULT VALUES` names no value and is not reported.
 
 use typedpg_core::quote_identifier;
@@ -114,6 +114,14 @@ pub(crate) fn width(select: &SelectStmt) -> Option<usize> {
         return width(select.larg.as_deref()?);
     }
     if let Some(Some(N::List(row))) = select.values_lists.first() {
+        // A `VALUES` row expands a `(row).*` or `t.*` item too.
+        if row
+            .items
+            .iter()
+            .any(|item| item.as_ref().is_none_or(expands))
+        {
+            return None;
+        }
         return Some(row.items.len());
     }
     let mut count = 0;
@@ -121,19 +129,24 @@ pub(crate) fn width(select: &SelectStmt) -> Option<usize> {
         let Some(N::ResTarget(target)) = target else {
             return None;
         };
-        let expands = match target.val.as_ref()? {
-            N::ColumnRef(column) => matches!(column.fields.last(), Some(Some(N::AStar(_)))),
-            N::AIndirection(indirection) => {
-                matches!(indirection.indirection.last(), Some(Some(N::AStar(_))))
-            }
-            _ => false,
-        };
-        if expands {
+        if expands(target.val.as_ref()?) {
             return None;
         }
         count += 1;
     }
     Some(count)
+}
+
+/// Whether `node` is a `*`, `t.*` or `(row).*`, which expands to several
+/// values.
+fn expands(node: &N) -> bool {
+    match node {
+        N::ColumnRef(column) => matches!(column.fields.last(), Some(Some(N::AStar(_)))),
+        N::AIndirection(indirection) => {
+            matches!(indirection.indirection.last(), Some(Some(N::AStar(_))))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +216,11 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(&sql[findings[0].span.clone()], "INSERT INTO posts");
         assert!(findings[0].fix.is_empty());
+        // A `VALUES` row expands `(row).*` into several values.
+        let sql = "INSERT INTO users VALUES ((ROW(1, 'a', 'a@x', 'abc')::users).*)";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        assert!(findings[0].fix.is_empty(), "{sql}");
     }
 
     #[test]

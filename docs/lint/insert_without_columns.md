@@ -49,7 +49,7 @@ column list, also inside a data-modifying CTE.
 ## Fix not offered
 
 - The number of values isn't plain from the text: a `*` or `(row).*` in the
-  select list.
+  select list or a `VALUES` row.
 - The table name has a database qualifier, or the table has fewer columns
   than the row has values.
 

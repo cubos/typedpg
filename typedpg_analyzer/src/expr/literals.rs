@@ -309,13 +309,22 @@ pub(crate) fn infer_type_cast(
     // coerce_type: any other `record` cast to a composite is rebuilt field
     // by field from the row it names (a whole-row reference to a subquery,
     // CTE, VALUES list, …) — or rejected when it names none.
-    let inner_type = if inner_type.type_oid == oid::RECORD
-        && coerce::is_complex(target_oid, snapshot)
-    {
-        super::coerce_record_to_complex(inner, target_oid, CoercionContext::Explicit, ctx, params)?
-    } else {
-        inner_type
-    };
+    // Such a cast is no relabeling: without it, the operand is a `record`.
+    let (inner_type, typed_alone) =
+        if inner_type.type_oid == oid::RECORD && coerce::is_complex(target_oid, snapshot) {
+            (
+                super::coerce_record_to_complex(
+                    inner,
+                    target_oid,
+                    CoercionContext::Explicit,
+                    ctx,
+                    params,
+                )?,
+                false,
+            )
+        } else {
+            (inner_type, typed_alone)
+        };
 
     if let Some(ast::Node::ParamRef(p)) = inner
         && !pass_through

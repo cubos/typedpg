@@ -174,6 +174,14 @@ mod tests {
                 "LEFT",
                 "an INNER",
             ),
+            // The `FROM` of `IS NOT DISTINCT FROM` is the condition's.
+            (
+                "SELECT u.id FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+                 WHERE p.status IS NOT DISTINCT FROM 'x' ORDER BY u.id",
+                "p.status IS NOT DISTINCT FROM 'x'",
+                "LEFT",
+                "an INNER",
+            ),
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");

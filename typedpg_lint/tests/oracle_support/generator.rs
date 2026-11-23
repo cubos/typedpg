@@ -1068,6 +1068,19 @@ impl Gen {
             },
             15 | 16 => self.cast_to(sc, ty, depth),
             17 if base == Base::Bool => format!("({})", self.pred(sc, depth + 1)),
+            // A parenthesized operand: the rules' spans and fixes must keep
+            // the parentheses with what they quote or remove.
+            19 => format!("({})", self.expr(sc, ty, depth + 1)),
+            // An integer division used as a non-integer value
+            // (`integer_division`).
+            20 if base == Base::Num => {
+                let e = self.expr(sc, &Ty::of(Base::Int), depth + 1);
+                match self.rng.below(3) {
+                    0 => format!("{e} / 2 * 1.5"),
+                    1 => format!("({e} / 3)::numeric"),
+                    _ => format!("{e} / 4 + 0.5"),
+                }
+            }
             // What `simplifiable_case` reports.
             18 if base == Base::Bool => format!(
                 "CASE WHEN {} THEN {} ELSE {} END",
@@ -1399,10 +1412,12 @@ impl Gen {
             }
             18 if base == Base::Text => {
                 let a = self.expr(sc, &ty, depth + 1);
-                let pat = if self.rng.chance(30) {
-                    self.param(Base::Text)
-                } else {
-                    self.rng.pick(&["'a%'", "'%'", "'x'", "'%b_'"]).to_string()
+                let pat = match self.rng.below(10) {
+                    0..=2 => self.param(Base::Text),
+                    // A pattern built from a parameter (`like_unescaped_param`).
+                    3 => format!("'%' || {} || '%'", self.param(Base::Text)),
+                    4 => format!("concat({}, '%')", self.param(Base::Text)),
+                    _ => self.rng.pick(&["'a%'", "'%'", "'x'", "'%b_'"]).to_string(),
                 };
                 format!(
                     "{a} {}{} {pat}",
@@ -1462,6 +1477,27 @@ impl Gen {
             24 => {
                 let a = self.expr(sc, &ty, depth + 1);
                 format!("{a} = {a}")
+            }
+            // A floating-point equality (`float_equality`).
+            25 if base.class() == Class::Number => {
+                let a = self.expr(sc, &ty, depth + 1);
+                let value = match self.rng.below(3) {
+                    0 if !self.no_params => "$f1::float8",
+                    1 => "1",
+                    _ => "0.1",
+                };
+                format!("({a})::float8 {} {value}", self.rng.pick(&["=", "<>"]))
+            }
+            // A date or timestamp compared with a timestamptz
+            // (`timestamp_timezone_mix`).
+            26 if matches!(base, Base::Date | Base::Ts) => {
+                let a = self.expr(sc, &ty, depth + 1);
+                let (lhs, rhs) = if base == Base::Date {
+                    (a, self.expr(sc, &Ty::of(Base::Ts), depth + 1))
+                } else {
+                    (format!("({a})::timestamp"), "now()".to_owned())
+                };
+                format!("{lhs} {} {rhs}", self.rng.pick(&["<", ">=", "="]))
             }
             _ => {
                 let a = self.expr(sc, &ty, depth + 1);
@@ -2112,7 +2148,7 @@ impl Gen {
                     format!("{}", 1 + self.rng.below(cols.len()))
                 } else {
                     match self.any_column(&local) {
-                        Some((c, _)) => c,
+                        Some((c, _)) => self.maybe_parens(&c),
                         None => "1".into(),
                     }
                 };
@@ -2823,13 +2859,15 @@ impl Gen {
             let _ = write!(sql, " WHERE {}", self.pred(&sc, 1));
         }
         if grouped && !plain.is_empty() {
-            let _ = write!(sql, " GROUP BY {}", plain.join(", "));
+            let keys: Vec<String> = plain.iter().map(|k| self.maybe_parens(k)).collect();
+            let _ = write!(sql, " GROUP BY {}", keys.join(", "));
         }
         if self.rng.chance(40) && !grouped && !distinct {
             let mut order = keys.clone();
             if let Some((c, _)) = self.any_column(&sc) {
                 order.push(c);
             }
+            let order: Vec<String> = order.iter().map(|k| self.maybe_parens(k)).collect();
             let _ = write!(sql, " ORDER BY {}", order.join(", "));
         }
         if self.rng.chance(30) {
@@ -2864,6 +2902,15 @@ impl Gen {
             rel.name,
             vals.join(", ")
         ))
+    }
+
+    /// `item`, sometimes in parentheses of its own (`ORDER BY (a.id)`).
+    fn maybe_parens(&mut self, item: &str) -> String {
+        if self.rng.chance(15) {
+            format!("({item})")
+        } else {
+            item.to_owned()
+        }
     }
 
     /// One statement: mostly SELECTs, the rest DML.

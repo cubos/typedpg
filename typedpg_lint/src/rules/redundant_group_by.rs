@@ -124,6 +124,12 @@ mod tests {
             "SELECT email, count(*) FROM users GROUP BY email, name",
             "SELECT email, count(*) FROM users GROUP BY email",
         );
+        // Keys in parentheses: removed with them.
+        check(
+            &db,
+            "SELECT id, count(*) FROM users GROUP BY (id), name",
+            "SELECT id, count(*) FROM users GROUP BY (id)",
+        );
     }
 
     #[test]

@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use typedpg_analyzer::{order_keys, unique_order_prefix};
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{AConstValue, Node, SelectStmt, SubLinkType};
+use typedpg_pg_query::ast::{AConstValue, LimitOption, Node, SelectStmt, SubLinkType};
 
 use super::limit_without_order::picks_from_at_most_one_row;
 use super::{clause_item_spans, list_item_removal};
@@ -52,7 +52,17 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let Some(spans) = clause_item_spans(ctx, &sorts) else {
             continue;
         };
-        let safe: Vec<bool> = sorts.iter().map(|node| removable_key(*node)).collect();
+        // An ORDER BY of an untyped literal output types it `text` where
+        // the context would otherwise (a set operation's branch, an
+        // INSERT's SELECT): removing it could change the column's type.
+        let types_outputs = ctx.view.clauses_type_unknown_outputs(select);
+        // `FETCH … WITH TIES` can't be written without an ORDER BY.
+        let with_ties = select.limit_option == LimitOption::WithTies;
+        let safe: Vec<bool> = sorts
+            .iter()
+            .map(|node| removable_key(*node) && !types_outputs)
+            .collect();
+        let whole_safe: Vec<bool> = safe.iter().map(|&safe| safe && !with_ties).collect();
         let picks_rows = select.limit_count.is_some()
             || select.limit_offset.is_some()
             || distinct_on_len(select) > 0;
@@ -69,7 +79,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 None
             };
         if let Some(why) = whole {
-            if let Some(finding) = whole_clause(ctx, &spans, &safe, why) {
+            if let Some(finding) = whole_clause(ctx, &spans, &whole_safe, why) {
                 out.push(finding);
             }
             continue;
@@ -108,8 +118,12 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
             // LIMIT / OFFSET / DISTINCT ON, removing it would only trade
             // this finding for `limit_without_order`'s.
             if !picks_rows
-                && let Some(finding) =
-                    whole_clause(ctx, &spans, &safe, "WHERE pins every key to one value")
+                && let Some(finding) = whole_clause(
+                    ctx,
+                    &spans,
+                    &whole_safe,
+                    "WHERE pins every key to one value",
+                )
             {
                 out.push(finding);
             }
@@ -305,6 +319,17 @@ mod tests {
             "SELECT id AS k, name FROM users ORDER BY k, name",
             "SELECT id AS k, name FROM users ORDER BY k",
         );
+        // Keys in parentheses: removed with them.
+        check(
+            &db,
+            "SELECT id FROM users ORDER BY (id), name",
+            "SELECT id FROM users ORDER BY (id)",
+        );
+        check(
+            &db,
+            "SELECT id FROM users ORDER BY ((id)), (name) DESC",
+            "SELECT id FROM users ORDER BY ((id))",
+        );
     }
 
     #[test]
@@ -331,6 +356,28 @@ mod tests {
             "SELECT id FROM users WHERE status = 'a' ORDER BY status",
             "SELECT id FROM users WHERE status = 'a'",
         );
+    }
+
+    #[test]
+    fn a_with_ties_fetch_keeps_its_order_by() {
+        let db = catalog();
+        // One row, but `FETCH … WITH TIES` needs an ORDER BY.
+        let sql =
+            "SELECT id FROM users WHERE id = $1 ORDER BY created_at FETCH FIRST 1 ROW WITH TIES";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn an_order_by_typing_an_untyped_literal_keeps_it() {
+        let db = catalog();
+        // ORDER BY resolves `'y'` to text, and the UNION's column with it:
+        // without it, the UNION resolves it to varchar.
+        let sql = "SELECT c FROM ((SELECT 'y' AS c ORDER BY 1) UNION (SELECT 'a'::varchar)) s";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
     }
 
     #[test]

@@ -31,9 +31,12 @@
 //! The ones both reject go to `invalid-generated.txt`, the generator's own
 //! mistakes.
 //!
-//! Every SELECT is linted as called with `fetch_all` (so
-//! `fetch_all_single_row` reports), and a statement with `RETURNING` also
-//! as called with `execute()` (`unused_returning`'s fix). A panic — an
+//! Every rule is on, the ones off by default too. Every SELECT is linted
+//! as called with `fetch_all` (so `fetch_all_single_row` reports), and a
+//! statement with `RETURNING` also as called with `execute()`
+//! (`unused_returning`'s fix). A fix the shape check withheld (an
+//! `internal_error` finding: the rule proposed a fix changing the query's
+//! columns, parameters or validity) is a broken claim too. A panic — an
 //! analyzer divergence the analyzer's own mirror reports while replaying a
 //! schema, or analyzing a fixed query — is counted apart.
 //!
@@ -331,7 +334,19 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
             return;
         }
     };
-    let options = LintOptions::default();
+    // Every rule, the ones off by default too.
+    let options = {
+        let mut config = typedpg_core::config::LintConfig::default();
+        for rule in typedpg_lint::Rule::ALL {
+            if rule.default_level().is_none() {
+                config.levels.insert(
+                    rule.name().to_owned(),
+                    typedpg_core::config::LintLevel::Info,
+                );
+            }
+        }
+        LintOptions::from_config(&config)
+    };
     let fetch_all = [Call {
         method: CallMethod::FetchAll,
         name: "fetch_all".to_owned(),
@@ -386,7 +401,7 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
         for calls in calls {
             let run = catch_unwind(AssertUnwindSafe(|| {
                 typedpg_lint::oracle::collect(|| {
-                    lint_query_called(&catalog, query, calls, &options).is_ok()
+                    lint_query_called(&catalog, query, calls, &options).ok()
                 })
             }));
             let stats = typedpg_lint::oracle::take_stats();
@@ -395,10 +410,27 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
                 *t.stats.entry(key).or_default() += n;
             }
             match run {
-                Ok((ok, broken)) => {
+                Ok((findings, mut broken)) => {
                     t.queries += 1;
-                    if !ok {
+                    let Some(findings) = findings else {
                         t.rejected += 1;
+                        continue;
+                    };
+                    // How often each rule reports, rules without a fix or
+                    // a claim included: which ones the corpus exercises.
+                    for finding in &findings {
+                        let finding = &finding.finding;
+                        *t.stats
+                            .entry((finding.rule.name().to_owned(), "reported".to_owned()))
+                            .or_default() += 1;
+                        // A fix `fix_keeps_shape` withheld: the rule
+                        // proposed a fix changing the query's shape.
+                        if finding.rule == typedpg_lint::Rule::InternalError {
+                            broken.push(format!(
+                                "lint oracle: {}\nquery:\n---\n{query}\n---",
+                                finding.message
+                            ));
+                        }
                     }
                     for message in broken {
                         let key = first_line(&message).to_owned();
