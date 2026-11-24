@@ -1663,3 +1663,58 @@ fn unlogged_materialized_view_is_rejected() {
         "materialized views cannot be unlogged",
     )]);
 }
+
+#[test]
+fn a_stored_query_cannot_hold_a_role_or_database_constant() {
+    // find_expr_references_walker records no dependency on a role or a
+    // database: a view, a materialized view, a rule or a SQL-standard
+    // body holding a `regrole` / `regdatabase` constant is refused. A
+    // regclass one names a relation, a string body is stored as text and
+    // a plain CREATE TABLE AS keeps no query.
+    let mut db = build_db(&[("0001.sql", "CREATE TABLE t (a int);")]);
+    for (sql, typname) in [
+        (
+            "CREATE VIEW v AS SELECT 'postgres'::regrole AS r;",
+            "regrole",
+        ),
+        (
+            "CREATE VIEW v AS SELECT 'postgres'::regdatabase AS r;",
+            "regdatabase",
+        ),
+        (
+            "CREATE VIEW v AS SELECT 'postgres'::regrole::oid AS r;",
+            "regrole",
+        ),
+        (
+            "CREATE VIEW v AS SELECT r FROM (SELECT 'postgres'::regrole AS r) s;",
+            "regrole",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW v AS SELECT 'postgres'::regrole AS r;",
+            "regrole",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO SELECT 'postgres'::regrole;",
+            "regrole",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS regrole LANGUAGE sql RETURN 'postgres'::regrole;",
+            "regrole",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(&format!(
+                "constant of the type {typname} cannot be used here"
+            )),
+            "{sql}\n  got: {err}"
+        );
+    }
+    db.apply_sql(
+        "CREATE VIEW v AS SELECT 'pg_class'::regclass AS r;
+         CREATE VIEW w AS SELECT NULL::regrole AS r;
+         CREATE TABLE c AS SELECT 'postgres'::regrole AS r;
+         CREATE FUNCTION f() RETURNS regrole LANGUAGE sql AS 'SELECT ''postgres''::regrole';",
+    )
+    .unwrap();
+}

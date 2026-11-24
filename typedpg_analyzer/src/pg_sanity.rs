@@ -1194,10 +1194,154 @@ impl PgSanityServer {
                 .names
                 .insert((2328, oid.get()), format!("foreign-data wrapper {name}"));
         }
-        catalog_state::diff(
+        let mut differences = catalog_state::diff(
             &catalog_state::normalize(&ours, db, &our_aux),
             &catalog_state::normalize(&pg, db, &pg_aux),
-        )
+        );
+        differences.extend(self.stored_expression_text_differences(db));
+        differences
+    }
+
+    /// The stored expressions' text: what the analyzer prints for each CHECK
+    /// constraint, index expression and index predicate (the text ALTER
+    /// COLUMN TYPE rebuilds them from, see [`crate::ddl::cooked::deparse`])
+    /// must be what `pg_get_expr` / `pg_get_indexdef` print, under the same
+    /// search path. Only the expressions the analyzer prints exactly are
+    /// compared.
+    fn stored_expression_text_differences(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+    ) -> Vec<String> {
+        use crate::ddl::tables::check_inherit::StoredExpr;
+        use std::collections::BTreeMap;
+        let user = |ns: crate::oid::PgNamespaceOid| {
+            db.namespace_name(ns)
+                .filter(|n| !n.starts_with("pg_") && *n != "information_schema")
+        };
+        let mut ours: BTreeMap<String, String> = BTreeMap::new();
+        for (oid, def) in db.check_defs.iter() {
+            let StoredExpr::Written(expr) = &def.expr else {
+                continue;
+            };
+            let Some(con) = db.pg_constraint.get(oid) else {
+                continue;
+            };
+            let Some(class) = db.pg_class.get(&con.conrelid) else {
+                continue;
+            };
+            let Some(ns) = user(class.relnamespace) else {
+                continue;
+            };
+            if let Some(text) =
+                crate::ddl::cooked::ruleutils_text(db, con.conrelid, (**expr).as_ref())
+            {
+                ours.insert(
+                    format!("CHECK {ns}.{}.{}", class.relname, con.conname),
+                    text,
+                );
+            }
+        }
+        for index in db.pg_index.values() {
+            let Some(class) = db.pg_class.get(&index.indexrelid) else {
+                continue;
+            };
+            let Some(ns) = user(class.relnamespace) else {
+                continue;
+            };
+            let nkeys = usize::try_from(index.indnkeyatts).unwrap_or(0);
+            let mut exprs = index.indexprs.iter();
+            for (i, key) in index.indkey.iter().enumerate().take(nkeys) {
+                if *key != 0 {
+                    continue;
+                }
+                let Some(e) = exprs.next() else {
+                    break;
+                };
+                if let Some(text) = crate::ddl::cooked::ruleutils_index_column_text(
+                    db,
+                    index.indrelid,
+                    e.ast.as_ref(),
+                ) {
+                    ours.insert(
+                        format!("index {ns}.{} column {}", class.relname, i + 1),
+                        text,
+                    );
+                }
+            }
+            if let Some(pred) = &index.indpred
+                && let Some(text) =
+                    crate::ddl::cooked::ruleutils_text(db, index.indrelid, pred.ast.as_ref())
+            {
+                ours.insert(format!("index {ns}.{} predicate", class.relname), text);
+            }
+        }
+        if ours.is_empty() {
+            return Vec::new();
+        }
+        let fail = |e: postgres::Error| -> ! {
+            panic!(
+                "pg_sanity: reading stored expressions failed: {}",
+                render_pg_error(&e)
+            )
+        };
+        let path: Vec<String> = db
+            .search_path
+            .iter()
+            .filter_map(|ns| db.namespace_name(*ns))
+            .map(|n| format!("\"{}\"", n.replace('"', "\"\"")))
+            .collect();
+        let path = path.join(", ");
+        self.client
+            .batch_execute("BEGIN")
+            .unwrap_or_else(|e| fail(e));
+        let mut theirs: BTreeMap<String, String> = BTreeMap::new();
+        let result = (|| -> Result<(), postgres::Error> {
+            self.client.execute(
+                "SELECT pg_catalog.set_config('search_path', $1, true)",
+                &[&path],
+            )?;
+            for row in self.client.query(
+                "SELECT 'CHECK ' || n.nspname || '.' || c.relname || '.' || con.conname, \
+                        pg_catalog.pg_get_expr(con.conbin, con.conrelid) \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE con.contype = 'c' AND con.conrelid >= 16384 \
+                 UNION ALL \
+                 SELECT 'index ' || n.nspname || '.' || i.relname || ' column ' || k, \
+                        pg_catalog.pg_get_indexdef(x.indexrelid, k, false) \
+                 FROM pg_catalog.pg_index x \
+                 JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace, \
+                      pg_catalog.generate_series(1, x.indnkeyatts) k \
+                 WHERE x.indexrelid >= 16384 AND x.indkey[k - 1] = 0 \
+                 UNION ALL \
+                 SELECT 'index ' || n.nspname || '.' || i.relname || ' predicate', \
+                        pg_catalog.pg_get_expr(x.indpred, x.indrelid) \
+                 FROM pg_catalog.pg_index x \
+                 JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace \
+                 WHERE x.indexrelid >= 16384 AND x.indpred IS NOT NULL",
+                &[],
+            )? {
+                theirs.insert(row.get(0), row.get(1));
+            }
+            Ok(())
+        })();
+        self.client
+            .batch_execute("ROLLBACK")
+            .unwrap_or_else(|e| fail(e));
+        result.unwrap_or_else(|e| fail(e));
+        ours.into_iter()
+            .filter_map(|(key, text)| {
+                let pg = theirs.get(&key)?;
+                (*pg != text).then(|| {
+                    format!(
+                        "stored expression {key}: `{text}` in the analyzer, `{pg}` in PostgreSQL"
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Remember the roles the catalog has seen created. Called after every

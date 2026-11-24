@@ -1491,12 +1491,21 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     cmds.sort_by_key(|cmd| alter_table_pass(cmd));
     // ATExecAlterColumnType: a column's type changes once per statement.
     let mut retyped: Vec<String> = Vec::new();
+    // The ALTER TYPE pass: its subcommands' dependents are rebuilt together
+    // once it ends.
+    let mut batch: Option<columns::RetypeBatch> = None;
     for cmd in cmds {
         let rec = inherit::Recursion {
             recurse,
             recursing: false,
         };
         let retype = cmd.subtype == AlterTableType::AtAlterColumnType;
+        if retype && batch.is_none() {
+            batch = Some(columns::RetypeBatch::begin());
+        }
+        if !retype && let Some(b) = batch.take() {
+            b.finish(interp)?;
+        }
         let before = interp
             .attribute_by_name(class_oid, &cmd.name)
             .map(|a| (a.atttypid, a.atttypmod));
@@ -1515,6 +1524,9 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         {
             retyped.push(cmd.name.clone());
         }
+    }
+    if let Some(b) = batch {
+        b.finish(interp)?;
     }
 
     Ok(())

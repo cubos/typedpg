@@ -46,6 +46,28 @@ pub enum OperatorMatch {
 
 const PG_CATALOG_SCHEMA: &str = "pg_catalog";
 
+thread_local! {
+    /// While a stored expression is analyzed: `pg_catalog` comes first on
+    /// the search path whatever the path says (see [`catalog_first`]).
+    static CATALOG_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with `pg_catalog` searched first. A bound stored expression
+/// names every object outside `pg_catalog` qualified (see
+/// [`crate::ddl::stored_exprs`]): its unqualified names are
+/// `pg_catalog`'s, which a later path naming another schema first must not
+/// capture — PG keeps them by OID.
+pub(crate) fn catalog_first<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CATALOG_FIRST.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(CATALOG_FIRST.with(|c| c.replace(true)));
+    f()
+}
+
 impl PgCatalog {
     // ── Namespace helpers ───────────────────────────────────────────────
 
@@ -166,12 +188,18 @@ impl PgCatalog {
         {
             out.push(temp);
         }
-        if !self.search_path_includes_pg_catalog()
+        let catalog_first = CATALOG_FIRST.with(std::cell::Cell::get);
+        if (catalog_first || !self.search_path_includes_pg_catalog())
             && let Some(pg_oid) = self.pg_catalog_oid()
         {
             out.push(pg_oid);
         }
-        out.extend(self.search_path.iter().copied());
+        out.extend(
+            self.search_path
+                .iter()
+                .copied()
+                .filter(|ns| !catalog_first || Some(*ns) != self.pg_catalog_oid()),
+        );
         out
     }
 

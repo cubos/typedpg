@@ -837,3 +837,146 @@ fn role_and_database_constants_cannot_be_stored() {
     db.apply_sql("CREATE TABLE r (g regrole, n int CHECK (n > 0));")
         .unwrap();
 }
+
+/// A table and the objects the expression tests below read.
+const EXPR_SETUP: &str =
+    "CREATE FUNCTION pos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+     CREATE FUNCTION inc(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1 + 1';
+     CREATE FUNCTION vsum(VARIADIC int[]) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+     CREATE FUNCTION named(x int, y int DEFAULT 0) RETURNS int LANGUAGE sql IMMUTABLE
+         AS 'SELECT 1';
+     CREATE TYPE ct AS (x int, y text);
+     CREATE DOMAIN dint AS int;
+     CREATE DOMAIN dbool AS bool;
+     CREATE SCHEMA s;
+     CREATE COLLATION s.co FROM \"C\";
+     CREATE FUNCTION s.ieq(int, int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
+     CREATE OPERATOR s.=== (LEFTARG = int, RIGHTARG = int, FUNCTION = s.ieq);
+     CREATE TABLE t (a int, b smallint, c varchar(10), d text, e numeric, f bool, g int[],
+         h date, k ct, dm dint, bd dbool);";
+
+#[test]
+fn stored_expressions_print_as_pg_get_expr_does() {
+    // The pg_sanity mirror compares the text the analyzer would rebuild
+    // each CHECK, index expression and predicate from with what
+    // pg_get_expr / pg_get_indexdef print: implicit coercions shown where
+    // ruleutils shows them and hidden where it hides them, constants
+    // typed, CASE laid out on lines, SQL syntax as SQL syntax.
+    let checks = [
+        "a > '5'",
+        "pos(b)",
+        "length(c) > 0",
+        "c = 'x'",
+        "NOT f",
+        "bd",
+        "bd AND f",
+        "f IS NOT UNKNOWN",
+        "a IS DISTINCT FROM b",
+        "a IS NOT DISTINCT FROM b",
+        "COALESCE(a, b, 0) > 0",
+        "GREATEST(a, b) > LEAST(a, 1)",
+        "NULLIF(c, 'x') IS NULL",
+        "CASE WHEN a > 0 THEN b END > 0",
+        "CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'y' END = 'x'",
+        "CASE WHEN a > 0 THEN CASE WHEN b > 0 THEN 1 ELSE 2 END ELSE 3 END > 0",
+        "c IN ('x', 'y')",
+        "a <> ALL (ARRAY[1, 2])",
+        "g[1:2] IS NOT NULL",
+        "(ARRAY[a, b])[1] > 0",
+        "(k).y IS NOT NULL",
+        "ROW(a, d)::ct IS NOT NULL",
+        "d COLLATE s.co > 'a'",
+        "a OPERATOR(s.===) a",
+        "vsum(a, b, 3) > 0",
+        "vsum(VARIADIC ARRAY[a, b]) > 0",
+        "named(y => b, x => a) > 0",
+        "d ILIKE 'x%'",
+        "d NOT SIMILAR TO 'x%'",
+        "h > '2020-01-01'",
+        "EXTRACT(year FROM h) > 2000",
+        "substring(d FROM 1 FOR 2) <> ''",
+        "trim(LEADING 'x' FROM d) <> ''",
+        "position('x' IN d) > 0",
+        "(h AT TIME ZONE 'UTC') IS NOT NULL",
+        "e::numeric(10,2) > 0",
+        "d::char(3) <> ''",
+        "dm > 0",
+    ];
+    let mut sql = String::new();
+    for (i, check) in checks.iter().enumerate() {
+        sql.push_str(&format!(
+            "ALTER TABLE t ADD CONSTRAINT k{i} CHECK ({check});\n"
+        ));
+    }
+    sql.push_str(
+        "CREATE INDEX i1 ON t ((a::bigint), NULLIF(a, 0), lower(c), (CASE WHEN f THEN a ELSE b END));
+         CREATE INDEX i2 ON t (a) WHERE c = 'x' AND bd;",
+    );
+    build_db(&[("0001.sql", EXPR_SETUP), ("0002.sql", &sql)]);
+}
+
+#[test]
+fn a_rebuild_keeps_the_coercions_inside_case_coalesce_and_calls() {
+    // ruleutils shows a CASE result's, a COALESCE argument's, a variadic
+    // element's and a named argument's coercion as a cast: the rebuild
+    // over the new type goes through it explicitly.
+    let mut db = build_db(&[
+        ("0001.sql", EXPR_SETUP),
+        (
+            "0002.sql",
+            "CREATE TABLE r (b smallint, x smallint, y smallint, z smallint, f bool,
+                 CHECK (COALESCE(b, 0) > 0), CHECK (CASE WHEN f THEN x ELSE 0 END > 0),
+                 CHECK (vsum(y, 1) > 0), CHECK (named(y => 1, x => z) > 0));",
+        ),
+    ]);
+    db.apply_sql(
+        "ALTER TABLE r ALTER b TYPE text;
+         ALTER TABLE r ALTER x TYPE text;
+         ALTER TABLE r ALTER y TYPE text;
+         ALTER TABLE r ALTER z TYPE text;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn alter_type_subcommands_are_rebuilt_together() {
+    // ATPostAlterTypeCleanup rebuilds what the statement's ALTER TYPE
+    // subcommands changed after the last of them, each dependent's text
+    // remembered before any column changed: `a = b` over two columns made
+    // text together holds.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int, CHECK (a = b));
+         CREATE INDEX ON t ((a + b));",
+    )]);
+    db.apply_sql("ALTER TABLE t ALTER a TYPE bigint, ALTER b TYPE bigint;")
+        .unwrap();
+    expect_failure(
+        &mut db,
+        "ALTER TABLE t ALTER a TYPE text, ALTER b TYPE text;",
+        "operator does not exist: text + text",
+    );
+    db.apply_sql("DROP INDEX t_expr_idx; ALTER TABLE t ALTER a TYPE text, ALTER b TYPE text;")
+        .unwrap();
+}
+
+#[test]
+fn a_later_search_path_does_not_rebind_a_stored_expression() {
+    // `a = 1` was bound to `pg_catalog.=` when written: a statement run
+    // later with a schema holding another `=` first on the path leaves it
+    // so, and its rebuild names `OPERATOR(pg_catalog.=)` under that path.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int CHECK (a = 1));
+         CREATE SCHEMA loose;
+         CREATE FUNCTION loose.eq(int, int) RETURNS boolean LANGUAGE sql IMMUTABLE
+             AS 'SELECT true';
+         CREATE OPERATOR loose.= (LEFTARG = int, RIGHTARG = int, FUNCTION = loose.eq);",
+    )]);
+    db.apply_sql(
+        "SET search_path = loose, pg_catalog, public;
+         CREATE TABLE public.u (b int CHECK (b = 1));
+         ALTER TABLE public.t ALTER a TYPE bigint;",
+    )
+    .unwrap();
+}

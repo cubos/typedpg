@@ -180,6 +180,22 @@ pub(crate) fn over_own_row(
 /// read the column by its new name. Called before `pg_attribute` is
 /// updated.
 pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str, new: &str) {
+    rename_column_refs_everywhere(interp, relid, old, new);
+    note_all_bound(interp);
+}
+
+/// The stored expressions as they are now are bound (a rename rewrote
+/// some of them).
+fn note_all_bound(interp: &mut PgCatalog) {
+    let hashes: Vec<u64> = stored_expressions(interp, true)
+        .iter()
+        .map(|(_, _, e)| tree_hash(e.as_ref()))
+        .collect();
+    interp.bound_stored_exprs.extend(hashes);
+}
+
+/// [`rename_column`]'s rewrites.
+fn rename_column_refs_everywhere(interp: &mut PgCatalog, relid: PgClassOid, old: &str, new: &str) {
     let relname = interp
         .pg_class
         .get(&relid)
@@ -263,6 +279,12 @@ pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str
 /// rewritten — inside an array literal — is no longer trusted for its
 /// comparisons.
 pub(crate) fn rename_enum_label(interp: &mut PgCatalog, enum_oid: PgTypeOid, old: &str, new: &str) {
+    rename_enum_label_everywhere(interp, enum_oid, old, new);
+    note_all_bound(interp);
+}
+
+/// [`rename_enum_label`]'s rewrites.
+fn rename_enum_label_everywhere(interp: &mut PgCatalog, enum_oid: PgTypeOid, old: &str, new: &str) {
     let is_enum = |interp: &PgCatalog, t: PgTypeOid| interp.unwrap_domain(t) == enum_oid;
     let is_enum_array = |interp: &PgCatalog, t: PgTypeOid| {
         interp
@@ -777,6 +799,7 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
 
 /// Store `expr` as the expression of `slot`.
 fn write_slot(interp: &mut PgCatalog, slot: Slot, expr: Option<ast::Node>) {
+    note_bound(interp, expr.as_ref());
     match slot {
         Slot::Check(oid) => {
             if let Some(mut def) = interp.check_defs.get(&oid).cloned() {
@@ -1025,9 +1048,24 @@ fn bind_slots(interp: &PgCatalog, expr: &mut Option<ast::Node>, bindings: &Bindi
     });
 }
 
+/// A hash of a stored expression's tree.
+fn tree_hash(expr: Option<&ast::Node>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{expr:?}").hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `expr`, written into a stored expression's slot from one already bound
+/// (a rename, a rebuild), is bound too.
+fn note_bound(interp: &mut PgCatalog, expr: Option<&ast::Node>) {
+    interp.bound_stored_exprs.insert(tree_hash(expr));
+}
+
 /// After a statement: bind the stored expressions it wrote (see above).
-/// One already bound has no unqualified name of an object outside
-/// `pg_catalog` left, and is skipped.
+/// One already bound — before this statement, or the copy of one (a
+/// child's CHECK) — keeps the objects it named, whatever the search path
+/// now says: an unqualified name in it is `pg_catalog`'s.
 pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), super::DdlError> {
     apply_reg_constants(interp);
     refuse_unstorable_constants(interp)?;
@@ -1035,19 +1073,27 @@ pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), supe
     if names.is_empty() {
         return Ok(());
     }
+    let mut seen = Vec::new();
     let bound: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, true)
         .into_iter()
         .filter(|(_, _, expr)| has_unbound_name(expr.as_ref(), &names))
+        .filter(|(_, _, expr)| {
+            !interp
+                .bound_stored_exprs
+                .contains(&tree_hash(expr.as_ref()))
+        })
         .filter_map(|(slot, over, mut expr)| {
             let bindings = bindings_of(interp, over, expr.as_ref());
             let before = expr.clone();
             bind_slots(interp, &mut expr, &bindings);
+            seen.push(tree_hash(expr.as_ref()));
             (expr != before).then_some((slot, expr))
         })
         .collect();
     for (slot, expr) in bound {
         write_slot(interp, slot, expr);
     }
+    interp.bound_stored_exprs.extend(seen);
     Ok(())
 }
 
@@ -1516,6 +1562,38 @@ fn unstorable_type(interp: &PgCatalog, t: PgTypeOid) -> Option<&'static str> {
         .copied()
 }
 
+/// recordDependencyOnExpr over a stored query (a view's, a materialized
+/// view's, a rule's, a SQL-standard routine body) holding a `regrole` or
+/// `regdatabase` constant: `constant of the type regrole cannot be used
+/// here`. The constant is a literal cast to the type (`'r'::regrole`,
+/// `regrole 'r'`); NULL names nothing.
+pub(crate) fn refuse_unstorable_constant_casts<'a>(
+    interp: &PgCatalog,
+    trees: impl IntoIterator<Item = Option<&'a ast::Node>>,
+) -> Result<(), super::DdlError> {
+    for tree in trees.into_iter().flatten() {
+        for (n, ..) in tree.nodes() {
+            let typedpg_pg_query::NodeRef::TypeCast(tc) = n else {
+                continue;
+            };
+            if !matches!(&tc.arg, Some(ast::Node::AConst(c)) if !c.isnull) {
+                continue;
+            }
+            if let Some(typname) = tc
+                .type_name
+                .as_ref()
+                .and_then(|tn| crate::ddl::util::resolve_type_name(tn, interp))
+                .and_then(|t| unstorable_type(interp, t))
+            {
+                return Err(super::DdlError::UnsupportedDdl(format!(
+                    "constant of the type {typname} cannot be used here"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// recordDependencyOnExpr over a stored expression holding a `regrole` or
 /// `regdatabase` constant: `constant of the type regrole cannot be used
 /// here`. Only an expression that can hold one is analyzed — casting to
@@ -1573,6 +1651,25 @@ fn refuse_unstorable_constants(interp: &PgCatalog) -> Result<(), super::DdlError
 
 // ─── Rebuilt by ALTER COLUMN TYPE ──────────────────────────────────────────
 
+thread_local! {
+    /// The CHECK constraints and indexes (by OID) whose text the ALTER
+    /// TABLE being applied has remembered for their rebuild, while its
+    /// ALTER TYPE subcommands run.
+    static REMEMBERED: std::cell::RefCell<Option<std::collections::HashSet<u32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// An ALTER TABLE's ALTER TYPE subcommands start: each dependent's text is
+/// remembered once.
+pub(crate) fn begin_remembering() {
+    REMEMBERED.with(|r| *r.borrow_mut() = Some(Default::default()));
+}
+
+/// They are done.
+pub(crate) fn end_remembering() {
+    REMEMBERED.with(|r| *r.borrow_mut() = None);
+}
+
 /// ALTER COLUMN TYPE of column `attnum` (named `attname`) of `relid`,
 /// before the column changes: the CHECK constraints reading it, and the
 /// expressions and predicates of the indexes reading it, become the text
@@ -1585,6 +1682,14 @@ pub(crate) fn deparse_for_rebuild(
     attnum: i16,
     attname: &str,
 ) {
+    // An expression an earlier subcommand of the statement remembered is
+    // left as it was remembered then.
+    let first_time = |oid: u32| {
+        REMEMBERED.with(|r| match r.borrow_mut().as_mut() {
+            Some(seen) => seen.insert(oid),
+            None => true,
+        })
+    };
     let checks: Vec<crate::oid::PgConstraintOid> = interp
         .pg_constraint
         .values()
@@ -1594,6 +1699,9 @@ pub(crate) fn deparse_for_rebuild(
         .map(|c| c.oid)
         .collect();
     for oid in checks {
+        if !first_time(oid.get()) {
+            continue;
+        }
         let Some(mut def) = interp.check_defs.get(&oid).cloned() else {
             continue;
         };
@@ -1606,6 +1714,7 @@ pub(crate) fn deparse_for_rebuild(
         // What the rebuilt text resolves to before the change, which the
         // recook after it compares with (`recook_checks_reading`).
         def.trusted = crate::ddl::volatile::trusted_over_relation(interp, relid, Some(&text));
+        note_bound(interp, Some(&text));
         def.expr = StoredExpr::Written(Box::new(Some(text)));
         interp.check_defs.insert(oid, def);
     }
@@ -1630,11 +1739,15 @@ pub(crate) fn deparse_for_rebuild(
         .map(|i| i.indexrelid)
         .collect();
     for index in indexes {
+        if !first_time(index.get()) {
+            continue;
+        }
         let Some(mut row) = interp.pg_index.get(&index).cloned() else {
             continue;
         };
         for e in row.indexprs.iter_mut().chain(row.indpred.as_mut()) {
             if let Some(text) = crate::ddl::cooked::deparse(interp, relid, e.ast.as_ref()) {
+                interp.bound_stored_exprs.insert(tree_hash(Some(&text)));
                 e.ast = Some(text);
             }
         }

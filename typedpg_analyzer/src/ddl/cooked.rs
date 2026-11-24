@@ -155,16 +155,54 @@ enum Kind {
     Func(PgProcOid, Vec<Cooked>),
     /// A coercion to a type: a cast function call, a `RelabelType`, a
     /// `CoerceViaIO`, an `ArrayCoerceExpr`, a `CoerceToDomain` — which one
-    /// follows from the two types.
-    Coerce(PgTypeOid, Box<Cooked>),
+    /// follows from the two types. Explicit (written as a cast) or implicit
+    /// (inserted by the parser): `equal()` doesn't tell them apart, ruleutils
+    /// hides an implicit one where it isn't asked to show it.
+    Coerce(PgTypeOid, Box<Cooked>, bool),
     /// An `ArrayExpr` of an element type.
     Array(PgTypeOid, Vec<Cooked>),
     /// A `BoolExpr` (AND / OR / NOT).
     Bool(u8, Vec<Cooked>),
     /// A `NullTest` (IS NULL when true).
     NullTest(bool, Box<Cooked>),
+    /// A `CaseExpr`: the argument of a simple CASE, each WHEN's condition
+    /// (for a simple CASE, the comparison's right side) and result, and the
+    /// ELSE result (a NULL constant when there is none).
+    Case(Option<Box<Cooked>>, Vec<(Cooked, Cooked)>, Box<Cooked>),
+    /// A `CoalesceExpr`.
+    Coalesce(Vec<Cooked>),
+    /// A `MinMaxExpr`: GREATEST when true, LEAST otherwise.
+    MinMax(bool, Vec<Cooked>),
+    /// A `NullIfExpr`, by its `=` operator.
+    NullIf(PgOperatorOid, Vec<Cooked>),
+    /// A `DistinctExpr` (IS DISTINCT FROM), by its `=` operator.
+    Distinct(PgOperatorOid, Vec<Cooked>),
+    /// A `RowExpr`, cast to a composite type when given.
+    Row(Vec<Cooked>, Option<PgTypeOid>),
+    /// A `BooleanTest` (`BoolTestType` as an integer).
+    BoolTest(u8, Box<Cooked>),
+    /// A `CollateExpr`.
+    Collate(crate::oid::PgCollationOid, Box<Cooked>),
+    /// A `SubscriptingRef`: each `[upper]`, or `[lower:upper]` when a
+    /// slice (an omitted bound is `None`).
+    Subscript(Box<Cooked>, Vec<(Option<Cooked>, Option<Cooked>, bool)>),
+    /// A `FieldSelect`.
+    Field(Box<Cooked>, String),
+    /// A `FuncExpr` with named arguments, a VARIADIC array (its last
+    /// argument) or written in a SQL syntax of its own.
+    Call(PgProcOid, Vec<(Option<String>, Cooked)>, CallForm),
     /// Anything else, as written.
     Raw(Option<ast::Node>),
+}
+
+/// How a [`Kind::Call`] was written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CallForm {
+    /// `funcvariadic`: its last argument is the variadic array.
+    variadic: bool,
+    /// `COERCE_SQL_SYNTAX` (`EXTRACT(… FROM …)`, `SUBSTRING(…)`): not a
+    /// difference `equal()` sees.
+    sql_syntax: bool,
 }
 
 impl PartialEq for Cooked {
@@ -178,10 +216,23 @@ impl PartialEq for Cooked {
                 o1 == o2 && u1 == u2 && a1 == a2
             }
             (Kind::Func(p1, a1), Kind::Func(p2, a2)) => p1 == p2 && a1 == a2,
-            (Kind::Coerce(t1, a1), Kind::Coerce(t2, a2)) => t1 == t2 && a1 == a2,
+            (Kind::Coerce(t1, a1, _), Kind::Coerce(t2, a2, _)) => t1 == t2 && a1 == a2,
             (Kind::Array(t1, e1), Kind::Array(t2, e2)) => t1 == t2 && e1 == e2,
             (Kind::Bool(k1, a1), Kind::Bool(k2, a2)) => k1 == k2 && a1 == a2,
             (Kind::NullTest(n1, a1), Kind::NullTest(n2, a2)) => n1 == n2 && a1 == a2,
+            (Kind::Case(a1, w1, d1), Kind::Case(a2, w2, d2)) => a1 == a2 && w1 == w2 && d1 == d2,
+            (Kind::Coalesce(a1), Kind::Coalesce(a2)) => a1 == a2,
+            (Kind::MinMax(g1, a1), Kind::MinMax(g2, a2)) => g1 == g2 && a1 == a2,
+            (Kind::NullIf(o1, a1), Kind::NullIf(o2, a2))
+            | (Kind::Distinct(o1, a1), Kind::Distinct(o2, a2)) => o1 == o2 && a1 == a2,
+            (Kind::Row(a1, t1), Kind::Row(a2, t2)) => a1 == a2 && t1 == t2,
+            (Kind::BoolTest(k1, a1), Kind::BoolTest(k2, a2)) => k1 == k2 && a1 == a2,
+            (Kind::Collate(c1, a1), Kind::Collate(c2, a2)) => c1 == c2 && a1 == a2,
+            (Kind::Subscript(a1, i1), Kind::Subscript(a2, i2)) => a1 == a2 && i1 == i2,
+            (Kind::Field(a1, f1), Kind::Field(a2, f2)) => a1 == a2 && f1 == f2,
+            (Kind::Call(p1, a1, f1), Kind::Call(p2, a2, f2)) => {
+                p1 == p2 && a1 == a2 && f1.variadic == f2.variadic
+            }
             (Kind::Raw(a), Kind::Raw(b)) => a.equal(b),
             _ => false,
         }
@@ -219,21 +270,25 @@ pub(crate) fn cook(
     // qualifies it.
     let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
     let goal = target.map_or(TypeGoal::NONE, TypeGoal::assignment);
-    let (inferred, _) = crate::ddl::depend::collect(|| {
-        let _level = crate::resolve::QueryLevel::enter();
-        infer_expr(expr.as_ref(), ctx, &mut params, goal)
-    });
-    inferred.ok()?;
-    let cooker = Cooker {
-        interp,
-        relid,
-        log: &log,
-    };
-    let node = expr.as_ref()?;
-    Some(match target {
-        // coerce_to_target_type, as the default is stored.
-        Some(t) => cooker.arg(node, Some(t)),
-        None => cooker.cook(node),
+    // Its unqualified names are `pg_catalog`'s (see
+    // [`crate::lookup::catalog_first`]).
+    crate::lookup::catalog_first(|| {
+        let (inferred, _) = crate::ddl::depend::collect(|| {
+            let _level = crate::resolve::QueryLevel::enter();
+            infer_expr(expr.as_ref(), ctx, &mut params, goal)
+        });
+        inferred.ok()?;
+        let cooker = Cooker {
+            interp,
+            relid,
+            log: &log,
+        };
+        let node = expr.as_ref()?;
+        Some(match target {
+            // coerce_to_target_type, as the default is stored.
+            Some(t) => cooker.arg(node, Some(t)),
+            None => cooker.cook(node),
+        })
     })
 }
 
@@ -332,6 +387,14 @@ impl Cooker<'_> {
     /// coerce_type): an untyped literal becomes a constant of the type,
     /// another type is coerced to it. `None`: a pseudo-type or not known.
     fn arg(&self, node: &ast::Node, decl: Option<PgTypeOid>) -> Cooked {
+        // Of a type the analysis doesn't know: whether PG coerces it isn't
+        // known either.
+        if decl.is_some_and(|d| !self.is_pseudo(d))
+            && Self::untyped(node).is_none()
+            && self.operand_type(node).is_none()
+        {
+            return self.raw(node);
+        }
         if let Some((ac, text)) = Self::untyped(node) {
             // The declared type when there is one, else the type the
             // inference coerced the literal to.
@@ -349,6 +412,15 @@ impl Cooker<'_> {
     /// when it is of that type already — or when either type isn't known,
     /// which the rest of the tree then determines.
     fn coerce(&self, c: Cooked, decl: Option<PgTypeOid>) -> Cooked {
+        // coerce_type: a COLLATE's argument is coerced, the COLLATE put
+        // back on top.
+        if let Kind::Collate(collation, inner) = c.kind {
+            let inner = self.coerce(*inner, decl);
+            return Cooked {
+                ty: inner.ty,
+                kind: Kind::Collate(collation, Box::new(inner)),
+            };
+        }
         match (decl, c.ty) {
             (Some(d), Some(t)) if t.oid != d && t.oid != oid::UNKNOWN && !self.is_pseudo(d) => {
                 coerced(d, c)
@@ -398,9 +470,131 @@ impl Cooker<'_> {
                 let elem = crate::expr::array_element_type(self.interp, ty?.oid)?;
                 return self.array(a, ty?.oid, elem);
             }
+            // transformCaseExpr: each result (and the ELSE, a NULL when
+            // omitted) coerced to the common type; a WHEN of a simple CASE
+            // is `arg = value`, of a searched one a boolean.
+            ast::Node::CaseExpr(ce) => {
+                let result = ty?.oid;
+                let arg = ce.arg.as_ref().map(|a| Box::new(self.cook(a)));
+                let mut whens = Vec::new();
+                for w in &ce.args {
+                    let Some(ast::Node::CaseWhen(w)) = w else {
+                        return None;
+                    };
+                    let cond = w.expr.as_ref()?;
+                    let cond = match &arg {
+                        Some(a) => {
+                            let right = self.operand_type(cond)?;
+                            let op = self.equality(a.ty?.oid, right)?;
+                            let row = self.interp.pg_operator.get(&op)?;
+                            self.arg(cond, Some(row.oprright))
+                        }
+                        None => self.arg(cond, Some(oid::BOOL)),
+                    };
+                    whens.push((cond, self.arg(w.result.as_ref()?, Some(result))));
+                }
+                let default = match ce.defresult.as_ref() {
+                    Some(d) => self.arg(d, Some(result)),
+                    None => constant(result, None),
+                };
+                Kind::Case(arg, whens, Box::new(default))
+            }
+            // transformCoalesceExpr / transformMinMaxExpr: each argument
+            // coerced to the common type.
+            ast::Node::CoalesceExpr(c) => {
+                let result = ty?.oid;
+                Kind::Coalesce(
+                    c.args
+                        .iter()
+                        .map(|a| a.as_ref().map(|a| self.arg(a, Some(result))))
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+            ast::Node::MinMaxExpr(m) => {
+                let result = ty?.oid;
+                Kind::MinMax(
+                    m.op == ast::MinMaxOp::IsGreatest,
+                    m.args
+                        .iter()
+                        .map(|a| a.as_ref().map(|a| self.arg(a, Some(result))))
+                        .collect::<Option<Vec<_>>>()?,
+                )
+            }
+            ast::Node::RowExpr(r) => Kind::Row(
+                r.args
+                    .iter()
+                    .map(|a| a.as_ref().map(|a| self.cook(a)))
+                    .collect::<Option<Vec<_>>>()?,
+                None,
+            ),
+            // transformBooleanTest: coerce_to_boolean.
+            ast::Node::BooleanTest(b) => Kind::BoolTest(
+                b.booltesttype as u8,
+                Box::new(self.arg(b.arg.as_ref()?, Some(oid::BOOL))),
+            ),
+            ast::Node::CollateClause(cc) => {
+                let names = crate::expr::extract_string_fields(&cc.collname);
+                let (schema, name) = match names.as_slice() {
+                    [n] => (None, n.as_str()),
+                    [s, n] => (Some(s.as_str()), n.as_str()),
+                    _ => return None,
+                };
+                let collation = self.interp.resolve_collation(schema, name)?.oid;
+                let arg = self.cook(cc.arg.as_ref()?);
+                return Some(Cooked {
+                    ty: arg.ty,
+                    kind: Kind::Collate(collation, Box::new(arg)),
+                });
+            }
+            ast::Node::AIndirection(ind) => {
+                let arg = self.cook(ind.arg.as_ref()?);
+                let items: Vec<&ast::Node> = ind.indirection.iter().flatten().collect();
+                if items.iter().all(|i| matches!(i, ast::Node::AIndices(_))) {
+                    let mut subscripts = Vec::new();
+                    for i in items {
+                        let ast::Node::AIndices(i) = i else {
+                            return None;
+                        };
+                        // transformContainerSubscripts: each subscript an
+                        // integer.
+                        let bound = |b: Option<&ast::Node>| b.map(|b| self.arg(b, Some(oid::INT4)));
+                        subscripts.push((
+                            bound(i.lidx.as_ref()),
+                            bound(i.uidx.as_ref()),
+                            i.is_slice,
+                        ));
+                    }
+                    Kind::Subscript(Box::new(arg), subscripts)
+                } else if let [ast::Node::String(field)] = items.as_slice() {
+                    Kind::Field(Box::new(arg), field.sval.clone())
+                } else {
+                    return None;
+                }
+            }
             _ => return None,
         };
         Some(Cooked { kind, ty })
+    }
+
+    /// The type of an operand (the inference's; an untyped literal's is
+    /// `unknown`).
+    fn operand_type(&self, node: &ast::Node) -> Option<PgTypeOid> {
+        if Self::untyped(node).is_some() {
+            return Some(oid::UNKNOWN);
+        }
+        // BETWEEN, IN and a simple CASE's WHEN infer copies of an operand,
+        // not the node itself: then it is typed as cooked.
+        self.ty(node)
+            .map(|t| t.oid)
+            .or_else(|| self.cook(node).ty.map(|t| t.oid))
+    }
+
+    /// The `=` operator over `left` and `right` (make_op).
+    fn equality(&self, left: PgTypeOid, right: PgTypeOid) -> Option<PgOperatorOid> {
+        match self.interp.find_operator_detailed("=", Some(left), right) {
+            crate::lookup::OperatorMatch::Found(op) => Some(op.oid),
+            _ => None,
+        }
     }
 
     /// make_const: an integer is an `int4` constant, a numeric literal an
@@ -438,6 +632,11 @@ impl Cooker<'_> {
     /// already is left alone, unless its type modifier is to be dropped
     /// (coerce_type_typmod's `RelabelType`).
     fn cast(&self, tc: &ast::TypeCast) -> Option<Cooked> {
+        if let Some(tn) = tc.type_name.as_ref()
+            && !tn.typmods.is_empty()
+        {
+            return self.typmod_cast(tc, tn);
+        }
         let target = crate::nonnull::cast_target(tc, self.interp)?;
         let arg = tc.arg.as_ref()?;
         if let Some((_, text)) = Self::untyped(arg) {
@@ -447,32 +646,120 @@ impl Cooker<'_> {
             let elem = crate::expr::array_element_type(self.interp, target)?;
             return self.array(a, target, elem);
         }
+        // coerce_record_to_complex: a ROW cast to a composite type is that
+        // type's row (`row_format` EXPLICIT_CAST), each field coerced to
+        // its column's type.
+        if let ast::Node::RowExpr(r) = arg
+            && let Some(relid) = self.interp.pg_type.get(&target).and_then(|t| t.typrelid)
+        {
+            let columns: Vec<PgTypeOid> = self
+                .interp
+                .attributes_of(relid)
+                .iter()
+                .filter(|a| a.attnum > 0)
+                .map(|a| a.atttypid)
+                .collect();
+            if columns.len() != r.args.len() {
+                return None;
+            }
+            let fields = r
+                .args
+                .iter()
+                .zip(columns)
+                .map(|(a, t)| a.as_ref().map(|a| self.arg(a, Some(t))))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(Cooked {
+                kind: Kind::Row(fields, Some(target)),
+                ty: Some(Ty {
+                    oid: target,
+                    typmod: None,
+                }),
+            });
+        }
         let c = self.cook(arg);
         let t = c.ty?;
         if t.oid == oid::UNKNOWN {
             return None;
         }
         if t.oid != target {
-            return Some(coerced(target, c));
+            // coerce_type: below a COLLATE.
+            if let Kind::Collate(collation, inner) = c.kind {
+                let inner = cast_to(target, *inner);
+                return Some(Cooked {
+                    ty: inner.ty,
+                    kind: Kind::Collate(collation, Box::new(inner)),
+                });
+            }
+            return Some(cast_to(target, c));
         }
         // The same type: no node when the value's type modifier is -1
         // already, as it is for a constant or an operator's or function's
         // result.
         let default_typmod = match &c.kind {
-            Kind::Var(_) => t.typmod.is_none(),
+            Kind::Var(_) | Kind::Subscript(..) | Kind::Field(..) => t.typmod.is_none(),
             Kind::Const(..)
             | Kind::Op(..)
             | Kind::ScalarArrayOp(..)
             | Kind::Func(..)
             | Kind::Coerce(..)
             | Kind::Bool(..)
-            | Kind::NullTest(..) => true,
+            | Kind::NullTest(..)
+            | Kind::Case(..)
+            | Kind::Coalesce(..)
+            | Kind::MinMax(..)
+            | Kind::NullIf(..)
+            | Kind::Distinct(..)
+            | Kind::Row(..)
+            | Kind::BoolTest(..)
+            | Kind::Collate(..)
+            | Kind::Call(..) => true,
             Kind::Array(..) | Kind::Raw(_) => false,
         };
         Some(if default_typmod {
             c
         } else {
-            coerced(target, c)
+            cast_to(target, c)
+        })
+    }
+
+    /// A cast to a type with a modifier (`c::varchar(5)`): the value cast
+    /// to the type (an untyped literal: a constant of it), then its length
+    /// coercion — none when it has that modifier already
+    /// (coerce_type_typmod).
+    fn typmod_cast(&self, tc: &ast::TypeCast, tn: &ast::TypeName) -> Option<Cooked> {
+        if !tn.array_bounds.is_empty() {
+            return None;
+        }
+        let target = crate::ddl::util::resolve_type_name(tn, self.interp)?;
+        let typmod = crate::typmod::encode(self.interp, target, tn).ok()??;
+        let arg = tc.arg.as_ref()?;
+        let base = match Self::untyped(arg) {
+            Some((_, text)) => self.literal(target, text)?,
+            None => {
+                let c = self.cook(arg);
+                let t = c.ty?;
+                if t.oid == oid::UNKNOWN {
+                    return None;
+                }
+                if t.oid == target {
+                    if t.typmod == Some(typmod) {
+                        return Some(c);
+                    }
+                    c
+                } else {
+                    // coerce_to_target_type: with a length coercion added
+                    // too, the inner coercion is shown as implicit
+                    // (hideInputCoercion).
+                    coerced(target, c)
+                }
+            }
+        };
+        Some(Cooked {
+            kind: Kind::Coerce(target, Box::new(base), true),
+            ty: Some(Ty {
+                oid: target,
+                typmod: Some(typmod),
+            }),
         })
     }
 
@@ -506,6 +793,81 @@ impl Cooker<'_> {
                 // A polymorphic operator's result is the inference's.
                 c.ty = c.ty.or(ty);
                 return Some(c);
+            }
+            // LIKE / ILIKE: their operators (`~~`, `!~~`, `~~*`, `!~~*`),
+            // named in the expression.
+            ast::AExprKind::AexprLike | ast::AExprKind::AexprIlike => {
+                let name = crate::expr::extract_string_fields(&e.name).join(".");
+                let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
+                let op = match self.interp.find_operator_detailed(
+                    &name,
+                    Some(self.operand_type(l)?),
+                    self.operand_type(r)?,
+                ) {
+                    crate::lookup::OperatorMatch::Found(op) => op.oid,
+                    _ => return None,
+                };
+                let mut c = self.op(op, Some(l), r)?;
+                c.ty = c.ty.or(ty);
+                return Some(c);
+            }
+            // transformAExprSimilar... (makeSimpleA_Expr over
+            // `similar_to_escape(pattern [, escape])`): `~` (`!~`).
+            ast::AExprKind::AexprSimilar => {
+                let name = crate::expr::extract_string_fields(&e.name).join(".");
+                let l = e.lexpr.as_ref()?;
+                let ast::Node::FuncCall(escape) = e.rexpr.as_ref()? else {
+                    return None;
+                };
+                let right = self.general_call(e.rexpr.as_ref()?, escape, false)?;
+                let op = match self.interp.find_operator_detailed(
+                    &name,
+                    Some(self.operand_type(l)?),
+                    right.ty?.oid,
+                ) {
+                    crate::lookup::OperatorMatch::Found(op) => op.oid,
+                    _ => return None,
+                };
+                let row = self.interp.pg_operator.get(&op)?;
+                let right = self.coerce(right, Some(row.oprright));
+                Kind::Op(op, vec![self.arg(l, row.oprleft), right])
+            }
+            // transformAExprNullIf: `=` over the operands, each coerced to
+            // its declared type.
+            ast::AExprKind::AexprNullif => {
+                let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
+                let op = self.equality(self.operand_type(l)?, self.operand_type(r)?)?;
+                let row = self.interp.pg_operator.get(&op)?;
+                Kind::NullIf(
+                    op,
+                    vec![self.arg(l, row.oprleft), self.arg(r, Some(row.oprright))],
+                )
+            }
+            // transformAExprDistinct: against an undecorated NULL, a
+            // NullTest of the other side; else `=` (NOT DISTINCT: NOT of
+            // it).
+            ast::AExprKind::AexprDistinct | ast::AExprKind::AexprNotDistinct => {
+                let (l, r) = (e.lexpr.as_ref()?, e.rexpr.as_ref()?);
+                let distinct = e.kind == ast::AExprKind::AexprDistinct;
+                let is_null = |n: &ast::Node| matches!(n, ast::Node::AConst(c) if c.isnull);
+                if is_null(r) || is_null(l) {
+                    let other = if is_null(r) { l } else { r };
+                    Kind::NullTest(!distinct, Box::new(self.cook(other)))
+                } else {
+                    let op = self.equality(self.operand_type(l)?, self.operand_type(r)?)?;
+                    let row = self.interp.pg_operator.get(&op)?;
+                    let d = Cooked {
+                        kind: Kind::Distinct(
+                            op,
+                            vec![self.arg(l, row.oprleft), self.arg(r, Some(row.oprright))],
+                        ),
+                        ty: Some(bool_ty()),
+                    };
+                    if distinct {
+                        return Some(d);
+                    }
+                    Kind::Bool(ast::BoolExprType::NotExpr as u8, vec![d])
+                }
             }
             // make_scalar_array_op: the left operand coerced to the
             // operator's left type, the array to the array of its right
@@ -614,7 +976,6 @@ impl Cooker<'_> {
                     _ => return None,
                 }
             }
-            _ => return None,
         };
         Some(Cooked { kind, ty })
     }
@@ -644,7 +1005,6 @@ impl Cooker<'_> {
         if fc.agg_star
             || fc.agg_distinct
             || fc.agg_within_group
-            || fc.func_variadic
             || fc.ignore_nulls != 0
             || fc.over.is_some()
             || fc.agg_filter.is_some()
@@ -652,22 +1012,127 @@ impl Cooker<'_> {
         {
             return None;
         }
-        let proc = recorded(&self.log.calls, &NodeKey::of(fc))?;
-        let row = self.interp.pg_proc.get(&proc)?;
-        if row.provariadic.is_some() {
+        let named = fc
+            .args
+            .iter()
+            .any(|a| matches!(a, Some(ast::Node::NamedArgExpr(_))));
+        let sql_syntax = fc.funcformat == ast::CoercionForm::CoerceSqlSyntax;
+        // An operand BETWEEN or IN inferred copies of has no call recorded:
+        // resolved again.
+        let recorded_call = recorded(&self.log.calls, &NodeKey::of(fc));
+        if !named
+            && !sql_syntax
+            && !fc.func_variadic
+            && let Some(proc) = recorded_call
+            && let Some(row) = self.interp.pg_proc.get(&proc)
+            && row.provariadic.is_none()
+        {
+            let mut args = Vec::new();
+            for (i, a) in fc.args.iter().enumerate() {
+                args.push(self.arg(a.as_ref()?, Some(*row.proargtypes.get(i)?)));
+            }
+            return Some(Cooked {
+                kind: Kind::Func(proc, args),
+                ty: self.ty(node),
+            });
+        }
+        self.general_call(node, fc, sql_syntax)
+    }
+
+    /// ParseFuncOrColumn for a call with named arguments, a variadic
+    /// parameter or a SQL syntax: resolved as the analysis did, each
+    /// argument coerced to its declared type, and the variadic ones merged
+    /// into an array (which makes it a VARIADIC call) unless the parameter
+    /// is `VARIADIC "any"`.
+    fn general_call(
+        &self,
+        node: &ast::Node,
+        fc: &ast::FuncCall,
+        sql_syntax: bool,
+    ) -> Option<Cooked> {
+        let names = crate::expr::extract_string_fields(&fc.funcname);
+        let (schema, name) = match names.as_slice() {
+            [n] => (None, n.as_str()),
+            [s, n] => (Some(s.as_str()), n.as_str()),
+            _ => return None,
+        };
+        let mut values: Vec<(Option<String>, &ast::Node)> = Vec::new();
+        for a in &fc.args {
+            match a.as_ref()? {
+                ast::Node::NamedArgExpr(na) => {
+                    values.push((Some(na.name.clone()), na.arg.as_ref()?))
+                }
+                other => values.push((None, other)),
+            }
+        }
+        let types = values
+            .iter()
+            .map(|(_, v)| self.operand_type(v))
+            .collect::<Option<Vec<_>>>()?;
+        let notation = crate::functions::CallNotation {
+            names: values.iter().filter_map(|(n, _)| n.clone()).collect(),
+            variadic: fc.func_variadic,
+            ..Default::default()
+        };
+        let resolved = crate::functions::resolve_function(
+            self.interp,
+            schema,
+            name,
+            &types,
+            &notation,
+            false,
+            None,
+        )
+        .ok()?;
+        if resolved.is_aggregate || resolved.is_window {
             return None;
         }
-        let mut args = Vec::new();
-        for (i, a) in fc.args.iter().enumerate() {
-            let a = a.as_ref()?;
-            if matches!(a, ast::Node::NamedArgExpr(_)) {
-                return None;
-            }
-            args.push(self.arg(a, Some(*row.proargtypes.get(i)?)));
+        let mut args: Vec<(Option<String>, Cooked)> = values
+            .iter()
+            .zip(&resolved.arg_types)
+            .map(|((n, v), t)| (n.clone(), self.arg(v, Some(*t))))
+            .collect();
+        let mut variadic = fc.func_variadic && resolved.provariadic.is_some();
+        // `"any"` (VARIADIC "any").
+        const ANY: PgTypeOid = PgTypeOid::from_raw(2276);
+        if resolved.nvargs > 0 && resolved.provariadic != Some(ANY) {
+            let first = args.len().checked_sub(resolved.nvargs)?;
+            let elems: Vec<Cooked> = args.split_off(first).into_iter().map(|(_, c)| c).collect();
+            let elem = elems.first()?.ty?.oid;
+            let array = self.interp.array_type_of(elem)?;
+            args.push((
+                None,
+                Cooked {
+                    kind: Kind::Array(elem, elems),
+                    ty: Some(Ty {
+                        oid: array,
+                        typmod: None,
+                    }),
+                },
+            ));
+            variadic = true;
+        }
+        // A plain call resolved again is the same `FuncExpr`.
+        let ty = self.ty(node).or(Some(Ty {
+            oid: resolved.return_type_oid,
+            typmod: None,
+        }));
+        if !variadic && !sql_syntax && args.iter().all(|(n, _)| n.is_none()) {
+            return Some(Cooked {
+                kind: Kind::Func(resolved.oid, args.into_iter().map(|(_, c)| c).collect()),
+                ty,
+            });
         }
         Some(Cooked {
-            kind: Kind::Func(proc, args),
-            ty: self.ty(node),
+            kind: Kind::Call(
+                resolved.oid,
+                args,
+                CallForm {
+                    variadic,
+                    sql_syntax,
+                },
+            ),
+            ty,
         })
     }
 }
@@ -679,10 +1144,21 @@ fn bool_ty() -> Ty {
     }
 }
 
-/// `c` coerced to `t`.
+/// `c` coerced to `t` (implicitly).
 fn coerced(t: PgTypeOid, c: Cooked) -> Cooked {
     Cooked {
-        kind: Kind::Coerce(t, Box::new(c)),
+        kind: Kind::Coerce(t, Box::new(c), false),
+        ty: Some(Ty {
+            oid: t,
+            typmod: None,
+        }),
+    }
+}
+
+/// `c` cast to `t` (an explicit coercion).
+fn cast_to(t: PgTypeOid, c: Cooked) -> Cooked {
+    Cooked {
+        kind: Kind::Coerce(t, Box::new(c), true),
         ty: Some(Ty {
             oid: t,
             typmod: None,
@@ -824,7 +1300,7 @@ impl Folder<'_> {
                 kind: Kind::ScalarArrayOp(op, use_or, self.fold_all(args)),
                 ty,
             },
-            Kind::Coerce(t, arg) => self.coerce(t, self.fold(*arg)),
+            Kind::Coerce(t, arg, _) => self.coerce(t, self.fold(*arg)),
             Kind::Array(elem, elems) => {
                 let elems = self.fold_all(elems);
                 self.array(elem, &elems, ty).unwrap_or(Cooked {
@@ -861,7 +1337,22 @@ impl Folder<'_> {
                     ty,
                 }
             }
-            kind @ (Kind::Var(_) | Kind::Const(..) | Kind::Raw(_)) => Cooked { kind, ty },
+            // Not folded (PG folds a CASE, a COALESCE… over constants): such
+            // a tree compares different, never wrongly equal.
+            kind @ (Kind::Var(_)
+            | Kind::Const(..)
+            | Kind::Raw(_)
+            | Kind::Case(..)
+            | Kind::Coalesce(..)
+            | Kind::MinMax(..)
+            | Kind::NullIf(..)
+            | Kind::Distinct(..)
+            | Kind::Row(..)
+            | Kind::BoolTest(..)
+            | Kind::Collate(..)
+            | Kind::Subscript(..)
+            | Kind::Field(..)
+            | Kind::Call(..)) => Cooked { kind, ty },
         }
     }
 
@@ -1130,7 +1621,7 @@ impl Folder<'_> {
     /// (with the default type modifier).
     fn relabel(&self, t: PgTypeOid, arg: Cooked) -> Cooked {
         let mut arg = arg;
-        while let Kind::Coerce(d, inner) = &arg.kind
+        while let Kind::Coerce(d, inner, _) = &arg.kind
             && self.is_relabel(*d, inner.ty)
         {
             arg = (**inner).clone();
@@ -1242,293 +1733,861 @@ pub(crate) fn index_predicate_is_true(
 // ALTER COLUMN TYPE rebuilds the CHECK constraints and indexes reading the
 // column from the text `pg_get_constraintdef` / `pg_get_indexdef` print
 // for them — before the column changes — and parses that text again over
-// the new type. The text is ruleutils' rendering of the stored tree:
-// function and operator arguments show their implicit coercions as casts
-// (`get_rule_expr` with `showimplicit`), a constant is printed as its
-// output function writes it, typed unless the parser would type it so
-// anyway (`get_const_expr`), and routines, operators and types are named
-// unqualified only where an unqualified lookup with the arguments' types
-// finds them (`generate_function_name`, `generate_operator_name`,
-// `format_type_be`). [`deparse`] builds that text's parse tree from the
-// cooked expression; what the cooker doesn't model stays as written.
+// the new type. [`Printer`] writes that text from the cooked expression as
+// ruleutils' `get_rule_expr` does without pretty-printing: every operator
+// expression parenthesized; the implicit coercions shown where ruleutils
+// shows them (a function's or operator's arguments, a CASE result, an
+// ARRAY element…) and hidden elsewhere (the expression itself, an AND / OR
+// argument, a cast's argument…); a constant written as its output function
+// prints it, typed unless the parser would type it so anyway
+// (`get_const_expr`); routines, operators, types and collations named
+// unqualified only where an unqualified lookup — with the arguments'
+// types, for a routine or an operator — finds them
+// (`generate_function_name`, `generate_operator_name`, `format_type_be`,
+// `generate_collation_name`). [`deparse`] parses that text back (what the
+// cooker doesn't model is carried through as written); [`ruleutils_text`]
+// is the text itself, which the pg_sanity mirror compares with
+// `pg_get_expr`'s.
 
 /// The parse tree of what ruleutils prints for `expr`, a stored expression
 /// over the row of `relid` (a CHECK constraint's, an index expression or
-/// predicate). `None` when it doesn't analyze.
+/// predicate): the text PG parses again when it rebuilds it. `None` when
+/// it doesn't analyze.
 pub(crate) fn deparse(
     interp: &PgCatalog,
     relid: PgClassOid,
     expr: Option<&ast::Node>,
 ) -> Option<ast::Node> {
     let cooked = cook(interp, relid, expr, None)?;
-    // Fresh source locations, apart from the original ones the parts kept
-    // as written carry: the bindings recorded over the tree are keyed by
-    // them.
-    let deparser = Deparser {
-        interp,
-        next_location: std::cell::Cell::new(DEPARSED_LOCATIONS),
+    let printer = Printer::new(interp, true);
+    let text = printer.text(&cooked, false)?;
+    let raws = printer.raws.into_inner();
+    // The new nodes' source locations come after every original one the
+    // parts kept as written carry: the bindings recorded over the tree are
+    // keyed by them.
+    let after = raws
+        .iter()
+        .flatten()
+        .flat_map(|n| n.nodes().filter_map(|(n, ..)| n.location()))
+        .max()
+        .map_or(0, |l| l as usize + 1);
+    let sql = format!("{}SELECT {text}", " ".repeat(after));
+    let parsed = typedpg_pg_query::parse(&sql).ok()?;
+    let stmt = parsed.tree.stmts.into_iter().next()?.stmt?;
+    let ast::Node::SelectStmt(select) = stmt else {
+        return None;
     };
-    deparser.node(&cooked)
-}
-
-/// Where the source locations of the nodes [`deparse`] makes start.
-const DEPARSED_LOCATIONS: i32 = 1 << 24;
-
-struct Deparser<'a> {
-    interp: &'a PgCatalog,
-    next_location: std::cell::Cell<i32>,
-}
-
-/// A `String` node.
-fn name_node(s: &str) -> Option<ast::Node> {
-    Some(ast::Node::String(typedpg_pg_query::NodeBox::new(
-        ast::String { sval: s.to_owned() },
-    )))
-}
-
-impl Deparser<'_> {
-    fn location(&self) -> i32 {
-        let l = self.next_location.get();
-        self.next_location.set(l + 1);
-        l
-    }
-
-    /// The schema to name object `ns`'s object in, or `None` when an
-    /// unqualified lookup `visible` finds it.
-    fn qualifier(&self, ns: crate::oid::PgNamespaceOid, visible: bool) -> Vec<Option<ast::Node>> {
-        match self.interp.namespace_name(ns) {
-            Some(n) if !visible => vec![name_node(n)],
-            _ => Vec::new(),
+    let Some(Some(ast::Node::ResTarget(target))) = select.target_list.first().cloned() else {
+        return None;
+    };
+    let mut tree = ast::ParseResult {
+        version: 0,
+        stmts: vec![ast::RawStmt {
+            stmt: target.val.clone(),
+            stmt_location: 0,
+            stmt_len: 0,
+        }],
+    };
+    // The placeholders stand for the parts kept as written.
+    let mut missing = false;
+    tree.for_each_node_mut(|n, _| {
+        if let typedpg_pg_query::NodeMut::ColumnRef(cr) = n
+            && let [Some(ast::Node::String(s))] = cr.fields.as_slice()
+            && let Some(i) = s.sval.strip_prefix(RAW_PLACEHOLDER)
+        {
+            missing |= i.parse::<usize>().ok().and_then(|i| raws.get(i)).is_none();
         }
+    });
+    if missing {
+        return None;
     }
+    let mut out = tree.stmts.pop()?.stmt;
+    substitute_raws(&mut out, &raws);
+    out
+}
 
-    /// `format_type_be`'s name for type `t`: qualified unless visible (a
-    /// built-in one by `pg_catalog.typname`, as the grammar writes them).
-    fn type_name(&self, t: PgTypeOid) -> Option<ast::Node> {
-        let ty = self.interp.pg_type.get(&t)?;
-        let catalog = self.interp.namespace_name(ty.typnamespace) == Some("pg_catalog");
-        let mut names = if catalog {
-            vec![name_node("pg_catalog")]
-        } else {
-            let visible = self
-                .interp
-                .resolve_type_by_name(None, &ty.typname)
-                .is_some_and(|v| v.oid == t);
-            self.qualifier(ty.typnamespace, visible)
-        };
-        names.push(name_node(&ty.typname));
-        Some(ast::Node::TypeName(typedpg_pg_query::NodeBox::new(
-            ast::TypeName {
-                names,
-                typemod: -1,
-                location: self.location(),
-                ..Default::default()
-            },
-        )))
-    }
+/// The text ruleutils prints for `expr` (see [`deparse`]), when every part
+/// of it is modelled — its constants included, whose text the analyzer
+/// prints as their output functions would; `None` otherwise.
+#[cfg(any(test, feature = "pg_sanity"))]
+pub(crate) fn ruleutils_text(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+) -> Option<String> {
+    let cooked = cook(interp, relid, expr, None)?;
+    let printer = Printer::new(interp, false);
+    let text = printer.text(&cooked, false)?;
+    printer.exact.get().then_some(text)
+}
 
-    /// `(arg)::t`.
-    fn cast(&self, arg: Option<ast::Node>, t: PgTypeOid) -> Option<ast::Node> {
-        let Some(ast::Node::TypeName(tn)) = self.type_name(t) else {
+/// What `pg_get_indexdef(index, column)` prints for an index expression:
+/// [`ruleutils_text`], parenthesized unless it reads as a function call
+/// (`looks_like_function`).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn ruleutils_index_column_text(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+) -> Option<String> {
+    // A COLLATE over the whole expression is the column's collation
+    // (`indcollation`), which this form doesn't print.
+    let expr = match expr {
+        Some(ast::Node::CollateClause(cc)) => cc.arg.as_ref(),
+        other => other,
+    };
+    let text = ruleutils_text(interp, relid, expr)?;
+    let cooked = cook(interp, relid, expr, None)?;
+    let function_like = match &cooked.kind {
+        Kind::Func(..) | Kind::NullIf(..) | Kind::Coalesce(..) | Kind::MinMax(..) => true,
+        // A SQL syntax prints as a function but for AT TIME ZONE, AT LOCAL,
+        // OVERLAPS and IS NORMALIZED.
+        Kind::Call(proc, _, form) => {
+            !form.sql_syntax
+                || !interp.pg_proc.get(proc).is_some_and(|p| {
+                    matches!(
+                        p.proname.as_str(),
+                        "timezone" | "overlaps" | "is_normalized"
+                    )
+                })
+        }
+        _ => false,
+    };
+    Some(if function_like {
+        text
+    } else {
+        format!("({text})")
+    })
+}
+
+/// The name of the column a part kept as written stands in as.
+const RAW_PLACEHOLDER: &str = "typedpg raw part ";
+
+/// Put the parts kept as written back in place of their placeholders.
+fn substitute_raws(expr: &mut Option<ast::Node>, raws: &[Option<ast::Node>]) {
+    let placeholder = |n: &ast::Node| -> Option<usize> {
+        let ast::Node::ColumnRef(cr) = n else {
             return None;
         };
-        Some(ast::Node::TypeCast(typedpg_pg_query::NodeBox::new(
-            ast::TypeCast {
-                arg,
-                type_name: Some(tn),
-                location: self.location(),
-            },
-        )))
-    }
-
-    fn a_const(&self, val: Option<ast::AConstValue>) -> ast::Node {
-        ast::Node::AConst(typedpg_pg_query::NodeBox::new(ast::AConst {
-            isnull: val.is_none(),
-            location: self.location(),
-            val,
-        }))
-    }
-
-    fn string_const(&self, s: &str) -> ast::Node {
-        self.a_const(Some(ast::AConstValue::String(ast::String {
-            sval: s.to_owned(),
-        })))
-    }
-
-    /// `get_const_expr`: an `int4` bare unless negative, a float-looking
-    /// `numeric` bare, a boolean as `true` / `false`, anything else quoted
-    /// and cast to its type — a reg* constant written as its output
-    /// function prints the object it names.
-    fn constant(&self, t: PgTypeOid, value: Option<&str>) -> Option<ast::Node> {
-        let Some(v) = value else {
-            return self.cast(Some(self.a_const(None)), t);
+        let [Some(ast::Node::String(s))] = cr.fields.as_slice() else {
+            return None;
         };
-        if t == oid::INT4
-            && !v.starts_with('-')
-            && let Ok(i) = v.parse::<i32>()
+        s.sval.strip_prefix(RAW_PLACEHOLDER)?.parse().ok()
+    };
+    if let Some(i) = expr.as_ref().and_then(placeholder) {
+        *expr = raws.get(i).cloned().flatten();
+        return;
+    }
+    let mut tree = ast::ParseResult {
+        version: 0,
+        stmts: vec![ast::RawStmt {
+            stmt: expr.take(),
+            stmt_location: 0,
+            stmt_len: 0,
+        }],
+    };
+    tree.for_each_node_mut(|n, _| {
+        let slots: Vec<&mut Option<ast::Node>> = match n {
+            typedpg_pg_query::NodeMut::AExpr(e) => vec![&mut e.lexpr, &mut e.rexpr],
+            typedpg_pg_query::NodeMut::TypeCast(c) => vec![&mut c.arg],
+            typedpg_pg_query::NodeMut::FuncCall(f) => f.args.iter_mut().collect(),
+            typedpg_pg_query::NodeMut::BoolExpr(b) => b.args.iter_mut().collect(),
+            typedpg_pg_query::NodeMut::NullTest(t) => vec![&mut t.arg],
+            typedpg_pg_query::NodeMut::BooleanTest(t) => vec![&mut t.arg],
+            typedpg_pg_query::NodeMut::AArrayExpr(a) => a.elements.iter_mut().collect(),
+            typedpg_pg_query::NodeMut::CaseExpr(c) => {
+                let mut v = vec![&mut c.arg, &mut c.defresult];
+                v.extend(c.args.iter_mut());
+                v
+            }
+            typedpg_pg_query::NodeMut::CaseWhen(w) => vec![&mut w.expr, &mut w.result],
+            typedpg_pg_query::NodeMut::CoalesceExpr(c) => c.args.iter_mut().collect(),
+            typedpg_pg_query::NodeMut::MinMaxExpr(m) => m.args.iter_mut().collect(),
+            typedpg_pg_query::NodeMut::RowExpr(r) => r.args.iter_mut().collect(),
+            typedpg_pg_query::NodeMut::CollateClause(c) => vec![&mut c.arg],
+            typedpg_pg_query::NodeMut::NamedArgExpr(a) => vec![&mut a.arg],
+            typedpg_pg_query::NodeMut::AIndirection(i) => vec![&mut i.arg],
+            typedpg_pg_query::NodeMut::AIndices(i) => vec![&mut i.lidx, &mut i.uidx],
+            typedpg_pg_query::NodeMut::List(l) => l.items.iter_mut().collect(),
+            _ => Vec::new(),
+        };
+        for slot in slots {
+            if let Some(i) = slot.as_ref().and_then(placeholder) {
+                *slot = raws.get(i).cloned().flatten();
+            }
+        }
+    });
+    *expr = tree.stmts.pop().and_then(|s| s.stmt);
+}
+
+struct Printer<'a> {
+    interp: &'a PgCatalog,
+    /// The parts kept as written, which placeholders stand in for; `None`
+    /// when such a part makes the text unprintable.
+    raws: RefCell<Vec<Option<ast::Node>>>,
+    placeholders: bool,
+    /// Every constant printed as its output function would.
+    exact: std::cell::Cell<bool>,
+    /// `deparse_context.indentLevel`.
+    indent: std::cell::Cell<i32>,
+}
+
+impl<'a> Printer<'a> {
+    fn new(interp: &'a PgCatalog, placeholders: bool) -> Self {
+        Printer {
+            interp,
+            raws: RefCell::new(Vec::new()),
+            placeholders,
+            exact: std::cell::Cell::new(true),
+            indent: std::cell::Cell::new(0),
+        }
+    }
+
+    fn type_of(c: &Cooked) -> Option<PgTypeOid> {
+        c.ty.map(|t| t.oid)
+    }
+
+    /// `format_type_with_typemod(t, -1)`: `format_type_be`'s name, but
+    /// `bpchar` (CHARACTER would mean `character(1)`).
+    fn type_name(&self, t: PgTypeOid) -> String {
+        let Some(ty) = self.interp.pg_type.get(&t) else {
+            return String::new();
+        };
+        if ty.typname == "bpchar" {
+            return "bpchar".to_owned();
+        }
+        if let Some(elem) = ty.typelem
+            && self.interp.array_type_of(elem) == Some(t)
+            && self
+                .interp
+                .pg_type
+                .get(&elem)
+                .is_some_and(|e| e.typname == "bpchar")
         {
-            return Some(self.a_const(Some(ast::AConstValue::Integer(ast::Integer { ival: i }))));
+            return "bpchar[]".to_owned();
         }
-        if t == oid::NUMERIC
-            && v.starts_with(|c: char| c.is_ascii_digit())
-            && v.contains(['.', 'e', 'E'])
-        {
-            return Some(self.a_const(Some(ast::AConstValue::Float(ast::Float {
-                fval: v.to_owned(),
-            }))));
+        crate::ddl::util::format_type_for_message(self.interp, t)
+    }
+
+    /// `format_type_with_typemod(t, typmod)` for a type with a modifier.
+    fn type_name_typmod(&self, t: PgTypeOid, typmod: i32) -> String {
+        use crate::typmod::DecodedTypmod;
+        let name = self
+            .interp
+            .pg_type
+            .get(&t)
+            .filter(|ty| self.interp.namespace_name(ty.typnamespace) == Some("pg_catalog"))
+            .map(|ty| ty.typname.as_str());
+        let decoded = crate::typmod::decode(self.interp, t, Some(typmod));
+        match (name, decoded) {
+            (Some("varchar"), DecodedTypmod::Length(n)) => format!("character varying({n})"),
+            (Some("bpchar"), DecodedTypmod::Length(n)) => format!("character({n})"),
+            (Some("bit"), DecodedTypmod::Length(n)) => format!("bit({n})"),
+            (Some("varbit"), DecodedTypmod::Length(n)) => format!("bit varying({n})"),
+            (Some("numeric"), DecodedTypmod::Numeric { precision, scale }) => {
+                format!("numeric({precision},{scale})")
+            }
+            (Some("timestamp"), DecodedTypmod::Precision(p)) => {
+                format!("timestamp({p}) without time zone")
+            }
+            (Some("timestamptz"), DecodedTypmod::Precision(p)) => {
+                format!("timestamp({p}) with time zone")
+            }
+            (Some("time"), DecodedTypmod::Precision(p)) => format!("time({p}) without time zone"),
+            (Some("timetz"), DecodedTypmod::Precision(p)) => format!("time({p}) with time zone"),
+            _ => {
+                self.exact.set(false);
+                self.type_name(t)
+            }
         }
-        if t == oid::BOOL {
-            return Some(self.a_const(Some(ast::AConstValue::Boolean(ast::Boolean {
-                boolval: v == "t",
-            }))));
+    }
+
+    /// `get_func_sql_syntax`: the SQL syntax of built-in routine `proc`
+    /// over `args`, appended to `buf` — `false` (nothing appended) for one
+    /// it doesn't know.
+    fn sql_syntax(&self, buf: &mut String, proc: PgProcOid, args: &[&Cooked]) -> Option<bool> {
+        let row = self.interp.pg_proc.get(&proc)?;
+        if self.interp.namespace_name(row.pronamespace) != Some("pg_catalog") {
+            return Some(false);
         }
-        let text =
-            crate::ddl::stored_exprs::reg_output(self.interp, t, v).unwrap_or_else(|| v.to_owned());
-        self.cast(Some(self.string_const(&text)), t)
+        let text = |c: &Cooked| self.text(c, false);
+        let constant = |c: &Cooked| match &c.kind {
+            Kind::Const(_, Some(v)) => Some(v.clone()),
+            _ => None,
+        };
+        let out = match (row.proname.as_str(), args) {
+            ("timezone", [zone, value]) => {
+                format!("({} AT TIME ZONE {})", text(value)?, text(zone)?)
+            }
+            ("timezone", [value]) => format!("({} AT LOCAL)", text(value)?),
+            ("overlaps", [a, b, c, d]) => format!(
+                "(({}, {}) OVERLAPS ({}, {}))",
+                text(a)?,
+                text(b)?,
+                text(c)?,
+                text(d)?
+            ),
+            ("extract", [field, value]) => format!(
+                "EXTRACT({} FROM {})",
+                typedpg_core::quote_identifier(&constant(field)?),
+                text(value)?
+            ),
+            ("is_normalized", [value]) => format!("({} IS NORMALIZED)", text(value)?),
+            ("is_normalized", [value, form]) => {
+                format!("({} IS {} NORMALIZED)", text(value)?, constant(form)?)
+            }
+            ("pg_collation_for", [value]) => format!("COLLATION FOR ({})", text(value)?),
+            ("normalize", [value]) => format!("NORMALIZE({})", text(value)?),
+            ("normalize", [value, form]) => {
+                format!("NORMALIZE({}, {})", text(value)?, constant(form)?)
+            }
+            ("overlay", [a, b, c]) => format!(
+                "OVERLAY({} PLACING {} FROM {})",
+                text(a)?,
+                text(b)?,
+                text(c)?
+            ),
+            ("overlay", [a, b, c, d]) => format!(
+                "OVERLAY({} PLACING {} FROM {} FOR {})",
+                text(a)?,
+                text(b)?,
+                text(c)?,
+                text(d)?
+            ),
+            ("position", [haystack, needle]) => {
+                format!("POSITION(({}) IN ({}))", text(needle)?, text(haystack)?)
+            }
+            ("substring", [value, pattern, escape])
+                if Self::type_of(pattern) == Some(oid::TEXT) =>
+            {
+                format!(
+                    "SUBSTRING({} SIMILAR {} ESCAPE {})",
+                    text(value)?,
+                    text(pattern)?,
+                    text(escape)?
+                )
+            }
+            ("substring", [value, from]) => {
+                format!("SUBSTRING({} FROM {})", text(value)?, text(from)?)
+            }
+            ("substring", [value, from, count]) => format!(
+                "SUBSTRING({} FROM {} FOR {})",
+                text(value)?,
+                text(from)?,
+                text(count)?
+            ),
+            (trim @ ("btrim" | "ltrim" | "rtrim"), [value, rest @ ..]) if rest.len() <= 1 => {
+                let side = match trim {
+                    "btrim" => "BOTH",
+                    "ltrim" => "LEADING",
+                    _ => "TRAILING",
+                };
+                let chars = match rest {
+                    [chars] => format!(" {}", text(chars)?),
+                    _ => String::new(),
+                };
+                format!("TRIM({side}{chars} FROM {})", text(value)?)
+            }
+            ("system_user", []) => "SYSTEM_USER".to_owned(),
+            _ => return Some(false),
+        };
+        buf.push_str(&out);
+        Some(true)
+    }
+
+    /// `quote_qualified_identifier(schema, name)`, the schema only when
+    /// not `visible`.
+    fn qualified(&self, ns: crate::oid::PgNamespaceOid, name: &str, visible: bool) -> String {
+        match self.interp.namespace_name(ns) {
+            Some(schema) if !visible => {
+                crate::qualified_name::QualifiedName::new(schema, name).to_string()
+            }
+            _ => typedpg_core::quote_identifier(name),
+        }
     }
 
     /// `generate_function_name`: unqualified when an unqualified call with
-    /// the arguments' types resolves to routine `proc`.
-    fn function_name(&self, proc: PgProcOid, args: &[Cooked]) -> Option<Vec<Option<ast::Node>>> {
+    /// the arguments' types (and names, and VARIADIC) resolves to `proc`.
+    fn function_name(
+        &self,
+        proc: PgProcOid,
+        args: &[(Option<String>, &Cooked)],
+        variadic: bool,
+    ) -> Option<String> {
         let row = self.interp.pg_proc.get(&proc)?;
-        let types: Option<Vec<PgTypeOid>> = args.iter().map(|a| a.ty.map(|t| t.oid)).collect();
+        let types: Option<Vec<PgTypeOid>> = args.iter().map(|(_, a)| Self::type_of(a)).collect();
         let types = types.unwrap_or_else(|| row.proargtypes.clone());
+        let notation = crate::functions::CallNotation {
+            names: args.iter().filter_map(|(n, _)| n.clone()).collect(),
+            variadic,
+            ..Default::default()
+        };
         let visible = crate::functions::resolve_function(
             self.interp,
             None,
             &row.proname,
             &types,
-            &crate::functions::CallNotation::default(),
+            &notation,
             false,
             None,
         )
         .is_ok_and(|f| f.oid == proc);
-        let mut names = self.qualifier(row.pronamespace, visible);
-        names.push(name_node(&row.proname));
-        Some(names)
+        Some(self.qualified(row.pronamespace, &row.proname, visible))
     }
 
-    /// `generate_operator_name`: unqualified (else `OPERATOR(schema.op)`)
-    /// when the unqualified operator over the operands' types resolves to
-    /// `op`.
-    fn operator_name(&self, op: PgOperatorOid, args: &[Cooked]) -> Option<Vec<Option<ast::Node>>> {
+    /// `generate_operator_name`: unqualified when the unqualified operator
+    /// over the operands' types resolves to `op`, else `OPERATOR(s.op)`.
+    fn operator_name(
+        &self,
+        op: PgOperatorOid,
+        left: Option<PgTypeOid>,
+        right: Option<PgTypeOid>,
+    ) -> Option<String> {
         let row = self.interp.pg_operator.get(&op)?;
-        let ty = |c: Option<&Cooked>| c.and_then(|c| c.ty).map(|t| t.oid);
-        let (left, right) = match args {
-            [l, r] => (
-                ty(Some(l)).or(row.oprleft),
-                ty(Some(r)).unwrap_or(row.oprright),
-            ),
-            [r] => (None, ty(Some(r)).unwrap_or(row.oprright)),
-            _ => (row.oprleft, row.oprright),
-        };
+        let left = left.or(row.oprleft);
+        let right = right.unwrap_or(row.oprright);
         let visible = matches!(
             self.interp.find_operator_detailed(&row.oprname, left, right),
             crate::lookup::OperatorMatch::Found(r) if r.oid == op
         );
-        let mut names = self.qualifier(row.oprnamespace, visible);
-        names.push(name_node(&row.oprname));
-        Some(names)
+        Some(if visible {
+            row.oprname.clone()
+        } else {
+            format!(
+                "OPERATOR({}.{})",
+                typedpg_core::quote_identifier(self.interp.namespace_name(row.oprnamespace)?),
+                row.oprname
+            )
+        })
     }
 
-    fn nodes(&self, args: &[Cooked]) -> Option<Vec<Option<ast::Node>>> {
-        args.iter().map(|a| self.node(a).map(Some)).collect()
-    }
-
-    fn node(&self, c: &Cooked) -> Option<ast::Node> {
-        Some(match &c.kind {
-            Kind::Var(name) => {
-                ast::Node::ColumnRef(typedpg_pg_query::NodeBox::new(ast::ColumnRef {
-                    fields: vec![name_node(name)],
-                    location: self.location(),
-                }))
+    /// `get_const_expr` (`showtype` 0, or -1 for no type label).
+    fn constant(&self, t: PgTypeOid, value: Option<&str>, label: bool) -> String {
+        let Some(v) = value else {
+            return if label {
+                format!("NULL::{}", self.type_name(t))
+            } else {
+                "NULL".to_owned()
+            };
+        };
+        let quoted = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let (text, needlabel) = if t == oid::INT4 {
+            if v.starts_with('-') {
+                (quoted(v), true)
+            } else {
+                (v.to_owned(), false)
             }
-            Kind::Const(t, value) => return self.constant(*t, value.as_deref()),
-            Kind::Coerce(t, arg) => return self.cast(Some(self.node(arg)?), *t),
-            Kind::Op(op, args) => {
-                let name = self.operator_name(*op, args)?;
-                let mut nodes = self.nodes(args)?;
-                let rexpr = nodes.pop().flatten();
-                let lexpr = nodes.pop().flatten();
-                ast::Node::AExpr(typedpg_pg_query::NodeBox::new(ast::AExpr {
-                    kind: ast::AExprKind::AexprOp,
-                    name,
-                    lexpr,
-                    rexpr,
-                    location: self.location(),
-                    ..Default::default()
+        } else if t == oid::NUMERIC {
+            if v.starts_with(|c: char| c.is_ascii_digit()) && v.contains(['.', 'e', 'E']) {
+                (v.to_owned(), false)
+            } else {
+                (quoted(v), true)
+            }
+        } else if t == oid::BOOL {
+            (if v == "t" { "true" } else { "false" }.to_owned(), false)
+        } else if let Some(out) = crate::ddl::stored_exprs::reg_output(self.interp, t, v) {
+            (quoted(&out), true)
+        } else {
+            if !self.output_is_input(t, v) {
+                self.exact.set(false);
+            }
+            (quoted(v), t != oid::UNKNOWN)
+        };
+        if label && needlabel {
+            format!("{text}::{}", self.type_name(t))
+        } else {
+            text
+        }
+    }
+
+    /// Whether the output function of type `t` prints `v` back as written:
+    /// for the string types and enums (a label is its own output), and
+    /// for an integer the cooker canonicalized.
+    fn output_is_input(&self, t: PgTypeOid, v: &str) -> bool {
+        let base = self.interp.unwrap_domain(t);
+        [oid::TEXT, oid::VARCHAR, oid::BPCHAR, oid::NAME, oid::INT2, oid::INT8].contains(&base)
+            || self
+                .interp
+                .get_type(base)
+                .is_some_and(|ty| ty.typtype == TypType::Enum)
+            || (base == oid::NUMERIC
+                && !v.starts_with(['0', '+', '.'])
+                && v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            // A date in the ISO form `date_out` writes (DateStyle ISO).
+            || (self.interp.pg_type.get(&base).is_some_and(|t| t.typname == "date")
+                && v.len() == 10
+                && v.char_indices().all(|(i, c)| {
+                    if i == 4 || i == 7 {
+                        c == '-'
+                    } else {
+                        c.is_ascii_digit()
+                    }
                 }))
+    }
+
+    /// `appendContextKeyword` with `PRETTYFLAG_INDENT` (which even the
+    /// non-pretty output has): the buffer's trailing spaces removed, a
+    /// newline, the indentation, the keyword.
+    fn keyword(&self, buf: &mut String, word: &str, before: i32, after: i32) {
+        let level = self.indent.get() + before;
+        while buf.ends_with(' ') {
+            buf.pop();
+        }
+        buf.push('\n');
+        // PRETTYINDENT_LIMIT: deeper levels wrap.
+        const LIMIT: i32 = 40;
+        let amount = if level < LIMIT {
+            level.max(0)
+        } else {
+            (LIMIT + (level - LIMIT) / 4) % LIMIT
+        };
+        buf.push_str(&" ".repeat(amount as usize));
+        buf.push_str(word);
+        self.indent.set((level + after).max(0));
+    }
+
+    fn list(&self, buf: &mut String, args: &[Cooked], show: bool) -> Option<()> {
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(", ");
+            }
+            self.write(buf, a, show)?;
+        }
+        Some(())
+    }
+
+    /// `get_rule_expr(c, showimplicit = show)`, as a string.
+    fn text(&self, c: &Cooked, show: bool) -> Option<String> {
+        let mut buf = String::new();
+        self.write(&mut buf, c, show)?;
+        Some(buf)
+    }
+
+    /// `get_rule_expr(c, showimplicit = show)`, appended to `buf`.
+    fn write(&self, buf: &mut String, c: &Cooked, show: bool) -> Option<()> {
+        match &c.kind {
+            Kind::Var(name) => buf.push_str(&typedpg_core::quote_identifier(name)),
+            Kind::Const(t, value) => buf.push_str(&self.constant(*t, value.as_deref(), true)),
+            Kind::Coerce(t, arg, explicit) => {
+                if !explicit && !show {
+                    return self.write(buf, arg, false);
+                }
+                // get_coercion_expr: a constant of the type already isn't
+                // labeled twice.
+                match &arg.kind {
+                    Kind::Const(ct, value) if ct == t => {
+                        buf.push_str(&self.constant(*ct, value.as_deref(), false));
+                    }
+                    _ => {
+                        buf.push('(');
+                        self.write(buf, arg, false)?;
+                        buf.push(')');
+                    }
+                }
+                buf.push_str("::");
+                match c.ty.and_then(|ty| ty.typmod) {
+                    Some(typmod) => buf.push_str(&self.type_name_typmod(*t, typmod)),
+                    None => buf.push_str(&self.type_name(*t)),
+                }
+            }
+            Kind::Op(op, args) => {
+                buf.push('(');
+                match args.as_slice() {
+                    [l, r] => {
+                        self.write(buf, l, true)?;
+                        buf.push(' ');
+                        buf.push_str(&self.operator_name(
+                            *op,
+                            Self::type_of(l),
+                            Self::type_of(r),
+                        )?);
+                        buf.push(' ');
+                        self.write(buf, r, true)?;
+                    }
+                    [r] => {
+                        buf.push_str(&self.operator_name(*op, None, Self::type_of(r))?);
+                        buf.push(' ');
+                        self.write(buf, r, true)?;
+                    }
+                    _ => return None,
+                }
+                buf.push(')');
             }
             Kind::ScalarArrayOp(op, use_or, args) => {
-                let name = self.operator_name(*op, args)?;
-                let mut nodes = self.nodes(args)?;
-                let rexpr = nodes.pop().flatten();
-                let lexpr = nodes.pop().flatten();
-                ast::Node::AExpr(typedpg_pg_query::NodeBox::new(ast::AExpr {
-                    kind: if *use_or {
-                        ast::AExprKind::AexprOpAny
-                    } else {
-                        ast::AExprKind::AexprOpAll
-                    },
-                    name,
-                    lexpr,
-                    rexpr,
-                    location: self.location(),
-                    ..Default::default()
-                }))
+                let [l, r] = args.as_slice() else {
+                    return None;
+                };
+                let elem =
+                    Self::type_of(r).and_then(|a| crate::expr::array_element_type(self.interp, a));
+                buf.push('(');
+                self.write(buf, l, true)?;
+                buf.push(' ');
+                buf.push_str(&self.operator_name(*op, Self::type_of(l), elem)?);
+                buf.push_str(if *use_or { " ANY (" } else { " ALL (" });
+                self.write(buf, r, true)?;
+                buf.push_str("))");
             }
             Kind::Func(proc, args) => {
-                ast::Node::FuncCall(typedpg_pg_query::NodeBox::new(ast::FuncCall {
-                    funcname: self.function_name(*proc, args)?,
-                    args: self.nodes(args)?,
-                    location: self.location(),
-                    ..Default::default()
-                }))
+                let named: Vec<(Option<String>, &Cooked)> =
+                    args.iter().map(|a| (None, a)).collect();
+                buf.push_str(&self.function_name(*proc, &named, false)?);
+                buf.push('(');
+                self.list(buf, args, true)?;
+                buf.push(')');
+            }
+            Kind::Call(proc, args, form) => {
+                // A SQL syntax of its own (`EXTRACT(year FROM t)`): as
+                // get_func_sql_syntax prints it, else as a call — the same
+                // routine, but not the same text.
+                if form.sql_syntax {
+                    let values: Vec<&Cooked> = args.iter().map(|(_, a)| a).collect();
+                    if self.sql_syntax(buf, *proc, &values)? {
+                        return Some(());
+                    }
+                    self.exact.set(false);
+                }
+                let named: Vec<(Option<String>, &Cooked)> =
+                    args.iter().map(|(n, a)| (n.clone(), a)).collect();
+                buf.push_str(&self.function_name(*proc, &named, form.variadic)?);
+                buf.push('(');
+                for (i, (name, a)) in args.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    if form.variadic && i + 1 == args.len() {
+                        buf.push_str("VARIADIC ");
+                    }
+                    if let Some(n) = name {
+                        buf.push_str(&typedpg_core::quote_identifier(n));
+                        buf.push_str(" => ");
+                    }
+                    self.write(buf, a, true)?;
+                }
+                buf.push(')');
             }
             Kind::Array(elem, elems) => {
-                let array =
-                    ast::Node::AArrayExpr(typedpg_pg_query::NodeBox::new(ast::AArrayExpr {
-                        elements: self.nodes(elems)?,
-                        location: self.location(),
-                        ..Default::default()
-                    }));
-                // An empty one is cast to its type.
+                buf.push_str("ARRAY[");
+                self.list(buf, elems, true)?;
+                buf.push(']');
                 if elems.is_empty() {
-                    return self.cast(Some(array), self.interp.array_type_of(*elem)?);
+                    buf.push_str("::");
+                    buf.push_str(&self.type_name(self.interp.array_type_of(*elem)?));
                 }
-                array
             }
             Kind::Bool(k, args) => {
-                let boolop = [
-                    ast::BoolExprType::AndExpr,
-                    ast::BoolExprType::OrExpr,
-                    ast::BoolExprType::NotExpr,
-                ]
-                .into_iter()
-                .find(|b| *b as u8 == *k)?;
-                ast::Node::BoolExpr(typedpg_pg_query::NodeBox::new(ast::BoolExpr {
-                    boolop,
-                    args: self.nodes(args)?,
-                    location: self.location(),
-                }))
+                buf.push('(');
+                if *k == ast::BoolExprType::NotExpr as u8 {
+                    buf.push_str("NOT ");
+                    self.write(buf, args.first()?, false)?;
+                } else {
+                    let sep = if *k == ast::BoolExprType::AndExpr as u8 {
+                        " AND "
+                    } else {
+                        " OR "
+                    };
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            buf.push_str(sep);
+                        }
+                        self.write(buf, a, false)?;
+                    }
+                }
+                buf.push(')');
             }
             Kind::NullTest(is_null, arg) => {
-                ast::Node::NullTest(typedpg_pg_query::NodeBox::new(ast::NullTest {
-                    arg: self.node(arg),
-                    nulltesttype: if *is_null {
-                        ast::NullTestType::IsNull
-                    } else {
-                        ast::NullTestType::IsNotNull
-                    },
-                    argisrow: false,
-                    location: self.location(),
-                }))
+                buf.push('(');
+                self.write(buf, arg, true)?;
+                buf.push_str(if *is_null {
+                    " IS NULL)"
+                } else {
+                    " IS NOT NULL)"
+                });
             }
-            // As written, its names printed as the current search path
-            // shows them.
+            Kind::BoolTest(k, arg) => {
+                let test = match *k {
+                    k if k == ast::BoolTestType::IsTrue as u8 => " IS TRUE)",
+                    k if k == ast::BoolTestType::IsNotTrue as u8 => " IS NOT TRUE)",
+                    k if k == ast::BoolTestType::IsFalse as u8 => " IS FALSE)",
+                    k if k == ast::BoolTestType::IsNotFalse as u8 => " IS NOT FALSE)",
+                    k if k == ast::BoolTestType::IsUnknown as u8 => " IS UNKNOWN)",
+                    _ => " IS NOT UNKNOWN)",
+                };
+                buf.push('(');
+                self.write(buf, arg, false)?;
+                buf.push_str(test);
+            }
+            Kind::Case(arg, whens, default) => {
+                // PRETTYINDENT_VAR.
+                self.keyword(buf, "CASE", 0, 4);
+                if let Some(a) = arg {
+                    buf.push(' ');
+                    self.write(buf, a, true)?;
+                }
+                for (cond, result) in whens {
+                    self.keyword(buf, "WHEN ", 0, 0);
+                    self.write(buf, cond, false)?;
+                    buf.push_str(" THEN ");
+                    self.write(buf, result, true)?;
+                }
+                self.keyword(buf, "ELSE ", 0, 0);
+                self.write(buf, default, true)?;
+                self.keyword(buf, "END", -4, 0);
+            }
+            Kind::Coalesce(args) => {
+                buf.push_str("COALESCE(");
+                self.list(buf, args, true)?;
+                buf.push(')');
+            }
+            Kind::MinMax(greatest, args) => {
+                buf.push_str(if *greatest { "GREATEST(" } else { "LEAST(" });
+                self.list(buf, args, true)?;
+                buf.push(')');
+            }
+            Kind::NullIf(_, args) => {
+                buf.push_str("NULLIF(");
+                self.list(buf, args, true)?;
+                buf.push(')');
+            }
+            Kind::Distinct(_, args) => {
+                let [l, r] = args.as_slice() else {
+                    return None;
+                };
+                buf.push('(');
+                self.write(buf, l, true)?;
+                buf.push_str(" IS DISTINCT FROM ");
+                self.write(buf, r, true)?;
+                buf.push(')');
+            }
+            Kind::Row(args, cast) => {
+                buf.push_str("ROW(");
+                self.list(buf, args, true)?;
+                buf.push(')');
+                if let Some(t) = cast {
+                    buf.push_str("::");
+                    buf.push_str(&self.type_name(*t));
+                }
+            }
+            Kind::Collate(collation, arg) => {
+                let row = self.interp.pg_collation.get(collation)?;
+                let visible = self
+                    .interp
+                    .resolve_collation(None, &row.collname)
+                    .is_some_and(|c| c.oid == *collation);
+                buf.push('(');
+                self.write(buf, arg, show)?;
+                buf.push_str(" COLLATE ");
+                buf.push_str(&self.qualified(row.collnamespace, &row.collname, visible));
+                buf.push(')');
+            }
+            Kind::Subscript(arg, subscripts) => {
+                let parens = !matches!(arg.kind, Kind::Var(_) | Kind::Field(..));
+                if parens {
+                    buf.push('(');
+                }
+                self.write(buf, arg, show)?;
+                if parens {
+                    buf.push(')');
+                }
+                for (lower, upper, slice) in subscripts {
+                    buf.push('[');
+                    if *slice {
+                        if let Some(l) = lower {
+                            self.write(buf, l, false)?;
+                        }
+                        buf.push(':');
+                    }
+                    if let Some(u) = upper {
+                        self.write(buf, u, false)?;
+                    }
+                    buf.push(']');
+                }
+            }
+            Kind::Field(arg, field) => {
+                // PG keeps the field's type from when the expression was
+                // stored; the row type a routine returns can change since
+                // (ALTER TABLE of the table it is), and the analyzer reads
+                // today's.
+                if matches!(arg.kind, Kind::Func(..) | Kind::Call(..)) {
+                    self.exact.set(false);
+                }
+                let parens = !matches!(arg.kind, Kind::Subscript(..) | Kind::Field(..));
+                if parens {
+                    buf.push('(');
+                }
+                self.write(buf, arg, true)?;
+                if parens {
+                    buf.push(')');
+                }
+                buf.push('.');
+                buf.push_str(&typedpg_core::quote_identifier(field));
+            }
             Kind::Raw(node) => {
-                return crate::ddl::stored_exprs::render(self.interp, node.as_ref());
+                if !self.placeholders {
+                    return None;
+                }
+                self.exact.set(false);
+                let mut raws = self.raws.borrow_mut();
+                raws.push(crate::ddl::stored_exprs::render(self.interp, node.as_ref()));
+                buf.push_str(&typedpg_core::quote_identifier(&format!(
+                    "{RAW_PLACEHOLDER}{}",
+                    raws.len() - 1
+                )));
             }
-        })
+        }
+        Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pg_catalog::PgCatalog;
+
+    /// The text ruleutils prints for `expr` over table `t`.
+    fn printed(db: &PgCatalog, expr: &str) -> Option<String> {
+        let relid = db
+            .pg_class
+            .iter()
+            .find(|(_, c)| c.relname == "t")
+            .map(|(&o, _)| o)?;
+        let parsed = typedpg_pg_query::parse(&format!("SELECT {expr}")).ok()?;
+        let typedpg_pg_query::ast::Node::SelectStmt(s) = parsed.tree.stmts[0].stmt.clone()? else {
+            return None;
+        };
+        let Some(Some(typedpg_pg_query::ast::Node::ResTarget(t))) = s.target_list.first().cloned()
+        else {
+            return None;
+        };
+        super::ruleutils_text(db, relid, t.val.as_ref())
+    }
+
+    #[test]
+    fn expressions_print_as_ruleutils_prints_them() {
+        // What pg_get_expr prints for these on PostgreSQL 19 (the pg_sanity
+        // mirror compares every stored expression's text the same way).
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE FUNCTION pos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+             CREATE DOMAIN dbool AS bool;
+             CREATE TABLE t (a int, b smallint, c varchar(10), d text, f bool, bd dbool);",
+        )
+        .unwrap();
+        for (expr, text) in [
+            ("a > '5'", "(a > 5)"),
+            ("pos(b)", "pos((b)::integer)"),
+            ("c = 'x'", "((c)::text = 'x'::text)"),
+            ("bd AND f", "(bd AND f)"),
+            (
+                "COALESCE(a, b, 0) > 0",
+                "(COALESCE(a, (b)::integer, 0) > 0)",
+            ),
+            (
+                "CASE WHEN a > 0 THEN b END > 0",
+                "(\nCASE\n    WHEN (a > 0) THEN b\n    ELSE NULL::smallint\nEND > 0)",
+            ),
+            ("d::char(3) <> ''", "((d)::character(3) <> ''::bpchar)"),
+            ("a IS NOT DISTINCT FROM b", "(NOT (a IS DISTINCT FROM b))"),
+        ] {
+            assert_eq!(printed(&db, expr).as_deref(), Some(text), "{expr}");
+        }
     }
 }

@@ -2266,17 +2266,88 @@ pub(crate) fn alter_column_type(
         crate::ddl::indexes::table_rewritten(interp, relid);
         super::toast::heap_rewritten(interp, relid);
     }
+    let retyped = Retyped {
+        relid,
+        attr,
+        old_type: old_type_oid,
+    };
+    let deferred = RETYPE_BATCH.with(|b| match b.borrow_mut().as_mut() {
+        Some(batch) => {
+            batch.push(retyped.clone());
+            true
+        }
+        None => false,
+    });
+    if deferred {
+        return Ok(());
+    }
+    rebuild_after_retype(interp, &retyped)
+}
+
+/// A column ALTER COLUMN TYPE changed: its relation, and the column as it
+/// was.
+#[derive(Clone)]
+struct Retyped {
+    relid: PgClassOid,
+    attr: PgAttribute,
+    old_type: crate::oid::PgTypeOid,
+}
+
+thread_local! {
+    /// The columns the ALTER TABLE being applied has retyped so far, whose
+    /// dependents are rebuilt once its ALTER TYPE subcommands are done.
+    static RETYPE_BATCH: std::cell::RefCell<Option<Vec<Retyped>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// ATPostAlterTypeCleanup for one retyped column: its indexes, foreign
+/// keys and CHECK constraints rebuilt over the new type.
+fn rebuild_after_retype(interp: &mut PgCatalog, r: &Retyped) -> Result<(), DdlError> {
     crate::ddl::indexes::rebuild_indexes_for_column_type(
         interp,
-        relid,
-        attr.attnum,
-        old_type_oid,
-        attr.attcollation,
+        r.relid,
+        r.attr.attnum,
+        r.old_type,
+        r.attr.attcollation,
     )?;
-    super::foreign_keys::repick_indexes_after_retype(interp, relid, attr.attnum);
-    recheck_dependents_of_retyped_column(interp, relid, &attr)?;
-    super::check_inherit::recook_checks_reading(interp, relid, attr.attnum);
+    super::foreign_keys::repick_indexes_after_retype(interp, r.relid, r.attr.attnum);
+    recheck_dependents_of_retyped_column(interp, r.relid, &r.attr)?;
+    super::check_inherit::recook_checks_reading(interp, r.relid, r.attr.attnum);
     Ok(())
+}
+
+/// The ALTER TYPE subcommands of one ALTER TABLE, run together as PG's
+/// AT_PASS_ALTER_TYPE does: each dependent expression's text remembered
+/// once, before any column of the statement changes
+/// (RememberAllDependentForRebuilding), and the dependents rebuilt after
+/// the last subcommand (ATPostAlterTypeCleanup). Dropped without
+/// [`RetypeBatch::finish`] (a subcommand failed), it forgets the batch.
+pub(crate) struct RetypeBatch(());
+
+impl RetypeBatch {
+    pub(crate) fn begin() -> Self {
+        RETYPE_BATCH.with(|b| *b.borrow_mut() = Some(Vec::new()));
+        crate::ddl::stored_exprs::begin_remembering();
+        RetypeBatch(())
+    }
+
+    /// Rebuild what the batch's columns' dependents.
+    pub(crate) fn finish(self, interp: &mut PgCatalog) -> Result<(), DdlError> {
+        let retyped = RETYPE_BATCH
+            .with(|b| b.borrow_mut().take())
+            .unwrap_or_default();
+        crate::ddl::stored_exprs::end_remembering();
+        retyped
+            .iter()
+            .try_for_each(|r| rebuild_after_retype(interp, r))
+    }
+}
+
+impl Drop for RetypeBatch {
+    fn drop(&mut self) {
+        RETYPE_BATCH.with(|b| *b.borrow_mut() = None);
+        crate::ddl::stored_exprs::end_remembering();
+    }
 }
 
 /// ATPostAlterTypeCleanup: what reads a retyped column is rebuilt from its

@@ -560,14 +560,24 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         // ── Functions ───────────────────────────────────────────────
         ast::Node::CreateFunctionStmt(s) => {
             functions::create_function(db, s)?;
+            // A SQL-standard body is stored analyzed.
+            stored_exprs::refuse_unstorable_constant_casts(db, [s.sql_body.as_ref()])?;
             note_user_code(db);
             Ok(())
         }
         ast::Node::AlterFunctionStmt(s) => functions::alter_function(db, s),
 
         // ── Views ───────────────────────────────────────────────────
-        ast::Node::ViewStmt(s) => views::create_view(db, s),
-        ast::Node::CreateTableAsStmt(s) => views::create_table_as(db, s),
+        ast::Node::ViewStmt(s) => views::create_view(db, s)
+            .and_then(|()| stored_exprs::refuse_unstorable_constant_casts(db, [s.query.as_ref()])),
+        ast::Node::CreateTableAsStmt(s) => {
+            views::create_table_as(db, s)?;
+            // A materialized view keeps its query.
+            if s.objtype == ast::ObjectType::ObjectMatview {
+                stored_exprs::refuse_unstorable_constant_casts(db, [s.query.as_ref()])?;
+            }
+            Ok(())
+        }
 
         // ── Extensions ──────────────────────────────────────────────
         ast::Node::CreateExtensionStmt(s) => extensions::create_extension(db, s),
@@ -642,7 +652,14 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::AlterPolicyStmt(s) => {
             policies::alter_policy(db, s).and_then(|()| coldeps::record_policy_alter(db, s))
         }
-        ast::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|refs| coldeps::record_rule(db, s, &refs)),
+        ast::Node::RuleStmt(s) => rules::create_rule(db, s)
+            .and_then(|refs| coldeps::record_rule(db, s, &refs))
+            .and_then(|()| {
+                stored_exprs::refuse_unstorable_constant_casts(
+                    db,
+                    std::iter::once(s.where_clause.as_ref()).chain(s.actions.iter().map(Option::as_ref)),
+                )
+            }),
         ast::Node::CreateAmStmt(s) => opclass::create_am(db, s),
         ast::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
         ast::Node::CreatePLangStmt(s) => languages::create_language(db, s),

@@ -570,6 +570,11 @@ pub struct PgCatalog {
     /// CHECK constraints' expressions and `connoinherit`.
     pub(crate) check_defs:
         Shared<HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>>,
+    /// The stored expressions (by a hash of their tree) already bound to
+    /// the objects their names found (see
+    /// [`crate::ddl::stored_exprs::bind_stored_expressions`]): a later
+    /// statement's search path doesn't rebind them.
+    pub(crate) bound_stored_exprs: Shared<std::collections::HashSet<u64>>,
     /// Tables and materialized views with a TOAST table (`reltoastrelid`):
     /// the CREATE or ALTER that first left them with a column needing one
     /// (needs_toast_table) made it, and it stays.
@@ -1047,6 +1052,7 @@ impl PgCatalog {
             fk_details: Shared::default(),
             partition_bounds: Shared::default(),
             check_defs: Shared::default(),
+            bound_stored_exprs: Shared::default(),
             toast_tables: Shared::default(),
             toast_rewrites: Shared::default(),
             security_barrier_views: Shared::default(),
