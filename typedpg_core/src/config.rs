@@ -70,7 +70,9 @@
 //! `redundant_binding` and `renaming_binding` ([`RUST_LINT_RULES`]) run over
 //! the Rust source of the invocations, so only `cargo typedpg lint` reports
 //! them, and only this configuration accepts their keys — the TypeScript CLI
-//! has no bindings.
+//! has no bindings. Likewise `json_stringify_param` ([`TS_LINT_RULES`]) runs
+//! over the TypeScript calls only, and only the TypeScript CLI accepts its
+//! key.
 //! `ignore` lists glob patterns, relative to the manifest's directory. A
 //! matching query file's findings are not reported; a matching migration
 //! file keeps its schema findings (`fk_without_index`, `redundant_index`),
@@ -259,6 +261,13 @@ pub const LINT_RULES: &[&str] = &[
 /// bindings and keeps rejecting them, so they are accepted only in
 /// `[package.metadata.typedpg.lint]`.
 pub const RUST_LINT_RULES: &[&str] = &["redundant_binding", "renaming_binding"];
+
+/// The lint rules over the TypeScript source of a query's calls:
+/// `json_stringify_param`, a `JSON.stringify(…)` passed as a `json` / `jsonb`
+/// value, which the TypeScript runtime encodes itself (the `sql!` macro rejects
+/// text for a `json` / `jsonb` parameter at compile time). Only the TypeScript
+/// CLI's `lint` object accepts their keys.
+pub const TS_LINT_RULES: &[&str] = &["json_stringify_param"];
 
 /// The types whose default Rust types can't hold `infinity` / `-infinity`
 /// (chrono's `NaiveDate`, `NaiveDateTime` and `DateTime<Utc>`, which
@@ -1770,6 +1779,18 @@ event_data = "crate::EventData"
              `prefer_jsonb`, \
              `fetch_may_return_many`, `fetch_all_single_row`, `unused_returning`, \
              `breaks_deployed_queries`, `redundant_binding`, `renaming_binding`"
+        );
+        // A TypeScript-only rule is not a key here: the `sql!` macro rejects
+        // text for a jsonb parameter at compile time.
+        let err = Config::from_str(&format!(
+            "{header}[package.metadata.typedpg.lint]\njson_stringify_param = \"off\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "unknown key `json_stringify_param` in [package.metadata.typedpg.lint]"
+            ),
+            "{err}"
         );
     }
 

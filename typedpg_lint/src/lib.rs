@@ -25,6 +25,7 @@ mod deployed;
 #[cfg(feature = "pg_sanity")]
 mod deployed_oracle;
 mod ignore;
+mod json_stringify;
 #[cfg(feature = "pg_sanity")]
 mod migration_oracle;
 mod migrations;
@@ -45,6 +46,7 @@ pub use deployed::{
     Decoding, DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries,
 };
 pub use ignore::IgnoreSet;
+pub use json_stringify::lint_copy_in_called;
 pub use migrations::{
     LintedMigrations, MigrationFile, MigrationFinding, MigrationLint, lint_migrations,
 };
@@ -227,6 +229,10 @@ pub enum Rule {
     /// A migration that breaks a query of the code deployed at
     /// `--previous-deployment`, which keeps running while it is applied.
     BreaksDeployedQueries,
+    /// A `JSON.stringify(…)` passed as the value of a `json` / `jsonb`
+    /// parameter, which the TypeScript runtime encodes again: a JSON string
+    /// is stored instead of the value. TypeScript only.
+    JsonStringifyParam,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
@@ -238,7 +244,7 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 59] = [
+    pub const ALL: [Rule; 60] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
@@ -298,6 +304,7 @@ impl Rule {
         Rule::FetchAllSingleRow,
         Rule::UnusedReturning,
         Rule::BreaksDeployedQueries,
+        Rule::JsonStringifyParam,
     ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
@@ -363,6 +370,7 @@ impl Rule {
             Rule::FetchAllSingleRow => "fetch_all_single_row",
             Rule::UnusedReturning => "unused_returning",
             Rule::BreaksDeployedQueries => "breaks_deployed_queries",
+            Rule::JsonStringifyParam => "json_stringify_param",
             Rule::InvalidAllow => "invalid_allow",
             Rule::InternalError => "internal_error",
         }
@@ -499,6 +507,9 @@ impl Rule {
             Rule::BreaksDeployedQueries => {
                 "a migration that breaks a query of the code deployed at --previous-deployment"
             }
+            Rule::JsonStringifyParam => {
+                "JSON.stringify(…) passed as a json or jsonb value, which stores a JSON string"
+            }
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
             Rule::InternalError => "a typedpg bug: a fix that would have changed the query",
         }
@@ -517,6 +528,7 @@ impl Rule {
             Rule::NullComparison
             | Rule::UnboundedWrite
             | Rule::RlsPolicyNotEnforced
+            | Rule::JsonStringifyParam
             | Rule::InvalidAllow => Some(Severity::Error),
             Rule::NotInNullable
             | Rule::CreateIndexBlocking
@@ -615,6 +627,29 @@ pub struct Call {
     /// The language whose spelling [`Self::name`] uses, and whose other
     /// methods the help line suggests.
     pub language: Language,
+    /// The `JSON.stringify(…)` calls the caller saw passed, as written, as
+    /// the call's values, in source order: what `json_stringify_param`
+    /// reads. Empty for Rust.
+    pub stringified: Vec<StringifiedValue>,
+}
+
+/// Where a call passes a `JSON.stringify(…)` call, written directly (through
+/// parentheses and type assertions) as a value: in the parameters object
+/// literal of a query call, or in the rows array literal of a COPY.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StringifiedValue {
+    /// The value of parameter `$name`: `{ name: JSON.stringify(x) }`.
+    Param(String),
+    /// An element of the array literal passed as parameter `$name` (an
+    /// array parameter, or an `IN $..name` list): `{ name:
+    /// [JSON.stringify(x)] }`.
+    Element(String),
+    /// Field `field` of an object of the array literal passed as the rows
+    /// spread `$..spread`: `{ spread: [{ field: JSON.stringify(x) }] }`.
+    Field { spread: String, field: String },
+    /// Column `name` of an object of the array literal a COPY's rows are:
+    /// `copyIn("t (name)").execute(pool, [{ name: JSON.stringify(x) }])`.
+    Column(String),
 }
 
 /// The method a query result's call has, independent of its spelling.
@@ -647,6 +682,10 @@ pub struct CallFinding {
     /// finding is reported at the method identifier in the calling file.
     /// `None` for a finding in the SQL text.
     pub call: Option<usize>,
+    /// For a finding about one of the call's values (`json_stringify_param`),
+    /// its index in the call's [`Call::stringified`]: the caller places the
+    /// finding at that value instead of the method identifier.
+    pub value: Option<usize>,
     pub finding: Finding,
 }
 
@@ -800,13 +839,14 @@ pub fn lint_query(
 
 /// [`lint_query`], with the methods the caller saw called on the query.
 ///
-/// The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
-/// `unused_returning`) read `calls` and the same
+/// The call-site rules (`fetch_may_return_many`, `fetch_all_single_row`,
+/// `unused_returning` and `json_stringify_param`) read `calls` and the same
 /// [`QueryView`](typedpg_analyzer::QueryView) every other query rule uses,
 /// so no query is analyzed twice. Their findings carry the index in `calls`
 /// the caller places them at; the caller knows the call's file and span,
-/// which a query can have in several files. Every other finding has `call`
-/// `None` and is placed in the query text.
+/// which a query can have in several files (a `json_stringify_param`
+/// finding also carries the index of the call's value it is placed at).
+/// Every other finding has `call` `None` and is placed in the query text.
 ///
 /// `unused_returning` is reported only when every call in `calls` is an
 /// `execute()`. The caller must leave out a query whose value may be used in
@@ -892,6 +932,7 @@ pub fn lint_query_called_as(
         .drain(..)
         .map(|finding| CallFinding {
             call: None,
+            value: None,
             finding,
         })
         .collect();
@@ -905,6 +946,7 @@ pub fn lint_query_called_as(
         for raw in rules::findings(rule, &ctx) {
             placed.push(CallFinding {
                 call: None,
+                value: None,
                 finding: Finding {
                     rule,
                     severity,
@@ -920,6 +962,7 @@ pub fn lint_query_called_as(
                 .into_iter()
                 .map(|raw| CallFinding {
                     call: raw.call,
+                    value: raw.value,
                     finding: Finding {
                         rule,
                         severity,
@@ -984,6 +1027,7 @@ pub fn lint_query_called_as(
             }
             bugs.push(CallFinding {
                 call: placed_finding.call,
+                value: placed_finding.value,
                 finding: Finding {
                     rule: Rule::InternalError,
                     severity: Severity::Warning,
@@ -1340,7 +1384,9 @@ pub fn render(path: &Path, line: u32, column: u32, finding: &Finding) -> String 
 mod tests {
     use super::*;
     use typedpg_analyzer::PgCatalog;
-    use typedpg_core::config::{LINT_RULES, LintLevel, LintSeverity, RUST_LINT_RULES};
+    use typedpg_core::config::{
+        LINT_RULES, LintLevel, LintSeverity, RUST_LINT_RULES, TS_LINT_RULES,
+    };
 
     /// Every rule has its page, `docs/lint/<name>.md`, which the SARIF
     /// report links to, and the index lists it.
@@ -1527,9 +1573,10 @@ mod tests {
 
     /// The config lists name every rule, each in `Rule::ALL`'s order: the
     /// query, migration, schema and call-site rules in [`LINT_RULES`], the
-    /// Rust-only binding rules in [`RUST_LINT_RULES`]. The two lists are not
-    /// concatenated in `Rule::ALL`'s order (the two binding rules come before
-    /// the new rules), so each list is checked as a subsequence.
+    /// Rust-only binding rules in [`RUST_LINT_RULES`], the TypeScript-only
+    /// rules in [`TS_LINT_RULES`]. The lists are not concatenated in
+    /// `Rule::ALL`'s order (the two binding rules come before the new rules),
+    /// so each list is checked as a subsequence.
     fn assert_rule_lists_match() {
         let names: Vec<&str> = Rule::ALL.iter().map(|rule| rule.name()).collect();
         let lint: Vec<&str> = names
@@ -1544,8 +1591,14 @@ mod tests {
             .filter(|name| RUST_LINT_RULES.contains(name))
             .collect();
         assert_eq!(rust, RUST_LINT_RULES);
+        let ts: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| TS_LINT_RULES.contains(name))
+            .collect();
+        assert_eq!(ts, TS_LINT_RULES);
         assert_eq!(
-            lint.len() + rust.len(),
+            lint.len() + rust.len() + ts.len(),
             names.len(),
             "a rule is in neither config list"
         );

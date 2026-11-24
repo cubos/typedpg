@@ -1,5 +1,5 @@
-//! The call-site rules: `fetch_may_return_many`, `fetch_all_single_row`
-//! and `unused_returning`.
+//! The call-site rules: `fetch_may_return_many`, `fetch_all_single_row`,
+//! `unused_returning` and `json_stringify_param` (in `json_stringify`).
 //!
 //! They run over the query's [`QueryView`](typedpg_analyzer::QueryView) like
 //! every other query rule: the methods called on the query result decide what
@@ -18,6 +18,8 @@ use crate::{Call, CallMethod, Ctx, Language, RawFinding, Rule, SqlEdit};
 /// severity and maps its fix.
 pub(crate) struct RawCallFinding {
     pub call: Option<usize>,
+    /// The index of the call's value the finding is about, if any.
+    pub value: Option<usize>,
     pub finding: RawFinding,
 }
 
@@ -35,6 +37,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCall
             })
             .map(|(index, call)| RawCallFinding {
                 call: Some(index),
+                value: None,
                 finding: fetch_may_return_many(call, ctx),
             })
             .collect(),
@@ -47,10 +50,14 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCall
             })
             .map(|(index, call)| RawCallFinding {
                 call: Some(index),
+                value: None,
                 finding: fetch_all_single_row(call),
             })
             .collect(),
         Rule::UnusedReturning => unused_returning(ctx, calls),
+        Rule::JsonStringifyParam => {
+            crate::json_stringify::query_findings(&ctx.view.analyzed, calls)
+        }
         _ => Vec::new(),
     }
 }
@@ -160,6 +167,7 @@ fn unused_returning(ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
         .enumerate()
         .map(|(index, call)| RawCallFinding {
             call: Some(index),
+            value: None,
             finding: RawFinding {
                 span: keyword..end,
                 message: format!("`.{}()` discards the RETURNING rows", call.name),
@@ -386,6 +394,7 @@ mod tests {
             method,
             name: name.to_owned(),
             language: Language::Rust,
+            stringified: Vec::new(),
         }
     }
 
@@ -394,6 +403,7 @@ mod tests {
             method,
             name: name.to_owned(),
             language: Language::TypeScript,
+            stringified: Vec::new(),
         }
     }
 

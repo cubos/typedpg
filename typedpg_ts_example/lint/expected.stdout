@@ -56,6 +56,34 @@ warning[table_rewrite]: ALTER TABLE rewrites every row of public.users under an 
     ╰────
    help: rewrite in steps: add a new column, backfill it in batches, then swap
 
+error[json_stringify_param]: parameter $body is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value
+    ╭─[src/json.ts:12:45]
+ 12 │   await insert.execute(pool, { id: 1, body: JSON.stringify(doc) });
+    ·                                             ───────────────────
+    ╰────
+   help: pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)
+
+error[json_stringify_param]: an element of parameter $tags is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value
+    ╭─[src/json.ts:15:95]
+ 15 │   await sql("UPDATE documents SET tags = $tags WHERE id = $id").execute(pool, { id: 1, tags: [JSON.stringify(doc)] });
+    ·                                                                                               ───────────────────
+    ╰────
+   help: pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)
+
+error[json_stringify_param]: field body of $..rows is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value
+    ╭─[src/json.ts:18:27]
+ 18 │     rows: [{ id: 3, body: JSON.stringify(doc) }],
+    ·                           ───────────────────
+    ╰────
+   help: pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)
+
+error[json_stringify_param]: column body is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value
+    ╭─[src/json.ts:21:70]
+ 21 │   await copyIn("documents (id, body)").execute(pool, [{ id: 4, body: JSON.stringify(doc) }]);
+    ·                                                                      ───────────────────
+    ╰────
+   help: pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)
+
 error[null_comparison]: comparison with NULL is never true
     ╭─[src/queries.ts:11:41]
  11 │   await sql("SELECT id FROM users WHERE email = NULL").fetchAll(pool);

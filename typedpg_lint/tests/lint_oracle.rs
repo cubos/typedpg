@@ -351,11 +351,13 @@ fn run_case(case: &Case, totals: &Mutex<Totals>) {
         method: CallMethod::FetchAll,
         name: "fetch_all".to_owned(),
         language: Language::Rust,
+        stringified: Vec::new(),
     }];
     let execute = [Call {
         method: CallMethod::Execute,
         name: "execute".to_owned(),
         language: Language::Rust,
+        stringified: Vec::new(),
     }];
     for query in &case.queries {
         if case.checked {

@@ -600,6 +600,16 @@
               }
             },
             {
+              "id": "json_stringify_param",
+              "shortDescription": {
+                "text": "JSON.stringify(…) passed as a json or jsonb value, which stores a JSON string"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/json_stringify_param.md",
+              "defaultConfiguration": {
+                "level": "error"
+              }
+            },
+            {
               "id": "invalid_allow",
               "shortDescription": {
                 "text": "a malformed or unknown rule name in a typedpg-lint comment"

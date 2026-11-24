@@ -32,7 +32,9 @@
 //! What is not checked: `scalar_subquery_may_return_many`,
 //! `case_without_else`'s reachability and `not_in_nullable` only say a
 //! thing *may* happen, which no execution refutes; the advisory rules
-//! (`cartesian_join`, `float_equality`, …) claim nothing about results.
+//! (`cartesian_join`, `float_equality`, …) claim nothing about results;
+//! `json_stringify_param` judges the TypeScript call's values, not the SQL,
+//! and has neither a fix nor a claim a query's execution could break.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -420,6 +422,9 @@ fn claims(ctx: &Ctx<'_>, record: &Record) -> Vec<LintProbe> {
         Rule::FetchAllSingleRow => vec![LintProbe::AtMostOneRow {
             sql: ctx.sql.to_owned(),
         }],
+        // About the caller's values (a `JSON.stringify(…)` passed to a
+        // `json` / `jsonb` parameter), not the rows: nothing to probe.
+        Rule::JsonStringifyParam => Vec::new(),
         _ => Vec::new(),
     }
 }

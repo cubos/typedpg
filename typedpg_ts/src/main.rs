@@ -13,7 +13,7 @@ use typedpg_lint::report::{
 use typedpg_lint::{CallFinding, IgnoreSet, LintOptions, MigrationLint, Rule};
 use typedpg_ts::cache;
 use typedpg_ts::config::{CONFIG_FILE, Config};
-use typedpg_ts::project::Project;
+use typedpg_ts::project::{LintCall, Project};
 use typedpg_ts::scan::LineIndex;
 use typedpg_ts::watch;
 
@@ -489,20 +489,13 @@ fn build_lint(
             for placed in findings {
                 let finding = &placed.finding;
                 let entry = match placed.call {
-                    Some(index) => {
-                        let call = &query.calls[index];
-                        let path = relative(call.file, &root);
-                        report
-                            .sources
-                            .entry(path.clone())
-                            .or_insert_with(|| call.lines.text().to_owned());
-                        Entry {
-                            path,
-                            start: position(call.lines.text(), call.span.start),
-                            end: position(call.lines.text(), call.span.end),
-                            finding: finding.clone(),
-                        }
-                    }
+                    Some(index) => call_entry(
+                        &mut report,
+                        &query.calls[index],
+                        placed.value,
+                        finding,
+                        &root,
+                    ),
                     None => Entry {
                         path: relative(query.file, &root),
                         start: position(
@@ -529,6 +522,40 @@ fn build_lint(
         }
         // An analysis error was already reported by `sync` above.
     }
+    // The `copyIn()` targets' `execute` calls: `json_stringify_param` on the
+    // rows they pass.
+    for copy in project.lint_copy_ins() {
+        if copy.calls.iter().all(|call| call.stringified.is_empty()) {
+            continue;
+        }
+        let Ok(catalog) = project.catalog(copy.db) else {
+            continue;
+        };
+        let calls: Vec<typedpg_lint::Call> = copy.calls.iter().map(|call| call.call()).collect();
+        // A target that does not analyze was already reported by `sync`.
+        let Ok(findings) = typedpg_lint::lint_copy_in_called(
+            catalog,
+            &copy.target,
+            &calls,
+            &project.config.databases[copy.db].roles,
+            &options,
+        ) else {
+            continue;
+        };
+        for placed in findings {
+            let Some(index) = placed.call else {
+                continue;
+            };
+            let entry = call_entry(
+                &mut report,
+                &copy.calls[index],
+                placed.value,
+                &placed.finding,
+                &root,
+            );
+            report.entries.push(entry);
+        }
+    }
     for db in 0..project.database_count() {
         if let Ok(catalog) = project.catalog(db) {
             report.schemas.push((
@@ -550,6 +577,33 @@ fn build_lint(
     report.sort();
     report.elapsed = start.elapsed();
     Ok((report, options, pending, root))
+}
+
+/// The report entry of a call-site finding: at the call's method
+/// identifier, or at the call's value `value` (a `JSON.stringify(…)` it
+/// passes) when the finding is about one. Records the calling file's text
+/// in the report's sources.
+fn call_entry(
+    report: &mut Report,
+    call: &LintCall<'_>,
+    value: Option<usize>,
+    finding: &typedpg_lint::Finding,
+    root: &Path,
+) -> Entry {
+    let path = relative(call.file, root);
+    report
+        .sources
+        .entry(path.clone())
+        .or_insert_with(|| call.lines.text().to_owned());
+    let span = value
+        .and_then(|value| call.stringified.get(value))
+        .map_or_else(|| call.span.clone(), |value| value.span.clone());
+    Entry {
+        path,
+        start: position(call.lines.text(), span.start),
+        end: position(call.lines.text(), span.end),
+        finding: finding.clone(),
+    }
 }
 
 /// The project as git ref `reference` has it, read from a checkout of the

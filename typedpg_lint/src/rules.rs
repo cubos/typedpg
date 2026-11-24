@@ -111,6 +111,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         | Rule::FetchMayReturnMany
         | Rule::FetchAllSingleRow
         | Rule::UnusedReturning
+        | Rule::JsonStringifyParam
         // It compares the deployed code's queries across two schemas, in
         // `deployed`.
         | Rule::BreaksDeployedQueries

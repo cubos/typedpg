@@ -331,6 +331,7 @@ fn build(
                         method,
                         name: call.method.clone(),
                         language: Language::Rust,
+                        stringified: Vec::new(),
                     });
                     call_sites.push(call);
                 }

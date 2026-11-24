@@ -24,7 +24,7 @@ use crate::config::{
 use crate::emit::{Embedded, Module, TypeCheck};
 use crate::generate::{GenError, Generated, generate};
 use crate::scan::{
-    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, QueryExport,
+    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, QueryExport, Stringified,
     module_exports, scan,
 };
 use crate::sqlfile::{ModuleNames, SqlFile};
@@ -213,6 +213,8 @@ pub struct LintCopyIn<'a> {
     /// The target as written: `table (columns)`.
     pub target: String,
     pub pos: Position,
+    /// Its `execute` calls, on the expression or a local binding of it.
+    pub calls: Vec<LintCall<'a>>,
 }
 
 /// A call on a [`LintQuery`], in the file that calls it.
@@ -224,6 +226,9 @@ pub struct LintCall<'a> {
     pub span: Range<usize>,
     pub file: &'a Path,
     pub lines: &'a LineIndex,
+    /// The `JSON.stringify(…)` calls it passes as values, each placed at its
+    /// own span in [`Self::file`].
+    pub stringified: Vec<Stringified>,
 }
 
 impl LintCall<'_> {
@@ -233,6 +238,7 @@ impl LintCall<'_> {
             method: call_method(&self.method).expect("only known methods become lint calls"),
             name: self.method.clone(),
             language: Language::TypeScript,
+            stringified: self.stringified.iter().map(|s| s.value.clone()).collect(),
         }
     }
 }
@@ -1182,8 +1188,13 @@ impl Project {
         let mut remote: HashMap<(PathBuf, String), Vec<LintCall<'_>>> = HashMap::new();
         for (path, scan) in &self.files {
             for call in &scan.remote_calls {
-                let Some(lint) = lint_call(path, &scan.lines, &call.method, call.span.clone())
-                else {
+                let Some(lint) = lint_call(
+                    path,
+                    &scan.lines,
+                    &call.method,
+                    call.span.clone(),
+                    &call.stringified,
+                ) else {
                     continue;
                 };
                 remote
@@ -1203,7 +1214,13 @@ impl Project {
                     .calls
                     .iter()
                     .filter_map(|call| {
-                        lint_call(path, &scan.lines, &call.method, call.span.clone())
+                        lint_call(
+                            path,
+                            &scan.lines,
+                            &call.method,
+                            call.span.clone(),
+                            &call.stringified,
+                        )
                     })
                     .collect();
                 let key = canonical(path);
@@ -1258,7 +1275,7 @@ impl Project {
 
     /// Every `copyIn()` target in the sources, sorted by file and position:
     /// the targets `breaks_deployed_queries` checks in the previous
-    /// deployment.
+    /// deployment, with the calls `json_stringify_param` checks.
     pub fn lint_copy_ins(&self) -> Vec<LintCopyIn<'_>> {
         let mut out = Vec::new();
         for (path, scan) in &self.files {
@@ -1269,6 +1286,20 @@ impl Project {
                         file: path,
                         target: query.text.clone(),
                         pos: query.pos,
+                        calls: query
+                            .calls
+                            .iter()
+                            .filter(|call| call.method == "execute")
+                            .filter_map(|call| {
+                                lint_call(
+                                    path,
+                                    &scan.lines,
+                                    &call.method,
+                                    call.span.clone(),
+                                    &call.stringified,
+                                )
+                            })
+                            .collect(),
                     });
                 }
             }
@@ -1356,12 +1387,14 @@ fn lint_call<'a>(
     lines: &'a LineIndex,
     method: &str,
     span: Range<usize>,
+    stringified: &[Stringified],
 ) -> Option<LintCall<'a>> {
     call_method(method).map(|_| LintCall {
         method: method.to_owned(),
         span,
         file: path,
         lines,
+        stringified: stringified.to_vec(),
     })
 }
 

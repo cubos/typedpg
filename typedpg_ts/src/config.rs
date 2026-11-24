@@ -28,7 +28,7 @@
 //! `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`,
 //! `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `countNotNull`,
 //! `nonSargablePredicate`, `floatEquality` and the call-site rules `fetchMayReturnMany`,
-//! `fetchAllSingleRow` and `unusedReturning`; the migration rules
+//! `fetchAllSingleRow`, `unusedReturning` and `jsonStringifyParam`; the migration rules
 //! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
 //! `tableRewrite`, `missingLockTimeout`, `dropIndexBlocking`,
 //! `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`
@@ -89,6 +89,7 @@ use serde::Deserialize;
 use typedpg_core::QualifiedName;
 use typedpg_core::config::{
     LINT_RULES, LintConfig, LintLevel, LintSeverity, MigrationsConfig, SimplifyConfig,
+    TS_LINT_RULES,
 };
 
 pub const CONFIG_FILE: &str = "typedpg.config.json";
@@ -199,10 +200,12 @@ fn lint_config(raw: Option<RawLint>) -> Result<LintConfig, String> {
     };
     let mut levels = BTreeMap::new();
     for (key, value) in raw.rules {
-        let Some(rule) = LINT_RULES.iter().find(|r| camel_key(r) == key) else {
+        // The shared rules, then the TypeScript-only ones.
+        let mut rules = LINT_RULES.iter().chain(TS_LINT_RULES);
+        let Some(rule) = rules.find(|r| camel_key(r) == key) else {
             let keys = std::iter::once("failOn".to_owned())
                 .chain(std::iter::once("ignore".to_owned()))
-                .chain(LINT_RULES.iter().map(|r| camel_key(r)))
+                .chain(LINT_RULES.iter().chain(TS_LINT_RULES).map(|r| camel_key(r)))
                 .map(|k| format!("`{k}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -775,8 +778,8 @@ pub fn declaration_path(out: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The npm README documents every `lint` key, in `LINT_RULES`' order,
-    /// and every rule in its rule table.
+    /// The npm README documents every `lint` key, in `LINT_RULES`' order
+    /// and then `TS_LINT_RULES`', and every rule in its rule table.
     #[test]
     fn the_npm_readme_lists_every_lint_key() {
         let readme = std::fs::read_to_string(
@@ -796,9 +799,13 @@ mod tests {
             .split(", ")
             .map(|key| key.trim_matches('`'))
             .collect();
-        let expected: Vec<String> = LINT_RULES.iter().map(|rule| camel_key(rule)).collect();
+        let expected: Vec<String> = LINT_RULES
+            .iter()
+            .chain(TS_LINT_RULES)
+            .map(|rule| camel_key(rule))
+            .collect();
         assert_eq!(keys, expected, "{row}");
-        for rule in LINT_RULES {
+        for rule in LINT_RULES.iter().chain(TS_LINT_RULES) {
             assert!(
                 readme.contains(&format!("| [`{rule}`](")),
                 "the npm README's rule table has no row for {rule}"
@@ -892,9 +899,12 @@ mod tests {
                            "missingLockTimeout": "warning", "preferTimestamptz": "off",
                            "preferIdentity": "off", "preferText": "off",
                            "preferBigintPk": "info", "fetchMayReturnMany": "warning",
-                           "fetchAllSingleRow": "info", "unusedReturning": "off" }"#,
+                           "fetchAllSingleRow": "info", "unusedReturning": "off",
+                           "jsonStringifyParam": "warning" }"#,
         )
         .unwrap();
+        // The TypeScript-only rule.
+        assert_eq!(lint.levels["json_stringify_param"], LintLevel::Warning);
         assert_eq!(lint.levels["redundant_null_check"], LintLevel::Warning);
         assert_eq!(lint.levels["like_unescaped_param"], LintLevel::Off);
         assert_eq!(lint.levels["prefer_bigint_pk"], LintLevel::Info);

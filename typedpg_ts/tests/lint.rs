@@ -847,3 +847,109 @@ fn allow_comments_around_sql_file_queries_belong_to_a_query() {
         "{stdout}"
     );
 }
+
+#[test]
+fn json_stringify_param_is_reported_at_the_stringify_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["src/*.sql"] }
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE DOMAIN prefs AS jsonb;\n\
+         CREATE TABLE docs (id int4 PRIMARY KEY, body jsonb NOT NULL, raw json, \
+         settings prefs, tags jsonb[], title text);\n",
+    );
+    write(
+        &root.join("src/queries.sql"),
+        "/* @name saveDoc */\nUPDATE docs SET body = $body WHERE id = $id;\n\n\
+         /* @name saveAllowed */\n-- typedpg-lint: allow(json_stringify_param)\n\
+         UPDATE docs SET body = $body WHERE id = $id;\n",
+    );
+    let app = concat!(
+        "import { sql, copyIn } from './db';\n",
+        "import { saveDoc, saveAllowed } from './queries';\n",
+        "\n",
+        "sql(`UPDATE docs SET body = $body WHERE id = $id`).execute(pool, { id, body: JSON.stringify(doc) });\n",
+        "const q = sql(`UPDATE docs SET raw = $raw, settings = $settings WHERE id = $id`);\n",
+        "q.execute(pool, { id, raw: (JSON.stringify(doc) as string), settings: JSON.stringify(doc)! });\n",
+        "sql(`UPDATE docs SET tags = $tags WHERE id = $id`).execute(pool, { id, tags: [JSON.stringify(doc)] });\n",
+        "sql(`INSERT INTO docs (id, body) VALUES $..rows { id, body }`).execute(pool, { rows: [{ id, body: JSON.stringify(doc) }] });\n",
+        "saveDoc.execute(pool, { id, body: JSON.stringify(doc) });\n",
+        "copyIn(`docs (id, body)`).execute(pool, [{ id, body: JSON.stringify(doc) }]);\n",
+        // Not reported: a text column, the value itself, a value from a
+        // variable, the allowed query.
+        "sql(`UPDATE docs SET title = $title WHERE id = $id`).execute(pool, { id, title: JSON.stringify(doc) });\n",
+        "sql(`UPDATE docs SET body = $body WHERE id = $id`).execute(pool, { id, body: doc });\n",
+        "const text = JSON.stringify(doc);\n",
+        "sql(`UPDATE docs SET body = $body WHERE id = $id`).execute(pool, { id, body: text });\n",
+        "saveAllowed.execute(pool, { id, body: JSON.stringify(doc) });\n",
+    );
+    write(&root.join("src/app.ts"), app);
+    generate(root);
+
+    let output = run(root, &["lint", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // An error by default: the run fails.
+    assert!(!output.status.success(), "{stdout}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let found: Vec<(u64, u64, u64, String)> = json["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .iter()
+        .filter(|finding| finding["rule"] == "json_stringify_param")
+        .map(|finding| {
+            assert_eq!(finding["severity"], "error", "{stdout}");
+            (
+                finding["line"].as_u64().unwrap(),
+                finding["column"].as_u64().unwrap(),
+                finding["endColumn"].as_u64().unwrap(),
+                finding["message"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let message = |subject: &str| {
+        format!("{subject}, and `JSON.stringify(…)` stores a JSON string, not the value")
+    };
+    // Each finding spans the `JSON.stringify(doc)` call (19 characters).
+    let at = |line: u64, column: u64, subject: &str| (line, column, column + 19, message(subject));
+    assert_eq!(
+        found,
+        [
+            at(4, 78, "parameter $body is jsonb"),
+            at(6, 29, "parameter $raw is json"),
+            at(
+                6,
+                71,
+                "parameter $settings is public.prefs, a domain over jsonb"
+            ),
+            at(7, 79, "an element of parameter $tags is jsonb"),
+            at(8, 99, "field body of $..rows is jsonb"),
+            at(9, 35, "parameter $body is jsonb"),
+            at(10, 54, "column body is jsonb"),
+        ],
+        "{stdout}"
+    );
+
+    // Off in the configuration, nothing is reported.
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["src/*.sql"] },
+            "lint": { "jsonStringifyParam": "off" }
+        }"#,
+    );
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("json_stringify_param"), "{stdout}");
+}

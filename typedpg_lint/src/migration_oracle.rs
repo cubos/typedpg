@@ -1470,7 +1470,10 @@ fn foreign_key_expectations(
     // An index serves the check when it is a btree or hash index whose
     // leading key columns are foreign-key columns: all of them (in any
     // order), or some that reference columns a non-partial unique index of
-    // the referenced table makes unique by themselves.
+    // the referenced table makes unique by themselves. `<@` is qualified:
+    // with `intarray` installed in the search path, a bare `smallint[] <@
+    // smallint[]` is "operator is not unique" (its `int4[]` operator against
+    // the built-in `anyarray` one).
     let mut unindexed = HashMap::new();
     for row in scratch.client().query(
         "SELECT k.conname::text, n.nspname::text, c.relname::text, \
@@ -1490,11 +1493,11 @@ fn foreign_key_expectations(
                  WHERE i.indrelid = k.conrelid \
                    AND am.amname IN ('btree', 'hash') \
                    AND cardinality(l.lead) > 0 \
-                   AND (k.conkey <@ l.lead \
+                   AND (k.conkey OPERATOR(pg_catalog.<@) l.lead \
                         OR EXISTS (SELECT FROM pg_catalog.pg_index ui \
                             WHERE ui.indrelid = k.confrelid AND ui.indisunique \
                               AND ui.indpred IS NULL AND ui.indnkeyatts > 0 \
-                              AND (ui.indkey::int2[])[0:ui.indnkeyatts - 1] <@ ARRAY( \
+                              AND (ui.indkey::int2[])[0:ui.indnkeyatts - 1] OPERATOR(pg_catalog.<@) ARRAY( \
                                   SELECT p.pk FROM unnest(k.conkey, k.confkey) p(fk, pk) \
                                   WHERE p.fk = ANY (l.lead))))) \
          FROM pg_catalog.pg_constraint k \

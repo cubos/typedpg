@@ -165,6 +165,7 @@ examples and configuration:
 | [`fetch_may_return_many`](docs/lint/fetch_may_return_many.md) | warning | `fetch_one` / `fetch_one_as` / `fetch_value` / `fetch_optional` / `fetch_optional_as` / `fetch_value_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
 | [`fetch_all_single_row`](docs/lint/fetch_all_single_row.md) | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
 | [`unused_returning`](docs/lint/unused_returning.md) | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
+| [`json_stringify_param`](docs/lint/json_stringify_param.md) | error | TypeScript only: `JSON.stringify(…)` passed as a `json` / `jsonb` parameter's value, which stores a JSON string instead of the value. |
 | [`breaks_deployed_queries`](docs/lint/breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
 
 The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and

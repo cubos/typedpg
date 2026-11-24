@@ -66,6 +66,7 @@ Rules over how a query's result is used (`fetch_one`, `fetchOne`, `execute`, …
 | [`fetch_may_return_many`](fetch_may_return_many.md) | warning | `fetch_one` / `fetch_optional` / `fetch_value` / `fetch_value_optional` on a query not proven to return at most one row. |
 | [`fetch_all_single_row`](fetch_all_single_row.md) | info | `fetch_all` on a query that returns at most one row. |
 | [`unused_returning`](unused_returning.md) | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
+| [`json_stringify_param`](json_stringify_param.md) | error | TypeScript only: `JSON.stringify(…)` passed as a `json` / `jsonb` parameter's value, which stores a JSON string instead of the value. |
 
 ## Migrations
 

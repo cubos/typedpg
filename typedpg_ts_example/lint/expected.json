@@ -67,6 +67,50 @@
       "help": "rewrite in steps: add a new column, backfill it in batches, then swap"
     },
     {
+      "path": "src/json.ts",
+      "line": 12,
+      "column": 45,
+      "endLine": 12,
+      "endColumn": 64,
+      "rule": "json_stringify_param",
+      "severity": "error",
+      "message": "parameter $body is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value",
+      "help": "pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)"
+    },
+    {
+      "path": "src/json.ts",
+      "line": 15,
+      "column": 95,
+      "endLine": 15,
+      "endColumn": 114,
+      "rule": "json_stringify_param",
+      "severity": "error",
+      "message": "an element of parameter $tags is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value",
+      "help": "pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)"
+    },
+    {
+      "path": "src/json.ts",
+      "line": 18,
+      "column": 27,
+      "endLine": 18,
+      "endColumn": 46,
+      "rule": "json_stringify_param",
+      "severity": "error",
+      "message": "field body of $..rows is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value",
+      "help": "pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)"
+    },
+    {
+      "path": "src/json.ts",
+      "line": 21,
+      "column": 70,
+      "endLine": 21,
+      "endColumn": 89,
+      "rule": "json_stringify_param",
+      "severity": "error",
+      "message": "column body is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value",
+      "help": "pass the value itself: typedpg encodes it as JSON (`jsonNull` for a JSON null)"
+    },
+    {
       "path": "src/queries.ts",
       "line": 11,
       "column": 41,
@@ -137,18 +181,18 @@
     }
   ],
   "summary": {
-    "errors": 1,
+    "errors": 5,
     "warnings": 9,
     "infos": 1,
-    "queries": 10,
-    "migrations": 2,
+    "queries": 14,
+    "migrations": 3,
     "migrationsUnchanged": 0,
     "failures": 2,
     "schema": {
       "default": {
-        "tables": 3,
+        "tables": 4,
         "views": 0,
-        "indexes": 7,
+        "indexes": 8,
         "sequences": 0,
         "types": 0,
         "functions": 0,
