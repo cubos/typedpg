@@ -457,3 +457,29 @@ fn third_party_pg_jsonschema_installs() {
         s(&["int4", "jsonb"])
     );
 }
+
+#[test]
+fn third_party_postgis_updates_through_pseudo_versions() {
+    // PostGIS's own upgrade path (what `postgis_extensions_upgrade()` runs)
+    // goes through `ANY`, even when already on the release.
+    for migration in [
+        "CREATE EXTENSION postgis;
+         ALTER EXTENSION postgis UPDATE TO 'ANY';
+         ALTER EXTENSION postgis UPDATE TO '3.7.0';",
+        "CREATE EXTENSION postgis;
+         ALTER EXTENSION postgis UPDATE TO 'ANY';
+         ALTER EXTENSION postgis UPDATE;",
+        "CREATE EXTENSION postgis; SELECT postgis_extensions_upgrade();",
+    ] {
+        let db = build(&[("0001.sql", migration)]);
+        assert!(
+            !db.find_functions(Some("public"), "st_dwithin").is_empty(),
+            "{migration}"
+        );
+        assert_eq!(
+            column_types(&db, "SELECT ST_MakePoint(1, 2) AS p"),
+            [("public.geometry".to_owned(), true)],
+            "{migration}"
+        );
+    }
+}

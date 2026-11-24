@@ -411,7 +411,8 @@ fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.7/sql/vector.sql
 # and the two pseudo-versions' small scripts — `unpackaged` installs nothing,
 # `3.7.0--ANY` only tags the version. The scripts back to 3.7.0
 # (`--ANY--3.7.0`, `--unpackaged--3.7.0`, the full upgrade, for databases
-# upgraded from an older PostGIS release) are not bundled. It has no
+# upgraded from an older PostGIS release) are not bundled: the registry
+# updates from `ANY` back to 3.7.0 without a script (see registry.rs). It has no
 # postgis_tiger_geocoder or address_standardizer.
 POSTGIS_IMAGE="postgis/postgis:19-3.7"
 POSTGIS_VERSION="3.7.0"

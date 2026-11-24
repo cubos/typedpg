@@ -16,6 +16,15 @@ use super::{ExtensionDef, ExtensionVersion};
 // versions and default versions here are that release's, as its parser
 // must accept every script and its server has every object they create.
 
+// PostGIS reaches a release from an older one through the `ANY`
+// pseudo-version (`postgis_extensions_upgrade()` updates to `ANY`, then to
+// the release, even when already on it), and packages loose objects through
+// `unpackaged`. Their scripts back to 3.7.0 (`--ANY--3.7.0`,
+// `--unpackaged--3.7.0`, about 17 MB) are not bundled. The only `ANY` the
+// registry reaches is tagged from 3.7.0, whose objects the full upgrade
+// leaves as they are, so updating back needs no script (the extension
+// oracle checks it against the server). Packaging loose objects is left out.
+
 pub(super) static REGISTRY: &[ExtensionDef] = &[
     // ── amcheck ────────────────────────────────────────────────────────
     ExtensionDef {
@@ -1081,8 +1090,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 sql: include_str!("../../extensions/postgis--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
-            // only tags the version (their scripts back to 3.7.0, the full
-            // upgrade, are not bundled).
+            // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
@@ -1092,6 +1100,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "ANY",
                 from: Some("3.7.0"),
                 sql: include_str!("../../extensions/postgis--3.7.0--ANY.sql"),
+            },
+            // Back to 3.7.0 (see the comment above `REGISTRY`).
+            ExtensionVersion {
+                version: "3.7.0",
+                from: Some("ANY"),
+                sql: "",
             },
         ],
     },
@@ -1112,8 +1126,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 sql: include_str!("../../extensions/postgis_raster--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
-            // only tags the version (their scripts back to 3.7.0, the full
-            // upgrade, are not bundled).
+            // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
@@ -1123,6 +1136,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "ANY",
                 from: Some("3.7.0"),
                 sql: include_str!("../../extensions/postgis_raster--3.7.0--ANY.sql"),
+            },
+            // Back to 3.7.0 (see the comment above `REGISTRY`).
+            ExtensionVersion {
+                version: "3.7.0",
+                from: Some("ANY"),
+                sql: "",
             },
         ],
     },
@@ -1143,8 +1162,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 sql: include_str!("../../extensions/postgis_sfcgal--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
-            // only tags the version (their scripts back to 3.7.0, the full
-            // upgrade, are not bundled).
+            // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
@@ -1154,6 +1172,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "ANY",
                 from: Some("3.7.0"),
                 sql: include_str!("../../extensions/postgis_sfcgal--3.7.0--ANY.sql"),
+            },
+            // Back to 3.7.0 (see the comment above `REGISTRY`).
+            ExtensionVersion {
+                version: "3.7.0",
+                from: Some("ANY"),
+                sql: "",
             },
         ],
     },
@@ -1174,8 +1198,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 sql: include_str!("../../extensions/postgis_topology--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
-            // only tags the version (their scripts back to 3.7.0, the full
-            // upgrade, are not bundled).
+            // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
@@ -1185,6 +1208,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
                 version: "ANY",
                 from: Some("3.7.0"),
                 sql: include_str!("../../extensions/postgis_topology--3.7.0--ANY.sql"),
+            },
+            // Back to 3.7.0 (see the comment above `REGISTRY`).
+            ExtensionVersion {
+                version: "3.7.0",
+                from: Some("ANY"),
+                sql: "",
             },
         ],
     },
