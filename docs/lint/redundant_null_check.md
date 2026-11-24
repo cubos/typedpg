@@ -74,13 +74,14 @@ The fix deletes the arguments after the first never-`NULL` one; when that is
 the first, the call goes: `COALESCE(views + 1, 0) * 2` becomes
 `(views + 1) * 2`. It is withheld when:
 
-- the kept argument doesn't have the call's result type:
-  `COALESCE('1', views)` is `integer`, `'1'` alone is `text`;
+- the kept argument doesn't have the call's result type, type modifier
+  included: `COALESCE('1', views)` is `integer`, `'1'` alone is `text`;
+  `COALESCE(code, 'x')` of a `varchar(10)` is a plain `varchar`;
 - a dropped argument contains a parameter (`COALESCE(id, $fallback)`), a
   column reference, a `COLLATE`, or a function call outside a subquery;
 - the `COALESCE` is a whole output column without an alias, named
   `coalesce`: `SELECT id, COALESCE(title, 'untitled') FROM posts`, also
-  under a cast: `COALESCE(title, 'untitled')::varchar`.
+  under a cast or as a `CASE`'s `ELSE`: `COALESCE(title, 'untitled')::varchar`.
 
 ## Configuration
 

@@ -53,14 +53,16 @@ pub(crate) fn infer_sublink(
                 // value is NULL only when the column is.
                 let nullable = if min_one_row { first.nullable } else { true };
                 // The sublink carries its column's collation, implicitly,
-                // and its value — an array's elements included (no row is
-                // NULL, not an array with other elements).
+                // and its value — what is known of it, an array's elements
+                // included (no row is NULL, not an array with other
+                // elements).
                 // Planned, it is a Param collated like the planned
                 // subquery's column (make_subplan).
                 let mut t = ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
                     .with_collation(first.sublink_collation())
                     .with_elem_nullable(first.elem_nullable)
-                    .with_elem_refine(first.elem_refine.clone());
+                    .with_elem_refine(first.elem_refine.clone())
+                    .with_refine(first.refine.clone());
                 t.planned = first.planned;
                 // A record (or records) keeps its column's row shape, which
                 // PG doesn't see: the SubLink is typed plain `record`.

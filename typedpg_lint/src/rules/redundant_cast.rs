@@ -26,17 +26,14 @@ use crate::{Ctx, RawFinding, SqlEdit};
 const CONTINUATIONS: &[&str] = &["precision", "varying", "with", "without", "time", "zone"];
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    // The casts that are an output column's whole expression with no
-    // alias: they name the column.
-    let mut naming = HashSet::new();
-    for (node, _) in ctx.tree.nodes() {
-        if let NodeRef::ResTarget(target) = node
-            && target.name.is_empty()
-            && let Some(N::TypeCast(cast)) = target.val.as_ref()
-        {
-            naming.insert(cast.location);
-        }
-    }
+    // The casts that name an output column (see `naming_expressions`).
+    let naming: HashSet<i32> = super::naming_expressions(ctx)
+        .into_iter()
+        .filter_map(|node| match node {
+            N::TypeCast(cast) => Some(cast.location),
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         if let NodeRef::TypeCast(cast) = node
@@ -242,6 +239,8 @@ mod tests {
         for sql in [
             // The cast names the column `int4`.
             "SELECT 1::int",
+            // The CASE is named after its ELSE's cast, `int4`.
+            "SELECT CASE WHEN id > 1 THEN 2 ELSE 1::int END FROM users",
             "SELECT CAST(id AS bigint) FROM users",
         ] {
             let findings = lint_rule(&db, sql, RULE);
@@ -274,6 +273,8 @@ mod tests {
             // rebuilds it as the composite.
             "SELECT s::users AS u FROM (SELECT id, name, email, code FROM users) s",
             "SELECT (s.*)::users AS u FROM (SELECT id, name, email, code FROM users) s",
+            // A cast to `record` forgets the row's fields.
+            "SELECT s::record AS r FROM (SELECT 1 AS a, 'x' AS b) s",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");

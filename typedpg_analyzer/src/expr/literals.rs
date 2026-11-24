@@ -520,6 +520,7 @@ pub(crate) fn infer_type_cast(
     // `ROW(a, b)::pair` is the row built for `pair` (and a cast to the
     // composite a value already is changes nothing): its fields keep
     // their nullability.
+    let had_record_fields = inner_type.record_fields.is_some();
     let record_fields = inner_type.record_fields.filter(|_| {
         coerce::is_complex(target_oid, snapshot)
             && snapshot.unwrap_domain(inner_type.type_oid) == snapshot.unwrap_domain(target_oid)
@@ -543,7 +544,9 @@ pub(crate) fn infer_type_cast(
             && typmod_of(written_typmod) == typmod_of(inner_type.typmod)
             && !inner_type.unknown_value
             && typed_alone
-            && !matches!(inner, Some(ast::Node::ParamRef(_))),
+            && !matches!(inner, Some(ast::Node::ParamRef(_)))
+            // `x::record` of a row whose fields are known forgets them.
+            && !(target_oid == oid::RECORD && had_record_fields),
     );
     let planned = if inner_type.type_oid == target_oid
         && written_typmod.is_none()

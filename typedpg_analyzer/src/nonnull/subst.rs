@@ -131,6 +131,16 @@ fn collect(
         Some(ast::Node::FuncCall(f)) => each(&f.args),
         Some(ast::Node::List(l)) => each(&l.items),
         Some(ast::Node::CoalesceExpr(c)) => each(&c.args),
+        Some(ast::Node::CaseExpr(c)) => {
+            let mut kids: Vec<Option<ast::Node>> = vec![c.arg.clone(), c.defresult.clone()];
+            for w in c.args.iter().flatten() {
+                if let ast::Node::CaseWhen(w) = w {
+                    kids.push(w.expr.clone());
+                    kids.push(w.result.clone());
+                }
+            }
+            each(&kids)
+        }
         Some(ast::Node::MinMaxExpr(m)) => each(&m.args),
         Some(ast::Node::RowExpr(r)) => each(&r.args),
         Some(ast::Node::TypeCast(c)) => c
@@ -284,6 +294,32 @@ impl Eval<'_> {
                     }
                 }
                 Val::Null
+            }
+            // A searched CASE whose WHENs are decided: the first one TRUE
+            // picks its result, converted to the CASE's type; none, the ELSE.
+            ast::Node::CaseExpr(c) if c.arg.is_none() => {
+                for w in c.args.iter().flatten() {
+                    let ast::Node::CaseWhen(w) = w else {
+                        return Val::Unknown;
+                    };
+                    match self.eval(w.expr.as_ref()) {
+                        Val::Bool(true) => {
+                            return match self.eval(w.result.as_ref()) {
+                                Val::Null => Val::Null,
+                                v => self.converted(c.location, v),
+                            };
+                        }
+                        Val::Bool(false) | Val::Null => continue,
+                        _ => return Val::Unknown,
+                    }
+                }
+                match c.defresult.as_ref() {
+                    None => Val::Null,
+                    Some(d) => match self.eval(Some(d)) {
+                        Val::Null => Val::Null,
+                        v => self.converted(c.location, v),
+                    },
+                }
             }
             ast::Node::MinMaxExpr(m) => {
                 let greatest = m.op == ast::MinMaxOp::IsGreatest;

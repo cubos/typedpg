@@ -139,6 +139,7 @@ fn a_reduced_or_empty_full_join_is_never_built() {
         "SELECT 1 FROM a FULL JOIN b ON CASE WHEN a.id IS NULL THEN false ELSE a.x = b.y END",
         // ... and `a.id IS NOT NULL` to TRUE: no clause is left.
         "SELECT 1 FROM a FULL JOIN b ON a.id IS NOT NULL",
+        "SELECT 1 FROM a FULL JOIN b ON (a.id > 0) IS UNKNOWN",
         "MERGE INTO a USING b ON a.id IS NOT NULL \
          WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED THEN INSERT (id) VALUES (1)",
         // A constant FALSE qual over the join (`restriction_is_constant_false`),

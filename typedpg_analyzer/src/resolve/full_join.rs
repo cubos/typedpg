@@ -190,7 +190,13 @@ fn flatten<'a>(n: &'a ast::Node, negated: bool, out: &mut Vec<(&'a ast::Node, bo
 /// input is non-nullable (`a.id IS NOT NULL` over a NOT NULL column is
 /// TRUE, and leaves no clause).
 fn folds_on_nonnull(c: &ast::Node) -> bool {
+    // (`x IS UNKNOWN` too, FALSE then; not `x IS TRUE`, which folds to
+    // `x`.)
     matches!(c, ast::Node::NullTest(_))
+        || matches!(c, ast::Node::BooleanTest(t) if matches!(
+            t.booltesttype,
+            ast::BoolTestType::IsUnknown | ast::BoolTestType::IsNotUnknown
+        ))
         || c.nodes().skip(1).any(|(n, _)| match n {
             NodeRef::NullTest(_) | NodeRef::BooleanTest(_) | NodeRef::CoalesceExpr(_) => true,
             NodeRef::AExpr(e) => matches!(

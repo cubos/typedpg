@@ -374,7 +374,10 @@ pub(crate) fn input_nonempty(
     where_log: &StrictLog,
     snapshot: &PgCatalog,
 ) -> bool {
-    let where_true = sel.where_clause.is_none() || is_true_const(sel.where_clause.as_ref());
+    let where_true = sel.where_clause.is_none()
+        || is_true_const(sel.where_clause.as_ref())
+        || crate::expr::plan_fold::certainly_true(sel.where_clause.as_ref(), snapshot)
+            == Some(true);
     if where_true
         && sel
             .from_clause

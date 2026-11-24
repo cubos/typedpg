@@ -187,6 +187,27 @@ pub(crate) fn agreed_typmod(inputs: &[ExprType], common: PgTypeOid) -> Option<i3
         .then_some(first)
 }
 
+/// Whether no row can be what `facts` (this level's, added to what holds
+/// around the expression) say: only a proven contradiction counts.
+fn facts_unreachable(facts: crate::nonnull::Facts, ctx: Ctx<'_>) -> bool {
+    let narrowed = ctx.null_ctx.with_local_facts(facts);
+    let null_ctx = narrowed.as_ref().unwrap_or(ctx.null_ctx);
+    let column = |c: &crate::nonnull::Col| {
+        let col = ctx
+            .scope
+            .find_source(&c.0)?
+            .columns
+            .iter()
+            .find(|sc| sc.name == c.1)?;
+        Some((
+            col.base_not_null,
+            crate::nonnull::checks::Space::of(col.type_oid, col.collation, ctx.snapshot)
+                .with_refinement(&col.refine),
+        ))
+    };
+    null_ctx.unreachable(&column)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // COALESCE — two-pass (PG chapter 10.5)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -226,8 +247,12 @@ pub(crate) fn infer_coalesce(
         .iter()
         .position(|a| super::plan_fold::certainly_non_null_constant(a.as_ref(), snapshot));
     let mut dead = false;
+    // Whether each argument is folded away (certainly dropped or dead):
+    // the narrowed second reading below skips those.
+    let mut skipped: Vec<bool> = Vec::with_capacity(expr.args.len());
     for (i, arg) in expr.args.iter().enumerate() {
         let dropped = literal_stop.is_some_and(|stop| i > stop);
+        skipped.push(dropped || dead);
         args.push(super::plan_fold::unless_dropped(dropped, || {
             super::plan_fold::unless_dead(dead, || {
                 infer_expr(arg.as_ref(), ctx, params, TypeGoal::NONE)
@@ -250,9 +275,65 @@ pub(crate) fn infer_coalesce(
     let type_oid = select_common_type("COALESCE", &types, &nodes, snapshot)?;
     // Each argument is coerced to the common type, which may map it to NULL.
     let kept = coerce_branches(&mut args, &nodes, type_oid, snapshot);
+    // Each argument is evaluated only where the ones before it are NULL, as
+    // `CASE WHEN a IS NULL THEN b …` reads `b`: read it again knowing the
+    // plain columns among them NULL (the conditions and CHECKs may then
+    // prove it non-NULL, or its values) — the columns their coercion to the
+    // common type keeps as they are: a cast function may map a non-NULL
+    // one to NULL. And an argument is the result only where it isn't NULL
+    // itself: one the facts prove always NULL there never is.
+    let own = crate::nonnull::own_aliases(ctx.scope);
+    let mut before_null = crate::nonnull::Facts::default();
+    let mut result_reached: Vec<bool> = vec![true; expr.args.len()];
+    if !crate::nonnull::disabled() {
+        for (i, arg) in expr.args.iter().enumerate() {
+            let column = arg
+                .as_ref()
+                .and_then(|a| crate::nonnull::plain_column(a, ctx.scope))
+                .map(|(c, _)| c);
+            // Reached where the ones before are NULL (and a column is not).
+            let mut taken = before_null.clone();
+            if let Some(c) = &column {
+                taken.columns.insert(c.clone());
+                taken.rels.insert(c.0.clone());
+            }
+            result_reached[i] = !facts_unreachable(taken.restricted_to(&own), ctx);
+            if !before_null.nulls.is_empty()
+                && !skipped[i]
+                && let Some(narrowed) = ctx
+                    .null_ctx
+                    .with_local_facts(before_null.clone().restricted_to(&own))
+            {
+                let again = infer_expr(
+                    arg.as_ref(),
+                    ctx.with_null_ctx(&narrowed),
+                    params,
+                    TypeGoal::NONE,
+                )?;
+                let mut again = [again];
+                coerce_branches(&mut again, &[nodes[i]], type_oid, snapshot);
+                let [again] = again;
+                if again.type_oid == args[i].type_oid {
+                    args[i] = again;
+                }
+            }
+            if let Some(c) = column
+                && kept[i]
+            {
+                before_null.nulls.insert(c);
+            }
+        }
+    }
     // NULL only when every argument is — not when the quals or CHECK
     // constraints say one of its (uncoerced) columns isn't.
+    // Nor when no row can have its plain columns all NULL (what a NULL
+    // result needs): what `CASE WHEN a IS NULL THEN b ELSE a END` finds
+    // unreachable.
+    let never_all_null = !before_null.nulls.is_empty()
+        && !crate::nonnull::disabled()
+        && facts_unreachable(before_null.clone().restricted_to(&own), ctx);
     let all_nullable = args.iter().all(|t| t.nullable)
+        && !never_all_null
         && !some_column_non_null(kept_nodes(&expr.args, &kept), ctx);
 
     // Pass 2: back-fill UNKNOWN args with the resolved common type. Literal
@@ -291,7 +372,13 @@ pub(crate) fn infer_coalesce(
             _ => t.nullable || has_param_ref(arg.as_ref()),
         })
         .collect();
-    let args_typed_as_result: Vec<bool> = args.iter().map(|t| t.type_oid == type_oid).collect();
+    // The type modifier too: `COALESCE(vc, NULL)` of a `varchar(10)` is a
+    // plain `varchar` (the arguments disagree), `vc` alone keeps its length.
+    let result_typmod = agreed_typmod(&args, type_oid);
+    let args_typed_as_result: Vec<bool> = args
+        .iter()
+        .map(|t| t.type_oid == type_oid && t.typmod == result_typmod)
+        .collect();
     crate::pg_catalog::note_coalesce_fact(
         expr.location,
         &args_nullable,
@@ -314,6 +401,9 @@ pub(crate) fn infer_coalesce(
         .map(Option::as_ref)
         .zip(&args)
         .take(reached)
+        .enumerate()
+        .filter(|(i, _)| result_reached.get(*i).copied().unwrap_or(true))
+        .map(|(_, branch)| branch)
         .collect();
     let typmod = agreed_typmod(&args, type_oid);
     ctx.note_strict(
@@ -611,6 +701,7 @@ pub(crate) fn infer_case(
         .is_some()
         .then(|| super::plan_fold::fold(expr.arg.as_ref(), snapshot));
     let mut stopped = false;
+    let mut certainly_stopped = false;
     // The planner drops a WHEN whose condition it folds to FALSE (its
     // result unfolded), and every one after a condition it folds to TRUE
     // (the ELSE too): past a condition that may fold, nothing is certainly
@@ -652,6 +743,14 @@ pub(crate) fn infer_case(
         let when_fold = super::plan_fold::case_when(test_fold, when.expr.as_ref(), snapshot);
         let cond_dead = stopped;
         let result_dead = stopped || !super::plan_fold::case_result_reached(when_fold);
+        // Certainly, not just possibly: an earlier WHEN folds to TRUE, or
+        // this one to FALSE or NULL.
+        let certainly_folded_away = certainly_stopped
+            || matches!(
+                when_fold,
+                super::plan_fold::Folded::Bool(false) | super::plan_fold::Folded::Null
+            );
+        certainly_stopped |= when_fold == super::plan_fold::Folded::Bool(true);
         stopped = stopped || super::plan_fold::case_stops_after(when_fold);
         let log = crate::nonnull::StrictLog::default();
         let mut taken = crate::nonnull::Facts::default();
@@ -697,7 +796,8 @@ pub(crate) fn infer_case(
                                 crate::nonnull::StrictNode::BuiltinCompare,
                             )
                             && let Some(test) = test.as_ref()
-                            && let Some((col, t)) = crate::nonnull::plain_column(test, ctx.scope)
+                            && let Some((col, t)) =
+                                crate::nonnull::compared_column(test, ctx.scope, snapshot)
                             && let Some(v) = crate::nonnull::literal_for(cond.as_ref(), t, snapshot)
                         {
                             let p = crate::nonnull::ValPred::In(vec![v.clone()]);
@@ -749,7 +849,9 @@ pub(crate) fn infer_case(
             // A simple CASE's `test = value` says of a column test what the
             // same comparison written in a searched CASE does.
             crate::pg_catalog::note_case_when_reached(when.location, when_reached);
-            reached.push(when_reached);
+            // A result the planner folds away (its WHEN folds to FALSE, or
+            // an earlier one to TRUE) is never the CASE's value either.
+            reached.push(when_reached && !certainly_folded_away && !literal_result_dropped);
             let facts = not_taken.clone().union(taken).restricted_to(&own);
             let mut narrowed = ctx.null_ctx.with_local_facts(facts);
             // `WHEN grouping(g) = 0`: the row's grouping set holds `g`.
@@ -864,7 +966,8 @@ pub(crate) fn infer_case(
     // Which inputs can be the result: the ELSE (input 0) unless no row
     // reaches it, each THEN unless its WHEN is refuted. The others still
     // take part in the result type, typmod and collation, as in PG.
-    let can_be_result: Vec<bool> = std::iter::once(!else_unreachable)
+    let else_folded_away = literal_else_dropped || certainly_stopped;
+    let can_be_result: Vec<bool> = std::iter::once(!else_unreachable && !else_folded_away)
         .chain(reached.iter().copied())
         .collect();
     let nullable = inputs
@@ -877,17 +980,27 @@ pub(crate) fn infer_case(
     // (Nor is a branch that can't be the result.)
     let branches: Vec<(Option<&ast::Node>, &ExprType)> = default
         .iter()
-        .map(|d| (d, !else_unreachable))
+        .map(|d| (d, !else_unreachable && !else_folded_away))
         .chain(results.iter().zip(reached.iter().copied()))
         .filter(|(_, can)| *can)
         .map(|((n, t), _)| (*n, t))
         .collect();
-    let mut out =
-        ExprType::scalar_with_typmod(type_oid, nullable, agreed_typmod(&inputs, type_oid))
-            .with_collation(collation)
-            .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
-            .with_refine(branches_refine(&branches, type_oid, snapshot))
-            .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
+    let typmod = agreed_typmod(&inputs, type_oid);
+    ctx.note_strict(
+        expr.location,
+        crate::nonnull::StrictNode::ExactFold,
+        crate::nonnull::subst::folds_exactly(type_oid, typmod, snapshot),
+    );
+    ctx.note_strict(
+        expr.location,
+        crate::nonnull::StrictNode::FloatFold,
+        crate::nonnull::subst::folds_as_float(type_oid, snapshot),
+    );
+    let mut out = ExprType::scalar_with_typmod(type_oid, nullable, typmod)
+        .with_collation(collation)
+        .with_elem_nullable(branches_elem_nullable(&branches, type_oid, snapshot))
+        .with_refine(branches_refine(&branches, type_oid, snapshot))
+        .with_elem_refine(branches_elem_refine(&branches, type_oid, snapshot));
     out.record_fields = branches_record_fields(&branches, type_oid);
     // PostgreSQL 19 relabels a CASE it folds to expose its collation
     // (applyRelabelType): planning keeps the parsed one.

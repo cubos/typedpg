@@ -598,6 +598,31 @@ pub(super) fn clause_item_spans(
         .collect()
 }
 
+/// The expressions that name an output column without an alias
+/// (`FigureColname`): a select list or `RETURNING` item's expression, and
+/// what it takes its name from — a cast's or `COLLATE`'s operand, a
+/// `CASE`'s `ELSE`. Rewriting one of them may rename the column.
+pub(super) fn naming_expressions<'a>(ctx: &'a Ctx<'_>) -> Vec<&'a Node> {
+    let mut out = Vec::new();
+    for (node, _) in ctx.tree.nodes() {
+        if let NodeRef::ResTarget(target) = node
+            && target.name.is_empty()
+        {
+            let mut value = target.val.as_ref();
+            while let Some(node) = value {
+                out.push(node);
+                value = match node {
+                    N::TypeCast(cast) => cast.arg.as_ref(),
+                    N::CollateClause(collate) => collate.arg.as_ref(),
+                    N::CaseExpr(case) => case.defresult.as_ref(),
+                    _ => None,
+                };
+            }
+        }
+    }
+    out
+}
+
 /// `span` widened over the parentheses wrapping it whole: `(x)` and `((x))`
 /// for `x`. Only for a span no call or other syntax can enclose in
 /// parentheses of its own (a list item of a clause, a `WHEN` condition).

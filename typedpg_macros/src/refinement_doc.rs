@@ -286,7 +286,8 @@ mod tests {
                 ("p".into(), lines(&["Greater than 0 and at most 99.5."])),
                 ("fin".into(), lines(&["Never infinite."])),
                 ("old".into(), lines(&["At least 0044-03-15 BC."])),
-                ("pos".into(), vec![]),
+                // `n` is between 1 and 100: `n > 0` is decided.
+                ("pos".into(), lines(&["Always true."])),
                 ("seven".into(), lines(&["Always 7."])),
                 ("same".into(), vec![]),
             ]

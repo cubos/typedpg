@@ -1420,10 +1420,22 @@ fn infer_generic_binary_op(
             if ctx.strict_log.is_some() {
                 note_std_compare(expr.location, op_name, &op, &left, &right, ctx);
             }
+            let mut decided = None;
             if let (Some(l), Some(r)) = (left.as_ref(), right.as_ref()) {
                 let collation = derive_collation([l, r], oid::TEXT, snapshot)
                     .ok()
                     .map(|d| d.collation);
+                let builtin = is_builtin_operator(snapshot, &op) && op.result_type_oid == oid::BOOL;
+                decided = crate::condition::comparison_value(
+                    expr,
+                    op_name,
+                    builtin,
+                    (op.left_type_oid, op.right_type_oid),
+                    l,
+                    r,
+                    collation,
+                    ctx,
+                );
                 crate::condition::note_comparison(
                     expr,
                     op_name,
@@ -1604,6 +1616,21 @@ fn infer_generic_binary_op(
                     crate::refine::of_builtin_call(p, &operands, snapshot)
                 })
                 .unwrap_or_default();
+            // A comparison its operands decide has that one value — so has
+            // one the planner folds to a boolean constant (`'a' <> 'b'`).
+            let decided = decided.or(match super::plan_fold::certain_a_expr(expr, snapshot) {
+                super::plan_fold::Certain::Bool(value) if op.result_type_oid == oid::BOOL => {
+                    Some(value)
+                }
+                _ => None,
+            });
+            let refine = match decided {
+                Some(value) => refine.and(&crate::refine::Refinement {
+                    values: Some(std::iter::once(value.to_string()).collect()),
+                    ..Default::default()
+                }),
+                None => refine,
+            };
             let mut out = ExprType::scalar(op.result_type_oid, nullable)
                 .with_collation(state)
                 .with_elem_nullable(elem_nullable)

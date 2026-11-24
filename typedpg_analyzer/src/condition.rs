@@ -196,6 +196,37 @@ pub(crate) fn note_comparison(
     crate::pg_catalog::note_condition_fact(expr.location, fact);
 }
 
+/// What every non-NULL result of the comparison `expr` is, when what its
+/// operands can be decides it (`flag = true` over a `flag` only ever
+/// `false`): the result's values, as `CASE WHEN expr THEN true ELSE false
+/// END` would know them. A NULL operand makes the result NULL, which no
+/// refinement describes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn comparison_value(
+    expr: &ast::AExpr,
+    op_name: &str,
+    builtin: bool,
+    declared: (Option<PgTypeOid>, PgTypeOid),
+    left: &ExprType,
+    right: &ExprType,
+    collation: Option<Option<crate::oid::PgCollationOid>>,
+    ctx: crate::expr::Ctx<'_>,
+) -> Option<bool> {
+    let cmp = Cmp::of(op_name)?;
+    if !builtin
+        || unreliable_column(expr.lexpr.as_ref(), ctx)
+        || unreliable_column(expr.rexpr.as_ref(), ctx)
+    {
+        return None;
+    }
+    let snapshot = ctx.snapshot;
+    let (tl, tr) = target_types(declared, left.type_oid, right.type_oid, snapshot)?;
+    let kind = kind_of(tl, tr, collation?, snapshot)?;
+    let l = left.refine.converted(left.type_oid, tl, snapshot);
+    let r = right.refine.converted(right.type_oid, tr, snapshot);
+    decide(cmp, &l, &r, kind)
+}
+
 /// Record the decision about the `IN` list `expr` (`<>` for `NOT IN`):
 /// `left` compared with each item's `items`, under `collation`.
 pub(crate) fn note_in_list(

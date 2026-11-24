@@ -23,10 +23,10 @@ use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let mut out = Vec::new();
-    // A `COALESCE` that is an unnamed `ResTarget`'s expression — under
-    // casts and `COLLATE` too, which take their operand's name
-    // (`FigureColname`) — names its output column `coalesce`; removing the
-    // call renames it, so its fix is withheld. Collect them first: a node
+    // A `COALESCE` that names an output column (`naming_expressions`: an
+    // unaliased item, or under a cast, `COLLATE` or a `CASE`'s `ELSE` there)
+    // names it `coalesce`; removing the call renames it, so its fix is
+    // withheld. Collect them first: a node
     // visited later needs to know.
     let mut unaliased = HashSet::new();
     for (node, _) in ctx.tree.nodes() {
@@ -41,21 +41,10 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 }
             }
         }
-        if let NodeRef::ResTarget(target) = node
-            && target.name.is_empty()
-        {
-            let mut value = target.val.as_ref();
-            loop {
-                match value {
-                    Some(N::TypeCast(cast)) => value = cast.arg.as_ref(),
-                    Some(N::CollateClause(collate)) => value = collate.arg.as_ref(),
-                    Some(N::CoalesceExpr(expr)) => {
-                        unaliased.insert(expr.location);
-                        break;
-                    }
-                    _ => break,
-                }
-            }
+    }
+    for node in super::naming_expressions(ctx) {
+        if let N::CoalesceExpr(expr) = node {
+            unaliased.insert(expr.location);
         }
     }
     let conjuncts = condition_conjuncts(ctx);
@@ -948,6 +937,23 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_whose_type_modifier_the_kept_argument_lacks_has_no_fix() {
+        let mut db = catalog();
+        db.apply_sql("CREATE TABLE vcs (vc varchar(10) NOT NULL)")
+            .unwrap();
+        // `COALESCE(vc, NULL)` is a plain varchar (its arguments' modifiers
+        // differ); `vc` alone a varchar(10). So is `COALESCE(vc, 'x')`.
+        for sql in [
+            "SELECT COALESCE(vc, NULL) AS v FROM vcs",
+            "SELECT COALESCE(vc, 'x') AS v FROM vcs",
+        ] {
+            let findings = lint(&db, sql);
+            let finding = only(&findings);
+            assert!(finding.fix.is_empty(), "{sql}: {finding:?}");
+        }
+    }
+
+    #[test]
     fn coalesce_naming_an_unaliased_target_has_no_fix() {
         let db = catalog();
         // The unnamed target column would be renamed from `coalesce` to `nn`,
@@ -958,6 +964,8 @@ mod tests {
             "SELECT * FROM (SELECT COALESCE(nn, 0) FROM checks) s",
             // A FROM item.
             "SELECT * FROM coalesce(1, 2)",
+            // A CASE takes its ELSE's name: `coalesce`.
+            "SELECT CASE WHEN id > 0 THEN 1 ELSE COALESCE(nn, 0) END FROM checks",
             // A cast or COLLATE takes its operand's name: still `coalesce`.
             "SELECT COALESCE(nn, 0)::bigint FROM checks",
             "SELECT (COALESCE(name, 'x'))::varchar FROM checks",

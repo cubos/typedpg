@@ -51,13 +51,15 @@ type is spelled: `title::pg_catalog.text`, `id::int8` on a `bigint`,
   `NULL::text`, `date '2020-01-01'`.
 - A cast to another type, or one that changes or drops the modifier:
   `views::bigint` of an `integer`, `email::varchar` of a `varchar(100)`.
-- A cast that types its operand: `ROW(…)::users`, `ARRAY[id::int]::bigint[]`.
+- A cast that types its operand: `ROW(…)::users`, `ARRAY[id::int]::bigint[]`,
+  a subquery's row `s::users`; and `s::record`, which forgets the row's fields.
 
 ## Fix not offered
 
 - For the `CAST(x AS type)` form.
-- When the cast is a whole output column without an alias and removing it
-  would rename the column: `SELECT 1::int` names it `int4`, `SELECT 1`
+- When the cast names an output column without an alias (as the whole
+  item, or the `ELSE` of a `CASE` that is) and removing it would rename the
+  column: `SELECT 1::int` names it `int4`, `SELECT 1`
   names it `?column?`. A column, function call, `COALESCE`, `GREATEST` or
   `LEAST` operand keeps the name, so `SELECT lower(name)::text FROM users`
   is fixed.

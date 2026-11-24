@@ -1870,7 +1870,7 @@ fn equal_literals(a: &Literal, b: &Literal) -> bool {
     }
 }
 
-fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
+pub(crate) fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
     let kind = e.kind;
     let operands: Vec<Option<&ast::Node>> = [e.lexpr.as_ref(), e.rexpr.as_ref()]
         .into_iter()

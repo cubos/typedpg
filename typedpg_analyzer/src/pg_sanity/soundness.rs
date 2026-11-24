@@ -487,7 +487,7 @@ impl Soundness {
         let param_refs: Vec<&(dyn ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
         let rows = row_comparison(catalog, original.0, ours);
-        if matches!(rows, Rows::Count) {
+        if matches!(rows, Rows::Count | Rows::ReturnedCount) {
             self.stats.equivalence_counts_only += 1;
         }
         let mut targets = written_tables(original.0);
@@ -837,6 +837,10 @@ enum Rows {
     All(Option<Vec<usize>>),
     /// By count (and the written tables by their row counts).
     Count,
+    /// By count, the written tables in full: an `UPDATE … FROM` or `DELETE
+    /// … USING` returns, for a target row several rows of its join match,
+    /// the values of whichever of them the plan meets first.
+    ReturnedCount,
 }
 
 /// How the rows of `sql` (analyzed as `ours`) and of a query that must
@@ -844,7 +848,9 @@ enum Rows {
 /// ([`crate::simplify::picks_rows_arbitrarily`]: a `LIMIT`, `OFFSET` or
 /// `DISTINCT ON` whose `ORDER BY` can tie), a `TABLESAMPLE`'s, or a system
 /// column's physical value (`ctid`, `xmin`, …) differ between runs: only
-/// their count is compared then.
+/// their count is compared then. So are the rows an `UPDATE … FROM` or
+/// `DELETE … USING` returns ([`joined_write`]), the tables it writes
+/// compared in full unless the `SET` reads the join.
 fn row_comparison(catalog: &crate::PgCatalog, sql: &str, ours: &AnalyzedQuery) -> Rows {
     use typedpg_pg_query::NodeRef;
     let lower = sql.to_ascii_lowercase();
@@ -858,9 +864,57 @@ fn row_comparison(catalog: &crate::PgCatalog, sql: &str, ours: &AnalyzedQuery) -
             .any(|(n, _)| matches!(n, NodeRef::RangeTableSample(_)))
     });
     if physical || sampled || crate::simplify::picks_rows_arbitrarily(catalog, sql, ours) {
-        Rows::Count
-    } else {
-        Rows::All(order_keys(sql, ours))
+        return Rows::Count;
+    }
+    match joined_write(sql) {
+        Some(true) => Rows::Count,
+        Some(false) => Rows::ReturnedCount,
+        None => Rows::All(order_keys(sql, ours)),
+    }
+}
+
+/// Whether `sql` is an `UPDATE … FROM` or a `DELETE … USING`: a target row
+/// several rows of the join match is written (deleted, or updated from)
+/// once, with whichever of them the plan meets first — what `RETURNING`
+/// shows of them is arbitrary. `Some(true)` when an `UPDATE`'s `SET` may
+/// read the join's rows too (an unqualified column, or one of a `FROM`
+/// item's), so the values written are arbitrary as well.
+fn joined_write(sql: &str) -> Option<bool> {
+    use typedpg_pg_query::NodeRef;
+    use typedpg_pg_query::ast::Node;
+    let parsed = typedpg_pg_query::parse(sql).ok()?;
+    match parsed.tree.stmts.first()?.stmt.as_ref()? {
+        Node::DeleteStmt(d) if !d.using_clause.is_empty() => Some(false),
+        Node::UpdateStmt(u) if !u.from_clause.is_empty() => {
+            let mut names: Vec<String> = Vec::new();
+            for item in u.from_clause.iter().flatten() {
+                for (n, _) in item.nodes() {
+                    match n {
+                        NodeRef::RangeVar(rv) => names.push(
+                            rv.alias
+                                .as_ref()
+                                .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone()),
+                        ),
+                        NodeRef::Alias(a) => names.push(a.aliasname.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            let reads_join = u.target_list.iter().flatten().any(|target| {
+                target.nodes().any(|(n, _)| match n {
+                    NodeRef::ColumnRef(c) => match c.fields.as_slice() {
+                        [_] => true,
+                        [Some(Node::String(q)), ..] => names.contains(&q.sval),
+                        _ => true,
+                    },
+                    // A subquery may read them too.
+                    NodeRef::SubLink(_) => true,
+                    _ => false,
+                })
+            });
+            Some(reads_join)
+        }
+        _ => None,
     }
 }
 
@@ -891,6 +945,7 @@ fn result_difference(
     };
     let tables_differ = match rows {
         Rows::All(_) => written_tables != sent_tables,
+        Rows::ReturnedCount => written_tables != sent_tables,
         Rows::Count => written_tables
             .iter()
             .map(|(t, r)| (t, r.len()))
@@ -916,12 +971,12 @@ fn result_difference(
                     sb.sort();
                     sa != sb
                 }
-                Rows::Count => a.len() != b.len(),
+                Rows::Count | Rows::ReturnedCount => a.len() != b.len(),
             };
             if rows_differ {
                 return Difference::Differs(match rows {
                     Rows::All(_) => format!("it returns other rows:\n{}", both(a, b)),
-                    Rows::Count => format!(
+                    Rows::Count | Rows::ReturnedCount => format!(
                         "it returns {} rows, the {a_name} query {}:\n{}",
                         b.len(),
                         a.len(),
@@ -1644,5 +1699,43 @@ impl ToSql for Param {
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         self.to_sql(ty, out)
+    }
+}
+
+#[cfg(test)]
+mod joined_write_tests {
+    use super::joined_write;
+
+    #[test]
+    fn writes_through_a_join_return_rows_of_an_arbitrary_match() {
+        assert_eq!(
+            joined_write("DELETE FROM a USING b WHERE a.id = b.id RETURNING *"),
+            Some(false)
+        );
+        assert_eq!(
+            joined_write("UPDATE a SET x = 1 FROM b WHERE a.id = b.id RETURNING *"),
+            Some(false)
+        );
+        // The SET reads the join: the values written are arbitrary too.
+        assert_eq!(
+            joined_write("UPDATE a SET x = b.x FROM b WHERE a.id = b.id"),
+            Some(true)
+        );
+        assert_eq!(
+            joined_write("UPDATE a SET x = y FROM b WHERE a.id = b.id"),
+            Some(true)
+        );
+        assert_eq!(
+            joined_write("UPDATE a SET x = (SELECT 1) FROM b AS c WHERE a.id = c.id"),
+            Some(true)
+        );
+        assert_eq!(
+            joined_write("UPDATE a SET x = a.x + 1 FROM b WHERE a.id = b.id"),
+            Some(false)
+        );
+        // No join.
+        assert_eq!(joined_write("UPDATE a SET x = 1 RETURNING *"), None);
+        assert_eq!(joined_write("DELETE FROM a RETURNING *"), None);
+        assert_eq!(joined_write("SELECT 1"), None);
     }
 }

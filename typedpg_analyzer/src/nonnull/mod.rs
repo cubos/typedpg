@@ -1848,7 +1848,7 @@ fn column_ref_facts(c: &ast::ColumnRef, scope: &Scope) -> Facts {
 /// The column a plain, non-composite column reference names (for a
 /// composite `x`, `x IS NULL` also holds for a row of NULLs).
 fn scalar_column(n: Option<&ast::Node>, scope: &Scope, snapshot: &PgCatalog) -> Option<Col> {
-    let col = plain_column(n?, scope)?;
+    let col = identity_cast_column(n?, scope, snapshot)?;
     (!crate::coerce::is_complex(col.1, snapshot) && col.1 != crate::pg_catalog::oid::RECORD)
         .then_some(col.0)
 }
@@ -1914,6 +1914,13 @@ pub(crate) fn literal_for(
     match n? {
         ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
+            // A cast of a cast to the same type adds no node:
+            // `('2020-01-01'::timestamptz)::timestamptz`.
+            if let Some(inner @ ast::Node::TypeCast(itc)) = tc.arg.as_ref()
+                && cast_target(itc, snapshot) == Some(target)
+            {
+                return literal_for(Some(inner), column_type, snapshot);
+            }
             let no_op = match tc.arg.as_ref() {
                 Some(ast::Node::AConst(c)) => {
                     crate::expr::literals::infer_a_const(c).is_ok_and(|t| {
@@ -2238,8 +2245,45 @@ fn between_facts(e: &ast::AExpr, scope: &Scope, log: &StrictLog, snapshot: &PgCa
 
 /// A plain column ([`plain_column`]), or one cast to the type and typmod
 /// it already has: coerce_type adds no node for that cast, so
-/// `name::text = 'x'` compares `name` itself.
-fn compared_column(
+/// `name::text = 'x'` compares `name` itself. Or such a column first in a
+/// `COALESCE` (or the `CASE WHEN x IS NULL THEN … ELSE x END` it
+/// abbreviates) whose other arguments are constants of its type: where the
+/// column is non-NULL, the `COALESCE` is the column, so what a comparison
+/// says of the `COALESCE` holds of the column's non-NULL values — all a
+/// [`ValPred`] claims (`COALESCE(n, 0) = 5` leaves a non-NULL `n` equal
+/// to 5; a NULL `n` is not described).
+pub(crate) fn compared_column(
+    n: &ast::Node,
+    scope: &Scope,
+    snapshot: &PgCatalog,
+) -> Option<(Col, crate::oid::PgTypeOid)> {
+    if let ast::Node::CoalesceExpr(c) = n {
+        let (first, rest) = c.args.split_first()?;
+        let (col, t) = compared_column(first.as_ref()?, scope, snapshot)?;
+        return rest
+            .iter()
+            .all(|arg| literal_for(arg.as_ref(), t, snapshot).is_some())
+            .then_some((col, t));
+    }
+    // The same written as `CASE WHEN x IS NULL THEN c ELSE x END`.
+    if let ast::Node::CaseExpr(case) = n
+        && case.arg.is_none()
+        && let [Some(ast::Node::CaseWhen(when))] = case.args.as_slice()
+        && let Some(ast::Node::NullTest(test)) = when.expr.as_ref()
+        && test.nulltesttype == ast::NullTestType::IsNull
+    {
+        let tested = identity_cast_column(test.arg.as_ref()?, scope, snapshot)?;
+        let (col, t) = identity_cast_column(case.defresult.as_ref()?, scope, snapshot)?;
+        return (tested.0 == col && literal_for(when.result.as_ref(), t, snapshot).is_some())
+            .then_some((col, t));
+    }
+    identity_cast_column(n, scope, snapshot)
+}
+
+/// A plain column ([`plain_column`]), or one under casts to the type and
+/// typmod it already has (`(x::int8)::int8` of an `int8`): coerce_type adds
+/// no node for those, so the value is the column's, NULL exactly when it is.
+fn identity_cast_column(
     n: &ast::Node,
     scope: &Scope,
     snapshot: &PgCatalog,
@@ -2247,7 +2291,7 @@ fn compared_column(
     let ast::Node::TypeCast(tc) = n else {
         return plain_column(n, scope);
     };
-    let (col, t) = plain_column(tc.arg.as_ref()?, scope)?;
+    let (col, t) = identity_cast_column(tc.arg.as_ref()?, scope, snapshot)?;
     let type_name = tc.type_name.as_ref()?;
     let target = crate::ddl::util::resolve_type_name(type_name, snapshot)?;
     let written = if type_name.typmods.is_empty() {
@@ -2392,6 +2436,20 @@ pub(crate) fn constants<'n>(
 /// `array_in` reads it (quotes, escapes, nesting, explicit bounds, the
 /// type's delimiter), each element as the string constant its input
 /// function gets; `None` when it doesn't parse.
+/// The element type of an `ARRAY[…]` of typed constants all of one type
+/// (`ARRAY[0, 1]` is `integer`); `None` for anything else.
+fn array_expr_type(a: &ast::AArrayExpr) -> Option<crate::oid::PgTypeOid> {
+    let mut types = a.elements.iter().map(|e| match e {
+        Some(ast::Node::AConst(c)) if !c.isnull => crate::expr::literals::infer_a_const(c)
+            .ok()
+            .map(|t| t.type_oid)
+            .filter(|t| *t != crate::pg_catalog::oid::UNKNOWN),
+        _ => None,
+    });
+    let first = types.next()??;
+    types.all(|t| t == Some(first)).then_some(first)
+}
+
 pub(crate) fn array_constants(
     n: Option<&ast::Node>,
     t: crate::oid::PgTypeOid,
@@ -2408,11 +2466,21 @@ pub(crate) fn array_constants(
         ),
         ast::Node::TypeCast(tc) => {
             let target = cast_target(tc, snapshot)?;
-            if snapshot.pg_type.get(&t).and_then(|ty| ty.typarray) != Some(target) {
-                return None;
-            }
+            let array_of = |elem: crate::oid::PgTypeOid| {
+                snapshot.pg_type.get(&elem).and_then(|ty| ty.typarray) == Some(target)
+            };
             match tc.arg.as_ref()? {
-                ast::Node::AConst(_) => array_constants(tc.arg.as_ref(), t, drop_nulls, snapshot),
+                ast::Node::AConst(_) if array_of(t) => {
+                    array_constants(tc.arg.as_ref(), t, drop_nulls, snapshot)
+                }
+                // `ARRAY[…]::t[]` coerces each element to `t`; a cast to the
+                // array type the constructor already has (`ARRAY[0]::int[]`)
+                // adds no node.
+                ast::Node::AArrayExpr(a)
+                    if array_of(t) || array_expr_type(a).is_some_and(array_of) =>
+                {
+                    array_constants(tc.arg.as_ref(), t, drop_nulls, snapshot)
+                }
                 _ => None,
             }
         }

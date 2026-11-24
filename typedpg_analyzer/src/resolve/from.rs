@@ -2494,7 +2494,8 @@ pub(crate) fn srfs_have_equal_static_rows<'a>(
     rows.is_some()
 }
 
-/// Whether a SELECT's input always has a row, whatever the data: no WHERE,
+/// Whether a SELECT's input always has a row, whatever the data: no WHERE
+/// (or one folding to TRUE),
 /// and a FROM list (none at all is one row) of items that always do —
 /// a VALUES list, a FROM-less SELECT, a function of statically known
 /// non-zero length, or a join keeping such a side. What an aggregate
@@ -2504,7 +2505,10 @@ pub(crate) fn select_input_never_empty(
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
-    sel.where_clause.is_none()
+    // (A WHERE the planner folds to TRUE, `WHERE 1 = 1`, filters nothing.)
+    (sel.where_clause.is_none()
+        || crate::expr::plan_fold::certainly_true(sel.where_clause.as_ref(), ctx.snapshot)
+            == Some(true))
         && sel
             .from_clause
             .iter()

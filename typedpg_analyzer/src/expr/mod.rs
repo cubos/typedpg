@@ -1867,6 +1867,18 @@ fn infer_expr_unlocated(
                 if let Some(p) = bare_param(arg.as_ref(), snapshot) {
                     params.mark_indeterminate_locked(p.number);
                 }
+                // A scalar never NULL here decides the test: `x IS NOT
+                // NULL` is TRUE, `x IS NULL` FALSE — what `CASE WHEN x IS
+                // NOT NULL THEN true ELSE false END` is known to be too.
+                if !composite && !arg_type.nullable && !has_param_ref(arg.as_ref()) {
+                    let value = t.nulltesttype == ast::NullTestType::IsNotNull;
+                    return Ok(ExprType::scalar(oid::BOOL, false).with_refine(
+                        crate::refine::Refinement {
+                            values: Some(std::iter::once(value.to_string()).collect()),
+                            ..Default::default()
+                        },
+                    ));
+                }
             }
             Ok(ExprType::scalar(oid::BOOL, false))
         }

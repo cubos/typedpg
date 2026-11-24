@@ -24,28 +24,14 @@ use super::{leftmost_start, location, scan_until};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    // The CASEs that are an output column's expression with no alias —
-    // under casts and `COLLATE` too, which take their operand's name or
-    // fall back to the type's: they name the column.
-    let mut naming = HashSet::new();
-    for (node, _) in ctx.tree.nodes() {
-        if let NodeRef::ResTarget(target) = node
-            && target.name.is_empty()
-        {
-            let mut value = target.val.as_ref();
-            loop {
-                match value {
-                    Some(N::TypeCast(cast)) => value = cast.arg.as_ref(),
-                    Some(N::CollateClause(collate)) => value = collate.arg.as_ref(),
-                    Some(N::CaseExpr(case)) => {
-                        naming.insert(case.location);
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-        }
-    }
+    // The CASEs that name an output column (see `naming_expressions`).
+    let naming: HashSet<i32> = super::naming_expressions(ctx)
+        .into_iter()
+        .filter_map(|node| match node {
+            N::CaseExpr(case) => Some(case.location),
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         if let NodeRef::CaseExpr(case) = node {
@@ -337,6 +323,9 @@ mod tests {
             // Under a cast, which names it after the CASE or its type.
             "SELECT (CASE WHEN name IS NULL THEN 'none' ELSE name END)::varchar FROM users",
             "SELECT CASE WHEN id > 1 THEN true ELSE false END::text FROM users",
+            // The ELSE of a CASE, which takes its name.
+            "SELECT CASE WHEN id > 1 THEN 'a' ELSE CASE WHEN name IS NULL THEN 'none' ELSE name \
+             END END FROM users",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");

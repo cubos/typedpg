@@ -46,6 +46,8 @@ mod dml_clause_kinds;
 mod dml_returning_narrowing;
 #[path = "query/dml_soundness.rs"]
 mod dml_soundness;
+#[path = "query/equivalent_spellings.rs"]
+mod equivalent_spellings;
 #[path = "query/expression_facts.rs"]
 mod expression_facts;
 #[path = "query/expressions.rs"]

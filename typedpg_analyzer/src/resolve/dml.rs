@@ -1866,10 +1866,43 @@ fn domain_check_violation(
         return super::failing_rows::array_elements_domain_error(arr, tc.atttypid, snapshot)
             .map(AnalyzeError::Invalid);
     }
-    let literal = crate::nonnull::literal(v)?;
+    let literal = crate::nonnull::literal(constant_value(v, snapshot))?;
     snapshot
         .domain_value_violation_at_execution(tc.atttypid, &literal)
         .map(AnalyzeError::CheckViolation)
+}
+
+/// The literal `v` is, seen through what leaves it as it is: a cast to the
+/// type it already has (`100::integer`, which adds no node) and a
+/// `COALESCE` whose first argument is such a non-NULL constant (the result,
+/// `COALESCE(-1, 0)`). Anything else is `v` itself.
+fn constant_value<'a>(v: Option<&'a ast::Node>, snapshot: &PgCatalog) -> Option<&'a ast::Node> {
+    match v? {
+        ast::Node::TypeCast(tc) => {
+            let inner = constant_value(tc.arg.as_ref(), snapshot);
+            let same_type = match (inner, tc.type_name.as_ref()) {
+                (Some(ast::Node::AConst(c)), Some(name)) if !c.isnull => {
+                    crate::expr::literals::infer_a_const(c).is_ok_and(|t| {
+                        t.type_oid != crate::pg_catalog::oid::UNKNOWN
+                            && name.typmods.is_empty()
+                            && crate::ddl::util::resolve_type_name(name, snapshot)
+                                == Some(t.type_oid)
+                    })
+                }
+                _ => false,
+            };
+            if same_type { inner } else { v }
+        }
+        ast::Node::CoalesceExpr(c) => match c
+            .args
+            .first()
+            .and_then(|a| constant_value(a.as_ref(), snapshot))
+        {
+            first @ Some(ast::Node::AConst(a)) if !a.isnull => first,
+            _ => v,
+        },
+        _ => v,
+    }
 }
 
 /// The partition constraint the row `items` of `tgt` surely fails when
@@ -3190,9 +3223,32 @@ fn analyze_update_here(
         // between WHERE and RETURNING. The old row keeps all of it.
         // Only the assigned columns' names are read: the SET list's row
         // expansion ([`analyze_set_clause`], after WHERE) leaves them as is.
+        // (`SET c = c` writes the value WHERE saw: no rewrite of it.)
+        let self_assigned: std::collections::HashSet<&str> = upd
+            .target_list
+            .iter()
+            .filter_map(|t| match t {
+                Some(ast::Node::ResTarget(rt)) if rt.indirection.is_empty() => {
+                    match rt.val.as_ref() {
+                        Some(ast::Node::ColumnRef(c)) => {
+                            let fields = expr::extract_string_fields(&c.fields);
+                            let names_it = match fields.as_slice() {
+                                [col] => col == &rt.name,
+                                [qualifier, col] => qualifier == alias && col == &rt.name,
+                                _ => false,
+                            };
+                            names_it.then_some(rt.name.as_str())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
         let assigned: std::collections::HashSet<String> = set_list_assigns(&upd.target_list)
             .into_iter()
             .map(|a| a.column)
+            .filter(|c| !self_assigned.contains(c.as_str()))
             .collect();
         let keeps = update_keeps_values(snapshot, table_oid);
         let old_as_is = rows_returned_as_is(snapshot, table_oid);
