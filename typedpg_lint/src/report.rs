@@ -132,14 +132,28 @@ impl Report {
         }
     }
 
-    /// Sort the failures and findings by path, position and rule.
+    /// Sort the failures and findings by path, position and rule, then by
+    /// where a finding ends and its message: findings of one rule at one
+    /// position come in whatever order the rules produced them, which isn't
+    /// stable from run to run.
     pub fn sort(&mut self) {
         self.entries.sort_by(|a, b| {
-            (a.path.as_str(), a.start, a.finding.rule).cmp(&(
-                b.path.as_str(),
-                b.start,
-                b.finding.rule,
-            ))
+            (
+                a.path.as_str(),
+                a.start,
+                a.finding.rule,
+                a.end,
+                &a.finding.message,
+                &a.finding.help,
+            )
+                .cmp(&(
+                    b.path.as_str(),
+                    b.start,
+                    b.finding.rule,
+                    b.end,
+                    &b.finding.message,
+                    &b.finding.help,
+                ))
         });
         self.failures
             .sort_by(|a, b| (&a.path, a.start, &a.message).cmp(&(&b.path, b.start, &b.message)));
@@ -960,6 +974,31 @@ mod tests {
             .map(|entry| entry.finding.message.as_str())
             .collect();
         assert_eq!(order, ["a0", "a1", "a2", "b"]);
+    }
+
+    #[test]
+    fn findings_of_one_rule_at_one_position_sort_by_message() {
+        let at = |message: &'static str| {
+            entry(
+                "a.rs",
+                1,
+                1,
+                finding(Rule::NullComparison, Severity::Error, message, None),
+            )
+        };
+        for entries in [vec![at("y"), at("x")], vec![at("x"), at("y")]] {
+            let mut report = Report {
+                entries,
+                ..Report::default()
+            };
+            report.sort();
+            let order: Vec<&str> = report
+                .entries
+                .iter()
+                .map(|entry| entry.finding.message.as_str())
+                .collect();
+            assert_eq!(order, ["x", "y"]);
+        }
     }
 
     #[test]
