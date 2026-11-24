@@ -27,8 +27,6 @@ struct CachedPgCatalog {
     migration_hash: String,
     /// Cache key: the runner's `use_transaction` setting.
     use_transaction: bool,
-    /// Cache key: the migrations' session as the configuration names it.
-    connection: typedpg_core::config::MigrationsConnection,
     /// The catalog with each set of analysis settings applied, shared by
     /// the queries analyzed with them: cloning a catalog costs far more
     /// than analyzing a query (the seed's thousands of rows).
@@ -78,15 +76,12 @@ fn get_or_build_pg_catalog(
     migrations_dirs: &[&Path],
     migration_hash: &str,
     use_transaction: bool,
-    connection: &typedpg_core::config::MigrationsConnection,
     settings: AnalysisSettings,
 ) -> Result<Rc<PgCatalog>, syn::Error> {
     CACHED_PG_CATALOG.with(|cell| {
         let mut cache = cell.borrow_mut();
         let found = cache.iter().position(|c| {
-            c.migration_hash == migration_hash
-                && c.use_transaction == use_transaction
-                && c.connection == *connection
+            c.migration_hash == migration_hash && c.use_transaction == use_transaction
         });
         let mut cached = match found {
             Some(i) => {
@@ -106,7 +101,7 @@ fn get_or_build_pg_catalog(
                 cached
             }
             None => {
-                let catalog = build_pg_catalog(migrations_dirs, use_transaction, connection)?;
+                let catalog = build_pg_catalog(migrations_dirs, use_transaction)?;
                 let failure = catalog.as_ref().err().map(|f| f.full.clone());
                 if cache.len() >= CACHED_CATALOGS {
                     cache.remove(0);
@@ -115,7 +110,6 @@ fn get_or_build_pg_catalog(
                     catalog,
                     migration_hash: migration_hash.to_string(),
                     use_transaction,
-                    connection: connection.clone(),
                     configured: Vec::new(),
                 });
                 if let Some(full) = failure {
@@ -152,7 +146,6 @@ fn get_or_build_pg_catalog(
 fn build_pg_catalog(
     migrations_dirs: &[&Path],
     use_transaction: bool,
-    connection: &typedpg_core::config::MigrationsConnection,
 ) -> Result<Result<PgCatalog, CatalogFailure>, syn::Error> {
     let migrations = collect_migration_files(migrations_dirs)?;
     let mut catalog = PgCatalog::new().map_err(|e| {
@@ -162,7 +155,6 @@ fn build_pg_catalog(
         )
     })?;
     catalog.set_migrations_use_transaction(use_transaction);
-    catalog.set_migrations_connection(connection);
     for (filename, sql) in &migrations {
         if let Err(e) = catalog.apply_migration(filename, sql) {
             let full = e.to_string();
@@ -514,7 +506,6 @@ pub(crate) fn catalog_for<'c>(
         &all_dirs,
         &migration_hash,
         resolved.migrations_use_transaction(),
-        &resolved.migrations_connection(),
         AnalysisSettings {
             finite,
             simplify: typedpg_analyzer::SimplifyOptions::from_config(&resolved.simplify),
@@ -846,38 +837,10 @@ mod catalog_tests {
         std::fs::write(a.path().join("0001_a.sql"), "CREATE TABLE a ();").unwrap();
         let b = tempfile::tempdir().unwrap();
         std::fs::write(b.path().join("0001_b.sql"), "CREATE TABLE b ();").unwrap();
-        let first_a = get_or_build_pg_catalog(
-            &[a.path()],
-            "share-a",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .unwrap();
-        let first_b = get_or_build_pg_catalog(
-            &[b.path()],
-            "share-b",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .unwrap();
-        let again_a = get_or_build_pg_catalog(
-            &[a.path()],
-            "share-a",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .unwrap();
-        let again_b = get_or_build_pg_catalog(
-            &[b.path()],
-            "share-b",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .unwrap();
+        let first_a = get_or_build_pg_catalog(&[a.path()], "share-a", true, settings()).unwrap();
+        let first_b = get_or_build_pg_catalog(&[b.path()], "share-b", true, settings()).unwrap();
+        let again_a = get_or_build_pg_catalog(&[a.path()], "share-a", true, settings()).unwrap();
+        let again_b = get_or_build_pg_catalog(&[b.path()], "share-b", true, settings()).unwrap();
         assert!(Rc::ptr_eq(&first_a, &again_a));
         assert!(Rc::ptr_eq(&first_b, &again_b));
         assert!(!Rc::ptr_eq(&first_a, &first_b));
@@ -890,45 +853,8 @@ mod catalog_tests {
             },
             ..settings()
         };
-        let other = get_or_build_pg_catalog(
-            &[a.path()],
-            "share-a",
-            true,
-            &Default::default(),
-            no_simplify,
-        )
-        .unwrap();
+        let other = get_or_build_pg_catalog(&[a.path()], "share-a", true, no_simplify).unwrap();
         assert!(!Rc::ptr_eq(&first_a, &other));
-    }
-
-    /// The configured migrations' user names the schema `CREATE SCHEMA
-    /// AUTHORIZATION CURRENT_USER` creates; a catalog built for one
-    /// connection isn't reused for another.
-    #[test]
-    fn the_migrations_connection_builds_its_own_catalog() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("0001_a.sql"),
-            "CREATE SCHEMA AUTHORIZATION CURRENT_USER; CREATE TABLE t (id int);",
-        )
-        .unwrap();
-        let named = typedpg_core::config::MigrationsConnection {
-            user: Some("deployer".to_owned()),
-            database: None,
-        };
-        let deployer =
-            get_or_build_pg_catalog(&[dir.path()], "connection", true, &named, settings()).unwrap();
-        assert!(deployer.resolve_table(Some("deployer"), "t").is_some());
-        assert!(deployer.resolve_table(Some("other"), "t").is_none());
-        let unnamed = get_or_build_pg_catalog(
-            &[dir.path()],
-            "connection",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .unwrap();
-        assert!(!Rc::ptr_eq(&deployer, &unnamed));
     }
 
     /// The macro reads the migrations at expansion time, so Cargo must
@@ -974,26 +900,14 @@ mod catalog_tests {
             "CREATE VIEW v AS\n    SELECT idd FROM t;\n",
         )
         .unwrap();
-        let first = get_or_build_pg_catalog(
-            &[dir.as_path()],
-            "failing",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .err()
-        .expect("the migration fails")
-        .to_string();
-        let second = get_or_build_pg_catalog(
-            &[dir.as_path()],
-            "failing",
-            true,
-            &Default::default(),
-            settings(),
-        )
-        .err()
-        .expect("the failure is cached")
-        .to_string();
+        let first = get_or_build_pg_catalog(&[dir.as_path()], "failing", true, settings())
+            .err()
+            .expect("the migration fails")
+            .to_string();
+        let second = get_or_build_pg_catalog(&[dir.as_path()], "failing", true, settings())
+            .err()
+            .expect("the failure is cached")
+            .to_string();
         std::fs::remove_dir_all(&dir).unwrap();
 
         let path = dir.join("0002_view.sql").display().to_string();

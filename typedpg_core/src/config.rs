@@ -466,15 +466,6 @@ pub struct DatabaseConfig {
     /// checked.
     #[serde(default)]
     roles: Vec<String>,
-    /// The user the migrations connect as, when known: `CURRENT_USER` in
-    /// them, and `$user` in the search path, name it (see
-    /// [`MigrationsConnection`]).
-    #[serde(default)]
-    migrations_user: Option<String>,
-    /// The database's name, when known: the privilege errors on the
-    /// database name it.
-    #[serde(default)]
-    database_name: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -485,21 +476,9 @@ impl Default for DatabaseConfig {
             migrations: Self::default_migrations(),
             extra_migrations: Vec::new(),
             roles: Vec::new(),
-            migrations_user: None,
-            database_name: None,
             unknown: BTreeMap::new(),
         }
     }
-}
-
-/// What the analysis knows of the session the migrations run in: the user
-/// they connect as — the one `CURRENT_USER` / `SESSION_USER` name before a
-/// `SET ROLE`, whose schema `$user` finds — and the database's name. Both
-/// optional; unknown, the analysis assumes nothing of them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct MigrationsConnection {
-    pub user: Option<String>,
-    pub database: Option<String>,
 }
 
 impl DatabaseConfig {
@@ -826,8 +805,7 @@ impl Config {
     fn check_unknown_keys(&self) -> Result<(), ConfigError> {
         const TOP: &str = "package.metadata.typedpg";
         const TOP_KEYS: &str = "`database`, `migrations`, `types`, `databases`, `simplify`, `lint`";
-        const DATABASE_KEYS: &str =
-            "`migrations`, `extra_migrations`, `roles`, `migrations_user`, `database_name`";
+        const DATABASE_KEYS: &str = "`migrations`, `extra_migrations`, `roles`";
         reject_unknown(&self.unknown, LEGACY_TOP_LEVEL_KEYS, TOP, TOP_KEYS)?;
         if let SimplifySetting::Rules(rules) = &self.simplify
             && let Some(rule) = rules.keys().find(|r| !SIMPLIFY_RULES.contains(&r.as_str()))
@@ -1015,16 +993,6 @@ impl ResolvedConfig<'_> {
     pub fn roles(&self) -> &[String] {
         &self.database.roles
     }
-
-    /// The migrations' session as the configuration names it
-    /// (`[package.metadata.typedpg.database] migrations_user`,
-    /// `database_name`).
-    pub fn migrations_connection(&self) -> MigrationsConnection {
-        MigrationsConnection {
-            user: self.database.migrations_user.clone(),
-            database: self.database.database_name.clone(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1194,7 +1162,7 @@ migrations = "./migrations"
         assert_eq!(
             parse_err("[package.metadata.typedpg.database]\nmigration = \"./m\"\n"),
             "unknown key `migration` in [package.metadata.typedpg.database]: expected one \
-             of `migrations`, `extra_migrations`, `roles`, `migrations_user`, `database_name`"
+             of `migrations`, `extra_migrations`, `roles`"
         );
         assert_eq!(
             parse_err("[package.metadata.typedpg.databases.analytics]\ntype = {}\n"),
@@ -1204,8 +1172,7 @@ migrations = "./migrations"
         assert_eq!(
             parse_err("[package.metadata.typedpg.databases.analytics.database]\npath = \"x\"\n"),
             "unknown key `path` in [package.metadata.typedpg.databases.analytics.database]: \
-             expected one of `migrations`, `extra_migrations`, `roles`, `migrations_user`, \
-             `database_name`"
+             expected one of `migrations`, `extra_migrations`, `roles`"
         );
         let err = parse_err("[package.metadata.typedpg.migrations]\ntabel = \"x\"\n");
         assert!(
@@ -1462,49 +1429,6 @@ migrations = "./plain"
                 .unwrap()
                 .roles()
                 .is_empty()
-        );
-    }
-
-    #[test]
-    fn the_migrations_connection_is_read_per_database() {
-        let toml = r#"
-[package]
-name = "my-app"
-version = "0.1.0"
-edition = "2021"
-
-[package.metadata.typedpg.database]
-migrations_user = "deployer"
-database_name = "app"
-
-[package.metadata.typedpg.databases.analytics.database]
-migrations_user = "etl"
-"#;
-        let config = Config::from_str(toml).unwrap();
-        assert_eq!(
-            config.resolve(None).unwrap().migrations_connection(),
-            MigrationsConnection {
-                user: Some("deployer".to_owned()),
-                database: Some("app".to_owned()),
-            }
-        );
-        assert_eq!(
-            config
-                .resolve(Some("analytics"))
-                .unwrap()
-                .migrations_connection(),
-            MigrationsConnection {
-                user: Some("etl".to_owned()),
-                database: None,
-            }
-        );
-        assert_eq!(
-            Config::from_str(MINIMAL_TOML)
-                .unwrap()
-                .resolve(None)
-                .unwrap()
-                .migrations_connection(),
-            MigrationsConnection::default()
         );
     }
 

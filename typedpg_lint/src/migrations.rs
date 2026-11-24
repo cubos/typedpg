@@ -75,20 +75,16 @@ pub struct LintedMigrations {
 ///
 /// `use_transaction` is the database runner's setting: it decides which
 /// statements can run at all (a `CREATE INDEX CONCURRENTLY` in a wrapped
-/// migration is an error, as it is at runtime). `connection` is what the
-/// configuration names of the migrations' session (its user, the
-/// database's name).
+/// migration is an error, as it is at runtime).
 pub fn lint_migrations(
     files: &[MigrationFile],
     use_transaction: bool,
-    connection: &typedpg_core::config::MigrationsConnection,
     options: &LintOptions,
 ) -> Result<LintedMigrations, DdlError> {
     let mut catalog = PgCatalog::new().map_err(|error| {
         DdlError::Internal(format!("failed to load the PG catalog seed: {error}"))
     })?;
     catalog.set_migrations_use_transaction(use_transaction);
-    catalog.set_migrations_connection(connection);
     let mut linter = MigrationLinter {
         files,
         options,
@@ -5312,34 +5308,9 @@ mod tests {
                 lint: *lint,
             })
             .collect();
-        lint_migrations(&files, use_transaction, &Default::default(), options)
+        lint_migrations(&files, use_transaction, options)
             .unwrap()
             .findings
-    }
-
-    /// The configuration's `migrations_user` names the schema `CREATE
-    /// SCHEMA AUTHORIZATION CURRENT_USER` creates, where `$user` puts an
-    /// unqualified table. (`postgres`: the `pg_sanity` mirror's user.)
-    #[test]
-    fn the_migrations_user_names_its_schema() {
-        let files = [MigrationFile {
-            path: "0001.sql".to_owned(),
-            sql: "CREATE SCHEMA AUTHORIZATION CURRENT_USER; CREATE TABLE t (id int);".to_owned(),
-            lint: MigrationLint::All,
-        }];
-        let connection = typedpg_core::config::MigrationsConnection {
-            user: Some("postgres".to_owned()),
-            database: None,
-        };
-        let linted = lint_migrations(&files, true, &connection, &LintOptions::default()).unwrap();
-        assert!(
-            linted
-                .catalog
-                .resolve_table(Some("postgres"), "t")
-                .is_some()
-        );
-        assert!(linted.catalog.resolve_table(Some("public"), "t").is_none());
-        assert!(linted.catalog.resolve_table(Some("other"), "t").is_none());
     }
 
     fn second(sql: &str) -> Vec<MigrationFinding> {

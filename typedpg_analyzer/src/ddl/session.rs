@@ -383,21 +383,6 @@ impl PgCatalog {
         self.refresh_search_path();
     }
 
-    /// Tell the catalog what the configuration says of the migrations'
-    /// session (`migrations_user`, `database_name`): what it names is set,
-    /// the rest left as it is.
-    pub fn set_migrations_connection(
-        &mut self,
-        connection: &typedpg_core::config::MigrationsConnection,
-    ) {
-        if let Some(user) = &connection.user {
-            self.set_connecting_user(user);
-        }
-        if let Some(database) = &connection.database {
-            self.set_database_name(database);
-        }
-    }
-
     /// Tell the catalog the name of the database the migrations run in,
     /// which privilege errors on the database name. Unknown by default.
     pub fn set_database_name(&mut self, name: &str) {

@@ -75,8 +75,6 @@ pub fn databases(config_json: &str) -> Result<Vec<Database>, String> {
         migrations,
         extra_migrations,
         roles,
-        migrations_user,
-        database_name,
         types,
     }) = serde_json::from_str(config_json)
         .map_err(|error| format!("invalid config JSON: {error}"))?;
@@ -87,13 +85,11 @@ pub fn databases(config_json: &str) -> Result<Vec<Database>, String> {
                 || migrations.is_some()
                 || extra_migrations.is_some()
                 || roles.is_some()
-                || migrations_user.is_some()
-                || database_name.is_some()
                 || types.is_some()
             {
                 return Err(
-                    "`out`, `sql`, `migrations`, `extraMigrations`, `roles`, `migrationsUser`, \
-                     `databaseName` and `types` go in each entry of `databases` when it is set"
+                    "`out`, `sql`, `migrations`, `extraMigrations`, `roles` and `types` go in \
+                     each entry of `databases` when it is set"
                         .to_owned(),
                 );
             }
@@ -217,9 +213,6 @@ struct Config {
     /// The roles a database is checked against: not part of the cache recipe
     /// (the whole config text is hashed), so only its place is validated.
     roles: Option<IgnoredAny>,
-    /// The migrations' session (likewise only placed: the text is hashed).
-    migrations_user: Option<IgnoredAny>,
-    database_name: Option<IgnoredAny>,
     types: Option<IgnoredAny>,
 }
 

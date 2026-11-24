@@ -745,15 +745,11 @@ impl Project {
         if migrations == db.migrations && db.catalog.is_ok() {
             return;
         }
-        db.catalog = build_catalog(
-            &migrations,
-            db.config.runner.use_transaction,
-            &db.config.connection,
-        )
-        .and_then(|mut catalog| {
-            db.prepare_catalog(&mut catalog)?;
-            Ok(catalog)
-        });
+        db.catalog =
+            build_catalog(&migrations, db.config.runner.use_transaction).and_then(|mut catalog| {
+                db.prepare_catalog(&mut catalog)?;
+                Ok(catalog)
+            });
         db.migrations = migrations;
         db.cache.clear();
     }
@@ -1308,11 +1304,6 @@ impl Project {
         self.dbs[i].config.runner.use_transaction
     }
 
-    /// What the config names of database `i`'s migrations' session.
-    pub fn migrations_connection(&self, i: usize) -> &typedpg_core::config::MigrationsConnection {
-        &self.dbs[i].config.connection
-    }
-
     /// Every file database `i`'s catalog is built from.
     pub fn migration_files(&self, i: usize) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -1738,12 +1729,10 @@ fn collect_migrations(dirs: &[PathBuf], root: &Path) -> Result<Vec<(String, Stri
 fn build_catalog(
     migrations: &[(String, String)],
     use_transaction: bool,
-    connection: &typedpg_core::config::MigrationsConnection,
 ) -> Result<PgCatalog, String> {
     let mut catalog =
         PgCatalog::new().map_err(|e| format!("failed to load the PG catalog seed: {e}"))?;
     catalog.set_migrations_use_transaction(use_transaction);
-    catalog.set_migrations_connection(connection);
     for (name, sql) in migrations {
         // The error is rendered with `--> file:line:col`.
         catalog
@@ -1756,26 +1745,6 @@ fn build_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The config's `migrationsUser` names the schema `CREATE SCHEMA
-    /// AUTHORIZATION CURRENT_USER` creates; unnamed, any schema that could
-    /// be the user's finds it.
-    #[test]
-    fn the_migrations_user_names_its_schema() {
-        let migrations = [(
-            "0001.sql".to_owned(),
-            "CREATE SCHEMA AUTHORIZATION CURRENT_USER; CREATE TABLE t (id int);".to_owned(),
-        )];
-        let named = typedpg_core::config::MigrationsConnection {
-            user: Some("deployer".to_owned()),
-            database: Some("app".to_owned()),
-        };
-        let catalog = build_catalog(&migrations, true, &named).unwrap();
-        assert!(catalog.resolve_table(Some("deployer"), "t").is_some());
-        assert!(catalog.resolve_table(Some("other"), "t").is_none());
-        let catalog = build_catalog(&migrations, true, &Default::default()).unwrap();
-        assert!(catalog.resolve_table(Some("other"), "t").is_some());
-    }
 
     #[test]
     fn relative_specifiers() {

@@ -2334,14 +2334,9 @@ mod tests {
                 lint: *lint,
             })
             .collect();
-        lint_migrations(
-            &files,
-            use_transaction,
-            &Default::default(),
-            &LintOptions::default(),
-        )
-        .unwrap()
-        .findings
+        lint_migrations(&files, use_transaction, &LintOptions::default())
+            .unwrap()
+            .findings
     }
 
     fn second(sql: &str) -> Vec<MigrationFinding> {

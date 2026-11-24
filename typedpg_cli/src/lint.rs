@@ -268,7 +268,6 @@ fn build(
                             files: &new.files,
                             first_new,
                             use_transaction: new.use_transaction,
-                            connection: &new.connection,
                             catalog,
                             prepare: &|catalog| catalog.assume_finite_parameters(finite),
                         },
@@ -895,8 +894,6 @@ struct NewMigrations {
     /// The first reported file `--previous-deployment` doesn't have as is.
     first_new: Option<usize>,
     use_transaction: bool,
-    /// What the configuration names of the migrations' session.
-    connection: typedpg_core::config::MigrationsConnection,
     /// The parameter types the catalog assumes finite.
     finite: Vec<QualifiedName>,
 }
@@ -986,12 +983,8 @@ fn catalog_for(
             file.lint = MigrationLint::SchemaOnly;
         }
     }
-    let linted = match lint_migrations(
-        &lint_files,
-        resolved.migrations_use_transaction(),
-        &resolved.migrations_connection(),
-        options,
-    ) {
+    let linted = match lint_migrations(&lint_files, resolved.migrations_use_transaction(), options)
+    {
         Ok(linted) => linted,
         Err(error) => {
             let message = error.to_string();
@@ -1030,7 +1023,6 @@ fn catalog_for(
         files: lint_files,
         first_new,
         use_transaction: resolved.migrations_use_transaction(),
-        connection: resolved.migrations_connection(),
         finite,
     };
     Ok((catalog, migrations))

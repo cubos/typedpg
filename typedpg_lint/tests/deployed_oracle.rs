@@ -681,7 +681,6 @@ fn run_case(case: &Case) -> Result<DeployedReport, String> {
             files: &files,
             first_new: case.old.len(),
             use_transaction: true,
-            connection: &Default::default(),
             catalog: &new_catalog,
             prepare: &|_| Ok(()),
         },
