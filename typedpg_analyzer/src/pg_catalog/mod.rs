@@ -1690,6 +1690,23 @@ impl PgCatalog {
         crate::resolve::column_type(t.oid, None, None, self).ok()
     }
 
+    /// Every enum type, each a [`crate::Type::Enum`] as
+    /// [`Self::type_named`] describes it, sorted by schema and name.
+    pub fn enum_types(&self) -> Vec<crate::Type> {
+        let mut enums: Vec<(&str, &str, crate::Type)> = self
+            .pg_type
+            .values()
+            .filter(|t| t.typtype == TypType::Enum)
+            .filter_map(|t| {
+                let schema = self.namespace_name(t.typnamespace)?;
+                let ty = crate::resolve::column_type(t.oid, None, None, self).ok()?;
+                Some((schema, t.typname.as_str(), ty))
+            })
+            .collect();
+        enums.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        enums.into_iter().map(|(_, _, ty)| ty).collect()
+    }
+
     /// Analyze a SQL query template against this catalog.
     ///
     /// Lexes `sql` to extract named parameters (`$name`), spreads (`$..name`),

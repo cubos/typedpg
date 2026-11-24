@@ -29,7 +29,7 @@ use crate::scan::{
 };
 use crate::sqlfile::{ModuleNames, SqlFile};
 use crate::sqlmodule::{Mapped, SqlModule, SqlQuery, generated_source, source_from};
-use crate::typemap::{RUNTIME_NS, TypeMapper};
+use crate::typemap::{EnumNames, Enums, RUNTIME_NS, TypeMapper};
 
 /// A problem to report, at a place in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +132,26 @@ impl Database {
             &self.config.simplify,
         ));
         Ok(())
+    }
+
+    /// The names the database's enums take in its module (`file: None`) or
+    /// the module of `.sql` file `file`: clear of every name either kind of
+    /// module declares or imports, so an enum is named alike in each — but
+    /// where a `.sql` file's queries or their types take the name.
+    fn enum_names(&self, enums: &Enums, file: Option<&SqlFile>) -> EnumNames {
+        let mut taken: Vec<String> = crate::emit::MODULE_BINDINGS
+            .iter()
+            .chain(crate::sqlmodule::MODULE_BINDINGS)
+            .map(|s| (*s).to_owned())
+            .chain(self.config.types.values().map(|o| o.export.clone()))
+            .collect();
+        if let (Some(file), Some(sql)) = (file, &self.config.sql) {
+            for q in &file.queries {
+                let (params, row) = sql.type_names.of(&q.name);
+                taken.extend([q.name.clone(), params, row]);
+            }
+        }
+        enums.names(taken.iter().map(String::as_str))
     }
 
     /// Read `source`, one of the database's `.sql` files.
@@ -837,6 +857,7 @@ impl Project {
             used: Default::default(),
             catalog,
         };
+        let enums = Enums::new(catalog, &db.overrides);
         // Drop what no source uses anymore.
         db.cache.retain(|(kind, text), _| {
             queries.contains_key(&(*kind, text.as_str()))
@@ -928,12 +949,14 @@ impl Project {
             let dir = first.parent().unwrap_or(Path::new("."));
             let imports = override_imports(&db.config, dir);
             let queries = sql_queries(file, &db.cache, &checks);
+            let enum_names = db.enum_names(&enums, Some(file));
             let module = SqlModule {
                 runtime: &config.runtime,
                 source: source_from(first, path),
                 imports: &imports,
                 queries: &queries,
                 type_names: &sql.type_names,
+                enums: &enum_names,
             };
             let contents = match sql.emit {
                 Emit::Ts => {
@@ -1000,10 +1023,12 @@ impl Project {
             None
         };
         let imports = override_imports(&db.config, out.parent().unwrap_or(Path::new(".")));
+        let enum_names = db.enum_names(&enums, None);
         let module = Module {
             runtime: &config.runtime,
             imports: &imports,
             checks: &checks,
+            enums: &enum_names,
             queries: &entries[0],
             copies: &entries[1],
             migrations: embedded.as_deref().map(|migrations| Embedded {
@@ -1116,12 +1141,14 @@ impl Project {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let enum_names = db.enum_names(&Enums::new(catalog, &db.overrides), Some(&file));
         let module = SqlModule {
             runtime: &self.config.runtime,
             source: name,
             imports: &imports,
             queries: &queries,
             type_names: &type_names,
+            enums: &enum_names,
         };
         let Mapped { text, exports } = module.mapped();
         let mappings = exports
@@ -1622,6 +1649,7 @@ fn ensure_exists(out: &Path, kind: OutKind, runtime: &str) -> Result<(), String>
         runtime,
         imports: &[],
         checks: &[],
+        enums: &EnumNames::default(),
         queries: &[],
         copies: &[],
         migrations: None,

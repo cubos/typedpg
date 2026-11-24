@@ -1,7 +1,10 @@
 import type { Row, Params } from "@cubos/typedpg";
 import { sql } from "./db.ts";
 import * as db from "./db.ts";
+import type { Color, Mood } from "./db.ts";
 import type { UserPrefs } from "./domains.ts";
+import type * as u from "./sql/users.ts";
+import type { Mood as UsersMood } from "./sql/users.ts";
 
 export const insertUsers = sql(`
   INSERT INTO users (name, email, mood, tags, prefs, visits, avatar)
@@ -135,4 +138,17 @@ export type Checks = [
     Equal<Row<typeof authorsWithPostCount>, { name: string; posts: bigint; titles: (string | null)[] }>
   >,
   Expect<Equal<Row<typeof annotatedPosts>, { title: string; author: string | null }>>,
+  // Each enum is exported by name, the union of its labels as declared:
+  // by the database's module, and by a `.sql` file's whose types name it.
+  Expect<Equal<Mood, "happy" | "sad" | "neutral">>,
+  Expect<Equal<Color, "red" | "green" | "with space" | 'quo"te' | "back\\slash" | "NULL">>,
+  Expect<Equal<UsersMood, Mood>>,
+  Expect<Equal<Row<typeof usersByMood>, { id: number; name: string; mood: Mood }>>,
+  Expect<Equal<Params<typeof usersWithMoods>, { moods: readonly Mood[]; after: number }>>,
+  Expect<Equal<Params<typeof u.insertUser>["mood"], Mood | null>>,
 ];
+
+// @ts-expect-error: "angry" is not a label of `mood`.
+export const angry: Mood = "angry";
+// @ts-expect-error: nor a value a `mood` parameter takes.
+export const angryParams: Params<typeof usersByMood> = { mood: "angry" };

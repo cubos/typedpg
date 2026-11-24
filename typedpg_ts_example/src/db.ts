@@ -5,6 +5,9 @@ import { createCopyIn, createSql, embedMigrations } from "@cubos/typedpg";
 import type * as typedpg from "@cubos/typedpg";
 import type { Point2, UserPrefs } from "./domains.ts";
 
+export type Color = "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL";
+export type Mood = "happy" | "sad" | "neutral";
+
 // Each type in `types` must fit what its PostgreSQL type is read as.
 export type TypeMappingChecks = [
   typedpg.Fits<Point2, { readonly x: number | null; readonly y: number | null }>, // public.point2
@@ -18,10 +21,10 @@ export interface Queries {
       email: string | null;
       qty: number | null;
       tags: readonly (string | null)[] | null;
-      colors: readonly ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
-      shapes: readonly ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null)[] | null;
+      colors: readonly (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      shape_d: { name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      shapes: readonly ({ name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: readonly typedpg.Range<Temporal.Instant | Temporal.ZonedDateTime | Date>[] | null;
       amounts: typedpg.Range<string | number> | null;
@@ -52,7 +55,7 @@ export interface Queries {
   };
   "\n  INSERT INTO users (name, email, mood, tags, prefs, visits, avatar)\n  VALUES $..users { name, email, mood, tags, prefs, visits, avatar }\n  RETURNING id, name\n": {
     params: {
-      users: readonly { name: string; email: string | null; mood: "happy" | "sad" | "neutral" | null; tags: readonly (string | null)[]; prefs: UserPrefs | null; visits: bigint | number | string; avatar: Uint8Array | null }[];
+      users: readonly { name: string; email: string | null; mood: Mood | null; tags: readonly (string | null)[]; prefs: UserPrefs | null; visits: bigint | number | string; avatar: Uint8Array | null }[];
     };
     row: {
       id: number;
@@ -189,10 +192,10 @@ export interface Queries {
       email: string | null;
       qty: number | null;
       tags: (string | null)[] | null;
-      colors: ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shapes: ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
+      colors: (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shape_d: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shapes: ({ name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: typedpg.Range<Temporal.Instant>[] | null;
       amounts: typedpg.Range<string> | null;
@@ -225,7 +228,7 @@ export interface Queries {
       id: number;
       name: string;
       email: string | null;
-      mood: "happy" | "sad" | "neutral" | null;
+      mood: Mood | null;
       tags: (string | null)[];
       prefs: UserPrefs | null;
       balance: string;
@@ -289,12 +292,12 @@ export interface Queries {
   };
   "SELECT id, name, mood FROM users WHERE mood = $mood ORDER BY id": {
     params: {
-      mood: "happy" | "sad" | "neutral";
+      mood: Mood;
     };
     row: {
       id: number;
       name: string;
-      mood: "happy" | "sad" | "neutral";
+      mood: Mood;
     };
   };
   "SELECT interval '1 mon -1 days' AS iv": {
@@ -315,7 +318,7 @@ export interface Queries {
   };
   "SELECT label FROM things WHERE $color = ANY (colors) ORDER BY id": {
     params: {
-      color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL";
+      color: Color;
     };
     row: {
       label: string;
@@ -359,7 +362,7 @@ export interface Queries {
   "SELECT name FROM users WHERE mood IN $..moods AND id > $after ORDER BY id": {
     params: {
       after: number;
-      moods: readonly ("happy" | "sad" | "neutral")[];
+      moods: readonly Mood[];
     };
     row: {
       name: string;
@@ -383,10 +386,10 @@ export interface Queries {
       email: string | null;
       qty: number | null;
       tags: (string | null)[] | null;
-      colors: ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shapes: ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
+      colors: (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shape_d: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shapes: ({ name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: typedpg.Range<Temporal.Instant>[] | null;
       amounts: typedpg.Range<string> | null;
@@ -452,8 +455,8 @@ export interface CopyTargets {
     row: {
       label: string;
       tags: readonly (string | null)[] | null;
-      colors: readonly ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      colors: readonly (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
       span: typedpg.Range<number> | null;
       attrs: Readonly<Record<string, string | null>> | null;
       big: bigint | number | string | null;

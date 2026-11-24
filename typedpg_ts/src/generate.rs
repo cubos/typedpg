@@ -568,7 +568,16 @@ mod tests {
             used: Default::default(),
             catalog: &c,
         };
-        generate(&c, &mapper, kind, sql, roles)
+        // As a module prints them: each enum by its name.
+        let names = crate::typemap::Enums::new(&c, &overrides).names([]);
+        let render = |s: &str| names.render(s).into_owned();
+        generate(&c, &mapper, kind, sql, roles).map(|g| Generated {
+            types: render(&g.types),
+            params: g.params.iter().map(|m| render(m)).collect(),
+            row: g.row.iter().map(|m| render(m)).collect(),
+            value: g.value.as_deref().map(render),
+            ..g
+        })
     }
 
     fn ok(sql: &str) -> Generated {
@@ -606,7 +615,7 @@ mod tests {
       id: number;
       name: string | null;
       big: bigint;
-      m: "happy" | "sad" | null;
+      m: Mood | null;
       tags: (string | null)[];
       prefs: typedpg.JsonValue | null;
     };
@@ -618,12 +627,50 @@ mod tests {
         );
     }
 
+    /// An enum is its name where any of its labels can be: a column, a
+    /// parameter, an array, a record's field; a value narrowed to some of
+    /// them is their literal union.
+    #[test]
+    fn enums_are_named_unless_narrowed() {
+        let g = ok("SELECT m, moods, home FROM users WHERE m = $m");
+        assert!(g.types.contains("m: Mood;"), "{}", g.types);
+        let g = ok("SELECT m, moods FROM users WHERE m <> 'sad' AND moods = $moods");
+        assert!(g.types.contains(r#"m: "happy";"#), "{}", g.types);
+        assert!(
+            g.types.contains("moods: readonly (Mood | null)[];"),
+            "{}",
+            g.types
+        );
+        assert!(g.types.contains("moods: (Mood | null)[];"), "{}", g.types);
+        let g = ok("SELECT name FROM users WHERE m IN $..ms");
+        assert!(g.types.contains("ms: readonly Mood[];"), "{}", g.types);
+        let g = ok("SELECT ROW(m, 1) AS r, ROW('sad'::mood, 2) AS s FROM users");
+        assert!(
+            g.types.contains("r: { f1: Mood | null; f2: 1 };"),
+            "{}",
+            g.types
+        );
+        assert!(
+            g.types.contains(r#"s: { f1: "sad"; f2: 2 };"#),
+            "{}",
+            g.types
+        );
+        assert_eq!(
+            ok("SELECT 'sad'::mood AS v").value.as_deref(),
+            Some(r#""sad""#)
+        );
+        assert_eq!(
+            ok("SELECT m AS v FROM users").value.as_deref(),
+            Some("Mood | null")
+        );
+    }
+
     #[test]
     fn hard_types() {
         let g = ok("SELECT home, moods, span, period, t2, homes FROM users");
         for expected in [
             "home: { street: string | null; num: number | null } | null;",
-            r#"moods: ("happy" | "sad" | null)[] | null;"#,
+            "moods: (Mood | null)[] | null;",
             "span: typedpg.Range<number> | null;",
             "period: typedpg.Range<Temporal.Instant>[] | null;",
             "t2: (string | null)[];",

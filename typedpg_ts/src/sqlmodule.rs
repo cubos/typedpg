@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{OutKind, TypeNames, declaration_path};
 use crate::emit::TypeCheck;
 use crate::generate::{GenError, Generated};
-use crate::typemap::{RUNTIME_NS, js_string};
+use crate::typemap::{EnumNames, RUNTIME_NS, js_string};
 
 /// A query of the file and what was generated for it.
 pub struct SqlQuery<'a> {
@@ -52,6 +52,9 @@ pub struct SqlModule<'a> {
     pub imports: &'a [(String, String)],
     pub queries: &'a [SqlQuery<'a>],
     pub type_names: &'a TypeNames,
+    /// The names the module gives the database's enums: it exports those
+    /// its types name.
+    pub enums: &'a EnumNames,
 }
 
 /// The names a module declares besides its queries: the runtime's values
@@ -174,6 +177,20 @@ impl SqlModule<'_> {
         }
     }
 
+    /// `export type Mood = "happy" | "sad";` for each enum the queries'
+    /// types name.
+    fn enum_types(&self, out: &mut String) {
+        let types = self
+            .queries
+            .iter()
+            .filter_map(|q| q.result.as_ref().ok().map(|g| g.types.as_str()));
+        let declarations = self.enums.declarations(types, false);
+        if !declarations.is_empty() {
+            out.push('\n');
+            out.push_str(&declarations);
+        }
+    }
+
     fn uses_runtime_types(&self) -> bool {
         let prefix = format!("{RUNTIME_NS}.");
         self.queries.iter().any(|q| {
@@ -192,6 +209,7 @@ impl SqlModule<'_> {
             let _ = writeln!(out, "import type * as {RUNTIME_NS} from {runtime};");
         }
         self.user_imports(&mut out);
+        self.enum_types(&mut out);
         let mut exports = Vec::new();
         for (i, q) in self.queries.iter().enumerate() {
             out.push('\n');
@@ -279,6 +297,7 @@ impl SqlModule<'_> {
             js_string(self.runtime)
         );
         self.user_imports(&mut out);
+        self.enum_types(&mut out);
         for q in self.queries {
             out.push('\n');
             self.types(&mut out, q);
@@ -316,9 +335,9 @@ impl SqlModule<'_> {
         let (params, row) = self.type_names.of(q.name);
         match q.result {
             Ok(g) => {
-                interface(out, &params, &g.params);
+                interface(out, &params, &g.params, self.enums);
                 out.push('\n');
-                interface(out, &row, &g.row);
+                interface(out, &row, &g.row, self.enums);
                 out.push('\n');
             }
             Err(_) => {
@@ -334,7 +353,10 @@ impl SqlModule<'_> {
     fn query_types(&self, name: &str, g: &Generated) -> String {
         let (params, row) = self.type_names.of(name);
         match &g.value {
-            Some(v) => format!("{{ params: {params}; row: {row}; value: {v} }}"),
+            Some(v) => format!(
+                "{{ params: {params}; row: {row}; value: {} }}",
+                self.enums.render(v)
+            ),
             None => format!("{{ params: {params}; row: {row} }}"),
         }
     }
@@ -353,14 +375,14 @@ fn checks(checks: &[&TypeCheck]) -> String {
     format!(", [{}]", fits.join(", "))
 }
 
-fn interface(out: &mut String, name: &str, members: &[String]) {
+fn interface(out: &mut String, name: &str, members: &[String], enums: &EnumNames) {
     if members.is_empty() {
         let _ = writeln!(out, "export interface {name} {{}}");
         return;
     }
     let _ = writeln!(out, "export interface {name} {{");
     for m in members {
-        let _ = writeln!(out, "  {m};");
+        let _ = writeln!(out, "  {};", enums.render(m));
     }
     out.push_str("}\n");
 }
@@ -495,6 +517,7 @@ mod tests {
             imports: &imports,
             queries: &queries,
             type_names: &names,
+            enums: &EnumNames::default(),
         };
         let files = m.files(Path::new("/p/queries.ts"), OutKind::TypeScript);
         let ts = &files[0].1;
@@ -589,9 +612,25 @@ export const bad = createBrokenQuery("SELECT x", "column \"x\" does not exist");
             Some("UserPrefs | null"),
             &["UserPrefs"],
         );
+        // Two enums, one named as `ranges`'s row type.
+        let enum_ty = |name: &str| typedpg_analyzer::Type::Enum {
+            schema: "public".into(),
+            name: name.into(),
+            labels: vec!["a".into()],
+            extension: None,
+        };
+        let mark = |name: &str| {
+            crate::typemap::enum_mark(&typedpg_core::QualifiedName::new("public", name))
+        };
+        let row = [
+            "r: typedpg.Range<number>".to_owned(),
+            format!("m: {}", mark("mood")),
+            format!("n: {}", mark("i_ranges_result")),
+        ];
         let typed = Ok(Generated {
-            types: "{ r: typedpg.Range<number> }".to_owned(),
-            ..ok(&[], &["r: typedpg.Range<number>"], None, &[]).unwrap()
+            types: format!("{{ {} }}", row.join("; ")),
+            row: row.to_vec(),
+            ..ok(&[], &[], None, &[]).unwrap()
         });
         let b = Err(GenError {
             message: "column \"x\" does not exist".into(),
@@ -624,18 +663,41 @@ export const bad = createBrokenQuery("SELECT x", "column \"x\" does not exist");
             },
         ];
         let type_names = names();
+        let mut own: Vec<String> = vec!["UserPrefs".to_owned()];
+        for q in &queries {
+            let (params, row) = type_names.of(q.name);
+            own.extend([q.name.to_owned(), params, row]);
+        }
+        let enums = crate::typemap::Enums::from_types(
+            vec![enum_ty("mood"), enum_ty("i_ranges_result")],
+            &Default::default(),
+        )
+        .names(
+            own.iter()
+                .map(String::as_str)
+                .chain(MODULE_BINDINGS.iter().copied()),
+        );
         let m = SqlModule {
             runtime: "@cubos/typedpg",
             source: "queries.sql".to_owned(),
             imports: &imports,
             queries: &queries,
             type_names: &type_names,
+            enums: &enums,
         };
-        let mut own: Vec<String> = vec!["UserPrefs".to_owned()];
-        for q in &queries {
-            let (params, row) = type_names.of(q.name);
-            own.extend([q.name.to_owned(), params, row]);
-        }
+        let ts = &m.files(Path::new("/p/q.ts"), OutKind::TypeScript)[0].1;
+        assert!(
+            ts.contains(
+                "export type Mood = \"a\";\nexport type PublicIRangesResult = \"a\";\n\n\
+                 export interface IGetPrefsParams {"
+            ),
+            "{ts}"
+        );
+        assert!(
+            ts.contains("  m: Mood;\n  n: PublicIRangesResult;\n}"),
+            "{ts}"
+        );
+        own.extend(["Mood".to_owned(), "PublicIRangesResult".to_owned()]);
         let ts = m.files(Path::new("/p/q.ts"), OutKind::TypeScript);
         let esm = m.files(Path::new("/p/q.js"), OutKind::EsModule);
         let cjs = m.files(Path::new("/p/q.cjs"), OutKind::CommonJs);

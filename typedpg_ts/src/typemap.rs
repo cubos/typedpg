@@ -12,8 +12,12 @@
 //! intervals are the global `Temporal`'s types (the runtime's declarations
 //! reference TypeScript's `esnext.temporal` lib).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
+
+use oxc_syntax::identifier::{is_identifier_part, is_identifier_start};
 
 use typedpg_analyzer::{PgCatalog, RecordField, Refinement, Type};
 use typedpg_core::QualifiedName;
@@ -305,23 +309,12 @@ impl TypeMapper<'_> {
                     None => base,
                 }
             }
-            Type::Enum {
-                schema,
-                name,
-                labels,
-                ..
-            } => {
-                let ts = self.override_for(schema, name).unwrap_or_else(|| {
-                    if labels.is_empty() {
-                        "never".to_owned()
-                    } else {
-                        labels
-                            .iter()
-                            .map(|l| js_string(l))
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    }
-                });
+            Type::Enum { schema, name, .. } => {
+                // The enum's name in the module, which exports it as the
+                // union of its labels ([`EnumNames`]).
+                let ts = self
+                    .override_for(schema, name)
+                    .unwrap_or_else(|| enum_mark(&QualifiedName::new(schema, name)));
                 same(ts, Codec::Text)
             }
             Type::Range {
@@ -611,6 +604,183 @@ pub fn js_string(s: &str) -> String {
     serde_json::to_string(s).expect("a string always serializes")
 }
 
+/// What an enum's name is written as in a generated type: its qualified
+/// name between NULs, which no identifier, label or type name holds. Each
+/// module names the enums itself and replaces the marks
+/// ([`EnumNames::render`]), so a query's types are generated once for every
+/// module that has it.
+pub(crate) fn enum_mark(qn: &QualifiedName) -> String {
+    format!("\0{qn}\0")
+}
+
+/// The global types the generated types use: an enum can't shadow them.
+const GLOBAL_TYPES: &[&str] = &[
+    "Buffer",
+    "Date",
+    "Readonly",
+    "Record",
+    "Temporal",
+    "Uint8Array",
+];
+
+/// An enum the generated modules name and export.
+#[derive(Debug, Clone)]
+pub struct EnumType {
+    pub qn: QualifiedName,
+    pub labels: Vec<String>,
+    /// An extension's: the database module exports it only when one of
+    /// its queries uses it.
+    pub extension: bool,
+}
+
+/// The enums of a database the modules name: every one `types` doesn't
+/// map, in the order they claim their names — the user's in `public` first,
+/// then those of other schemas, then extensions'; each by schema and name.
+#[derive(Debug, Clone, Default)]
+pub struct Enums(Vec<EnumType>);
+
+impl Enums {
+    pub fn new(catalog: &PgCatalog, overrides: &HashMap<QualifiedName, String>) -> Self {
+        Self::from_types(catalog.enum_types(), overrides)
+    }
+
+    pub fn from_types(types: Vec<Type>, overrides: &HashMap<QualifiedName, String>) -> Self {
+        let mut enums: Vec<EnumType> = types
+            .into_iter()
+            .filter_map(|ty| match ty {
+                Type::Enum {
+                    schema,
+                    name,
+                    labels,
+                    extension,
+                } => Some(EnumType {
+                    qn: QualifiedName::new(schema, name),
+                    labels,
+                    extension: extension.is_some(),
+                }),
+                _ => None,
+            })
+            .filter(|e| !overrides.contains_key(&e.qn))
+            .collect();
+        enums.sort_by_key(|e| (e.extension, e.qn.schema != "public", e.qn.clone()));
+        Enums(enums)
+    }
+
+    /// The enums' names in a module that binds `taken` already: PascalCase
+    /// of the name (the schema's before it outside `public`); on a
+    /// collision, qualified with the schema, then numbered.
+    pub fn names<'a>(&self, taken: impl IntoIterator<Item = &'a str>) -> EnumNames {
+        let mut taken: HashSet<String> = taken.into_iter().map(str::to_owned).collect();
+        taken.extend(GLOBAL_TYPES.iter().map(|s| (*s).to_owned()));
+        let mut names = EnumNames::default();
+        for e in &self.0 {
+            let own = pascal(&e.qn.name).unwrap_or_else(|| "Enum".to_owned());
+            let schema = pascal(&e.qn.schema).unwrap_or_else(|| "Schema".to_owned());
+            let qualified = identifier(format!("{schema}{own}"));
+            let base = if e.qn.schema == "public" {
+                identifier(own)
+            } else {
+                qualified.clone()
+            };
+            let name = [base, qualified.clone()]
+                .into_iter()
+                .chain((2..).map(|n| format!("{qualified}_{n}")))
+                .find(|n| !taken.contains(n))
+                .expect("a name not taken");
+            taken.insert(name.clone());
+            names.by_mark.insert(enum_mark(&e.qn), name.clone());
+            names.enums.push((name, e.clone()));
+        }
+        names.enums.sort_by(|a, b| a.0.cmp(&b.0));
+        names
+    }
+}
+
+/// The names a module gives the enums ([`Enums::names`]).
+#[derive(Debug, Clone, Default)]
+pub struct EnumNames {
+    by_mark: HashMap<String, String>,
+    /// Sorted by name.
+    enums: Vec<(String, EnumType)>,
+}
+
+impl EnumNames {
+    /// `text`, a generated type, with each enum's mark replaced by its
+    /// name.
+    pub fn render<'t>(&self, text: &'t str) -> Cow<'t, str> {
+        if !text.contains('\0') {
+            return Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len());
+        for (i, part) in text.split('\0').enumerate() {
+            if i % 2 == 0 {
+                out.push_str(part);
+            } else {
+                let name = self.by_mark.get(&format!("\0{part}\0"));
+                out.push_str(name.expect("every enum a type marks is named"));
+            }
+        }
+        Cow::Owned(out)
+    }
+
+    /// `export type <Name> = "a" | "b";` (the union of its labels as
+    /// declared) for each enum one of `types` names and, with `user`, each
+    /// not an extension's; by name.
+    pub fn declarations<'t>(&self, types: impl IntoIterator<Item = &'t str>, user: bool) -> String {
+        let mut named: HashSet<&str> = HashSet::new();
+        for text in types {
+            named.extend(text.split('\0').skip(1).step_by(2));
+        }
+        let mut out = String::new();
+        let exported = self
+            .enums
+            .iter()
+            .filter(|(_, e)| (user && !e.extension) || named.contains(e.qn.to_string().as_str()));
+        for (name, e) in exported {
+            let labels = if e.labels.is_empty() {
+                "never".to_owned()
+            } else {
+                e.labels
+                    .iter()
+                    .map(|l| js_string(l))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
+            let _ = writeln!(out, "export type {name} = {labels};");
+        }
+        out
+    }
+}
+
+/// `name` in PascalCase: each run of identifier characters (`_` and what
+/// an identifier can't hold separate them) capitalized; `None` when it
+/// has none.
+fn pascal(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut word_start = true;
+    for c in name.chars() {
+        if c == '_' || !is_identifier_part(c) {
+            word_start = true;
+        } else if word_start {
+            out.extend(c.to_uppercase());
+            word_start = false;
+        } else {
+            out.push(c);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `name`, made of identifier characters, as an identifier: `_` before it
+/// when it starts with what can't start one (a digit).
+fn identifier(name: String) -> String {
+    if name.starts_with(is_identifier_start) {
+        name
+    } else {
+        format!("_{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,17 +1033,135 @@ mod tests {
         });
     }
 
+    fn enum_ty(schema: &str, name: &str, labels: &[&str], extension: Option<&str>) -> Type {
+        Type::Enum {
+            schema: schema.into(),
+            name: name.into(),
+            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            extension: extension.map(str::to_owned),
+        }
+    }
+
+    fn output(ty: &Type) -> String {
+        with(|m| m.map(ty).output)
+    }
+
+    /// An enum is its name in the module, which exports it as the union of
+    /// its labels.
     #[test]
-    fn enums_are_label_unions() {
+    fn enums_are_named_label_unions() {
+        let mood = enum_ty("public", "mood", &["happy", "it's \"ok\""], None);
+        let empty = enum_ty("public", "nothing", &[], None);
+        let names = Enums::from_types(vec![mood.clone(), empty.clone()], &HashMap::new()).names([]);
         with(|m| {
-            let ty = Type::Enum {
-                schema: "public".into(),
-                name: "mood".into(),
-                labels: vec!["happy".into(), "it's \"ok\"".into()],
-                extension: None,
+            let mapped = m.map(&mood);
+            assert_eq!(names.render(&mapped.output), "Mood");
+            assert_eq!(names.render(&mapped.input), "Mood");
+            assert_eq!(mapped.codec, Codec::Text);
+            let array = Type::Array {
+                element: Box::new(mood.clone()),
+                element_nullable: None,
+                name: None,
             };
-            assert_eq!(m.map(&ty).output, r#""happy" | "it's \"ok\"""#);
+            let mapped = m.map(&array);
+            assert_eq!(names.render(&mapped.output), "(Mood | null)[]");
+            assert_eq!(names.render(&mapped.input), "readonly (Mood | null)[]");
+            assert_eq!(names.render(&m.map(&empty).output), "Nothing");
         });
+        let mood_type = r#"export type Mood = "happy" | "it's \"ok\"";"#;
+        assert_eq!(
+            names.declarations([], true),
+            format!("{mood_type}\nexport type Nothing = never;\n")
+        );
+        // Only the enums a type names, unless all the user's are wanted.
+        let text = format!("{{ m: {} }}", output(&mood));
+        assert_eq!(
+            names.declarations([text.as_str()], false),
+            format!("{mood_type}\n")
+        );
+        assert_eq!(names.declarations(["{ x: string }"], false), "");
+    }
+
+    /// PascalCase of the name, the schema's before it outside `public`;
+    /// any name made a valid identifier.
+    #[test]
+    fn enum_names() {
+        let names = |types: Vec<Type>, taken: &[&str]| {
+            let names =
+                Enums::from_types(types.clone(), &HashMap::new()).names(taken.iter().copied());
+            types
+                .iter()
+                .map(|t| names.render(&output(t)).into_owned())
+                .collect::<Vec<_>>()
+        };
+        let e = |schema: &str, name: &str| enum_ty(schema, name, &["a"], None);
+        assert_eq!(
+            names(
+                vec![
+                    e("public", "mood"),
+                    e("public", "post_status"),
+                    e("billing", "status"),
+                    e("public", "myEnum"),
+                    e("public", "2fa method"),
+                    e("public", "café-état"),
+                    e("public", "???"),
+                    e("Sales Data", "x"),
+                ],
+                &[]
+            ),
+            [
+                "Mood",
+                "PostStatus",
+                "BillingStatus",
+                "MyEnum",
+                "_2faMethod",
+                "CaféÉtat",
+                "Enum",
+                "SalesDataX"
+            ]
+        );
+        // Collisions: with what the module binds (and the global types the
+        // generated types use), then between enums — the user's in
+        // `public` first, extensions' last — schema-qualified, then
+        // numbered.
+        assert_eq!(
+            names(
+                vec![
+                    e("public", "queries"),
+                    e("public", "date"),
+                    e("public", "record"),
+                    e("public", "user_prefs"),
+                ],
+                &["Queries", "UserPrefs"]
+            ),
+            [
+                "PublicQueries",
+                "PublicDate",
+                "PublicRecord",
+                "PublicUserPrefs"
+            ]
+        );
+        assert_eq!(
+            names(
+                vec![
+                    e("billing", "status"),
+                    e("public", "billing_status"),
+                    e("public", "BillingStatus"),
+                    enum_ty("public", "billing__status", &["a"], Some("ext")),
+                ],
+                &[]
+            ),
+            [
+                "BillingStatus_2",
+                "PublicBillingStatus",
+                "BillingStatus",
+                "PublicBillingStatus_2"
+            ]
+        );
+        // `types` maps it: the override wins, and the enum takes no name.
+        let overrides = HashMap::from([(QualifiedName::new("public", "mood"), "Mood".to_owned())]);
+        let names = Enums::from_types(vec![e("public", "mood")], &overrides).names(["Mood"]);
+        assert_eq!(names.declarations([], true), "");
     }
 
     #[test]
@@ -903,10 +1191,8 @@ mod tests {
                 extension: None,
             };
             assert_eq!(out(&mood, &["ok", "happy"]), r#""happy" | "ok""#);
-            assert_eq!(
-                out(&mood, &["ok", "happy", "sad"]),
-                r#""sad" | "ok" | "happy""#
-            );
+            // Every label: the enum itself.
+            assert_eq!(out(&mood, &["ok", "happy", "sad"]), m.map(&mood).output);
             // Unrefined, and the input: any value of the type.
             assert_eq!(
                 m.map_refined(&basic_ty("text"), &Refinement::NONE).output,

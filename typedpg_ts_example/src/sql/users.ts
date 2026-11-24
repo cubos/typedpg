@@ -5,10 +5,12 @@ import { createQuery } from "@cubos/typedpg";
 import type * as typedpg from "@cubos/typedpg";
 import type { UserPrefs } from "../domains.ts";
 
+export type Mood = "happy" | "sad" | "neutral";
+
 export interface InsertUserParams {
   name: string;
   email: string | null;
-  mood: "happy" | "sad" | "neutral" | null;
+  mood: Mood | null;
   prefs: UserPrefs | null;
 }
 
@@ -36,7 +38,7 @@ export interface UserByIdRow {
   id: number;
   name: string;
   email: string | null;
-  mood: "happy" | "sad" | "neutral" | null;
+  mood: Mood | null;
   prefs: UserPrefs | null;
 }
 

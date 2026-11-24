@@ -431,13 +431,29 @@ await sql("UPDATE users SET name = $name? WHERE id = $id").execute(pool, { name,
 
 ### Enums and domains
 
-An enum reads as the union of its labels, NULL included when the column is.
-`CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')` gives:
+An enum is a type the generated module exports, the union of its labels as
+declared, NULL added when the column is nullable. `CREATE TYPE mood AS ENUM
+('happy', 'sad', 'neutral')` gives `export type Mood = "happy" | "sad" |
+"neutral";` in the module, for your own code to use too:
 
 ```ts
+import { sql, type Mood } from "./db.ts";
+
 const rows = await sql("SELECT mood FROM users").fetchAll(pool);
-// rows: { mood: "happy" | "sad" | "neutral" | null }[]
+// rows: { mood: Mood | null }[]
+
+const cheerful = (mood: Mood) => sql("SELECT name FROM users WHERE mood = $mood").fetchAll(pool, { mood });
 ```
+
+The name is the type's in PascalCase, the schema's before it outside
+`public` (`billing.status` is `BillingStatus`). A name the module already
+has (`Queries`, a type `types` maps to, a `.sql` file's query types) adds the
+schema's (`PublicQueries`), then a number (`BillingStatus_2`). The database's
+module exports every enum of the schema, and an extension's only when a
+query uses it; a `.sql` file's module exports the enums its queries' types
+use. An enum `types` maps is not exported: the mapping wins. A value
+narrowed to some labels (`WHERE mood <> 'neutral'`) stays their union,
+`"happy" | "sad"`.
 
 A domain reads as its base type, unless `types` maps it; a CHECK on the
 domain can still narrow it (the `band` domain above).
@@ -938,7 +954,7 @@ as it describes a statement before binding it.
 | `interval` | `Temporal.Duration`: years and months from its months, days, then hours down to microseconds from its time, as PostgreSQL prints it. A parameter's weeks are 7 days |
 | `json`, `jsonb` | `JsonValue`; parameters take any value but `null` (stringified), and `null` where SQL NULL is allowed |
 | `bytea` | `Buffer`; parameters take any `Uint8Array` |
-| enum | the union of its labels: `"draft" \| "published"` |
+| enum | a type the generated module exports, the union of its labels: `export type PostStatus = "draft" \| "published"` (see [Enums and domains](#enums-and-domains)) |
 | domain | its base type, or the type `types` maps it to |
 | composite, `ROW(...)` | an object with a property per field, each with its nullability — also inside an array (`array_agg(ROW(a, b))`, `ARRAY(SELECT ROW(…))`), a subquery or a `CASE` / `COALESCE` whose rows share one shape; a record whose fields nobody knows (a `RETURNS record` function's, rows of different shapes) reads as its text form |
 | array | `T[]`, or `(T \| null)[]` unless the elements are known not null |
