@@ -2702,6 +2702,108 @@ mod tests {
     }
 
     #[test]
+    fn fk_without_index_accepts_an_index_on_columns_finding_one_parent() {
+        // A composite key whose leading index column references a unique
+        // column alone: every row matching it references one parent, so the
+        // index finds exactly the rows the whole key does.
+        const TENANTS: &str = "CREATE TABLE exercises (
+                 id integer PRIMARY KEY,
+                 tenant_id integer NOT NULL,
+                 code integer NOT NULL,
+                 UNIQUE (id, tenant_id),
+                 UNIQUE (code, tenant_id)
+             );
+             CREATE TABLE scopes (
+                 id integer PRIMARY KEY,
+                 exercise_id integer NOT NULL,
+                 exercise_code integer,
+                 tenant_id integer NOT NULL,
+                 other integer
+             );";
+        for (sql, reported) in [
+            // `exercises.id` is unique alone: served.
+            (
+                "ALTER TABLE scopes ADD FOREIGN KEY (exercise_id, tenant_id)
+                     REFERENCES exercises (id, tenant_id);
+                 CREATE INDEX ON scopes (exercise_id);",
+                false,
+            ),
+            (
+                "ALTER TABLE scopes ADD FOREIGN KEY (tenant_id, exercise_id)
+                     REFERENCES exercises (tenant_id, id);
+                 CREATE UNIQUE INDEX ON scopes (exercise_id, other);",
+                false,
+            ),
+            (
+                "ALTER TABLE scopes ADD FOREIGN KEY (exercise_id, tenant_id)
+                     REFERENCES exercises (id, tenant_id);
+                 CREATE INDEX ON scopes USING hash (exercise_id);",
+                false,
+            ),
+            // `tenant_id` alone references nothing unique.
+            (
+                "ALTER TABLE scopes ADD FOREIGN KEY (exercise_id, tenant_id)
+                     REFERENCES exercises (id, tenant_id);
+                 CREATE INDEX ON scopes (tenant_id, other);",
+                true,
+            ),
+            // `exercises.code` is unique only with the tenant.
+            (
+                "ALTER TABLE scopes ADD FOREIGN KEY (exercise_code, tenant_id)
+                     REFERENCES exercises (code, tenant_id);
+                 CREATE INDEX ON scopes (exercise_code);",
+                true,
+            ),
+            // The key column is not leading.
+            (
+                "ALTER TABLE scopes ADD FOREIGN KEY (exercise_id, tenant_id)
+                     REFERENCES exercises (id, tenant_id);
+                 CREATE INDEX ON scopes (other, exercise_id);",
+                true,
+            ),
+        ] {
+            let findings = migrations(
+                &[
+                    ("001_base.sql", TENANTS, MigrationLint::All),
+                    ("002_change.sql", sql, MigrationLint::All),
+                ],
+                true,
+            );
+            assert_eq!(
+                only(&findings, Rule::FkWithoutIndex).len(),
+                usize::from(reported),
+                "{sql}: {findings:?}"
+            );
+        }
+        // A partial unique index on the parent doesn't make the column
+        // unique.
+        let findings = migrations(
+            &[
+                (
+                    "001_base.sql",
+                    "CREATE TABLE exercises (id integer, tenant_id integer, UNIQUE (id, tenant_id));
+                     CREATE UNIQUE INDEX ON exercises (id) WHERE id > 0;
+                     CREATE TABLE scopes (exercise_id integer, tenant_id integer);",
+                    MigrationLint::All,
+                ),
+                (
+                    "002_change.sql",
+                    "ALTER TABLE scopes ADD FOREIGN KEY (exercise_id, tenant_id)
+                         REFERENCES exercises (id, tenant_id);
+                     CREATE INDEX ON scopes (exercise_id);",
+                    MigrationLint::All,
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            only(&findings, Rule::FkWithoutIndex).len(),
+            1,
+            "{findings:?}"
+        );
+    }
+
+    #[test]
     fn fk_without_index_accepts_not_null_partial_indexes() {
         // A partial index whose predicate only requires the referencing
         // columns to be NOT NULL serves the foreign-key check: its equality

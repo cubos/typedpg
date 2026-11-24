@@ -11,8 +11,8 @@ use std::ops::Range;
 
 use typedpg_analyzer::{
     AttGenerated, ConType, DdlError, MigrationObserver, MigrationStatement, PgAttribute, PgCatalog,
-    PgClass, PgClassOid, PgCollationOid, PgConstraintOid, PgIndex, PgProcOid, PgTypeOid, ProKind,
-    RelKind, TypCategory,
+    PgClass, PgClassOid, PgCollationOid, PgConstraint, PgConstraintOid, PgIndex, PgProcOid,
+    PgTypeOid, ProKind, RelKind, TypCategory,
 };
 use typedpg_core::{QualifiedName, quote_identifier};
 use typedpg_pg_query::ast::{
@@ -2627,38 +2627,38 @@ impl MigrationLinter<'_> {
                 continue;
             }
             let key: HashSet<i16> = constraint.conkey.iter().copied().collect();
-            let key_count = key.len();
             let indexed = catalog
                 .iter_indexes()
                 .filter(|index| index.indrelid == constraint.conrelid)
-                // The check looks rows up by equality: a btree serves any
-                // key, a hash index a single column.
-                .filter(
-                    |index| match catalog.index_access_method(index.indexrelid) {
-                        "btree" => true,
-                        "hash" => key_count == 1,
-                        _ => false,
-                    },
-                )
+                // The check looks rows up by equality: a btree serves it, and
+                // so does a hash index (always on a single column).
+                .filter(|index| {
+                    matches!(
+                        catalog.index_access_method(index.indexrelid),
+                        "btree" | "hash"
+                    )
+                })
                 .any(|index| {
+                    // The leading key positions that are plain columns of the
+                    // foreign key: the equality lookup descends through them.
+                    // An expression later in the key (or in an INCLUDE
+                    // column) runs after the lookup has found the rows, so it
+                    // does not stop the index from serving the check.
                     let key_attributes = usize::try_from(index.indnkeyatts).unwrap_or(0);
-                    if key_attributes < key_count || index.indkey.len() < key_count {
-                        return false;
-                    }
-                    // Only the leading key positions must be plain columns:
-                    // an expression later in the key (or in an INCLUDE
-                    // column) runs after the equality lookup has found the
-                    // rows, so it does not stop the index from serving the
-                    // foreign-key check.
-                    if index.indkey[..key_count].contains(&0) {
-                        return false;
-                    }
-                    let leading: HashSet<i16> =
-                        index.indkey.iter().take(key_count).copied().collect();
+                    let leading: HashSet<i16> = index
+                        .indkey
+                        .iter()
+                        .take(key_attributes)
+                        .take_while(|attnum| key.contains(attnum))
+                        .copied()
+                        .collect();
                     // The lookup's equality implies each referencing column
                     // is NOT NULL, so a partial index that only requires
                     // that serves it too.
-                    leading == key && index_serves_foreign_key(catalog, index, &columns)
+                    !leading.is_empty()
+                        && index_serves_foreign_key(catalog, index, &columns)
+                        && (leading == key
+                            || leading_columns_find_one_parent(catalog, constraint, &leading))
                 });
             if indexed {
                 continue;
@@ -5085,6 +5085,43 @@ fn type_uses(catalog: &PgCatalog, oid: PgTypeOid, of: PgTypeOid) -> bool {
 
 fn keys_plain(index: &PgIndex) -> bool {
     index.indpred.is_none() && index.indexprs.is_empty() && index.indkey.iter().all(|&key| key != 0)
+}
+
+/// Whether the referencing columns `leading`, a proper subset of `constraint`'s,
+/// reference columns that are unique in the referenced table by themselves (a
+/// non-partial unique index on plain columns among them). Then every row
+/// matching them references one parent row, so an index leading with them
+/// finds exactly the rows the whole key does: a composite key `(x,
+/// tenant_id)` whose `x` references a primary key is served by an index on
+/// `x`.
+fn leading_columns_find_one_parent(
+    catalog: &PgCatalog,
+    constraint: &PgConstraint,
+    leading: &HashSet<i16>,
+) -> bool {
+    let Some(referenced) = constraint.confrelid else {
+        return false;
+    };
+    let referenced_columns: HashSet<i16> = constraint
+        .conkey
+        .iter()
+        .zip(&constraint.confkey)
+        .filter(|(conkey, _)| leading.contains(conkey))
+        .map(|(_, &confkey)| confkey)
+        .collect();
+    catalog
+        .iter_indexes()
+        .filter(|index| index.indrelid == referenced && index.indisunique)
+        .any(|index| {
+            let key_attributes = usize::try_from(index.indnkeyatts).unwrap_or(0);
+            index.indpred.is_none()
+                && key_attributes > 0
+                && index
+                    .indkey
+                    .iter()
+                    .take(key_attributes)
+                    .all(|attnum| referenced_columns.contains(attnum))
+        })
 }
 
 /// Whether the foreign-key check can use `index`: it is not partial, or its
