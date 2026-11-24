@@ -260,25 +260,15 @@ fn build_lint(
         Err(error) => return Ok(config_error(error)),
     };
     let root = project.config.root.clone();
-    // The check `cargo build` would run: every diagnostic it reports is a
-    // failure here too (a query or COPY target that does not analyze, a
-    // scanner error, a `.sql` layout error, a broken migration). Stale
-    // generated modules only need `typedpg gen`.
-    let sync = project.sync(true);
     let mut report = Report {
         previous_deployment: previous_deployment.map(str::to_owned),
         ..Report::default()
     };
-    for diagnostic in &sync.diagnostics {
-        report.failures.push(Failure {
-            path: relative(&diagnostic.file, &root),
-            start: diagnostic.pos.map(|pos| Position {
-                line: pos.line,
-                column: pos.col,
-            }),
-            message: diagnostic.message.clone(),
-        });
-    }
+    // The migration lints are started before the check below and the
+    // queries: each builds the schema again on a thread of its own, and the
+    // findings are added to the report once they are done.
+    let mut report_sources: Vec<(String, String)> = Vec::new();
+    let mut migrations_unchanged = 0;
     // `(database, text, calls)` → its findings or analysis error. The same
     // query is often written at several call sites.
     let mut cache: HashMap<(usize, String, Vec<typedpg_lint::Call>, bool), LintResult> =
@@ -288,6 +278,7 @@ fn build_lint(
     // previous deployment doesn't have as is.
     let mut new_migrations: Vec<Option<(Vec<typedpg_lint::MigrationFile>, Option<usize>)>> =
         Vec::new();
+    let mut migration_lints = Vec::new();
     for db in 0..project.database_count() {
         new_migrations.push(None);
         let files = match project.lint_migration_files(db) {
@@ -318,7 +309,7 @@ fn build_lint(
                     }
                     if unchanged.contains(&file.path) {
                         lint_file.lint = MigrationLint::SchemaOnly;
-                        report.migrations_unchanged += 1;
+                        migrations_unchanged += 1;
                     } else if first_new.is_none() {
                         first_new = Some(index);
                     }
@@ -333,26 +324,43 @@ fn build_lint(
             }
         }
         for file in &lint_files {
-            report.sources.insert(file.path.clone(), file.sql.clone());
+            report_sources.push((file.path.clone(), file.sql.clone()));
             migration_paths.insert(file.path.clone());
         }
-        if let Ok(linted) = typedpg_lint::lint_migrations(
-            &lint_files,
+        // Linted on a thread of its own, which builds the schema again,
+        // while the queries are: its findings are added below.
+        let (linted_files, use_transaction, linted_options) = (
+            lint_files.clone(),
             project.migrations_use_transaction(db),
-            &options,
-        ) {
-            for migration in linted.findings {
-                let file = &files[migration.file];
-                report.entries.push(Entry {
-                    path: relative(&file.path, &root),
-                    start: position(&file.sql, migration.finding.span.start),
-                    end: position(&file.sql, migration.finding.span.end),
-                    finding: migration.finding,
-                });
-            }
-        }
+            options.clone(),
+        );
+        let linting = std::thread::Builder::new()
+            .stack_size(typedpg_ts::parallel::STACK)
+            .spawn(move || {
+                typedpg_lint::lint_migrations(&linted_files, use_transaction, &linted_options)
+                    .map(|linted| linted.findings)
+            })
+            .expect("failed to spawn a thread");
+        migration_lints.push((files, linting));
         new_migrations[db] = Some((lint_files, first_new));
     }
+    // The check `cargo build` would run: every diagnostic it reports is a
+    // failure here too (a query or COPY target that does not analyze, a
+    // scanner error, a `.sql` layout error, a broken migration). Stale
+    // generated modules only need `typedpg gen`.
+    let sync = project.sync(true);
+    for diagnostic in &sync.diagnostics {
+        report.failures.push(Failure {
+            path: relative(&diagnostic.file, &root),
+            start: diagnostic.pos.map(|pos| Position {
+                line: pos.line,
+                column: pos.col,
+            }),
+            message: diagnostic.message.clone(),
+        });
+    }
+    report.migrations_unchanged = migrations_unchanged;
+    report.sources.extend(report_sources);
     if let Some(reference) = previous_deployment
         && options.level(Rule::BreaksDeployedQueries).is_some()
     {
@@ -456,6 +464,7 @@ fn build_lint(
     }
     let queries = project.lint_queries();
     report.queries = queries.len() + project.lint_copy_in_count();
+    lint_distinct_queries(&mut cache, &project, &queries, &options);
     let mut pending = Vec::new();
     for query in queries {
         report
@@ -467,23 +476,11 @@ fn build_lint(
             Err(_) => continue,
         };
         let calls: Vec<typedpg_lint::Call> = query.calls.iter().map(|call| call.call()).collect();
-        let mut query_options = options.clone();
-        if query.escapes {
-            query_options = query_options.with_rule_off(Rule::UnusedReturning);
-        }
+        let roles = &project.config.databases[query.db].roles;
         let result = cache
             .entry((query.db, query.text.clone(), calls.clone(), query.escapes))
             .or_insert_with(|| {
-                // As `typedpg check` analyzes it: as each of the database's
-                // roles, the rules reading the first one's analysis.
-                typedpg_lint::lint_query_called_as(
-                    catalog,
-                    &query.text,
-                    &calls,
-                    &project.config.databases[query.db].roles,
-                    &query_options,
-                )
-                .map_err(|error| (error.error.to_string(), error.offset))
+                lint_query(catalog, &query.text, &calls, query.escapes, roles, &options)
             });
         if let Ok(findings) = result {
             for placed in findings {
@@ -556,6 +553,22 @@ fn build_lint(
             report.entries.push(entry);
         }
     }
+    for (files, linting) in migration_lints {
+        let linted = linting
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        if let Ok(findings) = linted {
+            for migration in findings {
+                let file = &files[migration.file];
+                report.entries.push(Entry {
+                    path: relative(&file.path, &root),
+                    start: position(&file.sql, migration.finding.span.start),
+                    end: position(&file.sql, migration.finding.span.end),
+                    finding: migration.finding,
+                });
+            }
+        }
+    }
     for db in 0..project.database_count() {
         if let Ok(catalog) = project.catalog(db) {
             report.schemas.push((
@@ -604,6 +617,52 @@ fn call_entry(
         end: position(call.lines.text(), span.end),
         finding: finding.clone(),
     }
+}
+
+/// Lint every distinct query of `queries` into `cache`, across the
+/// machine's cores: the report reads them from it in order.
+fn lint_distinct_queries(
+    cache: &mut HashMap<(usize, String, Vec<typedpg_lint::Call>, bool), LintResult>,
+    project: &Project,
+    queries: &[typedpg_ts::project::LintQuery<'_>],
+    options: &LintOptions,
+) {
+    let mut seen = HashSet::new();
+    let mut distinct = Vec::new();
+    for query in queries {
+        let Ok(catalog) = project.catalog(query.db) else {
+            continue;
+        };
+        let calls: Vec<typedpg_lint::Call> = query.calls.iter().map(|call| call.call()).collect();
+        let key = (query.db, query.text.clone(), calls, query.escapes);
+        if !cache.contains_key(&key) && seen.insert(key.clone()) {
+            distinct.push((key, catalog, &project.config.databases[query.db].roles));
+        }
+    }
+    let results =
+        typedpg_ts::parallel::map(&distinct, |((_, text, calls, escapes), catalog, roles)| {
+            lint_query(catalog, text, calls, *escapes, roles, options)
+        });
+    cache.extend(distinct.into_iter().map(|(key, ..)| key).zip(results));
+}
+
+/// Lint one query as `typedpg check` analyzes it: as each of the
+/// database's `roles`, the rules reading the first one's analysis. An
+/// `escapes` query's calls can't tell that its value is unused.
+fn lint_query(
+    catalog: &typedpg_analyzer::PgCatalog,
+    text: &str,
+    calls: &[typedpg_lint::Call],
+    escapes: bool,
+    roles: &[String],
+    options: &LintOptions,
+) -> LintResult {
+    let mut options = options.clone();
+    if escapes {
+        options = options.with_rule_off(Rule::UnusedReturning);
+    }
+    typedpg_lint::lint_query_called_as(catalog, text, calls, roles, &options)
+        .map_err(|error| (error.error.to_string(), error.offset))
 }
 
 /// The project as git ref `reference` has it, read from a checkout of the

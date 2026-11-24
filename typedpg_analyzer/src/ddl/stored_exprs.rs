@@ -188,8 +188,8 @@ pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str
 /// some of them).
 pub(crate) fn note_all_bound(interp: &mut PgCatalog) {
     let hashes: Vec<u64> = stored_expressions(interp, true)
-        .iter()
-        .map(|(_, _, e)| tree_hash(e.as_ref()))
+        .into_iter()
+        .map(|(_, _, e)| tree_hash(e))
         .collect();
     interp.bound_stored_exprs.extend(hashes);
 }
@@ -571,8 +571,9 @@ enum Over {
 }
 
 /// Every stored expression, with what it is analyzed over — the policies'
-/// too when `policies` (their renames are [`crate::ddl::policies`]').
-fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Option<ast::Node>)> {
+/// too when `policies` (their renames are [`crate::ddl::policies`]'), as
+/// the catalog holds them.
+fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Option<&ast::Node>)> {
     let mut out = Vec::new();
     if policies {
         for ((relid, name), (using, with_check)) in &interp.column_deps.policy_quals {
@@ -581,7 +582,7 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
                     out.push((
                         Slot::Policy(*relid, name.clone(), is_check),
                         Over::Row(*relid),
-                        clause.expr.clone(),
+                        clause.expr.as_ref(),
                     ));
                 }
             }
@@ -591,7 +592,7 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
         if let StoredExpr::Written(expr) = &def.expr
             && let Some(con) = interp.pg_constraint.get(&oid)
         {
-            out.push((Slot::Check(oid), Over::Row(con.conrelid), (**expr).clone()));
+            out.push((Slot::Check(oid), Over::Row(con.conrelid), (**expr).as_ref()));
         }
     }
     for (&(relid, attnum), expr) in &interp.attr_default_exprs {
@@ -599,7 +600,7 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
             out.push((
                 Slot::Default(relid, attnum),
                 Over::Row(relid),
-                (**expr).clone(),
+                (**expr).as_ref(),
             ));
         }
     }
@@ -609,14 +610,14 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
             out.push((
                 Slot::IndexExpr(index.indexrelid, i),
                 Over::Row(relid),
-                e.ast.clone(),
+                e.ast.as_ref(),
             ));
         }
         if let Some(pred) = &index.indpred {
             out.push((
                 Slot::IndexPred(index.indexrelid),
                 Over::Row(relid),
-                pred.ast.clone(),
+                pred.ast.as_ref(),
             ));
         }
     }
@@ -625,7 +626,7 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
             out.push((
                 Slot::PartitionKey(relid, i),
                 Over::Row(relid),
-                e.ast.clone(),
+                e.ast.as_ref(),
             ));
         }
     }
@@ -640,20 +641,24 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
                 out.push((
                     Slot::DomainCheck(domain, i),
                     Over::Value(base),
-                    (**expr).clone(),
+                    (**expr).as_ref(),
                 ));
             }
         }
     }
     for (&domain, expr) in interp.domain_default_exprs.iter() {
         if let StoredExpr::Written(expr) = expr {
-            out.push((Slot::DomainDefault(domain), Over::Nothing, (**expr).clone()));
+            out.push((
+                Slot::DomainDefault(domain),
+                Over::Nothing,
+                (**expr).as_ref(),
+            ));
         }
     }
     for (&proc, defaults) in interp.routine_defaults.iter() {
         for (i, d) in defaults.iter().enumerate() {
             if d.expr.is_some() {
-                out.push((Slot::ArgDefault(proc, i), Over::Nothing, d.expr.clone()));
+                out.push((Slot::ArgDefault(proc, i), Over::Nothing, d.expr.as_ref()));
             }
         }
     }
@@ -663,7 +668,7 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
                 out.push((
                     Slot::TriggerWhen(relid, i),
                     Over::TriggerRow(relid),
-                    t.when.clone(),
+                    t.when.as_ref(),
                 ));
             }
         }
@@ -922,8 +927,9 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
     };
     let rewritten: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, false)
         .into_iter()
-        .filter(|(_, _, expr)| names.as_ref().is_none_or(|n| mentions(expr.as_ref(), n)))
-        .filter_map(|(slot, over, mut expr)| {
+        .filter(|(_, _, expr)| names.as_ref().is_none_or(|n| mentions(*expr, n)))
+        .filter_map(|(slot, over, expr)| {
+            let mut expr = expr.cloned();
             let refs = bindings_of(interp, &slot, over, expr.as_ref()).refs;
             let before = expr.clone();
             rewrite_slots(interp, &mut expr, &refs, renamed);
@@ -1053,7 +1059,7 @@ fn left_as_written(interp: &PgCatalog, ns: crate::oid::PgNamespaceOid) -> bool {
 
 /// The names of the routines, types, collations, operators and relations
 /// outside `pg_catalog`: an unqualified name among them may need binding.
-fn user_object_names(interp: &PgCatalog) -> std::collections::HashSet<String> {
+fn user_object_names(interp: &PgCatalog) -> std::collections::HashSet<&str> {
     let catalog = interp.namespace_oid("pg_catalog");
     let mut names = std::collections::HashSet::new();
     let user = |ns: crate::oid::PgNamespaceOid| Some(ns) != catalog;
@@ -1062,35 +1068,35 @@ fn user_object_names(interp: &PgCatalog) -> std::collections::HashSet<String> {
             .pg_proc
             .values()
             .filter(|p| user(p.pronamespace))
-            .map(|p| p.proname.clone()),
+            .map(|p| p.proname.as_str()),
     );
     names.extend(
         interp
             .pg_type
             .values()
             .filter(|t| user(t.typnamespace))
-            .map(|t| t.typname.clone()),
+            .map(|t| t.typname.as_str()),
     );
     names.extend(
         interp
             .pg_collation
             .values()
             .filter(|c| user(c.collnamespace))
-            .map(|c| c.collname.clone()),
+            .map(|c| c.collname.as_str()),
     );
     names.extend(
         interp
             .pg_operator
             .values()
             .filter(|o| user(o.oprnamespace))
-            .map(|o| o.oprname.clone()),
+            .map(|o| o.oprname.as_str()),
     );
     names.extend(
         interp
             .pg_class
             .values()
             .filter(|c| user(c.relnamespace))
-            .map(|c| c.relname.clone()),
+            .map(|c| c.relname.as_str()),
     );
     // A `regconfig` / `regdictionary` constant names a text search object.
     names.extend(
@@ -1098,17 +1104,17 @@ fn user_object_names(interp: &PgCatalog) -> std::collections::HashSet<String> {
             .pg_ts_objects
             .iter()
             .filter(|o| user(o.namespace))
-            .map(|o| o.name.clone()),
+            .map(|o| o.name.as_str()),
     );
     names
 }
 
 /// Whether `expr` has an unqualified name among `names` (or a string
 /// constant equal to one, which may be a `regclass`).
-fn has_unbound_name(expr: Option<&ast::Node>, names: &std::collections::HashSet<String>) -> bool {
+fn has_unbound_name(expr: Option<&ast::Node>, names: &std::collections::HashSet<&str>) -> bool {
     use typedpg_pg_query::NodeRef;
     let single = |list: &[Option<ast::Node>]| match list {
-        [Some(ast::Node::String(s))] => names.contains(&s.sval),
+        [Some(ast::Node::String(s))] => names.contains(s.sval.as_str()),
         _ => false,
     };
     expr.is_some_and(|e| {
@@ -1204,7 +1210,40 @@ fn bind_slots(interp: &PgCatalog, expr: &mut Option<ast::Node>, bindings: &Bindi
 }
 
 /// A hash of a stored expression's tree.
+///
+/// Every statement asks it of every stored expression, mostly ones it
+/// already hashed: the last hash of the tree at each address is kept, with
+/// a copy of the tree, and reused while the tree there is still equal to
+/// it (every field compared, as the hash reads them all).
 fn tree_hash(expr: Option<&ast::Node>) -> u64 {
+    thread_local! {
+        static HASHED: std::cell::RefCell<
+            std::collections::HashMap<usize, (Option<ast::Node>, u64)>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    /// The trees kept at most: past it, the copies are dropped.
+    const MAX_HASHED: usize = 1 << 16;
+    let Some(node) = expr else {
+        return tree_hash_of(expr);
+    };
+    let address = std::ptr::from_ref(node) as usize;
+    HASHED.with(|hashed| {
+        if let Some((tree, hash)) = hashed.borrow().get(&address)
+            && tree.as_ref() == expr
+        {
+            return *hash;
+        }
+        let hash = tree_hash_of(expr);
+        let mut hashed = hashed.borrow_mut();
+        if hashed.len() >= MAX_HASHED {
+            hashed.clear();
+        }
+        hashed.insert(address, (expr.cloned(), hash));
+        hash
+    })
+}
+
+fn tree_hash_of(expr: Option<&ast::Node>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     format!("{expr:?}").hash(&mut hasher);
@@ -1232,13 +1271,10 @@ pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), supe
     let mut seen = Vec::new();
     let bound: Vec<(Slot, Option<ast::Node>)> = stored_expressions(interp, true)
         .into_iter()
-        .filter(|(_, _, expr)| has_unbound_name(expr.as_ref(), &names))
-        .filter(|(_, _, expr)| {
-            !interp
-                .bound_stored_exprs
-                .contains(&tree_hash(expr.as_ref()))
-        })
-        .filter_map(|(slot, over, mut expr)| {
+        .filter(|(_, _, expr)| has_unbound_name(*expr, &names))
+        .filter(|(_, _, expr)| !interp.bound_stored_exprs.contains(&tree_hash(*expr)))
+        .filter_map(|(slot, over, expr)| {
+            let mut expr = expr.cloned();
             let bindings = bindings_of(interp, &slot, over, expr.as_ref());
             let before = expr.clone();
             bind_slots(interp, &mut expr, &bindings);
@@ -1263,7 +1299,8 @@ pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), supe
 fn settle_datetime_constants(interp: &mut PgCatalog) {
     let fresh: Vec<(Slot, Over, Option<ast::Node>)> = stored_expressions(interp, true)
         .into_iter()
-        .filter(|(_, _, e)| !interp.settled_stored_exprs.contains(&tree_hash(e.as_ref())))
+        .filter(|(_, _, e)| !interp.settled_stored_exprs.contains(&tree_hash(*e)))
+        .map(|(slot, over, e)| (slot, over, e.cloned()))
         .collect();
     for (slot, over, mut expr) in fresh {
         let has_string = expr.as_ref().is_some_and(|e| {
@@ -1668,7 +1705,7 @@ fn note_reg_constants(interp: &PgCatalog, renamed: Renamed<'_>) {
     use crate::reg_input::RegObject;
     let mut pending = Vec::new();
     for (slot, over, expr) in stored_expressions(interp, true) {
-        let has_string = expr.as_ref().is_some_and(|e| {
+        let has_string = expr.is_some_and(|e| {
             e.nodes().any(|(n, ..)| {
                 matches!(n, typedpg_pg_query::NodeRef::AConst(c)
                     if matches!(c.val, Some(ast::AConstValue::String(_))))
@@ -1677,7 +1714,7 @@ fn note_reg_constants(interp: &PgCatalog, renamed: Renamed<'_>) {
         if !has_string {
             continue;
         }
-        let literals = bindings_of(interp, &slot, over, expr.as_ref()).literals;
+        let literals = bindings_of(interp, &slot, over, expr).literals;
         for (n, ..) in expr.iter().flat_map(|e| e.nodes()) {
             let typedpg_pg_query::NodeRef::AConst(c) = n else {
                 continue;
@@ -1744,7 +1781,7 @@ fn read_slot(interp: &PgCatalog, slot: &Slot) -> Option<Option<ast::Node>> {
     stored_expressions(interp, true)
         .into_iter()
         .find(|(s, ..)| slot_eq(s, slot))
-        .map(|(_, _, e)| e)
+        .map(|(_, _, e)| e.cloned())
 }
 
 fn slot_eq(a: &Slot, b: &Slot) -> bool {
@@ -1827,11 +1864,15 @@ fn refuse_unstorable_constants(interp: &PgCatalog) -> Result<(), super::DdlError
             })
         })
     };
+    // Asked of a relation once per expression over its row: once is enough.
+    let holding = std::cell::RefCell::new(std::collections::HashMap::new());
     let relation_holds = |relid: PgClassOid| {
-        interp
-            .attributes_of(relid)
-            .iter()
-            .any(|a| unstorable_type(interp, a.atttypid).is_some())
+        *holding.borrow_mut().entry(relid).or_insert_with(|| {
+            interp
+                .attributes_of(relid)
+                .iter()
+                .any(|a| unstorable_type(interp, a.atttypid).is_some())
+        })
     };
     let refused = |typname: &str| {
         Err(super::DdlError::UnsupportedDdl(format!(
@@ -1846,11 +1887,11 @@ fn refuse_unstorable_constants(interp: &PgCatalog) -> Result<(), super::DdlError
                 .iter()
                 .find(|a| a.attnum == attnum)
                 .and_then(|a| unstorable_type(interp, a.atttypid))
-            && matches!(expr, Some(ast::Node::AConst(ref c)) if !c.isnull)
+            && matches!(expr, Some(ast::Node::AConst(c)) if !c.isnull)
         {
             return refused(typname);
         }
-        let candidate = has_cast(expr.as_ref())
+        let candidate = has_cast(expr)
             || match over {
                 Over::Row(relid) | Over::TriggerRow(relid) => relation_holds(relid),
                 Over::Value(base) => unstorable_type(interp, base).is_some(),
@@ -1859,7 +1900,7 @@ fn refuse_unstorable_constants(interp: &PgCatalog) -> Result<(), super::DdlError
         if !candidate {
             continue;
         }
-        let literals = bindings_of(interp, &slot, over, expr.as_ref()).literals;
+        let literals = bindings_of(interp, &slot, over, expr).literals;
         if let Some(typname) = literals.values().find_map(|&t| unstorable_type(interp, t)) {
             return refused(typname);
         }

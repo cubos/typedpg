@@ -4,7 +4,6 @@
 //! that file, a query already analyzed is not analyzed again, and a
 //! generated module is rewritten only when its content changes.
 
-use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -70,7 +69,7 @@ pub struct Project {
     resolver: ResolverGeneric<ProjectFs>,
     files: BTreeMap<PathBuf, FileScan>,
     /// The re-exports of each module a source imports from, parsed once.
-    modules: RefCell<HashMap<PathBuf, Option<ModuleExports>>>,
+    modules: std::sync::Mutex<HashMap<PathBuf, Option<ModuleExports>>>,
     /// Whether TypeScript sources are scanned (not to compile `.sql` files
     /// alone).
     scan_sources: bool,
@@ -117,21 +116,64 @@ struct Database {
     cache: HashMap<(Kind, String), Result<Generated, GenError>>,
 }
 
+/// A database's migrations as its directories hold them and the catalog
+/// they build, set up for analyzing its queries; or why they could not be
+/// read.
+struct LoadedMigrations {
+    /// The configured directories that don't exist.
+    missing_dirs: Vec<PathBuf>,
+    #[allow(clippy::type_complexity)]
+    migrations: Result<(Vec<(String, String)>, Result<PgCatalog, String>), String>,
+}
+
+/// Read the migrations of the database `config` configures (relative paths
+/// against `root`) and build its catalog, as
+/// [`Project::reload_migrations`] does for a database that has none yet.
+fn load_migrations(
+    config: &DatabaseConfig,
+    overrides: &HashMap<QualifiedName, String>,
+    root: &Path,
+) -> LoadedMigrations {
+    let dirs = config.migrations_dirs();
+    LoadedMigrations {
+        missing_dirs: dirs.iter().filter(|d| !d.is_dir()).cloned().collect(),
+        migrations: collect_migrations(&dirs, root).map(|migrations| {
+            let catalog = build_catalog(&migrations, config.runner.use_transaction).and_then(
+                |mut catalog| {
+                    prepare_catalog(config, overrides, &mut catalog)?;
+                    Ok(catalog)
+                },
+            );
+            (migrations, catalog)
+        }),
+    }
+}
+
+/// Set a catalog built from the migrations of the database `config`
+/// configures (`overrides` its `types`) up for analyzing its queries.
+fn prepare_catalog(
+    config: &DatabaseConfig,
+    overrides: &HashMap<QualifiedName, String>,
+    catalog: &mut PgCatalog,
+) -> Result<(), String> {
+    // Parameters bound from a Temporal value are never infinite.
+    let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
+        .iter()
+        .map(|t| QualifiedName::new("pg_catalog", *t))
+        .filter(|q| !overrides.contains_key(q))
+        .collect();
+    catalog.assume_finite_parameters(&finite)?;
+    catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
+        &config.simplify,
+    ));
+    Ok(())
+}
+
 impl Database {
     /// Set a catalog built from the database's migrations up for analyzing
     /// its queries.
     fn prepare_catalog(&self, catalog: &mut PgCatalog) -> Result<(), String> {
-        // Parameters bound from a Temporal value are never infinite.
-        let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
-            .iter()
-            .map(|t| QualifiedName::new("pg_catalog", *t))
-            .filter(|q| !self.overrides.contains_key(q))
-            .collect();
-        catalog.assume_finite_parameters(&finite)?;
-        catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
-            &self.config.simplify,
-        ));
-        Ok(())
+        prepare_catalog(&self.config, &self.overrides, catalog)
     }
 
     /// The names the database's enums take in its module (`file: None`) or
@@ -435,7 +477,7 @@ impl Project {
             dbs,
             resolver,
             files: BTreeMap::new(),
-            modules: RefCell::new(HashMap::new()),
+            modules: std::sync::Mutex::new(HashMap::new()),
             scan_sources,
             scan_without_modules,
             sql_files: BTreeMap::new(),
@@ -443,10 +485,46 @@ impl Project {
             sql_generated: BTreeSet::new(),
             sql_problems: Vec::new(),
         };
-        for i in 0..project.dbs.len() {
-            project.reload_migrations(i);
+        // Each database's catalog is built while the sources are scanned:
+        // neither reads the other.
+        let root = project.config.root.clone();
+        let sources: Vec<(DatabaseConfig, HashMap<QualifiedName, String>)> = project
+            .dbs
+            .iter()
+            .map(|db| (db.config.clone(), db.overrides.clone()))
+            .collect();
+        let loaded: Vec<LoadedMigrations> = std::thread::scope(|scope| {
+            let builds: Vec<_> = sources
+                .iter()
+                .map(|(config, overrides)| {
+                    let root = &root;
+                    std::thread::Builder::new()
+                        .stack_size(crate::parallel::STACK)
+                        .spawn_scoped(scope, move || load_migrations(config, overrides, root))
+                        .expect("failed to spawn a thread")
+                })
+                .collect();
+            project.rescan_all();
+            builds
+                .into_iter()
+                .map(|build| {
+                    build
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        });
+        for (db, loaded) in project.dbs.iter_mut().zip(loaded) {
+            db.missing_dirs = loaded.missing_dirs;
+            match loaded.migrations {
+                Ok((migrations, catalog)) => {
+                    db.catalog = catalog;
+                    db.migrations = migrations;
+                }
+                Err(e) => db.catalog = Err(e),
+            }
+            db.cache.clear();
         }
-        project.rescan_all();
         Ok(project)
     }
 
@@ -585,7 +663,10 @@ impl Project {
     /// Whether a source's re-exports were followed through `path`: a change
     /// to it can change what other sources' imports are.
     pub fn is_reexporter(&self, path: &Path) -> bool {
-        self.modules.borrow().contains_key(&canonical(path))
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&canonical(path))
     }
 
     /// The index of each database whose migrations `path` is in.
@@ -606,7 +687,10 @@ impl Project {
     pub fn rescan_all(&mut self) {
         self.collect_sql();
         self.resolver.clear_cache();
-        self.modules.borrow_mut().clear();
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.files.clear();
         if !self.scan_sources
             || (!self.scan_without_modules && !self.dbs.iter().any(|db| db.config.out.is_some()))
@@ -619,9 +703,35 @@ impl Project {
         }
         sources.sort();
         sources.dedup();
-        for path in sources {
-            if self.is_source(&path) {
-                self.rescan(&path);
+        let sources: Vec<PathBuf> = sources
+            .into_iter()
+            .filter(|path| self.is_source(path))
+            .collect();
+        // Each source is read and scanned on its own, resolving its imports
+        // against the project: neither a scan nor a resolution reads what
+        // another writes.
+        let scanned: Vec<(PathBuf, Option<FileScan>)> = {
+            let project = &*self;
+            crate::parallel::map(&sources, |path| {
+                let source = std::fs::read_to_string(path).ok()?;
+                let result = scan(path, &source, &mut |spec, name| {
+                    project.resolve_export(path, spec, name, 0)
+                });
+                Some((path.clone(), result))
+            })
+        }
+        .into_iter()
+        .flatten()
+        .collect();
+        for (path, result) in scanned {
+            match result {
+                Some(scan) => {
+                    self.files.insert(path, scan);
+                }
+                // Unparseable: keep the queries it had.
+                None => {
+                    self.files.entry(path).or_default();
+                }
             }
         }
     }
@@ -681,15 +791,26 @@ impl Project {
         if name == "*" || depth >= MAX_REEXPORT_DEPTH || !followable {
             return None;
         }
-        let exports = {
-            let mut modules = self.modules.borrow_mut();
-            modules
-                .entry(path.to_path_buf())
-                .or_insert_with(|| {
-                    let source = std::fs::read_to_string(path).ok()?;
-                    module_exports(path, &source)
-                })
-                .clone()?
+        // The module's exports, read once: a file's exports are a
+        // function of its text, so a concurrent read may compute the same.
+        let cached = self
+            .modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned();
+        let exports = match cached {
+            Some(exports) => exports?,
+            None => {
+                let exports = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|source| module_exports(path, &source));
+                self.modules
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(path.to_path_buf(), exports.clone());
+                exports?
+            }
         };
         // `export const x = sql(…)`, or a local one exported later.
         if exports.queries.iter().any(|query| query == name) {
@@ -873,11 +994,28 @@ impl Project {
             .keys()
             .copied()
             .chain(sql_texts.iter().map(|&t| (Kind::Query, t)));
+        // Each query not analyzed yet, once, analyzed across the machine's
+        // cores.
+        let mut fresh = Vec::new();
+        let mut seen = HashSet::new();
         for (kind, text) in wanted {
-            if let Entry::Vacant(e) = db.cache.entry((kind, text.to_owned())) {
-                report.analyzed += 1;
-                e.insert(generate(catalog, &mapper, kind, text, &db.config.roles));
+            if !db.cache.contains_key(&(kind, text.to_owned())) && seen.insert((kind, text)) {
+                fresh.push((kind, text));
             }
+        }
+        let overrides = &db.overrides;
+        let roles = &db.config.roles;
+        let generated = crate::parallel::map(&fresh, |&(kind, text)| {
+            let mapper = TypeMapper {
+                overrides,
+                used: Default::default(),
+                catalog,
+            };
+            generate(catalog, &mapper, kind, text, roles)
+        });
+        for ((kind, text), result) in fresh.into_iter().zip(generated) {
+            report.analyzed += 1;
+            db.cache.insert((kind, text.to_owned()), result);
         }
         let note = missing_dirs_note(&db.missing_dirs, root);
         let with_note = |e: &GenError| {
