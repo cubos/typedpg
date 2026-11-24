@@ -5,16 +5,25 @@
 //! `extensions` module. Child modules can name the parent's private
 //! `ExtensionDef`/`ExtensionVersion` structs, so they stay defined there.
 
-use super::{ExtensionDef, ExtensionVersion};
+use super::{ExtensionDef, ExtensionVersion, Script};
+
+/// A bundled script, `src/extensions/<file>`, embedded as its zstd
+/// compression `<file>.zst` (written by update_extensions.sh).
+macro_rules! script {
+    ($file:literal) => {
+        Script::Zstd(include_bytes!(concat!("../../extensions/", $file, ".zst")))
+    };
+}
 
 // ─── Registry ───────────────────────────────────────────────────────────────
 //
 // All PostgreSQL contrib extensions, alphabetical order, then the
 // third-party ones (PostGIS, pg_cron, pgmq, pg_jsonschema, pgvector).
-// SQL files are in typedpg_analyzer/src/extensions/ and fetched via
-// update_extensions.sh from the PostgreSQL release typedpg targets: the
-// versions and default versions here are that release's, as its parser
-// must accept every script and its server has every object they create.
+// SQL files are in typedpg_analyzer/src/extensions/ (embedded compressed,
+// `<file>.sql.zst`) and fetched via update_extensions.sh from the PostgreSQL
+// release typedpg targets: the versions and default versions here are that
+// release's, as its parser must accept every script and its server has
+// every object they create.
 
 // PostGIS reaches a release from an older one through the `ANY`
 // pseudo-version (`postgis_extensions_upgrade()` updates to `ANY`, then to
@@ -34,32 +43,32 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.0",
                 from: None,
-                sql: include_str!("../../extensions/amcheck--1.0.sql"),
+                sql: script!("amcheck--1.0.sql"),
             },
             ExtensionVersion {
                 version: "1.1",
                 from: Some("1.0"),
-                sql: include_str!("../../extensions/amcheck--1.0--1.1.sql"),
+                sql: script!("amcheck--1.0--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/amcheck--1.1--1.2.sql"),
+                sql: script!("amcheck--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/amcheck--1.2--1.3.sql"),
+                sql: script!("amcheck--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/amcheck--1.3--1.4.sql"),
+                sql: script!("amcheck--1.3--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/amcheck--1.4--1.5.sql"),
+                sql: script!("amcheck--1.4--1.5.sql"),
             },
         ],
     },
@@ -70,7 +79,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/autoinc--1.0.sql"),
+            sql: script!("autoinc--1.0.sql"),
         }],
     },
     // ── bloom ──────────────────────────────────────────────────────────
@@ -80,7 +89,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/bloom--1.0.sql"),
+            sql: script!("bloom--1.0.sql"),
         }],
     },
     // ── bool_plperl (requires plperl) ──────────────────────────────────
@@ -90,7 +99,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/bool_plperl--1.0.sql"),
+            sql: script!("bool_plperl--1.0.sql"),
         }],
     },
     // ── bool_plperlu (requires plperlu) ────────────────────────────────
@@ -100,7 +109,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/bool_plperlu--1.0.sql"),
+            sql: script!("bool_plperlu--1.0.sql"),
         }],
     },
     // ── btree_gin ──────────────────────────────────────────────────────
@@ -111,27 +120,27 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.0",
                 from: None,
-                sql: include_str!("../../extensions/btree_gin--1.0.sql"),
+                sql: script!("btree_gin--1.0.sql"),
             },
             ExtensionVersion {
                 version: "1.1",
                 from: Some("1.0"),
-                sql: include_str!("../../extensions/btree_gin--1.0--1.1.sql"),
+                sql: script!("btree_gin--1.0--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/btree_gin--1.1--1.2.sql"),
+                sql: script!("btree_gin--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/btree_gin--1.2--1.3.sql"),
+                sql: script!("btree_gin--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/btree_gin--1.3--1.4.sql"),
+                sql: script!("btree_gin--1.3--1.4.sql"),
             },
         ],
     },
@@ -142,7 +151,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.9",
             from: None,
-            sql: include_str!("../../extensions/btree_gist--1.9.sql"),
+            sql: script!("btree_gist--1.9.sql"),
         }],
     },
     // ── citext ─────────────────────────────────────────────────────────
@@ -153,27 +162,27 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.4",
                 from: None,
-                sql: include_str!("../../extensions/citext--1.4.sql"),
+                sql: script!("citext--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/citext--1.4--1.5.sql"),
+                sql: script!("citext--1.4--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/citext--1.5--1.6.sql"),
+                sql: script!("citext--1.5--1.6.sql"),
             },
             ExtensionVersion {
                 version: "1.7",
                 from: Some("1.6"),
-                sql: include_str!("../../extensions/citext--1.6--1.7.sql"),
+                sql: script!("citext--1.6--1.7.sql"),
             },
             ExtensionVersion {
                 version: "1.8",
                 from: Some("1.7"),
-                sql: include_str!("../../extensions/citext--1.7--1.8.sql"),
+                sql: script!("citext--1.7--1.8.sql"),
             },
         ],
     },
@@ -185,22 +194,22 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.2",
                 from: None,
-                sql: include_str!("../../extensions/cube--1.2.sql"),
+                sql: script!("cube--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/cube--1.2--1.3.sql"),
+                sql: script!("cube--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/cube--1.3--1.4.sql"),
+                sql: script!("cube--1.3--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/cube--1.4--1.5.sql"),
+                sql: script!("cube--1.4--1.5.sql"),
             },
         ],
     },
@@ -211,7 +220,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.2",
             from: None,
-            sql: include_str!("../../extensions/dblink--1.2.sql"),
+            sql: script!("dblink--1.2.sql"),
         }],
     },
     // ── dict_int ───────────────────────────────────────────────────────
@@ -221,7 +230,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/dict_int--1.0.sql"),
+            sql: script!("dict_int--1.0.sql"),
         }],
     },
     // ── dict_xsyn ──────────────────────────────────────────────────────
@@ -231,7 +240,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/dict_xsyn--1.0.sql"),
+            sql: script!("dict_xsyn--1.0.sql"),
         }],
     },
     // ── earthdistance (depends on cube) ────────────────────────────────
@@ -242,12 +251,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/earthdistance--1.1.sql"),
+                sql: script!("earthdistance--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/earthdistance--1.1--1.2.sql"),
+                sql: script!("earthdistance--1.1--1.2.sql"),
             },
         ],
     },
@@ -258,7 +267,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/file_fdw--1.0.sql"),
+            sql: script!("file_fdw--1.0.sql"),
         }],
     },
     // ── fuzzystrmatch ──────────────────────────────────────────────────
@@ -269,12 +278,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/fuzzystrmatch--1.1.sql"),
+                sql: script!("fuzzystrmatch--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/fuzzystrmatch--1.1--1.2.sql"),
+                sql: script!("fuzzystrmatch--1.1--1.2.sql"),
             },
         ],
     },
@@ -286,27 +295,27 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.4",
                 from: None,
-                sql: include_str!("../../extensions/hstore--1.4.sql"),
+                sql: script!("hstore--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/hstore--1.4--1.5.sql"),
+                sql: script!("hstore--1.4--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/hstore--1.5--1.6.sql"),
+                sql: script!("hstore--1.5--1.6.sql"),
             },
             ExtensionVersion {
                 version: "1.7",
                 from: Some("1.6"),
-                sql: include_str!("../../extensions/hstore--1.6--1.7.sql"),
+                sql: script!("hstore--1.6--1.7.sql"),
             },
             ExtensionVersion {
                 version: "1.8",
                 from: Some("1.7"),
-                sql: include_str!("../../extensions/hstore--1.7--1.8.sql"),
+                sql: script!("hstore--1.7--1.8.sql"),
             },
         ],
     },
@@ -317,7 +326,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/hstore_plperl--1.0.sql"),
+            sql: script!("hstore_plperl--1.0.sql"),
         }],
     },
     // ── hstore_plperlu (requires hstore + plperlu) ─────────────────────
@@ -327,7 +336,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/hstore_plperlu--1.0.sql"),
+            sql: script!("hstore_plperlu--1.0.sql"),
         }],
     },
     // ── hstore_plpython3u (requires hstore + plpython3u) ───────────────
@@ -337,7 +346,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/hstore_plpython3u--1.0.sql"),
+            sql: script!("hstore_plpython3u--1.0.sql"),
         }],
     },
     // ── intagg ─────────────────────────────────────────────────────────
@@ -347,7 +356,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.1",
             from: None,
-            sql: include_str!("../../extensions/intagg--1.1.sql"),
+            sql: script!("intagg--1.1.sql"),
         }],
     },
     // ── insert_username (SPI) ──────────────────────────────────────────
@@ -357,7 +366,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/insert_username--1.0.sql"),
+            sql: script!("insert_username--1.0.sql"),
         }],
     },
     // ── intarray ───────────────────────────────────────────────────────
@@ -368,22 +377,22 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.2",
                 from: None,
-                sql: include_str!("../../extensions/intarray--1.2.sql"),
+                sql: script!("intarray--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/intarray--1.2--1.3.sql"),
+                sql: script!("intarray--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/intarray--1.3--1.4.sql"),
+                sql: script!("intarray--1.3--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/intarray--1.4--1.5.sql"),
+                sql: script!("intarray--1.4--1.5.sql"),
             },
         ],
     },
@@ -395,17 +404,17 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/isn--1.1.sql"),
+                sql: script!("isn--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/isn--1.1--1.2.sql"),
+                sql: script!("isn--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/isn--1.2--1.3.sql"),
+                sql: script!("isn--1.2--1.3.sql"),
             },
         ],
     },
@@ -416,7 +425,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/jsonb_plperl--1.0.sql"),
+            sql: script!("jsonb_plperl--1.0.sql"),
         }],
     },
     // ── jsonb_plperlu (requires plperlu) ───────────────────────────────
@@ -426,7 +435,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/jsonb_plperlu--1.0.sql"),
+            sql: script!("jsonb_plperlu--1.0.sql"),
         }],
     },
     // ── jsonb_plpython3u (requires plpython3u) ─────────────────────────
@@ -436,7 +445,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/jsonb_plpython3u--1.0.sql"),
+            sql: script!("jsonb_plpython3u--1.0.sql"),
         }],
     },
     // ── lo ─────────────────────────────────────────────────────────────
@@ -447,12 +456,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/lo--1.1.sql"),
+                sql: script!("lo--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/lo--1.1--1.2.sql"),
+                sql: script!("lo--1.1--1.2.sql"),
             },
         ],
     },
@@ -464,17 +473,17 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/ltree--1.1.sql"),
+                sql: script!("ltree--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/ltree--1.1--1.2.sql"),
+                sql: script!("ltree--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/ltree--1.2--1.3.sql"),
+                sql: script!("ltree--1.2--1.3.sql"),
             },
         ],
     },
@@ -485,7 +494,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/ltree_plpython3u--1.0.sql"),
+            sql: script!("ltree_plpython3u--1.0.sql"),
         }],
     },
     // ── moddatetime (SPI) ──────────────────────────────────────────────
@@ -495,7 +504,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/moddatetime--1.0.sql"),
+            sql: script!("moddatetime--1.0.sql"),
         }],
     },
     // ── pageinspect ────────────────────────────────────────────────────
@@ -506,47 +515,47 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.5",
                 from: None,
-                sql: include_str!("../../extensions/pageinspect--1.5.sql"),
+                sql: script!("pageinspect--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/pageinspect--1.5--1.6.sql"),
+                sql: script!("pageinspect--1.5--1.6.sql"),
             },
             ExtensionVersion {
                 version: "1.7",
                 from: Some("1.6"),
-                sql: include_str!("../../extensions/pageinspect--1.6--1.7.sql"),
+                sql: script!("pageinspect--1.6--1.7.sql"),
             },
             ExtensionVersion {
                 version: "1.8",
                 from: Some("1.7"),
-                sql: include_str!("../../extensions/pageinspect--1.7--1.8.sql"),
+                sql: script!("pageinspect--1.7--1.8.sql"),
             },
             ExtensionVersion {
                 version: "1.9",
                 from: Some("1.8"),
-                sql: include_str!("../../extensions/pageinspect--1.8--1.9.sql"),
+                sql: script!("pageinspect--1.8--1.9.sql"),
             },
             ExtensionVersion {
                 version: "1.10",
                 from: Some("1.9"),
-                sql: include_str!("../../extensions/pageinspect--1.9--1.10.sql"),
+                sql: script!("pageinspect--1.9--1.10.sql"),
             },
             ExtensionVersion {
                 version: "1.11",
                 from: Some("1.10"),
-                sql: include_str!("../../extensions/pageinspect--1.10--1.11.sql"),
+                sql: script!("pageinspect--1.10--1.11.sql"),
             },
             ExtensionVersion {
                 version: "1.12",
                 from: Some("1.11"),
-                sql: include_str!("../../extensions/pageinspect--1.11--1.12.sql"),
+                sql: script!("pageinspect--1.11--1.12.sql"),
             },
             ExtensionVersion {
                 version: "1.13",
                 from: Some("1.12"),
-                sql: include_str!("../../extensions/pageinspect--1.12--1.13.sql"),
+                sql: script!("pageinspect--1.12--1.13.sql"),
             },
         ],
     },
@@ -558,32 +567,32 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.2",
                 from: None,
-                sql: include_str!("../../extensions/pg_buffercache--1.2.sql"),
+                sql: script!("pg_buffercache--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/pg_buffercache--1.2--1.3.sql"),
+                sql: script!("pg_buffercache--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/pg_buffercache--1.3--1.4.sql"),
+                sql: script!("pg_buffercache--1.3--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/pg_buffercache--1.4--1.5.sql"),
+                sql: script!("pg_buffercache--1.4--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/pg_buffercache--1.5--1.6.sql"),
+                sql: script!("pg_buffercache--1.5--1.6.sql"),
             },
             ExtensionVersion {
                 version: "1.7",
                 from: Some("1.6"),
-                sql: include_str!("../../extensions/pg_buffercache--1.6--1.7.sql"),
+                sql: script!("pg_buffercache--1.6--1.7.sql"),
             },
         ],
     },
@@ -595,17 +604,17 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/pg_freespacemap--1.1.sql"),
+                sql: script!("pg_freespacemap--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/pg_freespacemap--1.1--1.2.sql"),
+                sql: script!("pg_freespacemap--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/pg_freespacemap--1.2--1.3.sql"),
+                sql: script!("pg_freespacemap--1.2--1.3.sql"),
             },
         ],
     },
@@ -616,7 +625,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/pg_logicalinspect--1.0.sql"),
+            sql: script!("pg_logicalinspect--1.0.sql"),
         }],
     },
     // ── pg_prewarm ─────────────────────────────────────────────────────
@@ -627,12 +636,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/pg_prewarm--1.1.sql"),
+                sql: script!("pg_prewarm--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/pg_prewarm--1.1--1.2.sql"),
+                sql: script!("pg_prewarm--1.1--1.2.sql"),
             },
         ],
     },
@@ -643,7 +652,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/pg_stash_advice--1.0.sql"),
+            sql: script!("pg_stash_advice--1.0.sql"),
         }],
     },
     // ── pg_stat_statements ─────────────────────────────────────────────
@@ -654,52 +663,52 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.4",
                 from: None,
-                sql: include_str!("../../extensions/pg_stat_statements--1.4.sql"),
+                sql: script!("pg_stat_statements--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.4--1.5.sql"),
+                sql: script!("pg_stat_statements--1.4--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.5--1.6.sql"),
+                sql: script!("pg_stat_statements--1.5--1.6.sql"),
             },
             ExtensionVersion {
                 version: "1.7",
                 from: Some("1.6"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.6--1.7.sql"),
+                sql: script!("pg_stat_statements--1.6--1.7.sql"),
             },
             ExtensionVersion {
                 version: "1.8",
                 from: Some("1.7"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.7--1.8.sql"),
+                sql: script!("pg_stat_statements--1.7--1.8.sql"),
             },
             ExtensionVersion {
                 version: "1.9",
                 from: Some("1.8"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.8--1.9.sql"),
+                sql: script!("pg_stat_statements--1.8--1.9.sql"),
             },
             ExtensionVersion {
                 version: "1.10",
                 from: Some("1.9"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.9--1.10.sql"),
+                sql: script!("pg_stat_statements--1.9--1.10.sql"),
             },
             ExtensionVersion {
                 version: "1.11",
                 from: Some("1.10"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.10--1.11.sql"),
+                sql: script!("pg_stat_statements--1.10--1.11.sql"),
             },
             ExtensionVersion {
                 version: "1.12",
                 from: Some("1.11"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.11--1.12.sql"),
+                sql: script!("pg_stat_statements--1.11--1.12.sql"),
             },
             ExtensionVersion {
                 version: "1.13",
                 from: Some("1.12"),
-                sql: include_str!("../../extensions/pg_stat_statements--1.12--1.13.sql"),
+                sql: script!("pg_stat_statements--1.12--1.13.sql"),
             },
         ],
     },
@@ -710,7 +719,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/pg_surgery--1.0.sql"),
+            sql: script!("pg_surgery--1.0.sql"),
         }],
     },
     // ── pg_trgm ────────────────────────────────────────────────────────
@@ -721,22 +730,22 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.3",
                 from: None,
-                sql: include_str!("../../extensions/pg_trgm--1.3.sql"),
+                sql: script!("pg_trgm--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/pg_trgm--1.3--1.4.sql"),
+                sql: script!("pg_trgm--1.3--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/pg_trgm--1.4--1.5.sql"),
+                sql: script!("pg_trgm--1.4--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/pg_trgm--1.5--1.6.sql"),
+                sql: script!("pg_trgm--1.5--1.6.sql"),
             },
         ],
     },
@@ -748,12 +757,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/pg_visibility--1.1.sql"),
+                sql: script!("pg_visibility--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/pg_visibility--1.1--1.2.sql"),
+                sql: script!("pg_visibility--1.1--1.2.sql"),
             },
         ],
     },
@@ -765,12 +774,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.0",
                 from: None,
-                sql: include_str!("../../extensions/pg_walinspect--1.0.sql"),
+                sql: script!("pg_walinspect--1.0.sql"),
             },
             ExtensionVersion {
                 version: "1.1",
                 from: Some("1.0"),
-                sql: include_str!("../../extensions/pg_walinspect--1.0--1.1.sql"),
+                sql: script!("pg_walinspect--1.0--1.1.sql"),
             },
         ],
     },
@@ -782,12 +791,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.3",
                 from: None,
-                sql: include_str!("../../extensions/pgcrypto--1.3.sql"),
+                sql: script!("pgcrypto--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/pgcrypto--1.3--1.4.sql"),
+                sql: script!("pgcrypto--1.3--1.4.sql"),
             },
         ],
     },
@@ -798,7 +807,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.2",
             from: None,
-            sql: include_str!("../../extensions/pgrowlocks--1.2.sql"),
+            sql: script!("pgrowlocks--1.2.sql"),
         }],
     },
     // ── pgstattuple ────────────────────────────────────────────────────
@@ -809,12 +818,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.4",
                 from: None,
-                sql: include_str!("../../extensions/pgstattuple--1.4.sql"),
+                sql: script!("pgstattuple--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/pgstattuple--1.4--1.5.sql"),
+                sql: script!("pgstattuple--1.4--1.5.sql"),
             },
         ],
     },
@@ -825,7 +834,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/plperl--1.0.sql"),
+            sql: script!("plperl--1.0.sql"),
         }],
     },
     // ── plperlu (src/pl/plperl) ────────────────────────────────────────
@@ -835,7 +844,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/plperlu--1.0.sql"),
+            sql: script!("plperlu--1.0.sql"),
         }],
     },
     // ── plpgsql (src/pl/plpgsql, installed by initdb) ─────────────────
@@ -845,7 +854,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/plpgsql--1.0.sql"),
+            sql: script!("plpgsql--1.0.sql"),
         }],
     },
     // ── plpython3u (src/pl/plpython) ───────────────────────────────────
@@ -855,7 +864,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/plpython3u--1.0.sql"),
+            sql: script!("plpython3u--1.0.sql"),
         }],
     },
     // ── postgres_fdw ───────────────────────────────────────────────────
@@ -866,22 +875,22 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.0",
                 from: None,
-                sql: include_str!("../../extensions/postgres_fdw--1.0.sql"),
+                sql: script!("postgres_fdw--1.0.sql"),
             },
             ExtensionVersion {
                 version: "1.1",
                 from: Some("1.0"),
-                sql: include_str!("../../extensions/postgres_fdw--1.0--1.1.sql"),
+                sql: script!("postgres_fdw--1.0--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/postgres_fdw--1.1--1.2.sql"),
+                sql: script!("postgres_fdw--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/postgres_fdw--1.2--1.3.sql"),
+                sql: script!("postgres_fdw--1.2--1.3.sql"),
             },
         ],
     },
@@ -892,7 +901,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/refint--1.0.sql"),
+            sql: script!("refint--1.0.sql"),
         }],
     },
     // ── seg ────────────────────────────────────────────────────────────
@@ -903,22 +912,22 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/seg--1.1.sql"),
+                sql: script!("seg--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/seg--1.1--1.2.sql"),
+                sql: script!("seg--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/seg--1.2--1.3.sql"),
+                sql: script!("seg--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/seg--1.3--1.4.sql"),
+                sql: script!("seg--1.3--1.4.sql"),
             },
         ],
     },
@@ -929,7 +938,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.2",
             from: None,
-            sql: include_str!("../../extensions/sslinfo--1.2.sql"),
+            sql: script!("sslinfo--1.2.sql"),
         }],
     },
     // ── tablefunc ──────────────────────────────────────────────────────
@@ -939,7 +948,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/tablefunc--1.0.sql"),
+            sql: script!("tablefunc--1.0.sql"),
         }],
     },
     // ── tcn ────────────────────────────────────────────────────────────
@@ -949,7 +958,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/tcn--1.0.sql"),
+            sql: script!("tcn--1.0.sql"),
         }],
     },
     // ── tsm_system_rows ────────────────────────────────────────────────
@@ -959,7 +968,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/tsm_system_rows--1.0.sql"),
+            sql: script!("tsm_system_rows--1.0.sql"),
         }],
     },
     // ── tsm_system_time ────────────────────────────────────────────────
@@ -969,7 +978,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.0",
             from: None,
-            sql: include_str!("../../extensions/tsm_system_time--1.0.sql"),
+            sql: script!("tsm_system_time--1.0.sql"),
         }],
     },
     // ── unaccent ───────────────────────────────────────────────────────
@@ -979,7 +988,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.1",
             from: None,
-            sql: include_str!("../../extensions/unaccent--1.1.sql"),
+            sql: script!("unaccent--1.1.sql"),
         }],
     },
     // ── uuid-ossp ──────────────────────────────────────────────────────
@@ -989,7 +998,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.1",
             from: None,
-            sql: include_str!("../../extensions/uuid-ossp--1.1.sql"),
+            sql: script!("uuid-ossp--1.1.sql"),
         }],
     },
     // ── xml2 ───────────────────────────────────────────────────────────
@@ -1000,12 +1009,12 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.1",
                 from: None,
-                sql: include_str!("../../extensions/xml2--1.1.sql"),
+                sql: script!("xml2--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/xml2--1.1--1.2.sql"),
+                sql: script!("xml2--1.1--1.2.sql"),
             },
         ],
     },
@@ -1020,42 +1029,42 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "1.0",
                 from: None,
-                sql: include_str!("../../extensions/pg_cron--1.0.sql"),
+                sql: script!("pg_cron--1.0.sql"),
             },
             ExtensionVersion {
                 version: "1.1",
                 from: Some("1.0"),
-                sql: include_str!("../../extensions/pg_cron--1.0--1.1.sql"),
+                sql: script!("pg_cron--1.0--1.1.sql"),
             },
             ExtensionVersion {
                 version: "1.2",
                 from: Some("1.1"),
-                sql: include_str!("../../extensions/pg_cron--1.1--1.2.sql"),
+                sql: script!("pg_cron--1.1--1.2.sql"),
             },
             ExtensionVersion {
                 version: "1.3",
                 from: Some("1.2"),
-                sql: include_str!("../../extensions/pg_cron--1.2--1.3.sql"),
+                sql: script!("pg_cron--1.2--1.3.sql"),
             },
             ExtensionVersion {
                 version: "1.4",
                 from: Some("1.3"),
-                sql: include_str!("../../extensions/pg_cron--1.3--1.4.sql"),
+                sql: script!("pg_cron--1.3--1.4.sql"),
             },
             ExtensionVersion {
                 version: "1.4-1",
                 from: Some("1.4"),
-                sql: include_str!("../../extensions/pg_cron--1.4--1.4-1.sql"),
+                sql: script!("pg_cron--1.4--1.4-1.sql"),
             },
             ExtensionVersion {
                 version: "1.5",
                 from: Some("1.4-1"),
-                sql: include_str!("../../extensions/pg_cron--1.4-1--1.5.sql"),
+                sql: script!("pg_cron--1.4-1--1.5.sql"),
             },
             ExtensionVersion {
                 version: "1.6",
                 from: Some("1.5"),
-                sql: include_str!("../../extensions/pg_cron--1.5--1.6.sql"),
+                sql: script!("pg_cron--1.5--1.6.sql"),
             },
         ],
     },
@@ -1066,7 +1075,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "0.3.4",
             from: None,
-            sql: include_str!("../../extensions/pg_jsonschema--0.3.4.sql"),
+            sql: script!("pg_jsonschema--0.3.4.sql"),
         }],
     },
     // ── pgmq (its release installs 1.13.2 only) ─────────────────────────
@@ -1076,7 +1085,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "1.13.2",
             from: None,
-            sql: include_str!("../../extensions/pgmq--1.13.2.sql"),
+            sql: script!("pgmq--1.13.2.sql"),
         }],
     },
     // ── postgis ───────────────────────────────────────────────────────
@@ -1087,25 +1096,25 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "3.7.0",
                 from: None,
-                sql: include_str!("../../extensions/postgis--3.7.0.sql"),
+                sql: script!("postgis--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
             // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
-                sql: include_str!("../../extensions/postgis--unpackaged.sql"),
+                sql: script!("postgis--unpackaged.sql"),
             },
             ExtensionVersion {
                 version: "ANY",
                 from: Some("3.7.0"),
-                sql: include_str!("../../extensions/postgis--3.7.0--ANY.sql"),
+                sql: script!("postgis--3.7.0--ANY.sql"),
             },
             // Back to 3.7.0 (see the comment above `REGISTRY`).
             ExtensionVersion {
                 version: "3.7.0",
                 from: Some("ANY"),
-                sql: "",
+                sql: Script::Text(""),
             },
         ],
     },
@@ -1123,25 +1132,25 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "3.7.0",
                 from: None,
-                sql: include_str!("../../extensions/postgis_raster--3.7.0.sql"),
+                sql: script!("postgis_raster--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
             // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
-                sql: include_str!("../../extensions/postgis_raster--unpackaged.sql"),
+                sql: script!("postgis_raster--unpackaged.sql"),
             },
             ExtensionVersion {
                 version: "ANY",
                 from: Some("3.7.0"),
-                sql: include_str!("../../extensions/postgis_raster--3.7.0--ANY.sql"),
+                sql: script!("postgis_raster--3.7.0--ANY.sql"),
             },
             // Back to 3.7.0 (see the comment above `REGISTRY`).
             ExtensionVersion {
                 version: "3.7.0",
                 from: Some("ANY"),
-                sql: "",
+                sql: Script::Text(""),
             },
         ],
     },
@@ -1159,25 +1168,25 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "3.7.0",
                 from: None,
-                sql: include_str!("../../extensions/postgis_sfcgal--3.7.0.sql"),
+                sql: script!("postgis_sfcgal--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
             // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
-                sql: include_str!("../../extensions/postgis_sfcgal--unpackaged.sql"),
+                sql: script!("postgis_sfcgal--unpackaged.sql"),
             },
             ExtensionVersion {
                 version: "ANY",
                 from: Some("3.7.0"),
-                sql: include_str!("../../extensions/postgis_sfcgal--3.7.0--ANY.sql"),
+                sql: script!("postgis_sfcgal--3.7.0--ANY.sql"),
             },
             // Back to 3.7.0 (see the comment above `REGISTRY`).
             ExtensionVersion {
                 version: "3.7.0",
                 from: Some("ANY"),
-                sql: "",
+                sql: Script::Text(""),
             },
         ],
     },
@@ -1195,25 +1204,25 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             ExtensionVersion {
                 version: "3.7.0",
                 from: None,
-                sql: include_str!("../../extensions/postgis_topology--3.7.0.sql"),
+                sql: script!("postgis_topology--3.7.0.sql"),
             },
             // The pseudo-versions: `unpackaged` installs nothing, `ANY`
             // only tags the version.
             ExtensionVersion {
                 version: "unpackaged",
                 from: None,
-                sql: include_str!("../../extensions/postgis_topology--unpackaged.sql"),
+                sql: script!("postgis_topology--unpackaged.sql"),
             },
             ExtensionVersion {
                 version: "ANY",
                 from: Some("3.7.0"),
-                sql: include_str!("../../extensions/postgis_topology--3.7.0--ANY.sql"),
+                sql: script!("postgis_topology--3.7.0--ANY.sql"),
             },
             // Back to 3.7.0 (see the comment above `REGISTRY`).
             ExtensionVersion {
                 version: "3.7.0",
                 from: Some("ANY"),
-                sql: "",
+                sql: Script::Text(""),
             },
         ],
     },
@@ -1232,7 +1241,7 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
         versions: &[ExtensionVersion {
             version: "0.8.7",
             from: None,
-            sql: include_str!("../../extensions/vector--0.8.7.sql"),
+            sql: script!("vector--0.8.7.sql"),
         }],
     },
 ];

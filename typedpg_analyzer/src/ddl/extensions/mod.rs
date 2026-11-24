@@ -7,8 +7,12 @@
 //!
 //! To add support for a new extension:
 //! 1. Add `.sql` files to `typedpg_analyzer/src/extensions/`
-//! 2. Add an `ExtensionDef` entry to the `REGISTRY` array below
+//! 2. Add an `ExtensionDef` entry to the `REGISTRY` array (`registry.rs`)
 //! 3. Run `./update_extensions.sh` to fetch from PG upstream
+//!
+//! The scripts are embedded compressed with zstd: update_extensions.sh
+//! writes `<file>.sql.zst` next to each `<file>.sql` (the crate ships only
+//! those), and [`Script::sql`] decompresses one when it is applied.
 
 use typedpg_pg_query::ast::{self, AlterExtensionStmt, CreateExtensionStmt};
 
@@ -29,7 +33,34 @@ struct ExtensionVersion {
     /// The version this upgrades FROM. `None` = base install.
     from: Option<&'static str>,
     /// The SQL to execute for this version.
-    sql: &'static str,
+    sql: Script,
+}
+
+/// An extension script's SQL.
+enum Script {
+    /// A bundled script, compressed with zstd.
+    Zstd(&'static [u8]),
+    /// SQL written in the registry itself.
+    Text(&'static str),
+}
+
+impl Script {
+    /// The script's SQL, decompressed when it is a bundled one.
+    fn sql(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Script::Text(sql) => std::borrow::Cow::Borrowed(sql),
+            Script::Zstd(compressed) => {
+                let mut sql = String::new();
+                std::io::Read::read_to_string(
+                    &mut ruzstd::decoding::StreamingDecoder::new(*compressed)
+                        .expect("a bundled extension script is a zstd frame"),
+                    &mut sql,
+                )
+                .expect("a bundled extension script decompresses to UTF-8");
+                std::borrow::Cow::Owned(sql)
+            }
+        }
+    }
 }
 
 /// An extension definition in the registry.
@@ -376,18 +407,21 @@ impl OtherMembers {
 /// script inserts for `srid` (its rows are written one per line, `(srid,
 /// 'auth', auth_srid, 'srtext', 'proj4text')`). Read from the script only
 /// when asked.
-pub(crate) fn postgis_proj4text(srid: i64) -> Option<&'static str> {
+pub(crate) fn postgis_proj4text(srid: i64) -> Option<String> {
     let script = REGISTRY
         .iter()
         .find(|e| e.name == "postgis")?
         .versions
         .iter()
         .find(|v| v.from.is_none())?
-        .sql;
+        .sql
+        .sql();
     let prefix = format!("({srid}, '");
     let line = script.lines().find(|l| l.starts_with(&prefix))?;
     let start = line.rfind(", '")? + 3;
-    line[start..].rsplit_once('\'').map(|(text, _)| text)
+    line[start..]
+        .rsplit_once('\'')
+        .map(|(text, _)| text.to_owned())
 }
 
 /// Bundled extensions that aren't PostgreSQL's own (the registry's
@@ -527,14 +561,14 @@ pub(crate) fn requires(name: &str) -> &'static [&'static str] {
 /// CreateExtensionInternal: the target version's own installation script
 /// when there is one, else the shortest update path from a version that has
 /// one (find_install_path).
-fn find_install_path<'a>(ext: &'a ExtensionDef, target: &str) -> Result<Vec<&'a str>, DdlError> {
+fn find_install_path<'a>(ext: &'a ExtensionDef, target: &str) -> Result<Vec<&'a Script>, DdlError> {
     let bases = || ext.versions.iter().filter(|v| v.from.is_none());
     if let Some(direct) = bases().find(|v| v.version == target) {
-        return Ok(vec![direct.sql]);
+        return Ok(vec![&direct.sql]);
     }
     let shortest = bases()
         .filter_map(|base| {
-            let mut path = vec![base.sql];
+            let mut path = vec![&base.sql];
             path.extend(find_upgrade_path(ext, base.version, target).ok()?);
             Some(path)
         })
@@ -554,13 +588,13 @@ fn find_upgrade_path<'a>(
     ext: &'a ExtensionDef,
     from: &str,
     target: &str,
-) -> Result<Vec<&'a str>, DdlError> {
+) -> Result<Vec<&'a Script>, DdlError> {
     let mut path = Vec::new();
     let mut current = from;
 
     for _ in 0..100 {
         if let Some(upgrade) = ext.versions.iter().find(|v| v.from == Some(current)) {
-            path.push(upgrade.sql);
+            path.push(&upgrade.sql);
             current = upgrade.version;
             if current == target {
                 return Ok(path);
@@ -585,7 +619,7 @@ fn apply_with_schema(
     interp: &mut PgCatalog,
     name: &str,
     schema: &str,
-    scripts: &[&str],
+    scripts: &[&Script],
 ) -> Result<(), DdlError> {
     ensure_namespace(interp, schema)?;
     search_path_element_check(schema)?;
@@ -607,14 +641,15 @@ fn apply_with_schema(
     let original = crate::ddl::permissions::suspended(|| interp.replace_search_path(path));
 
     let mut result = Ok(());
-    for sql in scripts {
+    for script in scripts {
+        let sql = script.sql();
         if !sql.is_empty() {
             // Bypass the public `apply_sql` so we don't double-mirror to
             // PGlite under `pglite_sanity` — the user-facing `CREATE
             // EXTENSION` already went there once and PGlite handles its
             // own internal scripts. Our embedded scripts also use
             // `MODULE_PATHNAME` placeholders that PGlite would reject.
-            let sql = match substitute_extschema(interp, name, schema, sql) {
+            let sql = match substitute_extschema(interp, name, schema, &sql) {
                 Ok(sql) => sql,
                 Err(e) => {
                     result = Err(e);
@@ -1360,6 +1395,40 @@ pub fn extension_registry() -> Vec<ExtensionInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `src/extensions/<file>.sql` has a `<file>.sql.zst` that
+    /// decompresses to it byte for byte, and every `.zst` has its `.sql`:
+    /// run `./update_extensions.sh --compress` after changing a script.
+    #[test]
+    fn compressed_extension_scripts_match_the_sql_files() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/extensions");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            if let Some(sql_name) = name.strip_suffix(".zst") {
+                assert!(
+                    sql_name.ends_with(".sql") && dir.join(sql_name).is_file(),
+                    "{name} has no {sql_name} next to it"
+                );
+            } else if name.ends_with(".sql") {
+                let compressed = std::fs::read(dir.join(format!("{name}.zst")))
+                    .unwrap_or_else(|e| panic!("{name}.zst: {e}"));
+                let mut decompressed = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut ruzstd::decoding::StreamingDecoder::new(compressed.as_slice()).unwrap(),
+                    &mut decompressed,
+                )
+                .unwrap();
+                assert!(
+                    decompressed == std::fs::read(&path).unwrap(),
+                    "{name}.zst does not decompress to {name}: run ./update_extensions.sh --compress"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no .sql file in {}", dir.display());
+    }
 
     #[test]
     fn bundled_extensions_outside_the_postgres_image() {

@@ -5,8 +5,11 @@
 # from their releases — PostGIS's from its Docker image, so Docker is needed.
 #
 # These SQL files define the types, functions, operators, and casts that each
-# extension provides. They are embedded in typedpg_analyzer via include_str!
-# and processed by the DDL interpreter when a migration contains CREATE EXTENSION.
+# extension provides. They are embedded in typedpg_analyzer and processed by
+# the DDL interpreter when a migration contains CREATE EXTENSION. What is
+# embedded is each file's zstd compression, `<file>.sql.zst`, written next to
+# it (`zstd -19`, needs the zstd CLI): the crate ships only those, and a test
+# checks that every `.zst` decompresses to its `.sql`.
 #
 # Each extension is defined as a base install script + optional upgrade chain.
 # For example, citext ships as:
@@ -24,8 +27,9 @@
 # Usage:
 #   ./update_extensions.sh              # the release typedpg targets (default)
 #   ./update_extensions.sh REL_19_0     # use a specific tag/branch
+#   ./update_extensions.sh --compress   # only rewrite the .sql.zst files
 #
-# Output: typedpg_analyzer/src/extensions/*.sql. Every file is downloaded
+# Output: typedpg_analyzer/src/extensions/*.sql and *.sql.zst. Every file is downloaded
 # into a temporary directory first; the bundled files are replaced only once
 # all downloads succeeded, so a failure leaves them untouched.
 #
@@ -33,13 +37,29 @@
 # 1. Review the downloaded files for pg_query compatibility
 #    (check for reserved-word parameter names)
 # 2. Update the REGISTRY array in
-#    typedpg_analyzer/src/ddl/extensions/registry.rs to include_str! the new
+#    typedpg_analyzer/src/ddl/extensions/registry.rs to embed (`script!`) the new
 #    files in order, with each control file's default_version
 # 3. Run: cargo nextest run --release -p typedpg_analyzer
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
+
+OUT_DIR="typedpg_analyzer/src/extensions"
+
+# Write `<file>.sql.zst` next to every `<file>.sql` in directory `dir`.
+compress() {
+    local dir="$1"
+    for sql in "${dir}"/*.sql; do
+        zstd -19 -q --no-progress -f "$sql" -o "${sql}.zst"
+    done
+}
+
+if [[ "${1:-}" == "--compress" ]]; then
+    rm -f "${OUT_DIR}"/*.sql.zst
+    compress "$OUT_DIR"
+    exit 0
+fi
 
 if [[ $# -ge 1 ]]; then
     BRANCH="$1"
@@ -55,7 +75,6 @@ else
     BRANCH="REL_${BASH_REMATCH[1]}_${BASH_REMATCH[2]}"
 fi
 BASE_URL="https://raw.githubusercontent.com/postgres/postgres/${BRANCH}"
-OUT_DIR="typedpg_analyzer/src/extensions"
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -469,6 +488,8 @@ install -m 0644 "${TMP_DIR}/deb/usr/share/postgresql/18/extension/pg_jsonschema-
     "${TMP_DIR}/"
 rm -rf "${TMP_DIR}/deb" "${TMP_DIR}/${deb}"
 
+compress "$TMP_DIR"
+
 # ── Every download succeeded: replace the bundled files ────────────────────
-rm -f "${OUT_DIR}"/*.sql
-mv "${TMP_DIR}"/*.sql "${OUT_DIR}/"
+rm -f "${OUT_DIR}"/*.sql "${OUT_DIR}"/*.sql.zst
+mv "${TMP_DIR}"/*.sql "${TMP_DIR}"/*.sql.zst "${OUT_DIR}/"
