@@ -319,12 +319,16 @@ pub struct PgCatalog {
     /// servers, and the pg_sanity mirror's), until a `SET TIME ZONE` /
     /// `SET timezone` / `set_config('TimeZone', ...)` says otherwise.
     pub(crate) timezone_utc: crate::ddl::session::BoolGuc,
-    /// Whether `DateStyle` writes dates ISO-style (`ISO, MDY` is the
-    /// server's default and the mirror's), for the stored constants the
-    /// analyzer prints as `pg_get_expr` would.
-    pub(crate) datestyle_iso: crate::ddl::session::BoolGuc,
-    /// Whether `IntervalStyle` is `postgres` (the default).
-    pub(crate) intervalstyle_postgres: crate::ddl::session::BoolGuc,
+    /// `TimeZone` as the migrations' session set it.
+    pub(crate) timezone: crate::ddl::session::Guc<crate::tz::TzSetting>,
+    /// `DateStyle`: how dates print, and the field order numeric dates
+    /// are read in (`ISO, MDY` is the server's default and the mirror's).
+    pub(crate) datestyle: crate::ddl::session::Guc<(
+        crate::ddl::session::DateStyle,
+        crate::datetime_input::DateOrder,
+    )>,
+    /// `IntervalStyle`.
+    pub(crate) intervalstyle: crate::ddl::session::Guc<crate::ddl::session::IntervalStyle>,
     /// The custom (placeholder, `prefix.name`) settings the migrations'
     /// session set, for `current_setting` in a body the analyzer runs.
     pub(crate) custom_settings: crate::ddl::session::CustomSettings,
@@ -581,6 +585,14 @@ pub struct PgCatalog {
     /// [`crate::ddl::stored_exprs::bind_stored_expressions`]): a later
     /// statement's search path doesn't rebind them.
     pub(crate) bound_stored_exprs: Shared<std::collections::HashSet<u64>>,
+    /// The stored expressions (by tree hash) whose datetime literals hold
+    /// their canonical text ([`crate::ddl::stored_exprs`]).
+    pub(crate) settled_stored_exprs: Shared<std::collections::HashSet<u64>>,
+    /// The datetime literals of stored expressions whose value wasn't known
+    /// when they were written (a zone-less timestamptz in the server's
+    /// unknown zone, `today`): read again later, under other settings, they
+    /// would be taken for another value, so they never are.
+    pub(crate) unsettled_datetime_literals: Shared<std::collections::HashSet<String>>,
     /// Tables and materialized views with a TOAST table (`reltoastrelid`):
     /// the CREATE or ALTER that first left them with a column needing one
     /// (needs_toast_table) made it, and it stays.
@@ -987,8 +999,11 @@ impl PgCatalog {
             row_security_guc: crate::ddl::session::BoolGuc::new(true),
             database_row_security: None,
             timezone_utc: crate::ddl::session::BoolGuc::new(true),
-            datestyle_iso: crate::ddl::session::BoolGuc::new(true),
-            intervalstyle_postgres: crate::ddl::session::BoolGuc::new(true),
+            timezone: crate::ddl::session::Guc::new(crate::tz::TzSetting::Default),
+            datestyle: crate::ddl::session::Guc::new(crate::ddl::session::DEFAULT_DATESTYLE),
+            intervalstyle: crate::ddl::session::Guc::new(
+                crate::ddl::session::IntervalStyle::Postgres,
+            ),
             custom_settings: Default::default(),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
@@ -1061,6 +1076,8 @@ impl PgCatalog {
             partition_bounds: Shared::default(),
             check_defs: Shared::default(),
             bound_stored_exprs: Shared::default(),
+            settled_stored_exprs: Shared::default(),
+            unsettled_datetime_literals: Shared::default(),
             toast_tables: Shared::default(),
             toast_rewrites: Shared::default(),
             security_barrier_views: Shared::default(),

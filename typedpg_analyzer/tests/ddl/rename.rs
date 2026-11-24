@@ -1202,3 +1202,84 @@ CREATE INDEX ON k (f8) WHERE f8 > '2.50' AND iv < '1 day';"#,
     )
     .unwrap();
 }
+
+#[test]
+fn stored_datetime_constants_keep_the_values_read_when_written() {
+    // PG reads a datetime literal into its Const under the session's
+    // DateOrder, TimeZone and IntervalStyle of the moment, and prints it
+    // under those of when it is printed; a rebuild reads the printed text
+    // back. The pg_sanity mirror compares every stored text with
+    // pg_get_expr under each combination below. A zone whose offset
+    // changed over time (`America/New_York`) isn't known here: its values
+    // are accepted, and their text isn't claimed.
+    let mut db = build_db(&[(
+        "0001.sql",
+        r#"SET TimeZone = -3;
+SET DateStyle = 'SQL, DMY';
+SET IntervalStyle = 'sql_standard';
+CREATE TABLE z (
+  tz timestamptz CHECK (tz > '2024-01-05 10:30' AND tz < '01/02/2024 10:30'
+      AND tz <> 'epoch' AND tz <> '1890-01-01 00:00' AND tz <> '2024-01-05 10:30 Etc/GMT+5'),
+  d date CHECK (d > '01/02/2024' AND d <> '2024-02-03' AND d <> 'Feb 4, 2024'),
+  ts timestamp CHECK (ts > '01/02/2024 10:30'),
+  iv interval CHECK (iv <> '-1 2:00:00' AND iv <> '1-2' AND iv <> '1 day -1 hour'
+      AND iv <> 'infinity'),
+  tt timetz CHECK (tt <> '10:30+05:30' AND tt <> '10:30 UTC' AND tt <> '10:30'),
+  t time CHECK (t <> '10:30 PM' AND t <> '04:05:06.789' AND t <> 'allballs' AND t <> '040506'),
+  r tstzrange CHECK (r <> '[2024-01-01, 2024-07-01)'),
+  dr daterange CHECK (dr <> '[01/02/2024, 03/02/2024]'),
+  ar date[] CHECK (ar <> '{01/02/2024}'),
+  cn cidr CHECK (cn <> '10'::cidr AND cn <> '192.168.1'::cidr AND cn <> '128.1'::cidr
+      AND cn <> '0x0a01'::cidr AND cn <> '224'::cidr),
+  n numeric CHECK (n <> '1.235'::numeric(5,2)),
+  ts2 timestamp CHECK (ts2 <> '2024-01-05 10:30:00.126'::timestamp(2)),
+  CONSTRAINT named CHECK (tz <> '2024-03-10 02:30 America/New_York'
+      AND tt <> '2024-07-01 10:30 Europe/Berlin')
+);
+CREATE INDEX ON z (tz) WHERE tz > '2024-06-01 12:00';"#,
+    )]);
+    db.apply_sql("RESET ALL;").unwrap();
+    // Rebuilt under other settings: the text printed under them reads back
+    // as the same values.
+    db.apply_sql(
+        "SET TimeZone = 'Etc/GMT-5';
+         SET DateStyle = 'Postgres, MDY';
+         SET IntervalStyle = 'postgres_verbose';
+         ALTER TABLE z ALTER d TYPE timestamp, ALTER ts TYPE timestamptz;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "SET DateStyle = 'German';
+         SET IntervalStyle = 'iso_8601';
+         SET TimeZone = -3;",
+    )
+    .unwrap();
+    db.apply_sql(
+        "SET DateStyle = 'Postgres, DMY';
+         SET TIME ZONE INTERVAL '+05:45' HOUR TO MINUTE;
+         ALTER TABLE z ADD CHECK (d <> '03-02-2024' AND tz <> '03-02-2024 10:00');",
+    )
+    .unwrap();
+    db.apply_sql("SET DateStyle = 'ISO, YMD'; SET TimeZone = 'UTC'; ALTER TABLE z ADD CHECK (d <> '24-02-05');")
+        .unwrap();
+}
+
+#[test]
+fn a_datetime_literal_read_in_the_servers_zone_is_never_read_again() {
+    // With no `SET TimeZone`, a zone-less timestamptz is read in the
+    // server's zone, which the analyzer doesn't know: the literal is kept
+    // as written and never taken, under a zone set later, for the value
+    // that zone would read.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE w (tz timestamptz CHECK (tz > '2024-01-05 10:30'),
+             d date CHECK (d > '2024-01-05'));",
+    )]);
+    db.apply_sql(
+        "SET TimeZone = -3;
+         ALTER TABLE w ALTER d TYPE timestamp;
+         ALTER TABLE w RENAME tz TO tz2;
+         ALTER TABLE w ADD CHECK (tz2 < '2025-01-05 10:30');",
+    )
+    .unwrap();
+}

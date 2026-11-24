@@ -1224,6 +1224,7 @@ fn note_bound(interp: &mut PgCatalog, expr: Option<&ast::Node>) {
 pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), super::DdlError> {
     apply_reg_constants(interp);
     refuse_unstorable_constants(interp)?;
+    settle_datetime_constants(interp);
     let names = user_object_names(interp);
     if names.is_empty() {
         return Ok(());
@@ -1250,6 +1251,68 @@ pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), supe
     }
     interp.bound_stored_exprs.extend(seen);
     Ok(())
+}
+
+/// After a statement: the datetime literals of the stored expressions it
+/// wrote, read under the session's settings of the moment (DateOrder,
+/// TimeZone, IntervalStyle) as PG read them into its `Const`s, rewritten
+/// to their canonical text (ISO, UTC, ISO 8601 intervals), which reads
+/// as the same value whatever the settings a later statement — a
+/// rebuild, a reading — runs under. A literal whose value isn't known
+/// here (`today`, a zone not known here) is left as written.
+fn settle_datetime_constants(interp: &mut PgCatalog) {
+    let fresh: Vec<(Slot, Over, Option<ast::Node>)> = stored_expressions(interp, true)
+        .into_iter()
+        .filter(|(_, _, e)| !interp.settled_stored_exprs.contains(&tree_hash(e.as_ref())))
+        .collect();
+    for (slot, over, mut expr) in fresh {
+        let has_string = expr.as_ref().is_some_and(|e| {
+            e.nodes().any(|(n, ..)| {
+                matches!(n, typedpg_pg_query::NodeRef::AConst(c)
+                    if matches!(c.val, Some(ast::AConstValue::String(_))))
+            })
+        });
+        if has_string {
+            let literals = bindings_of(interp, &slot, over, expr.as_ref()).literals;
+            let mut changed = false;
+            let mut unsettled = Vec::new();
+            edit_nodes(&mut expr, &mut |n| {
+                let typedpg_pg_query::NodeMut::AConst(c) = n else {
+                    return;
+                };
+                let (Some(&t), Some(ast::AConstValue::String(s))) =
+                    (literals.get(&c.location), c.val.as_mut())
+                else {
+                    return;
+                };
+                if !crate::ddl::const_output::depends_on_settings(interp, t)
+                    || interp.unsettled_datetime_literals.contains(&s.sval)
+                {
+                    return;
+                }
+                match crate::ddl::const_output::canonical(interp, t, &s.sval) {
+                    Some(text) if text != s.sval => {
+                        s.sval = text;
+                        changed = true;
+                    }
+                    Some(_) => {}
+                    None => unsettled.push(s.sval.clone()),
+                }
+            });
+            interp.unsettled_datetime_literals.extend(unsettled);
+            if changed {
+                let bound = interp
+                    .bound_stored_exprs
+                    .contains(&tree_hash(read_slot(interp, &slot).flatten().as_ref()));
+                write_slot(interp, slot, expr.clone());
+                if !bound {
+                    // Its names are still to bind.
+                    interp.bound_stored_exprs.remove(&tree_hash(expr.as_ref()));
+                }
+            }
+        }
+        interp.settled_stored_exprs.insert(tree_hash(expr.as_ref()));
+    }
 }
 
 /// Whether ruleutils would print routine `name` of schema `ns` unqualified

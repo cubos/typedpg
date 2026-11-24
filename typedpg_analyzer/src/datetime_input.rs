@@ -32,6 +32,40 @@
 
 use crate::pgmsg;
 
+/// `DateOrder`, the field order `DateStyle` sets for dates written with
+/// numbers only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DateOrder {
+    Mdy,
+    Dmy,
+    Ymd,
+}
+
+thread_local! {
+    /// The DateOrder the decoder reads with (`MDY`, the default, unless
+    /// [`with_input_settings`] says otherwise).
+    static DATE_ORDER: std::cell::Cell<DateOrder> = const { std::cell::Cell::new(DateOrder::Mdy) };
+    /// Whether `IntervalStyle` is `sql_standard`, whose interval input gives
+    /// a leading sign to every field.
+    static SQL_STANDARD_INTERVALS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the decoder reading under `order` and, when
+/// `sql_standard`, IntervalStyle `sql_standard`.
+pub(crate) fn with_input_settings<R>(
+    order: DateOrder,
+    sql_standard: bool,
+    f: impl FnOnce() -> R,
+) -> R {
+    let old = (DATE_ORDER.get(), SQL_STANDARD_INTERVALS.get());
+    DATE_ORDER.set(order);
+    SQL_STANDARD_INTERVALS.set(sql_standard);
+    let r = f();
+    DATE_ORDER.set(old.0);
+    SQL_STANDARD_INTERVALS.set(old.1);
+    r
+}
+
 /// The datetime types whose input goes through the datetime decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum DatetimeType {
@@ -845,8 +879,8 @@ fn decode_number_field(
     Err(Dterr::BadFormat)
 }
 
-/// `DecodeNumber`: a plain numeric field interpreted in context
-/// (DateOrder = MDY).
+/// `DecodeNumber`: a plain numeric field interpreted in context (under
+/// the decoder's DateOrder).
 fn decode_number(
     s: &[u8],
     have_text_month: bool,
@@ -886,9 +920,13 @@ fn decode_number(
 
     match fmask & DTK_DATE_M {
         0 => {
-            if flen >= 3 {
+            let order = DATE_ORDER.get();
+            if flen >= 3 || order == DateOrder::Ymd {
                 *tmask = dtk_m(YEAR);
                 tm.year = val;
+            } else if order == DateOrder::Dmy {
+                *tmask = dtk_m(DAY);
+                tm.mday = val;
             } else {
                 *tmask = dtk_m(MONTH);
                 tm.mon = val;
@@ -899,7 +937,7 @@ fn decode_number(
             tm.mon = val;
         }
         m if m == dtk_m(MONTH) => {
-            if have_text_month && flen >= 3 {
+            if have_text_month && (flen >= 3 || DATE_ORDER.get() == DateOrder::Ymd) {
                 *tmask = dtk_m(YEAR);
                 tm.year = val;
             } else {
@@ -1243,6 +1281,8 @@ struct Decoded {
     /// The value names no zone: `timestamptz_in` reads it in the session's
     /// TimeZone (DetermineTimeZoneOffset over `session_timezone`).
     session_zone: bool,
+    /// The zone it names (`… America/Sao_Paulo`), lowercase.
+    zone: Option<String>,
     /// Read relative to the current date or time (`now`, `today`,
     /// `tomorrow`, `yesterday`): `tm` holds a stand-in.
     relative: bool,
@@ -1303,6 +1343,7 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
     let mut fsec = 0i32;
     let mut tz: Option<i32> = Some(0);
     let mut dtype = DTK_DATE_V;
+    let mut zone: Option<String> = None;
 
     for f in fields {
         let field = f.text.as_slice();
@@ -1351,6 +1392,7 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
                         let bad = Dterr::BadTimezone(String::from_utf8_lossy(field).into_owned());
                         apply_zone(pg_tzset(field), bad, unsure)?;
                         named_tz = true;
+                        zone = Some(String::from_utf8_lossy(field).into_owned());
                         tmask = dtk_m(TZ);
                     }
                 } else {
@@ -1540,6 +1582,7 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
                         // Perhaps an all-alpha time zone name.
                         apply_zone(pg_tzset(field), Dterr::BadFormat, unsure)?;
                         named_tz = true;
+                        zone = Some(String::from_utf8_lossy(field).into_owned());
                         tmask = dtk_m(TZ);
                     }
                     _ => return Err(Dterr::BadFormat),
@@ -1593,6 +1636,7 @@ fn decode_date_time_inner(fields: &[Field], unsure: &mut bool) -> DtResult<Decod
         fsec,
         tz,
         session_zone,
+        zone: if named_tz { zone } else { None },
         relative: relative || now_used,
     })
 }
@@ -1668,6 +1712,149 @@ pub(crate) fn datetime_value(
         .then_some(i128::from(t))
 }
 
+/// The zone a datetime literal is read in.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LiteralZone {
+    /// None given: the session's TimeZone.
+    Session,
+    /// An offset or a fixed abbreviation, in seconds west of UTC.
+    Offset(i32),
+    /// A zone named in the literal (lowercase).
+    Named(String),
+}
+
+/// What `date_in` / `timestamp_in` / `timestamptz_in` decode a literal to.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DatetimeFields {
+    Infinity,
+    NegInfinity,
+    /// `epoch`: 1970-01-01 00:00, UTC for a `timestamptz`.
+    Epoch,
+    /// Days since 2000-01-01 and microseconds of the day, local to `zone`.
+    Value {
+        days: i64,
+        usec: i64,
+        zone: LiteralZone,
+    },
+}
+
+/// The fields `content` decodes to under DateOrder `order` — `with_time`
+/// for a timestamp's input, else a date's; `None` where it doesn't decode
+/// here or is read relative to the current time (`now`, `today`).
+pub(crate) fn datetime_fields(
+    content: &str,
+    with_time: bool,
+    order: DateOrder,
+) -> Option<DatetimeFields> {
+    with_input_settings(order, false, || {
+        let buflen = if with_time {
+            MAXDATELEN + MAXDATEFIELDS
+        } else {
+            MAXDATELEN + 1
+        };
+        let fields = parse_date_time(content.as_bytes(), buflen).ok()?;
+        let d = decode_date_time(&fields).ok()?;
+        if d.relative {
+            return None;
+        }
+        match d.dtype {
+            DTK_LATE => return Some(DatetimeFields::Infinity),
+            DTK_EARLY => return Some(DatetimeFields::NegInfinity),
+            DTK_EPOCH => return Some(DatetimeFields::Epoch),
+            DTK_DATE_V => {}
+            _ => return None,
+        }
+        let tm = d.tm;
+        if !is_valid_julian(tm.year, tm.mon) {
+            return None;
+        }
+        let days = i64::from(date2j(tm.year, tm.mon, tm.mday)) - POSTGRES_EPOCH_JDATE;
+        let usec = ((i64::from(tm.hour) * 60 + i64::from(tm.min)) * 60 + i64::from(tm.sec))
+            * USECS_PER_SEC
+            + i64::from(d.fsec);
+        let zone = match (d.tz, d.zone) {
+            (_, Some(name)) => LiteralZone::Named(name),
+            (Some(tz), None) => LiteralZone::Offset(tz),
+            (None, None) if d.session_zone => LiteralZone::Session,
+            (None, None) => return None,
+        };
+        Some(DatetimeFields::Value { days, usec, zone })
+    })
+}
+
+/// Whether `days` (since 2000-01-01) is a valid `date`.
+pub(crate) fn date_in_range(days: i64) -> bool {
+    (DATETIME_MIN_JULIAN - POSTGRES_EPOCH_JDATE..DATE_END_JULIAN - POSTGRES_EPOCH_JDATE)
+        .contains(&days)
+}
+
+/// Whether `usec` (since 2000-01-01) is a valid timestamp.
+pub(crate) fn timestamp_in_range(usec: i128) -> bool {
+    (i128::from(MIN_TIMESTAMP)..i128::from(END_TIMESTAMP)).contains(&usec)
+}
+
+/// What `time_in` / `timetz_in` decode a literal to.
+pub(crate) struct TimeFields {
+    /// Microseconds since midnight.
+    pub(crate) usec: i64,
+    pub(crate) zone: LiteralZone,
+}
+
+/// The fields `content` decodes to as a time of day under DateOrder
+/// `order`; `None` where it doesn't decode here or depends on the
+/// current time.
+pub(crate) fn time_fields(content: &str, order: DateOrder) -> Option<TimeFields> {
+    with_input_settings(order, false, || {
+        let fields = parse_date_time(content.as_bytes(), MAXDATELEN + 1).ok()?;
+        let t = decode_time_only(&fields).ok()?;
+        if t.relative {
+            return None;
+        }
+        let usec = ((i64::from(t.tm.hour) * 60 + i64::from(t.tm.min)) * 60 + i64::from(t.tm.sec))
+            * USECS_PER_SEC
+            + i64::from(t.fsec);
+        let zone = match (t.tz, t.zone) {
+            (_, Some(name)) => LiteralZone::Named(name),
+            (Some(tz), None) => LiteralZone::Offset(tz),
+            (None, None) if !t.has_tz => LiteralZone::Session,
+            (None, None) => return None,
+        };
+        Some(TimeFields { usec, zone })
+    })
+}
+
+/// An interval `interval_in` reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum IntervalValue {
+    /// Months, days, microseconds.
+    Finite(i32, i32, i64),
+    Infinity,
+    NegInfinity,
+}
+
+/// The interval `content` reads as with no typmod, under IntervalStyle
+/// `sql_standard` when `sql_standard`.
+pub(crate) fn interval_value(content: &str, sql_standard: bool) -> Option<IntervalValue> {
+    with_input_settings(DateOrder::Mdy, sql_standard, || {
+        match interval_in_range(content, INTERVAL_FULL_RANGE).ok()? {
+            Some((i32::MAX, i32::MAX, i64::MAX)) => Some(IntervalValue::Infinity),
+            Some((i32::MIN, i32::MIN, i64::MIN)) => Some(IntervalValue::NegInfinity),
+            Some((m, d, t)) => Some(IntervalValue::Finite(m, d, t)),
+            None => {
+                let fields = parse_date_time(content.as_bytes(), 256).ok()?;
+                let mut itm = ItmIn::default();
+                let mut dtype = DTK_DELTA;
+                decode_interval(&fields, INTERVAL_FULL_RANGE, &mut dtype, &mut itm).ok()?;
+                match dtype {
+                    DTK_LATE => Some(IntervalValue::Infinity),
+                    DTK_EARLY => Some(IntervalValue::NegInfinity),
+                    _ => None,
+                }
+            }
+        }
+    })
+}
+
 /// AdjustTimestampForTypmod: a finite timestamp (in microseconds) rounded
 /// to `precision` fractional digits, halves away from zero.
 pub(crate) fn round_timestamp(t: i128, precision: i32) -> i128 {
@@ -1684,7 +1871,7 @@ pub(crate) fn round_timestamp(t: i128, precision: i32) -> i128 {
 }
 
 /// `DecodeTimeOnly`: time / timetz input.
-fn decode_time_only(fields: &[Field]) -> DtResult<()> {
+fn decode_time_only(fields: &[Field]) -> DtResult<TimeOnly> {
     let mut unsure = false;
     match decode_time_only_inner(fields, &mut unsure) {
         Err(_) if unsure => Err(Dterr::Unsure),
@@ -1692,8 +1879,25 @@ fn decode_time_only(fields: &[Field]) -> DtResult<()> {
     }
 }
 
-fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
+/// What `DecodeTimeOnly` read.
+struct TimeOnly {
+    tm: Tm,
+    fsec: i32,
+    /// PG's `*tzp` (seconds west) when the value gives it as an offset or
+    /// a fixed abbreviation.
+    tz: Option<i32>,
+    /// The zone it names, lowercase.
+    zone: Option<String>,
+    /// Whether it gives a zone at all.
+    has_tz: bool,
+    /// Read relative to the current time, or with a dynamic abbreviation.
+    relative: bool,
+}
+
+fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<TimeOnly> {
     let nf = fields.len();
+    let mut tz: Option<i32> = None;
+    let mut zone: Option<String> = None;
     let mut fmask = 0i32;
     let mut tmask = 0i32;
     let mut ptype = 0i32;
@@ -1724,7 +1928,7 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
                     let Some(dash) = field.iter().position(|&c| c == b'-') else {
                         return Err(Dterr::BadFormat);
                     };
-                    decode_timezone(&field[dash..])?;
+                    tz = Some(decode_timezone(&field[dash..])?);
                     decode_number_field(
                         &field[..dash],
                         fmask | DTK_DATE_M,
@@ -1737,6 +1941,7 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
                 } else {
                     let bad = Dterr::BadTimezone(String::from_utf8_lossy(field).into_owned());
                     named_tz = Some(apply_zone(pg_tzset(field), bad, unsure)?);
+                    zone = Some(String::from_utf8_lossy(field).into_owned());
                     tmask = dtk_m(TZ);
                 }
             }
@@ -1751,7 +1956,7 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
                 decode_time(field, &mut tm, &mut fsec)?;
             }
             DTK_TZ => {
-                decode_timezone(field)?;
+                tz = Some(decode_timezone(field)?);
                 tmask = dtk_m(TZ);
             }
             DTK_NUMBER => {
@@ -1833,9 +2038,12 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
                 }
             }
             DTK_STRING | DTK_SPECIAL => {
-                let (ty, val) = match decode_timezone_abbrev(field) {
-                    Some((ty, off)) => (ty, off.unwrap_or(0)),
-                    None => decode_special(field),
+                let (ty, val, off) = match decode_timezone_abbrev(field) {
+                    Some((ty, off)) => (ty, off.unwrap_or(0), off),
+                    None => {
+                        let (ty, val) = decode_special(field);
+                        (ty, val, None)
+                    }
                 };
                 if ty == IGNORE_DTF {
                     continue;
@@ -1851,12 +2059,19 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
                         DTK_ZULU => {
                             tmask = DTK_TIME_M | dtk_m(TZ);
                             (tm.hour, tm.min, tm.sec) = (0, 0, 0);
+                            tz = Some(0);
                         }
                         _ => return Err(Dterr::BadFormat),
                     },
-                    DTZMOD => tmask |= dtk_m(DTZ),
-                    DTZ => tmask |= dtk_m(TZ),
-                    TZ => {}
+                    DTZMOD => {
+                        tmask |= dtk_m(DTZ);
+                        tz = tz.map(|t| t - val);
+                    }
+                    DTZ => {
+                        tmask |= dtk_m(TZ);
+                        tz = off.map(|o| -o);
+                    }
+                    TZ => tz = off.map(|o| -o),
                     DYNTZ => {
                         tmask |= dtk_m(TZ);
                         dyn_tz = true;
@@ -1872,6 +2087,7 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
                     }
                     UNKNOWN_FIELD => {
                         named_tz = Some(apply_zone(pg_tzset(field), Dterr::BadFormat, unsure)?);
+                        zone = Some(String::from_utf8_lossy(field).into_owned());
                         tmask = dtk_m(TZ);
                     }
                     _ => return Err(Dterr::BadFormat),
@@ -1935,7 +2151,19 @@ fn decode_time_only_inner(fields: &[Field], unsure: &mut bool) -> DtResult<()> {
             return Err(Dterr::BadFormat);
         }
     }
-    Ok(())
+    let has_tz = fmask & dtk_m(TZ) != 0;
+    Ok(TimeOnly {
+        tm,
+        fsec,
+        tz: if named_tz.is_some() || dyn_tz {
+            None
+        } else {
+            tz
+        },
+        zone: if named_tz.is_some() { zone } else { None },
+        has_tz,
+        relative: now_used || dyn_tz,
+    })
 }
 // ─── input functions ────────────────────────────────────────────────────────
 
@@ -1963,7 +2191,7 @@ fn date_in(content: &str) -> DtResult<()> {
 /// `time_in` / `timetz_in` (date.c): no range check beyond the decoder's.
 fn time_in(content: &str) -> DtResult<()> {
     let fields = parse_date_time(content.as_bytes(), MAXDATELEN + 1)?;
-    decode_time_only(&fields)
+    decode_time_only(&fields).map(|_| ())
 }
 
 /// `timestamp_in` / `timestamptz_in` (timestamp.c) with `tm2timestamp`'s
@@ -2230,6 +2458,14 @@ fn decode_interval(fields: &[Field], range: i32, dtype: &mut i32, itm: &mut ItmI
     let mut fmask = 0i32;
     let mut ty = IGNORE_DTF;
     *dtype = DTK_DELTA;
+    // IntervalStyle sql_standard: a leading `-` applies to every field,
+    // unless another field has an explicit sign.
+    let force_negative = SQL_STANDARD_INTERVALS.get()
+        && nf > 0
+        && fields[0].text.first() == Some(&b'-')
+        && !fields[1..]
+            .iter()
+            .any(|f| matches!(f.text.first(), Some(b'-' | b'+')));
 
     // Read backwards to pick up units before values.
     for i in (0..nf).rev() {
@@ -2238,6 +2474,9 @@ fn decode_interval(fields: &[Field], range: i32, dtype: &mut i32, itm: &mut ItmI
         let mut ftype = fields[i].ftype;
         if ftype == DTK_TIME {
             decode_time_for_interval(field, range, itm)?;
+            if force_negative && itm.usec > 0 {
+                itm.usec = -itm.usec;
+            }
             tmask = DTK_TIME_M;
             ty = DTK_DAY;
             parsing_unit_val = false;
@@ -2260,6 +2499,9 @@ fn decode_interval(fields: &[Field], range: i32, dtype: &mut i32, itm: &mut ItmI
                         if itm.usec == i64::MIN {
                             return Err(Dterr::FieldOverflow);
                         }
+                        itm.usec = -itm.usec;
+                    }
+                    if force_negative && itm.usec > 0 {
                         itm.usec = -itm.usec;
                     }
                     ty = DTK_DAY;
@@ -2335,6 +2577,14 @@ fn decode_interval(fields: &[Field], range: i32, dtype: &mut i32, itm: &mut ItmI
                     0 if end == field.len() => fval = 0.0,
                     _ => return Err(Dterr::BadFormat),
                 }
+                let (val, fval) = if force_negative {
+                    (
+                        if val > 0 { -val } else { val },
+                        if fval > 0.0 { -fval } else { fval },
+                    )
+                } else {
+                    (val, fval)
+                };
                 let ok;
                 match ty {
                     DTK_MICROSEC => {

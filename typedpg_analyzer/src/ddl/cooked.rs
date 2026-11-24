@@ -518,7 +518,15 @@ impl Cooker<'_> {
                         .unwrap_or_else(|| s.to_owned()),
                 )
             }
-            Some(s) => Some(s.to_owned()),
+            // A datetime value, read under the session's settings as PG
+            // reads it into its Const: its canonical text (a stored
+            // literal holds it already).
+            Some(s) => Some(
+                Some(s)
+                    .filter(|s| !self.interp.unsettled_datetime_literals.contains(*s))
+                    .and_then(|s| crate::ddl::const_output::canonical(self.interp, base, s))
+                    .unwrap_or_else(|| s.to_owned()),
+            ),
         };
         let constant = Cooked {
             kind: Kind::Const(base, value),
@@ -2364,8 +2372,16 @@ impl<'a> Printer<'a> {
             let text = if v == "t" { "true" } else { "false" }.to_owned();
             return text;
         }
+        // A datetime literal not in its canonical text: what it stores was
+        // read under the settings of when it was written, not known here.
+        let settled = !crate::ddl::const_output::depends_on_settings(self.interp, t)
+            || crate::ddl::const_output::canonical(self.interp, t, v).as_deref() == Some(v);
         let out = match crate::ddl::stored_exprs::reg_output(self.interp, t, v) {
             Some(out) => out,
+            None if !settled => {
+                self.exact.set(false);
+                v.to_owned()
+            }
             None => match crate::ddl::const_output::output(self.interp, t, v) {
                 Some(out) => out,
                 // The output function isn't reproduced: the literal as

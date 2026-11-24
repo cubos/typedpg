@@ -475,8 +475,9 @@ impl PgCatalog {
         self.allow_system_table_mods.local = None;
         self.row_security_guc.local = None;
         self.timezone_utc.local = None;
-        self.datestyle_iso.local = None;
-        self.intervalstyle_postgres.local = None;
+        self.timezone.local = None;
+        self.datestyle.local = None;
+        self.intervalstyle.local = None;
         self.custom_settings.local.clear();
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
@@ -618,8 +619,9 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         interp.check_function_bodies = BoolGuc::new(true);
         interp.allow_system_table_mods = BoolGuc::new(false);
         interp.timezone_utc = BoolGuc::new(true);
-        interp.datestyle_iso = BoolGuc::new(true);
-        interp.intervalstyle_postgres = BoolGuc::new(true);
+        interp.timezone = Guc::new(crate::tz::TzSetting::Default);
+        interp.datestyle = Guc::new(DEFAULT_DATESTYLE);
+        interp.intervalstyle = Guc::new(IntervalStyle::Postgres);
         interp.custom_settings = CustomSettings::default();
         return Ok(());
     }
@@ -676,10 +678,18 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
                     interp
                         .timezone_utc
                         .set(Some(timezone_arg_is_utc(arg.as_ref())), stmt.is_local);
+                    interp
+                        .timezone
+                        .set(Some(timezone_setting(arg.as_ref())), stmt.is_local);
+                } else {
+                    interp
+                        .timezone
+                        .set(Some(crate::tz::TzSetting::Unknown), stmt.is_local);
                 }
             }
             VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
                 interp.timezone_utc.set(None, stmt.is_local);
+                interp.timezone.set(None, stmt.is_local);
             }
             _ => {}
         }
@@ -701,9 +711,9 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
             }
             VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
                 if stmt.name.eq_ignore_ascii_case("datestyle") {
-                    interp.datestyle_iso.set(None, stmt.is_local);
+                    interp.datestyle.set(None, stmt.is_local);
                 } else {
-                    interp.intervalstyle_postgres.set(None, stmt.is_local);
+                    interp.intervalstyle.set(None, stmt.is_local);
                 }
             }
             _ => {}
@@ -905,6 +915,15 @@ pub(crate) fn select_side_effects(
             interp
                 .timezone_utc
                 .set(Some(timezone_is_utc(&value)), is_local);
+            let setting = if value
+                .get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("interval"))
+            {
+                crate::tz::TzSetting::Unknown
+            } else {
+                crate::tz::TzSetting::Text(value)
+            };
+            interp.timezone.set(Some(setting), is_local);
         }
         for name in ["DateStyle", "IntervalStyle"] {
             if let Some((value, is_local)) = constant_named_set_config(fc, name) {
@@ -1110,23 +1129,153 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     Some((setting.sval, value.sval, is_local))
 }
 
-/// `SET DateStyle` / `SET IntervalStyle` to `value` (`None`: not known):
-/// whether dates print ISO-style (check_datestyle: a value naming only the
-/// field order keeps the style), and intervals `postgres`-style.
+/// `SET DateStyle` / `SET IntervalStyle` to `value` (`None`: not known).
 fn set_output_style(interp: &mut PgCatalog, name: &str, value: Option<&str>, is_local: bool) {
     if name.eq_ignore_ascii_case("datestyle") {
-        let mut iso = value.is_some() && interp.datestyle_iso.get();
-        for token in value.unwrap_or_default().split(',') {
-            match token.trim().to_ascii_lowercase().as_str() {
-                "iso" | "default" => iso = true,
-                "sql" | "postgres" | "german" => iso = false,
-                _ => {}
+        let style = match value {
+            Some(v) => parse_datestyle(v, interp.datestyle.get()),
+            None => (DateStyle::Unknown, interp.datestyle.get().1),
+        };
+        interp.datestyle.set(Some(style), is_local);
+    } else {
+        let style = match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("postgres") => IntervalStyle::Postgres,
+            Some("postgres_verbose") => IntervalStyle::PostgresVerbose,
+            Some("sql_standard") => IntervalStyle::SqlStandard,
+            Some("iso_8601") => IntervalStyle::Iso8601,
+            _ => IntervalStyle::Unknown,
+        };
+        interp.intervalstyle.set(Some(style), is_local);
+    }
+}
+
+/// check_datestyle: the style and field order `value` sets over `current`
+/// (a value naming only one of them keeps the other; GERMAN also sets DMY
+/// unless an order is named).
+fn parse_datestyle(
+    value: &str,
+    current: (DateStyle, crate::datetime_input::DateOrder),
+) -> (DateStyle, crate::datetime_input::DateOrder) {
+    use crate::datetime_input::DateOrder;
+    let (mut style, mut order) = current;
+    let (mut have_style, mut have_order) = (false, false);
+    for token in split_identifier_string(value) {
+        let t = token.to_ascii_lowercase();
+        if t == "iso" {
+            style = DateStyle::Iso;
+            have_style = true;
+        } else if t == "sql" {
+            style = DateStyle::Sql;
+            have_style = true;
+        } else if t.starts_with("postgres") {
+            style = DateStyle::Postgres;
+            have_style = true;
+        } else if t == "german" {
+            style = DateStyle::German;
+            have_style = true;
+            if !have_order {
+                order = DateOrder::Dmy;
+            }
+        } else if t == "ymd" {
+            order = DateOrder::Ymd;
+            have_order = true;
+        } else if t == "dmy" || t.starts_with("euro") {
+            order = DateOrder::Dmy;
+            have_order = true;
+        } else if t == "mdy" || t == "us" || t.starts_with("noneuro") {
+            order = DateOrder::Mdy;
+            have_order = true;
+        } else if t == "default" {
+            if !have_style {
+                style = DEFAULT_DATESTYLE.0;
+            }
+            if !have_order {
+                order = DEFAULT_DATESTYLE.1;
             }
         }
-        interp.datestyle_iso.set(Some(iso), is_local);
-    } else {
-        let postgres = value.is_some_and(|v| v.trim().eq_ignore_ascii_case("postgres"));
-        interp.intervalstyle_postgres.set(Some(postgres), is_local);
+    }
+    (style, order)
+}
+
+/// How `DateStyle` prints dates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DateStyle {
+    Iso,
+    Sql,
+    Postgres,
+    German,
+    /// Set to a value not known here.
+    Unknown,
+}
+
+/// The server's `DateStyle`, `ISO, MDY`.
+pub(crate) const DEFAULT_DATESTYLE: (DateStyle, crate::datetime_input::DateOrder) =
+    (DateStyle::Iso, crate::datetime_input::DateOrder::Mdy);
+
+/// `IntervalStyle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntervalStyle {
+    Postgres,
+    PostgresVerbose,
+    SqlStandard,
+    Iso8601,
+    /// Set to a value not known here.
+    Unknown,
+}
+
+/// A setting the session tracks: its boot / RESET value, the session's,
+/// and a `SET LOCAL` one until the transaction ends.
+#[derive(Clone, Debug)]
+pub(crate) struct Guc<T> {
+    default: T,
+    session: T,
+    pub(crate) local: Option<T>,
+}
+
+impl<T: Clone> Guc<T> {
+    pub(crate) fn new(default: T) -> Self {
+        Self {
+            session: default.clone(),
+            default,
+            local: None,
+        }
+    }
+
+    /// The value in effect.
+    pub(crate) fn get(&self) -> T {
+        self.local.clone().unwrap_or_else(|| self.session.clone())
+    }
+
+    /// `SET [LOCAL]` (`value`), or `SET ... TO DEFAULT` / `RESET` (`None`).
+    fn set(&mut self, value: Option<T>, is_local: bool) {
+        let value = value.unwrap_or_else(|| self.default.clone());
+        if is_local {
+            self.local = Some(value);
+        } else {
+            self.local = None;
+            self.session = value;
+        }
+    }
+}
+
+/// The TimeZone a `SET TIME ZONE` argument sets.
+fn timezone_setting(arg: Option<&typedpg_pg_query::ast::Node>) -> crate::tz::TzSetting {
+    use crate::tz::TzSetting;
+    match arg {
+        // `INTERVAL '…' [HOUR TO MINUTE]`: its time, in SQL's sign
+        // convention (months and days are refused).
+        Some(ast::Node::TypeCast(tc)) => match const_arg_string(tc.arg.as_ref())
+            .and_then(|v| crate::datetime_input::interval_value(&v, false))
+        {
+            Some(crate::datetime_input::IntervalValue::Finite(0, 0, usec)) => {
+                TzSetting::Interval(usec / 1_000_000)
+            }
+            _ => TzSetting::Unknown,
+        },
+        _ => match const_arg_string(arg) {
+            Some(v) => TzSetting::Text(v),
+            None => TzSetting::Unknown,
+        },
     }
 }
 

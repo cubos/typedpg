@@ -6,6 +6,7 @@
 //! the literal as written. [`output`] is what that function prints for
 //! the literal, where it is known here.
 
+use crate::ddl::datetime_output::{self as dt, Settings, Style};
 use crate::oid::PgTypeOid;
 use crate::pg_catalog::{PgCatalog, TypType};
 
@@ -14,6 +15,41 @@ use crate::pg_catalog::{PgCatalog, TypType};
 /// session's DateStyle, IntervalStyle and TimeZone); `None` where that is
 /// not known here.
 pub(crate) fn output(interp: &PgCatalog, t: PgTypeOid, v: &str) -> Option<String> {
+    text_of(interp, t, v, Style::Session)
+}
+
+/// The text of the value literal `v` of type `t` (read under the session's
+/// settings) that reads as the same value under every setting — the text
+/// a stored literal is kept as — when the type's constants depend on the
+/// settings (the datetime family, and arrays, ranges and domains of it).
+/// `None` for another type, or where the value isn't known here.
+pub(crate) fn canonical(interp: &PgCatalog, t: PgTypeOid, v: &str) -> Option<String> {
+    depends_on_settings(interp, t)
+        .then(|| text_of(interp, t, v, Style::Canonical))
+        .flatten()
+}
+
+/// Whether the constants of type `t` are read or printed under the
+/// session's settings: a datetime type, or an array, range or domain of
+/// one.
+pub(crate) fn depends_on_settings(interp: &PgCatalog, t: PgTypeOid) -> bool {
+    let base = interp.unwrap_domain(t);
+    let Some(ty) = interp.get_type(base) else {
+        return false;
+    };
+    if let Some(elem) = ty.typelem
+        && interp.array_type_of(elem) == Some(base)
+        && ty.typlen == -1
+    {
+        return depends_on_settings(interp, elem);
+    }
+    interp.namespace_name(ty.typnamespace) == Some("pg_catalog")
+        && (dt::is_settings_dependent(&ty.typname)
+            || matches!(ty.typname.as_str(), "daterange" | "tsrange" | "tstzrange"))
+}
+
+/// [`output`] / [`canonical`].
+fn text_of(interp: &PgCatalog, t: PgTypeOid, v: &str, style: Style) -> Option<String> {
     let base = interp.unwrap_domain(t);
     let ty = interp.get_type(base)?;
     if ty.typtype == TypType::Enum {
@@ -23,12 +59,14 @@ pub(crate) fn output(interp: &PgCatalog, t: PgTypeOid, v: &str) -> Option<String
         && interp.array_type_of(elem) == Some(base)
         && ty.typlen == -1
     {
-        return array_out(interp, elem, v);
+        return array_out(interp, elem, v, style);
     }
     if interp.namespace_name(ty.typnamespace) != Some("pg_catalog") {
         return None;
     }
-    let iso = interp.datestyle_iso.get();
+    if dt::is_settings_dependent(&ty.typname) {
+        return dt::output(&ty.typname, v, &Settings::of(interp), style);
+    }
     match ty.typname.as_str() {
         "text" | "varchar" | "bpchar" | "unknown" | "json" => Some(v.to_owned()),
         // namein: at most NAMEDATALEN - 1 bytes, cut at a character.
@@ -56,22 +94,6 @@ pub(crate) fn output(interp: &PgCatalog, t: PgTypeOid, v: &str) -> Option<String
         "float4" => float_out(v, true),
         "float8" => float_out(v, false),
         "numeric" => numeric_out(v),
-        "date" if iso => date_out(crate::datetime_input::datetime_value(v, None, false)?),
-        "timestamp" if iso => timestamp_out(
-            crate::datetime_input::datetime_value(v, Some(false), false)?,
-            None,
-        ),
-        // A value naming no zone was read in the session's zone when the
-        // expression was written, which may not be today's.
-        "timestamptz" if iso && interp.timezone_utc.get() => timestamp_out(
-            crate::datetime_input::datetime_value(v, Some(true), false)?,
-            Some(0),
-        ),
-        "time" => time_out(v),
-        "interval" if interp.intervalstyle_postgres.get() => {
-            let (months, days, usec) = crate::datetime_input::finite_interval(v)?;
-            Some(interval_out(months, days, usec))
-        }
         "bytea" => bytea_out(v),
         "uuid" => uuid_out(v),
         "inet" => inet_out(v, false),
@@ -139,7 +161,7 @@ pub(crate) fn output(interp: &PgCatalog, t: PgTypeOid, v: &str) -> Option<String
             })
         }
         "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
-            range_out(interp, &ty.typname, v)
+            range_out(interp, &ty.typname, v, style)
         }
         // xml_out prints the text kept, but a declaration is rewritten.
         "xml" if !v.trim_start().starts_with("<?xml") => Some(v.to_owned()),
@@ -279,164 +301,6 @@ pub(crate) fn numeric_out(v: &str) -> Option<String> {
     })
 }
 
-const POSTGRES_EPOCH_JDATE: i128 = 2_451_545;
-const USECS_PER_DAY: i128 = 86_400_000_000;
-
-/// EncodeDateOnly (USE_ISO_DATES): `YYYY-MM-DD`, ` BC` for a year ≤ 0.
-fn ymd(days: i128) -> Option<(String, bool)> {
-    let jd = i32::try_from(days + POSTGRES_EPOCH_JDATE).ok()?;
-    let (y, m, d) = crate::datetime_input::j2date(jd);
-    let bc = y <= 0;
-    let year = if bc { -(y - 1) } else { y };
-    Some((format!("{year:04}-{m:02}-{d:02}"), bc))
-}
-
-/// `date_out` (DateStyle ISO) of a day count since 2000-01-01.
-fn date_out(days: i128) -> Option<String> {
-    match days {
-        i128::MAX => Some("infinity".to_owned()),
-        i128::MIN => Some("-infinity".to_owned()),
-        _ => {
-            let (date, bc) = ymd(days)?;
-            Some(if bc { format!("{date} BC") } else { date })
-        }
-    }
-}
-
-/// AppendSeconds with `fillzeros`: the seconds on two digits, then the
-/// fraction without its trailing zeros.
-fn seconds(sec: i64, usec: i64) -> String {
-    let mut out = format!("{:02}", sec.abs());
-    if usec != 0 {
-        let frac = format!("{:06}", usec.abs());
-        out.push('.');
-        out.push_str(frac.trim_end_matches('0'));
-    }
-    out
-}
-
-/// `timestamp_out` / `timestamptz_out` (DateStyle ISO) of microseconds
-/// since 2000-01-01, with the zone offset `tz` (seconds west, as
-/// EncodeTimezone takes it) for a `timestamptz`.
-fn timestamp_out(t: i128, tz: Option<i32>) -> Option<String> {
-    match t {
-        i128::MAX => return Some("infinity".to_owned()),
-        i128::MIN => return Some("-infinity".to_owned()),
-        _ => {}
-    }
-    let local = t - i128::from(tz.unwrap_or(0)) * 1_000_000;
-    let days = local.div_euclid(USECS_PER_DAY);
-    let time = i64::try_from(local.rem_euclid(USECS_PER_DAY)).ok()?;
-    let (date, bc) = ymd(days)?;
-    let (hour, rest) = (time / 3_600_000_000, time % 3_600_000_000);
-    let (min, rest) = (rest / 60_000_000, rest % 60_000_000);
-    let (sec, usec) = (rest / 1_000_000, rest % 1_000_000);
-    let mut out = format!("{date} {hour:02}:{min:02}:{}", seconds(sec, usec));
-    if let Some(tz) = tz {
-        let abs = tz.abs();
-        let (h, m, s) = (abs / 3600, abs / 60 % 60, abs % 60);
-        out.push(if tz <= 0 { '+' } else { '-' });
-        if s != 0 {
-            out.push_str(&format!("{h:02}:{m:02}:{s:02}"));
-        } else if m != 0 {
-            out.push_str(&format!("{h:02}:{m:02}"));
-        } else {
-            out.push_str(&format!("{h:02}"));
-        }
-    }
-    if bc {
-        out.push_str(" BC");
-    }
-    Some(out)
-}
-
-/// `time_out` of a literal written `HH:MM[:SS[.ffffff]]`.
-fn time_out(v: &str) -> Option<String> {
-    let s = v.trim();
-    let mut parts = s.split(':');
-    let hour: i64 = digits_of(parts.next()?, 1, 2)?.parse().ok()?;
-    let min: i64 = digits_of(parts.next()?, 2, 2)?.parse().ok()?;
-    let (sec, usec) = match parts.next() {
-        None => (0, 0),
-        Some(sec) => {
-            let (whole, frac) = sec.split_once('.').unwrap_or((sec, ""));
-            let whole: i64 = digits_of(whole, 2, 2)?.parse().ok()?;
-            if frac.len() > 6 || !frac.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            let usec: i64 = if frac.is_empty() {
-                0
-            } else {
-                format!("{frac:0<6}").parse().ok()?
-            };
-            (whole, usec)
-        }
-    };
-    if parts.next().is_some() || min > 59 || sec > 59 {
-        return None;
-    }
-    if hour > 24 || (hour == 24 && (min, sec, usec) != (0, 0, 0)) {
-        return None;
-    }
-    Some(format!("{hour:02}:{min:02}:{}", seconds(sec, usec)))
-}
-
-/// `s` when it is `min` to `max` ASCII digits.
-fn digits_of(s: &str, min: usize, max: usize) -> Option<&str> {
-    ((min..=max).contains(&s.len()) && s.chars().all(|c| c.is_ascii_digit())).then_some(s)
-}
-
-/// `interval_out` under IntervalStyle `postgres` (EncodeInterval).
-fn interval_out(months: i32, days: i32, usec: i64) -> String {
-    let mut out = String::new();
-    let mut is_zero = true;
-    let mut is_before = false;
-    let mut part = |out: &mut String, value: i64, unit: &str| {
-        if value == 0 {
-            return;
-        }
-        if !is_zero {
-            out.push(' ');
-        }
-        if is_before && value > 0 {
-            out.push('+');
-        }
-        out.push_str(&format!(
-            "{value} {unit}{}",
-            if value != 1 { "s" } else { "" }
-        ));
-        is_before = value < 0;
-        is_zero = false;
-    };
-    part(&mut out, i64::from(months / 12), "year");
-    part(&mut out, i64::from(months % 12), "mon");
-    part(&mut out, i64::from(days), "day");
-    let hour = usec / 3_600_000_000;
-    let rest = usec - hour * 3_600_000_000;
-    let min = rest / 60_000_000;
-    let rest = rest - min * 60_000_000;
-    let sec = rest / 1_000_000;
-    let fsec = rest - sec * 1_000_000;
-    if is_zero || hour != 0 || min != 0 || sec != 0 || fsec != 0 {
-        let minus = hour < 0 || min < 0 || sec < 0 || fsec < 0;
-        out.push_str(&format!(
-            "{}{}{:02}:{:02}:{}",
-            if is_zero { "" } else { " " },
-            if minus {
-                "-"
-            } else if is_before {
-                "+"
-            } else {
-                ""
-            },
-            hour.abs(),
-            min.abs(),
-            seconds(sec, fsec)
-        ));
-    }
-    out
-}
-
 /// `byteaout` (bytea_output `hex`) of what `byteain` reads.
 fn bytea_out(v: &str) -> Option<String> {
     let mut bytes = Vec::new();
@@ -503,24 +367,24 @@ fn uuid_out(v: &str) -> Option<String> {
 /// `inet_out` / `cidr_out` (network_out, over inet_net_ntop) of an address
 /// written in full, with its mask length.
 fn inet_out(v: &str, cidr: bool) -> Option<String> {
-    let s = v.trim();
-    let (addr, bits) = match s.split_once('/') {
-        Some((a, b)) => (a, Some(b.parse::<u32>().ok()?)),
-        None => (s, None),
-    };
-    if let Ok(v4) = addr.parse::<std::net::Ipv4Addr>() {
-        // A cidr without a mask length takes a classful one.
-        let bits = match (bits, cidr) {
-            (Some(b), _) if b <= 32 => b,
-            (None, false) => 32,
-            _ => return None,
+    // network_in: an address with a `:` is IPv6.
+    if !v.contains(':') {
+        let (octets, bits) = if cidr {
+            cidr_pton_ipv4(v)?
+        } else {
+            inet_pton_ipv4(v)?
         };
-        let mut out = v4.to_string();
+        let mut out = format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3]);
         if bits != 32 || cidr {
             out.push_str(&format!("/{bits}"));
         }
         return Some(out);
     }
+    let s = v.trim();
+    let (addr, bits) = match s.split_once('/') {
+        Some((a, b)) => (a, Some(b.parse::<u32>().ok()?)),
+        None => (s, None),
+    };
     let v6: std::net::Ipv6Addr = addr.parse().ok()?;
     let bits = bits.unwrap_or(128);
     if bits > 128 {
@@ -531,6 +395,115 @@ fn inet_out(v: &str, cidr: bool) -> Option<String> {
         out.push_str(&format!("/{bits}"));
     }
     Some(out)
+}
+
+/// The dotted decimal octets of an IPv4 address and what follows them.
+fn dotted_octets(s: &str) -> Option<(Vec<u8>, &str)> {
+    let b = s.as_bytes();
+    let mut octets = Vec::new();
+    let mut i = 0;
+    loop {
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start || octets.len() == 4 {
+            return None;
+        }
+        octets.push(u8::try_from(s[start..i].parse::<u32>().ok()?).ok()?);
+        match b.get(i) {
+            Some(b'.') => i += 1,
+            _ => return Some((octets, &s[i..])),
+        }
+    }
+}
+
+/// A `/n` suffix of at most 32 (`None`: no suffix, `Some(None)`: invalid).
+fn mask_suffix(rest: &str) -> Option<Option<u32>> {
+    match rest.strip_prefix('/') {
+        None if rest.is_empty() => Some(None),
+        Some(bits) if !bits.is_empty() && bits.chars().all(|c| c.is_ascii_digit()) => {
+            let bits: u32 = bits.parse().ok()?;
+            (bits <= 32).then_some(Some(bits))
+        }
+        _ => None,
+    }
+}
+
+/// `inet_net_pton_ipv4`: an inet's octets (abbreviated ones given a mask
+/// covering them) and mask length.
+fn inet_pton_ipv4(s: &str) -> Option<([u8; 4], u32)> {
+    let (octets, rest) = dotted_octets(s)?;
+    let bits = match mask_suffix(rest)? {
+        Some(bits) => bits,
+        None if octets.len() == 4 => 32,
+        None => return None,
+    };
+    if (bits / 8) as usize > octets.len() {
+        return None;
+    }
+    let mut out = [0; 4];
+    out[..octets.len()].copy_from_slice(&octets);
+    Some((out, bits))
+}
+
+/// `inet_cidr_pton_ipv4`: a cidr's octets (dotted decimal or `0x` hex)
+/// and mask length — without one, the address class's, widened to the
+/// octets given.
+fn cidr_pton_ipv4(s: &str) -> Option<([u8; 4], u32)> {
+    let (octets, rest) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) if hex.starts_with(|c: char| c.is_ascii_hexdigit()) => {
+            let end = hex
+                .find(|c: char| !c.is_ascii_hexdigit())
+                .unwrap_or(hex.len());
+            let digits = &hex[..end];
+            let mut octets = Vec::new();
+            for pair in digits.as_bytes().chunks(2) {
+                let hi = char::from(pair[0]).to_digit(16)?;
+                let lo = match pair.get(1) {
+                    Some(c) => char::from(*c).to_digit(16)?,
+                    None => 0,
+                };
+                octets.push(u8::try_from(hi * 16 + lo).ok()?);
+            }
+            (octets, &hex[end..])
+        }
+        _ => dotted_octets(s)?,
+    };
+    if octets.is_empty() || octets.len() > 4 {
+        return None;
+    }
+    let bits = match mask_suffix(rest)? {
+        Some(bits) => bits,
+        None => {
+            let first = octets[0];
+            let mut bits = match first {
+                240.. => 32,
+                224.. => 8,
+                192.. => 24,
+                128.. => 16,
+                _ => 8,
+            };
+            let given = 8 * octets.len() as u32;
+            if bits < given {
+                bits = given;
+            }
+            if bits == 8 && first == 224 {
+                bits = 4;
+            }
+            bits
+        }
+    };
+    let mut out = [0; 4];
+    out[..octets.len()].copy_from_slice(&octets);
+    // addressOK: no bit set beyond the mask.
+    let addr = u32::from_be_bytes(out);
+    let mask = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    (addr & !mask == 0).then_some((out, bits))
 }
 
 /// `inet_net_ntop_ipv6`: the longest run of two or more zero words (the
@@ -746,7 +719,7 @@ fn array_element_text(value: &str, delim: u8) -> String {
 }
 
 /// `array_out` of what `array_in` reads `v` as.
-fn array_out(interp: &PgCatalog, elem: PgTypeOid, v: &str) -> Option<String> {
+fn array_out(interp: &PgCatalog, elem: PgTypeOid, v: &str, style: Style) -> Option<String> {
     let delim = crate::literal_input::array_delimiter(elem, interp)?;
     let mut elems: Vec<Option<String>> = Vec::new();
     crate::array_input::parse_array(v, delim, &mut |e| {
@@ -762,7 +735,7 @@ fn array_out(interp: &PgCatalog, elem: PgTypeOid, v: &str) -> Option<String> {
         .iter()
         .map(|e| match e {
             None => Some("NULL".to_owned()),
-            Some(e) => output(interp, elem, e).map(|o| array_element_text(&o, delim)),
+            Some(e) => text_of(interp, elem, e, style).map(|o| array_element_text(&o, delim)),
         })
         .collect::<Option<Vec<String>>>()?;
     let mut out = String::new();
@@ -801,7 +774,7 @@ fn array_out(interp: &PgCatalog, elem: PgTypeOid, v: &str) -> Option<String> {
 
 /// `range_out` of what `range_in` reads `v` as, discrete ranges in their
 /// canonical `[lower,upper)` form.
-fn range_out(interp: &PgCatalog, typname: &str, v: &str) -> Option<String> {
+fn range_out(interp: &PgCatalog, typname: &str, v: &str, style: Style) -> Option<String> {
     let parts = crate::range_input::range_parts(v)?;
     if parts.empty {
         return Some("empty".to_owned());
@@ -812,7 +785,7 @@ fn range_out(interp: &PgCatalog, typname: &str, v: &str) -> Option<String> {
         Num(crate::decimal::Decimal),
         Time(i128),
     }
-    let iso = interp.datestyle_iso.get();
+    let settings = Settings::of(interp);
     let bound = |b: &str| -> Option<(Val, String)> {
         Some(match typname {
             "int4range" | "int8range" => {
@@ -823,17 +796,23 @@ fn range_out(interp: &PgCatalog, typname: &str, v: &str) -> Option<String> {
                 let out = numeric_out(b)?;
                 (Val::Num(crate::decimal::Decimal::parse(&out)?), out)
             }
-            "daterange" if iso => {
-                let d = crate::datetime_input::datetime_value(b, None, false)?;
-                (Val::Time(d), date_out(d)?)
+            "daterange" => {
+                let d = dt::date_value(b, &settings)?;
+                (Val::Time(d), dt::value_text("date", d, &settings, style)?)
             }
-            "tsrange" if iso => {
-                let t = crate::datetime_input::datetime_value(b, Some(false), false)?;
-                (Val::Time(t), timestamp_out(t, None)?)
+            "tsrange" => {
+                let t = dt::timestamp_value(b, &settings)?;
+                (
+                    Val::Time(t),
+                    dt::value_text("timestamp", t, &settings, style)?,
+                )
             }
-            "tstzrange" if iso && interp.timezone_utc.get() => {
-                let t = crate::datetime_input::datetime_value(b, Some(true), false)?;
-                (Val::Time(t), timestamp_out(t, Some(0))?)
+            "tstzrange" => {
+                let t = dt::timestamptz_value(b, &settings)?;
+                (
+                    Val::Time(t),
+                    dt::value_text("timestamptz", t, &settings, style)?,
+                )
             }
             _ => return None,
         })
@@ -858,7 +837,10 @@ fn range_out(interp: &PgCatalog, typname: &str, v: &str) -> Option<String> {
                 if d == i128::MAX || d == i128::MIN {
                     return Some((Val::Time(d), b.1.clone()));
                 }
-                Some((Val::Time(d + 1), date_out(d + 1)?))
+                Some((
+                    Val::Time(d + 1),
+                    dt::value_text("date", d + 1, &settings, style)?,
+                ))
             }
             _ => None,
         }
@@ -1226,20 +1208,6 @@ mod tests {
             ("nan", "NaN"),
         ] {
             assert_eq!(super::numeric_out(v).as_deref(), Some(out), "{v}");
-        }
-    }
-
-    #[test]
-    fn intervals_print_in_the_postgres_style() {
-        for ((months, days, usec), out) in [
-            ((0, 0, 0), "00:00:00"),
-            ((14, 3, 0), "1 year 2 mons 3 days"),
-            ((0, 1, 7_200_000_000), "1 day 02:00:00"),
-            ((0, -1, 7_200_000_000), "-1 days +02:00:00"),
-            ((-1, 0, -1_500_000), "-1 mons -00:00:01.5"),
-            ((0, 0, 90_000_000_000), "25:00:00"),
-        ] {
-            assert_eq!(super::interval_out(months, days, usec), out);
         }
     }
 }

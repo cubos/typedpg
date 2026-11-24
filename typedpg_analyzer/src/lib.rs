@@ -94,6 +94,7 @@ mod tsearch_input;
 mod type_facts;
 mod types;
 mod typmod;
+mod tz;
 mod xml_input;
 
 /// Re-exports of types defined in `typedpg_core` but used pervasively by

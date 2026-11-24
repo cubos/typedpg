@@ -17,6 +17,7 @@ mod conversion_procs;
 pub(crate) mod conversions;
 pub(crate) mod cooked;
 pub(crate) mod cursors;
+pub(crate) mod datetime_output;
 pub(crate) mod defaults;
 pub(crate) mod depend;
 mod dml;
@@ -522,7 +523,14 @@ fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError>
     }
     permissions::check_statement(db, stmt)?;
     fk_bypass::note(db, stmt);
-    if let Err(e) = dispatch_statement(db, stmt) {
+    // The migration's session reads datetime literals under its DateOrder
+    // and IntervalStyle.
+    let order = db.datestyle.get().1;
+    let sql_standard = db.intervalstyle.get() == session::IntervalStyle::SqlStandard;
+    let dispatched = crate::datetime_input::with_input_settings(order, sql_standard, || {
+        dispatch_statement(db, stmt)
+    });
+    if let Err(e) = dispatched {
         stored_exprs::discard_pending_reg_constants();
         return Err(e);
     }
