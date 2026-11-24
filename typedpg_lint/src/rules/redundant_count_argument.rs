@@ -1,4 +1,4 @@
-//! The `count_not_null` rule: reports `count(expr)` over a value the
+//! The `redundant_count_argument` rule: reports `count(expr)` over a value the
 //! analyzer proves is never NULL — a NOT NULL column of a table no outer
 //! join null-extends, a literal (`count(1)`), a column the call's own
 //! `FILTER` or the query's `WHERE` proves non-NULL — which counts every
@@ -142,7 +142,7 @@ mod tests {
     use crate::Rule;
     use crate::rules::test_support::{fixed, lint_rule};
 
-    const RULE: Rule = Rule::CountNotNull;
+    const RULE: Rule = Rule::RedundantCountArgument;
 
     fn catalog() -> PgCatalog {
         let mut catalog = PgCatalog::new().unwrap();

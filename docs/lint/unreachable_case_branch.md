@@ -2,9 +2,9 @@
 
 A `CASE` branch that is never taken.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | — |
 
 ## Example
 
@@ -22,14 +22,14 @@ SELECT id, CASE status WHEN 'draft' THEN 1 WHEN 'published' THEN 2 WHEN 'archive
 ```
 
 ```
-warning[unreachable_case_branch]: CASE branch is never taken: its condition is never true (`status` is always one of 'archived', 'draft', 'published' (CHECK constraint "posts_status_check"))
+info[redundant/unreachable_case_branch]: CASE branch is never taken: its condition is never true (`status` is always one of 'archived', 'draft', 'published' (CHECK constraint "posts_status_check"))
    ╭─[queries.sql:2:17]
  2 │ SELECT id, CASE WHEN status = 'deleted' THEN 'gone' ELSE 'here' END AS state FROM posts;
    ·                 ───────────────────────────────────
    ╰────
   help: remove the branch, or fix its condition
 
-warning[unreachable_case_branch]: CASE branches after an always-true WHEN are never taken (`views` is always at least 0 (CHECK constraint "posts_views_check"))
+info[redundant/unreachable_case_branch]: CASE branches after an always-true WHEN are never taken (`views` is always at least 0 (CHECK constraint "posts_views_check"))
    ╭─[queries.sql:4:48]
  4 │ SELECT id, CASE WHEN views >= 0 THEN 'counted' WHEN views > 100 THEN 'hot' END AS heat FROM posts;
    ·                                                ───────────────────────────

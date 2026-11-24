@@ -3,9 +3,9 @@
 A `NOT IN (SELECT …)` or `<> ALL (SELECT …)` whose left side or subquery
 may be `NULL`, which makes it return no rows.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -19,21 +19,21 @@ SELECT id FROM users WHERE name <> ALL (SELECT user_id::text FROM posts);
 ```
 
 ```
-warning[not_in_nullable]: NOT IN (SELECT …) returns no rows when the subquery returns a NULL
+error[correctness/not_in_nullable]: NOT IN (SELECT …) returns no rows when the subquery returns a NULL
    ╭─[queries.sql:2:28]
  2 │ SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM posts);
    ·                            ─────────────────────────────────────
    ╰────
   help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
 
-warning[not_in_nullable]: NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row
+error[correctness/not_in_nullable]: NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row
    ╭─[queries.sql:4:28]
  4 │ SELECT id FROM users WHERE name NOT IN (SELECT title FROM posts);
    ·                            ─────────────────────────────────────
    ╰────
   help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
 
-warning[not_in_nullable]: <> ALL (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL
+error[correctness/not_in_nullable]: <> ALL (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL
    ╭─[queries.sql:6:28]
  6 │ SELECT id FROM users WHERE name <> ALL (SELECT user_id::text FROM posts);
    ·                            ─────────────────────────────────────────────

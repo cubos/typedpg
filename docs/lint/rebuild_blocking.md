@@ -1,11 +1,11 @@
-# `blocking_rebuild`
+# `rebuild_blocking`
 
 `REINDEX`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on a
 table that already has rows, holding a blocking lock for the whole rebuild.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -24,14 +24,14 @@ VACUUM FULL posts;
 ```
 
 ```
-warning[blocking_rebuild]: REINDEX without CONCURRENTLY blocks writes on public.users, and reads that use the indexes it rebuilds, for the whole rebuild
+warning[locking/rebuild_blocking]: REINDEX without CONCURRENTLY blocks writes on public.users, and reads that use the indexes it rebuilds, for the whole rebuild
    ╭─[migrations/0002_reindex.sql:1:1]
  1 │ REINDEX TABLE users;
    · ───────────────────
    ╰────
   help: use REINDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
 
-warning[blocking_rebuild]: VACUUM FULL rewrites public.posts under an ACCESS EXCLUSIVE lock, blocking every query on it for the whole rebuild
+warning[locking/rebuild_blocking]: VACUUM FULL rewrites public.posts under an ACCESS EXCLUSIVE lock, blocking every query on it for the whole rebuild
    ╭─[migrations/0003_vacuum.sql:2:1]
  2 │ VACUUM FULL posts;
    · ─────────────────
@@ -39,7 +39,7 @@ warning[blocking_rebuild]: VACUUM FULL rewrites public.posts under an ACCESS EXC
   help: use REPACK (CONCURRENTLY), in a migration whose first line is -- no-transaction
 ```
 
-Each statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md)
+Each statement also gets a [`lock_without_timeout`](lock_without_timeout.md)
 finding. The fix:
 
 ```sql
@@ -79,14 +79,14 @@ On a table or materialized view created by an earlier migration file:
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-blocking_rebuild = "error"   # error | warning | info | off
+rebuild_blocking = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "blockingRebuild": "error" } }
+{ "lint": { "rebuildBlocking": "error" } }
 ```
 
-Allow one statement with `-- typedpg-lint: allow(blocking_rebuild)` before
+Allow one statement with `-- typedpg-lint: allow(rebuild_blocking)` before
 it in the migration file.
 See [Configuring rules](README.md#configuring-rules).
 
@@ -94,7 +94,7 @@ See [Configuring rules](README.md#configuring-rules).
 
 - [`create_index_blocking`](create_index_blocking.md): `CREATE INDEX`
   without `CONCURRENTLY`.
-- [`table_rewrite`](table_rewrite.md): `ALTER TABLE` that rewrites every
+- [`alter_table_rewrite`](alter_table_rewrite.md): `ALTER TABLE` that rewrites every
   row.
-- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+- [`lock_without_timeout`](lock_without_timeout.md): the same statement
   waiting for its lock with no timeout.

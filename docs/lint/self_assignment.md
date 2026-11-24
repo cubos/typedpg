@@ -3,9 +3,9 @@
 An `UPDATE`, `ON CONFLICT DO UPDATE` or `MERGE … UPDATE` that assigns a
 column its own value.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | removes the assignment |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | removes the assignment |
 
 ## Example
 
@@ -23,14 +23,14 @@ MERGE INTO posts p USING users u ON p.user_id = u.id
 ```
 
 ```
-warning[self_assignment]: assigning name its own value changes nothing
+warning[suspicious/self_assignment]: assigning name its own value changes nothing
    ╭─[queries.sql:2:18]
  2 │ UPDATE users SET name = name, email = $email WHERE id = $id;
    ·                  ───────────
    ╰────
   help: remove the assignment, or assign the value meant
 
-warning[self_assignment]: assigning name its own value rewrites the row with the same value
+warning[suspicious/self_assignment]: assigning name its own value rewrites the row with the same value
    ╭─[queries.sql:3:20]
  3 │ UPDATE users u SET name = u.name WHERE id = $id;
    ·                    ─────────────

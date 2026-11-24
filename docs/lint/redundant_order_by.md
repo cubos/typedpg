@@ -3,9 +3,9 @@
 `ORDER BY` keys that can't change the order, and whole `ORDER BY` clauses
 whose order nothing observes.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the keys, or the whole `ORDER BY` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the keys, or the whole `ORDER BY` |
 
 ## Example
 
@@ -22,14 +22,14 @@ SELECT id FROM users ORDER BY id, lower(name);
 ```
 
 ```
-info[redundant_order_by]: the ORDER BY key created_at can't change the order: the keys before it already determine a unique row, so it never breaks a tie
+info[redundant/redundant_order_by]: the ORDER BY key created_at can't change the order: the keys before it already determine a unique row, so it never breaks a tie
    ╭─[queries.sql:2:45]
  2 │ SELECT id, email FROM users ORDER BY email, created_at;
    ·                                             ──────────
    ╰────
   help: remove it
 
-info[redundant_order_by]: ORDER BY has no effect: a subquery that only tests membership never observes its rows' order
+info[redundant/redundant_order_by]: ORDER BY has no effect: a subquery that only tests membership never observes its rows' order
    ╭─[queries.sql:8:61]
  8 │ SELECT id FROM users WHERE id IN (SELECT user_id FROM posts ORDER BY created_at);
    ·                                                             ───────────────────

@@ -3,9 +3,9 @@
 `ALTER COLUMN … SET NOT NULL` that scans every row of an existing table
 under an `ACCESS EXCLUSIVE` lock.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -18,7 +18,7 @@ ALTER TABLE users ALTER COLUMN email SET NOT NULL, ALTER COLUMN name SET NOT NUL
 ```
 
 ```
-warning[set_not_null_scan]: SET NOT NULL scans every row of public.users under a lock
+warning[locking/set_not_null_scan]: SET NOT NULL scans every row of public.users under a lock
    ╭─[migrations/0002_email_not_null.sql:1:1]
  1 │ ALTER TABLE users ALTER COLUMN email SET NOT NULL, ALTER COLUMN name SET NOT NULL;
    · ─────────────────────────────────────────────────────────────────────────────────
@@ -98,9 +98,9 @@ it in the migration. See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`constraint_validating`](constraint_validating.md): the `NOT VALID` /
+- [`add_constraint_scan`](add_constraint_scan.md): the `NOT VALID` /
   `VALIDATE` split for any check.
-- [`validate_in_same_transaction`](validate_in_same_transaction.md):
+- [`validate_constraint_blocking`](validate_constraint_blocking.md):
   validating in the transaction that added the check.
-- [`missing_lock_timeout`](missing_lock_timeout.md): a blocking lock without
+- [`lock_without_timeout`](lock_without_timeout.md): a blocking lock without
   `lock_timeout`.

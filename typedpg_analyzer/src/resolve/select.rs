@@ -3566,7 +3566,10 @@ fn sort_target_key(
     if !has_star
         && let Some(i) = target_list.iter().position(|t| {
             matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
-                if rt.val.as_ref().is_some_and(|v| grouping::typed_fingerprint(v, scope, snapshot) == fp))
+            if rt.val.as_ref().is_some_and(|v| {
+                grouping::typed_fingerprint(v, scope, snapshot) == fp
+                    || grouping::same_level_exprs_equal(Some(v), Some(inner), scope, snapshot)
+            }))
         })
     {
         return SortKey::Target(i);

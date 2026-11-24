@@ -3,9 +3,9 @@
 A `WHERE` condition that rejects the NULL-extended rows of an outer join, so
 the join behaves as an inner join.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -21,14 +21,14 @@ SELECT u.id FROM users u LEFT JOIN posts p ON p.user_id = u.id WHERE p.id IS NOT
 ```
 
 ```
-warning[left_join_nullified]: this condition is never true for the NULL-extended rows of p, on the nullable side of a LEFT JOIN: the join behaves as an INNER JOIN
+warning[suspicious/left_join_nullified]: this condition is never true for the NULL-extended rows of p, on the nullable side of a LEFT JOIN: the join behaves as an INNER JOIN
    ╭─[queries.sql:5:7]
  5 │ WHERE p.status = 'published';
    ·       ──────────────────────
    ╰────
   help: to keep the rows without a match in p, move the condition into the join's ON clause; to drop them, write an INNER JOIN
 
-warning[left_join_nullified]: this condition is never true for the NULL-extended rows of p, on the nullable side of a LEFT JOIN: the join behaves as an INNER JOIN
+warning[suspicious/left_join_nullified]: this condition is never true for the NULL-extended rows of p, on the nullable side of a LEFT JOIN: the join behaves as an INNER JOIN
    ╭─[queries.sql:7:70]
  7 │ SELECT u.id FROM users u LEFT JOIN posts p ON p.user_id = u.id WHERE p.id IS NOT NULL;
    ·                                                                      ────────────────

@@ -285,7 +285,10 @@ fn coalesce(
                 ordinal(index)
             ),
         },
-        help: None,
+        help: Some(
+            "remove the COALESCE, or find why the value was expected to be NULL (an outer join?)"
+                .to_owned(),
+        ),
         fix,
     });
 }
@@ -525,7 +528,7 @@ mod tests {
     fn only(findings: &[Finding]) -> &Finding {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].rule, Rule::RedundantNullCheck);
-        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].severity, Severity::Info);
         &findings[0]
     }
 

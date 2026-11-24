@@ -1,4 +1,4 @@
-//! The `scalar_subquery_may_return_many` rule: reports a subquery used as
+//! The `scalar_subquery_multiple_rows` rule: reports a subquery used as
 //! a value — `(SELECT x FROM t WHERE …)` in a select list, a comparison,
 //! a `SET`, a function argument, `(a, b) = (SELECT …)` — that may return
 //! more than one row. PostgreSQL then fails the statement at run time with
@@ -229,7 +229,7 @@ mod tests {
     use crate::Rule;
     use crate::rules::test_support::{catalog, lint_rule};
 
-    const RULE: Rule = Rule::ScalarSubqueryMayReturnMany;
+    const RULE: Rule = Rule::ScalarSubqueryMultipleRows;
 
     fn db() -> typedpg_analyzer::PgCatalog {
         let mut db = catalog();
@@ -255,7 +255,7 @@ mod tests {
         let findings = lint_rule(&db, sql, RULE);
         assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
         assert_eq!(&sql[findings[0].span.clone()], subquery, "{sql}");
-        assert_eq!(findings[0].severity, crate::Severity::Warning);
+        assert_eq!(findings[0].severity, crate::Severity::Error);
     }
 
     fn assert_clean(sql: &str) {
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn an_allow_comment_suppresses_the_rule() {
         assert_clean(
-            "-- typedpg-lint: allow(scalar_subquery_may_return_many)\n\
+            "-- typedpg-lint: allow(scalar_subquery_multiple_rows)\n\
              SELECT (SELECT id FROM posts WHERE title = $t) AS id",
         );
     }

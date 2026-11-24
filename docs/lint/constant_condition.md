@@ -2,9 +2,9 @@
 
 A condition that is always true or never true.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | removes a whole `WHERE` / `HAVING` that is a constant true |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | removes a whole `WHERE` / `HAVING` that is a constant true |
 
 ## Example
 
@@ -25,21 +25,21 @@ SELECT id FROM users WHERE name = 'a' AND name = 'b';
 ```
 
 ```
-warning[constant_condition]: condition is always true: it filters nothing
+warning[suspicious/constant_condition]: condition is always true: it filters nothing
    ╭─[queries.sql:2:22]
  2 │ SELECT id FROM posts WHERE 1 = 1;
    ·                      ───────────
    ╰────
   help: remove it
 
-warning[constant_condition]: `status` is always one of 'archived', 'draft', 'published' (CHECK constraint "posts_status_check"), so this condition is never true
+warning[suspicious/constant_condition]: `status` is always one of 'archived', 'draft', 'published' (CHECK constraint "posts_status_check"), so this condition is never true
    ╭─[queries.sql:4:28]
  4 │ SELECT id FROM posts WHERE status = 'publsihed';
    ·                            ────────────────────
    ╰────
   help: fix the condition (a mistyped value?), or remove it
 
-warning[constant_condition]: `name` is always 'a' where this is evaluated, so this condition is never true
+warning[suspicious/constant_condition]: `name` is always 'a' where this is evaluated, so this condition is never true
    ╭─[queries.sql:8:43]
  8 │ SELECT id FROM users WHERE name = 'a' AND name = 'b';
    ·                                           ──────────

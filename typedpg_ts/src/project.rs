@@ -1412,7 +1412,7 @@ impl Project {
     }
 
     /// Every `copyIn()` target in the sources, sorted by file and position:
-    /// the targets `breaks_deployed_queries` checks in the previous
+    /// the targets `deployed_query_breakage` checks in the previous
     /// deployment, with the calls `json_stringify_param` checks.
     pub fn lint_copy_ins(&self) -> Vec<LintCopyIn<'_>> {
         let mut out = Vec::new();

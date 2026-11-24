@@ -1464,7 +1464,7 @@ fn inline_parameter_usage(
     Some(counts.into_iter().map(|c| c > 0).collect())
 }
 
-/// Record, for the lint's `count_not_null` rule, whether the argument of a
+/// Record, for the lint's `redundant_count_argument` rule, whether the argument of a
 /// `pg_catalog.count("any")` call may be NULL — read over the rows its
 /// `FILTER` passes. A `DISTINCT` or `*` call records nothing, nor does a
 /// row / composite argument (whose NULL test differs from its null flag);

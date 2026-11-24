@@ -1,12 +1,12 @@
-# `fetch_may_return_many`
+# `fetch_one_multiple_rows`
 
 `fetch_one`, `fetch_optional`, `fetch_value` or `fetch_value_optional`
 (`fetchOne`, `fetchOptional`, `fetchValue`, `fetchValueOptional` in
 TypeScript) on a query the schema doesn't limit to one row.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | call sites | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | call sites | — |
 
 ## Example
 
@@ -26,7 +26,7 @@ export async function latestPost(pool: Pool, userId: number) {
 ```
 
 ```
-warning[fetch_may_return_many]: `.fetchOne()` fails with TooManyRows if this query returns a second row, and nothing in the schema limits it to one
+error[correctness/fetch_one_multiple_rows]: `.fetchOne()` fails with TooManyRows if this query returns a second row, and nothing in the schema limits it to one
    ╭─[src/posts.ts:5:69]
  5 │   return sql("SELECT id, title FROM posts WHERE user_id = $userId").fetchOne(pool, { userId });
    ·                                                                     ────────
@@ -112,21 +112,21 @@ Also not reported:
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-fetch_may_return_many = "error"   # error | warning | info | off
+fetch_one_multiple_rows = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "fetchMayReturnMany": "error" } }
+{ "lint": { "fetchOneMultipleRows": "error" } }
 ```
 
-Allow one query with `-- typedpg-lint: allow(fetch_may_return_many)` in its
+Allow one query with `-- typedpg-lint: allow(fetch_one_multiple_rows)` in its
 SQL; it covers every call of that query.
 See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
 - [`fetch_all_single_row`](fetch_all_single_row.md): the opposite mismatch.
-- [`scalar_subquery_may_return_many`](scalar_subquery_may_return_many.md):
+- [`scalar_subquery_multiple_rows`](scalar_subquery_multiple_rows.md):
   a subquery used as a value that may return several rows.
 - [`unstable_order`](unstable_order.md): an `ORDER BY … LIMIT 1` whose keys
   can tie.

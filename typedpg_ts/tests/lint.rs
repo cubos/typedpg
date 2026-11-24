@@ -145,7 +145,7 @@ export const exportedExecute = sql(`INSERT INTO users (id, org_id, name) VALUES 
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     // Every offending call, named as written, at its own line.
     for (line, method) in [
         (9, "fetchOne"),
@@ -163,7 +163,9 @@ export const exportedExecute = sql(`INSERT INTO users (id, org_id, name) VALUES 
         );
     }
     assert_eq!(
-        stdout.matches("warning[fetch_may_return_many]").count(),
+        stdout
+            .matches("error[correctness/fetch_one_multiple_rows]")
+            .count(),
         6,
         "{stdout}"
     );
@@ -201,7 +203,10 @@ fn fix_removes_returning_of_a_direct_execute() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:3:2]"), "{stdout}");
-    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(
+        stdout.contains("info[redundant/unused_returning]"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("`.execute()` discards the RETURNING rows"),
         "{stdout}"
@@ -255,10 +260,13 @@ fn inline_calls_are_linted_before_the_module_is_generated() {
     // ... but the calls on `sql()` imported from it are linted all the same.
     assert!(stderr.contains("checked 3 queries"), "{stderr}");
     assert!(stdout.contains("src/app/users.ts:2:70]"), "{stdout}");
-    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(
+        stdout.contains("info[redundant/unused_returning]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("src/app/users.ts:3:49]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
     // A query that doesn't analyze fails the run, as it fails `gen`.
@@ -336,10 +344,10 @@ fn a_sql_file_imported_directly_is_linted_at_the_calls() {
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:2:10]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
     assert!(
@@ -379,10 +387,10 @@ SELECT id FROM users WHERE org_id = $org;
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:2:10]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
 }
@@ -417,10 +425,10 @@ fn a_sql_file_imported_through_its_declaration_is_linted_at_the_calls() {
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:2:10]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
 }
@@ -515,7 +523,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 #[test]
-fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
+fn deployed_query_breakage_checks_the_previous_deployments_queries() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -563,9 +571,11 @@ fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
         let output = run(root, &["lint", flag, "HEAD"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
         assert_eq!(
-            stdout.matches("warning[breaks_deployed_queries]").count(),
+            stdout
+                .matches("error[correctness/deployed_query_breakage]")
+                .count(),
             2,
             "{stdout}"
         );
@@ -587,7 +597,7 @@ fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
 
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+    assert!(!stdout.contains("deployed_query_breakage"), "{stdout}");
 }
 
 #[test]
@@ -643,7 +653,7 @@ fn queries_are_linted_as_the_databases_roles() {
 }
 
 #[test]
-fn breaks_deployed_queries_checks_the_previous_deployments_copy_in_targets() {
+fn deployed_query_breakage_checks_the_previous_deployments_copy_in_targets() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -687,9 +697,11 @@ fn breaks_deployed_queries_checks_the_previous_deployments_copy_in_targets() {
     let output = run(root, &["lint", "--previous-deployment", "HEAD"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert_eq!(
-        stdout.matches("warning[breaks_deployed_queries]").count(),
+        stdout
+            .matches("error[correctness/deployed_query_breakage]")
+            .count(),
         2,
         "{stdout}"
     );
@@ -754,10 +766,11 @@ fn queries_imported_through_tsconfig_paths_are_linted() {
         let output = run(root, &["lint"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{when}: {stdout}\n{stderr}");
+        // `LIMIT 1 OFFSET 0` without ORDER BY is a correctness error.
+        assert_eq!(output.status.code(), Some(1), "{when}: {stdout}\n{stderr}");
         assert!(stderr.contains("checked 3 queries"), "{when}: {stderr}");
         assert_eq!(
-            stdout.matches("info[redundant_distinct]").count(),
+            stdout.matches("info[redundant/redundant_distinct]").count(),
             2,
             "{when}: {stdout}"
         );

@@ -17,6 +17,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/null_comparison.md",
               "defaultConfiguration": {
                 "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -26,7 +31,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unbounded_write.md",
               "defaultConfiguration": {
-                "level": "error"
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -36,7 +46,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/not_in_nullable.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -47,16 +62,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/create_index_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
-              "id": "constraint_validating",
+              "id": "add_constraint_scan",
               "shortDescription": {
                 "text": "a constraint that validates existing rows under a lock"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/constraint_validating.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/add_constraint_scan.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
@@ -67,16 +92,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/set_not_null_scan.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
-              "id": "table_rewrite",
+              "id": "alter_table_rewrite",
               "shortDescription": {
                 "text": "ALTER TABLE that rewrites every row under a lock"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/table_rewrite.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/alter_table_rewrite.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
@@ -87,6 +122,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fk_without_index.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "performance"
+                ]
               }
             },
             {
@@ -96,7 +136,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_index.md",
               "defaultConfiguration": {
-                "level": "note"
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "performance"
+                ]
               }
             },
             {
@@ -106,7 +151,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_binding.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -117,6 +167,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/renaming_binding.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -126,7 +181,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_null_check.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -136,7 +196,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/limit_without_order.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -147,6 +212,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_limit.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -157,6 +227,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_distinct.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -167,6 +242,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/constant_condition.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -176,7 +256,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unreachable_case_branch.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -186,7 +271,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/case_without_else.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "style"
+                ]
               }
             },
             {
@@ -197,6 +287,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_cast.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -207,6 +302,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_alias.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -217,6 +317,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/outer_reference_in_subquery.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -227,6 +332,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/cartesian_join.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -237,6 +347,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/insert_without_columns.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -247,6 +362,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/self_assignment.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -256,7 +376,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unused_cte.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -267,6 +392,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/simplifiable_case.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -276,7 +406,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/like_unescaped_param.md",
               "defaultConfiguration": {
-                "level": "none"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -287,16 +422,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_join.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
-              "id": "scalar_subquery_may_return_many",
+              "id": "scalar_subquery_multiple_rows",
               "shortDescription": {
                 "text": "a scalar subquery used as a value that may return more than one row"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/scalar_subquery_may_return_many.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/scalar_subquery_multiple_rows.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -307,6 +452,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/timestamp_timezone_mix.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -317,6 +467,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/integer_division.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -327,6 +482,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/left_join_nullified.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -336,7 +496,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/check_violation.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -346,7 +511,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unstable_order.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -357,6 +527,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_order_by.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -367,16 +542,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_group_by.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
-              "id": "count_not_null",
+              "id": "redundant_count_argument",
               "shortDescription": {
                 "text": "count(expr) over a value that is never NULL, which is count(*)"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/count_not_null.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_count_argument.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -386,7 +571,12 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/non_sargable_predicate.md",
               "defaultConfiguration": {
-                "level": "note"
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "performance"
+                ]
               }
             },
             {
@@ -397,6 +587,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/float_equality.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
@@ -407,16 +602,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fk_type_mismatch.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "performance"
+                ]
               }
             },
             {
-              "id": "missing_lock_timeout",
+              "id": "lock_without_timeout",
               "shortDescription": {
                 "text": "a migration taking a blocking lock on an existing table without SET lock_timeout"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/missing_lock_timeout.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/lock_without_timeout.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
@@ -427,16 +632,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/drop_index_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
-              "id": "blocking_rebuild",
+              "id": "rebuild_blocking",
               "shortDescription": {
                 "text": "REINDEX, VACUUM FULL, CLUSTER or REPACK holding a blocking lock for the whole rebuild"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/blocking_rebuild.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/rebuild_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
@@ -447,16 +662,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/detach_partition_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
-              "id": "validate_in_same_transaction",
+              "id": "validate_constraint_blocking",
               "shortDescription": {
                 "text": "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/validate_in_same_transaction.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/validate_constraint_blocking.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
@@ -467,46 +692,71 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "locking"
+                ]
               }
             },
             {
-              "id": "missing_primary_key",
+              "id": "table_without_primary_key",
               "shortDescription": {
                 "text": "a table without a primary key"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/missing_primary_key.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/table_without_primary_key.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "suspicious"
+                ]
               }
             },
             {
-              "id": "rls_policy_not_enforced",
+              "id": "policy_without_rls",
               "shortDescription": {
                 "text": "row-level security policies on a table that does not enable row-level security"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/rls_policy_not_enforced.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/policy_without_rls.md",
               "defaultConfiguration": {
                 "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security"
+                ]
               }
             },
             {
-              "id": "rls_no_policy",
+              "id": "rls_without_policy",
               "shortDescription": {
                 "text": "row-level security enabled on a table with no policy"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/rls_no_policy.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/rls_without_policy.md",
               "defaultConfiguration": {
-                "level": "note"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security"
+                ]
               }
             },
             {
-              "id": "security_definer_search_path",
+              "id": "security_definer_without_search_path",
               "shortDescription": {
                 "text": "a SECURITY DEFINER routine without SET search_path"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/security_definer_search_path.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/security_definer_without_search_path.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "security"
+                ]
               }
             },
             {
@@ -517,6 +767,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_timestamptz.md",
               "defaultConfiguration": {
                 "level": "none"
+              },
+              "properties": {
+                "tags": [
+                  "pedantic"
+                ]
               }
             },
             {
@@ -527,6 +782,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_identity.md",
               "defaultConfiguration": {
                 "level": "none"
+              },
+              "properties": {
+                "tags": [
+                  "pedantic"
+                ]
               }
             },
             {
@@ -537,6 +797,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_text.md",
               "defaultConfiguration": {
                 "level": "none"
+              },
+              "properties": {
+                "tags": [
+                  "pedantic"
+                ]
               }
             },
             {
@@ -547,6 +812,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_bigint_pk.md",
               "defaultConfiguration": {
                 "level": "none"
+              },
+              "properties": {
+                "tags": [
+                  "pedantic"
+                ]
               }
             },
             {
@@ -556,17 +826,27 @@
               },
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_jsonb.md",
               "defaultConfiguration": {
-                "level": "none"
+                "level": "warning"
+              },
+              "properties": {
+                "tags": [
+                  "performance"
+                ]
               }
             },
             {
-              "id": "fetch_may_return_many",
+              "id": "fetch_one_multiple_rows",
               "shortDescription": {
                 "text": "fetch_one / fetch_optional on a query not proven to return at most one row"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_may_return_many.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_one_multiple_rows.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -577,6 +857,11 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_all_single_row.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
@@ -587,16 +872,26 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/unused_returning.md",
               "defaultConfiguration": {
                 "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "redundant"
+                ]
               }
             },
             {
-              "id": "breaks_deployed_queries",
+              "id": "deployed_query_breakage",
               "shortDescription": {
                 "text": "a migration that breaks a query of the code deployed at --previous-deployment"
               },
-              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/breaks_deployed_queries.md",
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/deployed_query_breakage.md",
               "defaultConfiguration": {
-                "level": "warning"
+                "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
               }
             },
             {
@@ -607,6 +902,56 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/json_stringify_param.md",
               "defaultConfiguration": {
                 "level": "error"
+              },
+              "properties": {
+                "tags": [
+                  "correctness"
+                ]
+              }
+            },
+            {
+              "id": "comma_join",
+              "shortDescription": {
+                "text": "a FROM list joining relations with commas instead of JOIN … ON"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/comma_join.md",
+              "defaultConfiguration": {
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "style"
+                ]
+              }
+            },
+            {
+              "id": "ordinal_reference",
+              "shortDescription": {
+                "text": "ORDER BY, GROUP BY or DISTINCT ON by an output column's position"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/ordinal_reference.md",
+              "defaultConfiguration": {
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "style"
+                ]
+              }
+            },
+            {
+              "id": "boolean_comparison",
+              "shortDescription": {
+                "text": "a comparison of a boolean value with the literal true or false"
+              },
+              "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/boolean_comparison.md",
+              "defaultConfiguration": {
+                "level": "note"
+              },
+              "properties": {
+                "tags": [
+                  "style"
+                ]
               }
             },
             {
@@ -617,6 +962,9 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/invalid_allow.md",
               "defaultConfiguration": {
                 "level": "error"
+              },
+              "properties": {
+                "tags": []
               }
             },
             {
@@ -627,6 +975,9 @@
               "helpUri": "https://github.com/cubos/typedpg/blob/main/docs/lint/internal_error.md",
               "defaultConfiguration": {
                 "level": "warning"
+              },
+              "properties": {
+                "tags": []
               }
             },
             {
@@ -672,7 +1023,7 @@
           ]
         },
         {
-          "ruleId": "constraint_validating",
+          "ruleId": "add_constraint_scan",
           "level": "warning",
           "message": {
             "text": "adding a constraint validates every row of public.posts under a lock\nadd it NOT VALID, then VALIDATE CONSTRAINT in a later migration"
@@ -788,7 +1139,7 @@
         },
         {
           "ruleId": "not_in_nullable",
-          "level": "warning",
+          "level": "error",
           "message": {
             "text": "NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL\nuse NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL"
           },
@@ -811,7 +1162,7 @@
         },
         {
           "ruleId": "unbounded_write",
-          "level": "error",
+          "level": "warning",
           "message": {
             "text": "UPDATE without WHERE changes every row of users\nadd a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)"
           },
@@ -857,7 +1208,7 @@
         },
         {
           "ruleId": "redundant_binding",
-          "level": "warning",
+          "level": "note",
           "message": {
             "text": "`id = id` binds `$id` to the variable it captures without a binding\nremove the binding: a parameter without one captures the variable of its name (`cargo typedpg lint --fix` removes it)"
           },

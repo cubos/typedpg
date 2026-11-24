@@ -399,7 +399,7 @@ fn subquery_non_aggregate_still_nullable() {
 }
 
 #[test]
-fn subquery_case_wrapping_count_not_null() {
+fn subquery_case_wrapping_redundant_count_argument() {
     let db = setup();
     // CASE WHEN ... THEN COUNT(*) ELSE 0 END — aggregate inside CASE with ELSE.
     let sql = "SELECT (SELECT CASE WHEN true THEN COUNT(*) ELSE 0 END FROM posts) as cnt";

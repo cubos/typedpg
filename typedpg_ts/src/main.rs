@@ -55,7 +55,7 @@ enum Command {
         /// The git ref of the code and migrations deployed now (e.g.
         /// `origin/main`): migrations identical to it skip the statement
         /// rules (the schema rules still report on the statements that
-        /// created their objects), and `breaks_deployed_queries` checks the
+        /// created their objects), and `deployed_query_breakage` checks the
         /// queries of its code against the new migrations.
         #[arg(long, alias = "ignore-migrations-from")]
         previous_deployment: Option<String>,
@@ -179,7 +179,7 @@ fn relative(path: &Path, root: &Path) -> String {
 /// have their statement rules skipped; the schema rules still report on the
 /// statements that created the schema's objects. The queries of the code at
 /// that ref are checked against the new migrations
-/// (`breaks_deployed_queries`).
+/// (`deployed_query_breakage`).
 ///
 /// With `fix`, the findings that have edits are applied to their files, and
 /// the report is built again from the fixed text so its positions match.
@@ -362,7 +362,7 @@ fn build_lint(
     report.migrations_unchanged = migrations_unchanged;
     report.sources.extend(report_sources);
     if let Some(reference) = previous_deployment
-        && options.level(Rule::BreaksDeployedQueries).is_some()
+        && options.level(Rule::DeployedQueryBreakage).is_some()
     {
         match deployed_project(reference, config_path) {
             Ok(Some((_snapshot, deployed))) => {
@@ -425,7 +425,7 @@ fn build_lint(
                     else {
                         continue;
                     };
-                    let findings = typedpg_lint::breaks_deployed_queries(
+                    let findings = typedpg_lint::deployed_query_breakage(
                         &typedpg_lint::Deployment {
                             reference,
                             catalog: old_catalog,
@@ -667,7 +667,7 @@ fn lint_query(
 
 /// The project as git ref `reference` has it, read from a checkout of the
 /// ref exactly as the project itself is read: the previous deployment, whose
-/// queries `breaks_deployed_queries` checks. The checkout lives as long as
+/// queries `deployed_query_breakage` checks. The checkout lives as long as
 /// the snapshot. `None` when the ref has no typedpg configuration there.
 fn deployed_project(
     reference: &str,

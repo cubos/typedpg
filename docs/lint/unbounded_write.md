@@ -2,9 +2,9 @@
 
 An `UPDATE` or `DELETE` without a `WHERE` clause.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| error | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -17,14 +17,14 @@ WITH gone AS (DELETE FROM posts RETURNING id) SELECT count(*) AS n FROM gone;
 ```
 
 ```
-error[unbounded_write]: UPDATE without WHERE changes every row of users
+warning[suspicious/unbounded_write]: UPDATE without WHERE changes every row of users
    ╭─[queries.sql:2:1]
  2 │ UPDATE users SET deleted_at = now();
    · ────────────
    ╰────
   help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
 
-error[unbounded_write]: DELETE without WHERE removes every row of posts
+warning[suspicious/unbounded_write]: DELETE without WHERE removes every row of posts
    ╭─[queries.sql:4:15]
  4 │ WITH gone AS (DELETE FROM posts RETURNING id) SELECT count(*) AS n FROM gone;
    ·               ─────────────────

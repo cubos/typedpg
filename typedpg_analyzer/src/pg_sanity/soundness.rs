@@ -748,7 +748,7 @@ impl Soundness {
 /// nullable (a NULL array element or record field included), or a value
 /// outside its refinement — worded as the nullability oracle reports it, a
 /// broken refinement ending in `(refinement: <what>)`. For the
-/// `breaks_deployed_queries` oracle (`typedpg_lint`), which checks what the
+/// `deployed_query_breakage` oracle (`typedpg_lint`), which checks what the
 /// deployed code's analysis promised against what the new schema returns.
 pub fn value_violation(col: &crate::resolve::AnalyzedColumn, raw: Option<&[u8]>) -> Option<String> {
     match raw {

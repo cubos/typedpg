@@ -3,9 +3,9 @@
 A typedpg bug: a rule's `--fix` would have changed what the query means, so
 the fix was withheld.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning, always | queries, call sites | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| — | warning, always | queries, call sites | — |
 
 ## What it means
 

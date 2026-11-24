@@ -1,10 +1,10 @@
-# `scalar_subquery_may_return_many`
+# `scalar_subquery_multiple_rows`
 
 A subquery used as a single value that may return more than one row.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -22,7 +22,7 @@ UPDATE users SET name = (SELECT title FROM posts WHERE user_id = $id) WHERE id =
 ```
 
 ```
-warning[scalar_subquery_may_return_many]: this subquery is used as a value but may return more than one row: PostgreSQL then fails with "more than one row returned by a subquery used as an expression"
+error[correctness/scalar_subquery_multiple_rows]: this subquery is used as a value but may return more than one row: PostgreSQL then fails with "more than one row returned by a subquery used as an expression"
    ╭─[queries.sql:2:14]
  2 │ SELECT u.id, (SELECT p.title FROM posts p WHERE p.user_id = u.id) AS title FROM users u;
    ·              ────────────────────────────────────────────────────
@@ -71,22 +71,22 @@ A `VALUES` list of two or more rows without `LIMIT` is always reported:
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-scalar_subquery_may_return_many = "error"   # error | warning | info | off
+scalar_subquery_multiple_rows = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "scalarSubqueryMayReturnMany": "error" } }
+{ "lint": { "scalarSubqueryMultipleRows": "error" } }
 ```
 
 Allow one query with
-`-- typedpg-lint: allow(scalar_subquery_may_return_many)` in its text. A
+`-- typedpg-lint: allow(scalar_subquery_multiple_rows)` in its text. A
 unique constraint stating what you know about the data is better: it clears
 the finding and enforces it. See
 [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`fetch_may_return_many`](fetch_may_return_many.md): `fetch_one` /
+- [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md): `fetch_one` /
   `fetchOne` on a query that may return many rows.
 - [`unstable_order`](unstable_order.md): `ORDER BY … LIMIT 1` whose keys can
   tie.

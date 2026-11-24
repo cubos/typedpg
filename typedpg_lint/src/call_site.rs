@@ -1,4 +1,4 @@
-//! The call-site rules: `fetch_may_return_many`, `fetch_all_single_row`,
+//! The call-site rules: `fetch_one_multiple_rows`, `fetch_all_single_row`,
 //! `unused_returning` and `json_stringify_param` (in `json_stringify`).
 //!
 //! They run over the query's [`QueryView`](typedpg_analyzer::QueryView) like
@@ -26,7 +26,7 @@ pub(crate) struct RawCallFinding {
 /// The findings of `rule` at the call sites `calls`, as written.
 pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCallFinding> {
     match rule {
-        Rule::FetchMayReturnMany => calls
+        Rule::FetchOneMultipleRows => calls
             .iter()
             .enumerate()
             .filter(|(_, call)| {
@@ -38,7 +38,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCall
             .map(|(index, call)| RawCallFinding {
                 call: Some(index),
                 value: None,
-                finding: fetch_may_return_many(call, ctx),
+                finding: fetch_one_multiple_rows(call, ctx),
             })
             .collect(),
         Rule::FetchAllSingleRow => calls
@@ -64,7 +64,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>, calls: &[Call]) -> Vec<RawCall
 
 /// The finding for `fetch_one` / `fetch_optional` on a statement the proof
 /// does not bound to one row.
-fn fetch_may_return_many(call: &Call, ctx: &Ctx<'_>) -> RawFinding {
+fn fetch_one_multiple_rows(call: &Call, ctx: &Ctx<'_>) -> RawFinding {
     RawFinding {
         span: statement_start(ctx),
         message: format!(
@@ -435,7 +435,7 @@ mod tests {
             rust(CallMethod::FetchOne, "fetch_one"),
             rust(CallMethod::FetchOptional, "fetch_optional"),
         ] {
-            assert!(only(lint(&db, sql, &[call]), Rule::FetchMayReturnMany).is_empty());
+            assert!(only(lint(&db, sql, &[call]), Rule::FetchOneMultipleRows).is_empty());
         }
     }
 
@@ -445,13 +445,13 @@ mod tests {
         let sql = "SELECT id, name FROM users WHERE org_id = $1";
         let findings = only(
             lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-            Rule::FetchMayReturnMany,
+            Rule::FetchOneMultipleRows,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
         let placed = &findings[0];
         assert_eq!(placed.call, Some(0));
         let finding = &placed.finding;
-        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.severity, Severity::Error);
         assert_eq!(
             finding.message,
             "`.fetch_one()` fails with TooManyRows if this query returns a second row, and \
@@ -476,7 +476,7 @@ mod tests {
                     ts(CallMethod::FetchOptional, "fetchOptional"),
                 ],
             ),
-            Rule::FetchMayReturnMany,
+            Rule::FetchOneMultipleRows,
         );
         assert_eq!(findings.len(), 2, "{findings:?}");
         assert_eq!(findings[0].call, Some(0));
@@ -502,7 +502,7 @@ mod tests {
                 sql,
                 &[rust(CallMethod::FetchOptional, "fetch_optional_as")],
             ),
-            Rule::FetchMayReturnMany,
+            Rule::FetchOneMultipleRows,
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
@@ -526,7 +526,7 @@ mod tests {
             assert!(
                 only(
                     lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                    Rule::FetchMayReturnMany
+                    Rule::FetchOneMultipleRows
                 )
                 .is_empty(),
                 "{sql}"
@@ -555,7 +555,7 @@ mod tests {
                     sql,
                     &[rust(CallMethod::FetchOptional, "fetch_optional")]
                 ),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -590,7 +590,7 @@ mod tests {
                     sql,
                     &[rust(CallMethod::FetchOptional, "fetch_optional")]
                 ),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -615,7 +615,7 @@ mod tests {
                     sql,
                     &[rust(CallMethod::FetchOptional, "fetch_optional")]
                 ),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -631,7 +631,7 @@ mod tests {
                     sql_lateral,
                     &[rust(CallMethod::FetchOptional, "fetch_optional")]
                 ),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -654,7 +654,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -668,7 +668,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .len(),
             1
@@ -702,7 +702,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -711,7 +711,7 @@ mod tests {
         assert_eq!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .len(),
             1
@@ -726,7 +726,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .len(),
             1
@@ -750,7 +750,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .len(),
             1
@@ -779,7 +779,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -806,7 +806,7 @@ mod tests {
                     sql,
                     &[rust(CallMethod::FetchOptional, "fetch_optional")]
                 ),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -888,7 +888,7 @@ mod tests {
             assert!(
                 only(
                     lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                    Rule::FetchMayReturnMany
+                    Rule::FetchOneMultipleRows
                 )
                 .is_empty(),
                 "{sql}"
@@ -954,7 +954,7 @@ mod tests {
             assert_eq!(
                 only(
                     lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                    Rule::FetchMayReturnMany
+                    Rule::FetchOneMultipleRows
                 )
                 .len(),
                 1,
@@ -990,7 +990,7 @@ mod tests {
                 "{findings:?}"
             );
             assert!(
-                only(findings.clone(), Rule::FetchMayReturnMany).is_empty(),
+                only(findings.clone(), Rule::FetchOneMultipleRows).is_empty(),
                 "{findings:?}"
             );
         }
@@ -1291,7 +1291,7 @@ mod tests {
         ] {
             let findings = lint(&db, sql, &[]);
             for rule in [
-                Rule::FetchMayReturnMany,
+                Rule::FetchOneMultipleRows,
                 Rule::FetchAllSingleRow,
                 Rule::UnusedReturning,
             ] {
@@ -1303,12 +1303,12 @@ mod tests {
     #[test]
     fn an_allow_comment_suppresses_the_call_site_rules() {
         let db = catalog();
-        let sql = "-- typedpg-lint: allow(fetch_may_return_many)\n\
+        let sql = "-- typedpg-lint: allow(fetch_one_multiple_rows)\n\
                    SELECT id, name FROM users WHERE org_id = $1";
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .len(),
             1
@@ -1391,7 +1391,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -1405,7 +1405,7 @@ mod tests {
             assert_eq!(
                 only(
                     lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                    Rule::FetchMayReturnMany
+                    Rule::FetchOneMultipleRows
                 )
                 .len(),
                 1,
@@ -1437,7 +1437,7 @@ mod tests {
         assert!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .is_empty()
         );
@@ -1447,14 +1447,14 @@ mod tests {
         assert_eq!(
             only(
                 lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
-                Rule::FetchMayReturnMany
+                Rule::FetchOneMultipleRows
             )
             .len(),
             1
         );
     }
 
-    /// How many `fetch_may_return_many` findings a `.fetch_optional()` of
+    /// How many `fetch_one_multiple_rows` findings a `.fetch_optional()` of
     /// `sql` gets.
     fn optional_findings(db: &PgCatalog, sql: &str) -> usize {
         only(
@@ -1463,7 +1463,7 @@ mod tests {
                 sql,
                 &[rust(CallMethod::FetchOptional, "fetch_optional")],
             ),
-            Rule::FetchMayReturnMany,
+            Rule::FetchOneMultipleRows,
         )
         .len()
     }

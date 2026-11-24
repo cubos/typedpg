@@ -2,9 +2,9 @@
 
 An index another index on the same table already covers.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | the final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| performance | warning | the final schema | — |
 
 ## Example
 
@@ -21,21 +21,23 @@ CREATE INDEX users_id_idx ON users (id);
 ```
 
 ```
-info[redundant_index]: index users_email_idx is redundant with users_email_name_idx
+warning[performance/redundant_index]: index users_email_idx is redundant with users_email_name_idx
    ╭─[migrations/001_init.sql:6:1]
  6 │ CREATE INDEX users_email_idx ON users (email);
    · ─────────────────────────────────────────────
    ╰────
+  help: drop the index; users_email_name_idx serves the same lookups
 
-info[redundant_index]: index users_id_idx is redundant with users_pkey
+warning[performance/redundant_index]: index users_id_idx is redundant with users_pkey
    ╭─[migrations/001_init.sql:8:1]
  8 │ CREATE INDEX users_id_idx ON users (id);
    · ───────────────────────────────────────
    ╰────
+  help: drop the index; users_pkey serves the same lookups
 ```
 
-When the migration is unchanged from `--previous-deployment`, the finding
-gets a help line:
+When the migration is unchanged from `--previous-deployment` or matched by
+`ignore`, the help puts the drop in a new migration instead:
 `help: DROP INDEX CONCURRENTLY users_email_idx, in a new migration whose first line is -- no-transaction`.
 
 ## Why

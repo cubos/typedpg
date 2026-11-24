@@ -2,9 +2,9 @@
 
 A plain `DISTINCT` on rows that are already distinct.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes `DISTINCT` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes `DISTINCT` |
 
 ## Example
 
@@ -18,7 +18,7 @@ SELECT DISTINCT id, 100 / views AS ratio FROM posts;
 ```
 
 ```
-info[redundant_distinct]: DISTINCT has no effect: the rows are already distinct
+info[redundant/redundant_distinct]: DISTINCT has no effect: the rows are already distinct
    ╭─[queries.sql:2:8]
  2 │ SELECT DISTINCT id, name FROM users;
    ·        ─────────

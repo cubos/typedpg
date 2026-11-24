@@ -3,9 +3,9 @@
 A `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks
 arbitrary rows.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -19,14 +19,14 @@ SELECT DISTINCT ON (user_id) user_id, title FROM posts;
 ```
 
 ```
-warning[limit_without_order]: LIMIT without ORDER BY returns arbitrary rows
+error[correctness/limit_without_order]: LIMIT without ORDER BY returns arbitrary rows
    ╭─[queries.sql:2:54]
  2 │ SELECT id, title FROM posts WHERE user_id = $user_id LIMIT 10;
    ·                                                      ────────
    ╰────
   help: add an ORDER BY that makes the choice deterministic, or allow it with -- typedpg-lint: allow(limit_without_order)
 
-warning[limit_without_order]: DISTINCT ON without ORDER BY keeps an arbitrary row of each group
+error[correctness/limit_without_order]: DISTINCT ON without ORDER BY keeps an arbitrary row of each group
    ╭─[queries.sql:6:8]
  6 │ SELECT DISTINCT ON (user_id) user_id, title FROM posts;
    ·        ─────────────────────
@@ -100,5 +100,5 @@ text. See [Configuring rules](README.md#configuring-rules).
   keys can tie.
 - [`redundant_limit`](redundant_limit.md): a `LIMIT` on a query that returns
   at most one row.
-- [`fetch_may_return_many`](fetch_may_return_many.md): `fetch_one` on a query
+- [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md): `fetch_one` on a query
   not proven to return one row.

@@ -1,4 +1,4 @@
-//! The `breaks_deployed_queries` oracle's corpus run: generated migration
+//! The `deployed_query_breakage` oracle's corpus run: generated migration
 //! changes × deployed query shapes (and the docs page's example), each
 //! linted with the rule and checked by running the deployed queries on a
 //! real PostgreSQL before and after the change (see
@@ -21,7 +21,7 @@ use typedpg_analyzer::PgCatalog;
 use typedpg_lint::oracle::{DeployedCase, DeployedReport, run_deployed};
 use typedpg_lint::{
     Decoding, DeployedKind, DeployedQuery, Deployment, LintOptions, MigrationFile, MigrationLint,
-    NewSchema, breaks_deployed_queries,
+    NewSchema, deployed_query_breakage,
 };
 
 /// One case: the deployed schema's migrations, the new ones, the deployed
@@ -589,12 +589,12 @@ fn cases() -> Vec<Case> {
     out
 }
 
-/// The docs page's example (`docs/lint/breaks_deployed_queries.md`): its
+/// The docs page's example (`docs/lint/deployed_query_breakage.md`): its
 /// first block's `migrations/0001`, queries and `migrations/0002`.
 fn docs_case() -> Case {
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../docs/lint/breaks_deployed_queries.md"
+        "/../docs/lint/deployed_query_breakage.md"
     ))
     .unwrap();
     let block = text
@@ -670,7 +670,7 @@ fn run_case(case: &Case) -> Result<DeployedReport, String> {
     }
     let types = std::collections::HashMap::new();
     let decoding = Decoding::TypeScript { types: &types };
-    let findings = breaks_deployed_queries(
+    let findings = deployed_query_breakage(
         &Deployment {
             reference: "origin/main",
             catalog: &old_catalog,

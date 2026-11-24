@@ -32,10 +32,18 @@
 //!
 //! [package.metadata.typedpg.lint]
 //! fail_on = "warning"            # the severity `typedpg lint` fails on (default "error")
+//! correctness = "error"          # one category's level: sets every rule in it
+//! style = "off"
 //! null_comparison = "off"        # one rule's level: "error", "warning", "info" or "off"
 //! redundant_index = "info"
 //! ignore = ["tests/**"]          # paths whose statement findings are not reported
 //! ```
+//!
+//! Every rule belongs to a category, and its default level is the
+//! category's: `correctness` and `security` are errors, `suspicious`,
+//! `locking` and `performance` warnings, `redundant` and `style` infos, and
+//! `pedantic` is off. A category key sets every rule of the category, and a
+//! rule's own key wins over its category's.
 //!
 //! The query rules are `null_comparison`, `unbounded_write`,
 //! `not_in_nullable`, `redundant_null_check`, `limit_without_order`,
@@ -44,26 +52,28 @@
 //! `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`,
 //! `insert_without_columns`, `self_assignment`, `unused_cte`,
 //! `simplifiable_case`, `like_unescaped_param`, `redundant_join`,
-//! `scalar_subquery_may_return_many`, `timestamp_timezone_mix`,
+//! `scalar_subquery_multiple_rows`, `timestamp_timezone_mix`,
 //! `integer_division`, `left_join_nullified`, `check_violation`,
 //! `unstable_order`, `redundant_order_by`, `redundant_group_by`,
-//! `count_not_null`, `non_sargable_predicate`, `float_equality`,
-//! `fetch_may_return_many`, `fetch_all_single_row` and `unused_returning`;
-//! the migration rules `create_index_blocking`, `constraint_validating`,
-//! `set_not_null_scan`, `table_rewrite`, `missing_lock_timeout`,
-//! `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`,
-//! `validate_in_same_transaction` and `attach_partition_scan`; and the
+//! `redundant_count_argument`, `non_sargable_predicate`, `float_equality`,
+//! `fetch_one_multiple_rows`, `fetch_all_single_row`, `unused_returning`,
+//! `comma_join`, `ordinal_reference` and `boolean_comparison`; the migration
+//! rules `create_index_blocking`, `add_constraint_scan`,
+//! `set_not_null_scan`, `alter_table_rewrite`, `lock_without_timeout`,
+//! `drop_index_blocking`, `rebuild_blocking`, `detach_partition_blocking`,
+//! `validate_constraint_blocking` and `attach_partition_scan`; and the
 //! schema rules `fk_without_index`, `redundant_index`, `fk_type_mismatch`,
-//! `missing_primary_key`, `rls_policy_not_enforced`, `rls_no_policy`,
-//! `security_definer_search_path`, `prefer_timestamptz`, `prefer_identity`,
+//! `table_without_primary_key`, `policy_without_rls`, `rls_without_policy`,
+//! `security_definer_without_search_path`, `prefer_timestamptz`, `prefer_identity`,
 //! `prefer_text`, `prefer_bigint_pk` and `prefer_jsonb`, evaluated over the
-//! migrations' final schema. `breaks_deployed_queries` runs with
+//! migrations' final schema. `deployed_query_breakage` runs with
 //! `--previous-deployment <ref>` only: it analyzes the queries of the code
 //! at that ref against the new schema, and reports on a new migration what
 //! breaks for that code, which keeps running while the migration applies.
-//! `like_unescaped_param` and the `prefer_*` rules are off by default; set
-//! them to a level to enable them. [`LINT_RULES`] is the one list of their
-//! keys. The call-site rules (`fetch_may_return_many`,
+//! The `prefer_*` rules are the `pedantic` category: off until given a
+//! level. [`LINT_RULES`] is the one list of their keys and
+//! [`LINT_CATEGORIES`] of the category keys. The call-site rules
+//! (`fetch_one_multiple_rows`,
 //! `fetch_all_single_row` and `unused_returning`) run in both CLIs: they
 //! check how a query is called (`fetch_one`, `fetchOne`, `execute`, …)
 //! against what the schema proves about its rows. The `sql!` rules
@@ -199,9 +209,9 @@ pub const LINT_RULES: &[&str] = &[
     "unbounded_write",
     "not_in_nullable",
     "create_index_blocking",
-    "constraint_validating",
+    "add_constraint_scan",
     "set_not_null_scan",
-    "table_rewrite",
+    "alter_table_rewrite",
     "fk_without_index",
     "redundant_index",
     "redundant_null_check",
@@ -221,7 +231,7 @@ pub const LINT_RULES: &[&str] = &[
     "simplifiable_case",
     "like_unescaped_param",
     "redundant_join",
-    "scalar_subquery_may_return_many",
+    "scalar_subquery_multiple_rows",
     "timestamp_timezone_mix",
     "integer_division",
     "left_join_nullified",
@@ -229,29 +239,47 @@ pub const LINT_RULES: &[&str] = &[
     "unstable_order",
     "redundant_order_by",
     "redundant_group_by",
-    "count_not_null",
+    "redundant_count_argument",
     "non_sargable_predicate",
     "float_equality",
     "fk_type_mismatch",
-    "missing_lock_timeout",
+    "lock_without_timeout",
     "drop_index_blocking",
-    "blocking_rebuild",
+    "rebuild_blocking",
     "detach_partition_blocking",
-    "validate_in_same_transaction",
+    "validate_constraint_blocking",
     "attach_partition_scan",
-    "missing_primary_key",
-    "rls_policy_not_enforced",
-    "rls_no_policy",
-    "security_definer_search_path",
+    "table_without_primary_key",
+    "policy_without_rls",
+    "rls_without_policy",
+    "security_definer_without_search_path",
     "prefer_timestamptz",
     "prefer_identity",
     "prefer_text",
     "prefer_bigint_pk",
     "prefer_jsonb",
-    "fetch_may_return_many",
+    "fetch_one_multiple_rows",
     "fetch_all_single_row",
     "unused_returning",
-    "breaks_deployed_queries",
+    "deployed_query_breakage",
+    "comma_join",
+    "ordinal_reference",
+    "boolean_comparison",
+];
+
+/// The lint categories, one per [`LINT_RULES`] rule but the two meta rules:
+/// a `[package.metadata.typedpg.lint]` key (and the TypeScript CLI's `lint`
+/// object's) naming every rule of the category, whose level sets their
+/// default. A rule's own key wins over its category's.
+pub const LINT_CATEGORIES: &[&str] = &[
+    "correctness",
+    "security",
+    "suspicious",
+    "locking",
+    "performance",
+    "redundant",
+    "style",
+    "pedantic",
 ];
 
 /// The lint rules over the Rust source of `sql!` invocations: the binding
@@ -363,13 +391,15 @@ impl LintLevel {
 
 /// The `lint` section: the severity `typedpg lint` fails on, each rule's
 /// level, and the paths whose statement findings are not reported. Rules
-/// without an override use their default (in `typedpg_lint`).
+/// without an override use their default (in `typedpg_lint`); a category
+/// key in `levels` sets every rule of the category.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintConfig {
     /// A finding at or above this severity fails the run.
     pub fail_on: LintSeverity,
-    /// The rules whose level is overridden, keyed by [`LINT_RULES`] (or
-    /// [`RUST_LINT_RULES`]).
+    /// The keys whose level is overridden: a rule's ([`LINT_RULES`], or
+    /// [`RUST_LINT_RULES`]) or a category's ([`LINT_CATEGORIES`], which
+    /// `typedpg_lint::LintOptions` expands to its rules).
     pub levels: BTreeMap<String, LintLevel>,
     /// Glob patterns, relative to the project root with forward slashes. A
     /// matching query file's findings are not reported; a matching migration
@@ -833,13 +863,14 @@ impl Config {
             });
         }
         let lint_section = format!("{TOP}.lint");
-        if let Some(rule) =
-            self.lint.levels.keys().find(|r| {
-                !LINT_RULES.contains(&r.as_str()) && !RUST_LINT_RULES.contains(&r.as_str())
-            })
-        {
+        if let Some(rule) = self.lint.levels.keys().find(|r| {
+            !LINT_CATEGORIES.contains(&r.as_str())
+                && !LINT_RULES.contains(&r.as_str())
+                && !RUST_LINT_RULES.contains(&r.as_str())
+        }) {
             let keys = std::iter::once("fail_on")
                 .chain(std::iter::once("ignore"))
+                .chain(LINT_CATEGORIES.iter().copied())
                 .chain(LINT_RULES.iter().copied())
                 .chain(RUST_LINT_RULES.iter().copied())
                 .map(|r| format!("`{r}`"))
@@ -1724,6 +1755,14 @@ event_data = "crate::EventData"
         assert_eq!(config.ignore, ["tests/**", "**/fixtures/*.sql"]);
         assert_eq!(LintLevel::Off.severity(), None);
         assert_eq!(LintLevel::Warning.severity(), Some(LintSeverity::Warning));
+        // A category is a key of the same table.
+        let config = lint(
+            "[package.metadata.typedpg.lint]\nstyle = \"off\"\ncorrectness = \"warning\"\n\
+             boolean_comparison = \"error\"\n",
+        );
+        assert_eq!(config.levels["style"], LintLevel::Off);
+        assert_eq!(config.levels["correctness"], LintLevel::Warning);
+        assert_eq!(config.levels["boolean_comparison"], LintLevel::Error);
     }
 
     #[test]
@@ -1758,27 +1797,30 @@ event_data = "crate::EventData"
         assert_eq!(
             err.to_string(),
             "unknown key `null_comparisions` in [package.metadata.typedpg.lint]: expected one \
-             of `fail_on`, `ignore`, `null_comparison`, `unbounded_write`, `not_in_nullable`, \
-             `create_index_blocking`, `constraint_validating`, `set_not_null_scan`, \
-             `table_rewrite`, `fk_without_index`, `redundant_index`, `redundant_null_check`, \
+             of `fail_on`, `ignore`, `correctness`, `security`, `suspicious`, `locking`, \
+             `performance`, `redundant`, `style`, `pedantic`, `null_comparison`, \
+             `unbounded_write`, `not_in_nullable`, `create_index_blocking`, `add_constraint_scan`, \
+             `set_not_null_scan`, \
+             `alter_table_rewrite`, `fk_without_index`, `redundant_index`, `redundant_null_check`, \
              `limit_without_order`, `redundant_limit`, `redundant_distinct`, \
              `constant_condition`, `unreachable_case_branch`, `case_without_else`, \
              `redundant_cast`, \
              `redundant_alias`, `outer_reference_in_subquery`, `cartesian_join`, \
              `insert_without_columns`, `self_assignment`, `unused_cte`, `simplifiable_case`, \
-             `like_unescaped_param`, `redundant_join`, `scalar_subquery_may_return_many`, \
+             `like_unescaped_param`, `redundant_join`, `scalar_subquery_multiple_rows`, \
              `timestamp_timezone_mix`, `integer_division`, `left_join_nullified`, \
              `check_violation`, `unstable_order`, `redundant_order_by`, \
-             `redundant_group_by`, `count_not_null`, `non_sargable_predicate`, \
+             `redundant_group_by`, `redundant_count_argument`, `non_sargable_predicate`, \
              `float_equality`, `fk_type_mismatch`, \
-             `missing_lock_timeout`, \
-             `drop_index_blocking`, `blocking_rebuild`, `detach_partition_blocking`, \
-             `validate_in_same_transaction`, `attach_partition_scan`, `missing_primary_key`, \
-             `rls_policy_not_enforced`, `rls_no_policy`, `security_definer_search_path`, \
+             `lock_without_timeout`, \
+             `drop_index_blocking`, `rebuild_blocking`, `detach_partition_blocking`, \
+             `validate_constraint_blocking`, `attach_partition_scan`, `table_without_primary_key`, \
+             `policy_without_rls`, `rls_without_policy`, `security_definer_without_search_path`, \
              `prefer_timestamptz`, `prefer_identity`, `prefer_text`, `prefer_bigint_pk`, \
              `prefer_jsonb`, \
-             `fetch_may_return_many`, `fetch_all_single_row`, `unused_returning`, \
-             `breaks_deployed_queries`, `redundant_binding`, `renaming_binding`"
+             `fetch_one_multiple_rows`, `fetch_all_single_row`, `unused_returning`, \
+             `deployed_query_breakage`, `comma_join`, `ordinal_reference`, `boolean_comparison`, \
+             `redundant_binding`, `renaming_binding`"
         );
         // A TypeScript-only rule is not a key here: the `sql!` macro rejects
         // text for a jsonb parameter at compile time.

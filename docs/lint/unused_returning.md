@@ -3,9 +3,9 @@
 `execute()` on an `INSERT`, `UPDATE`, `DELETE` or `MERGE` whose `RETURNING`
 rows it discards.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | call sites | removes the `RETURNING` clause |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | call sites | removes the `RETURNING` clause |
 
 ## Example
 
@@ -27,7 +27,7 @@ export async function rename(pool: Pool, id: number, name: string) {
 ```
 
 ```
-info[unused_returning]: `.execute()` discards the RETURNING rows
+info[redundant/unused_returning]: `.execute()` discards the RETURNING rows
    ╭─[src/users.ts:4:80]
  4 │   await sql("INSERT INTO users (id, email) VALUES ($id, $email) RETURNING id").execute(pool, { id, email });
    ·                                                                                ───────
@@ -95,7 +95,7 @@ See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`fetch_may_return_many`](fetch_may_return_many.md): `fetch_one` on a
+- [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md): `fetch_one` on a
   query that may return many rows.
 - [`fetch_all_single_row`](fetch_all_single_row.md): `fetch_all` on a
   single-row query.

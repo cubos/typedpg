@@ -37,7 +37,7 @@ mod catalog_extras;
 mod catalog_state;
 mod soundness;
 
-/// What the `breaks_deployed_queries` oracle (`typedpg_lint`) reuses of
+/// What the `deployed_query_breakage` oracle (`typedpg_lint`) reuses of
 /// the mirror: scratch databases, the seeder, text-format parameters, raw
 /// results and the nullability oracle's value checks.
 #[doc(hidden)]

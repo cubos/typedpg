@@ -281,7 +281,7 @@ fn resolve_commit(top: &Path, reference: &str) -> Result<String, String> {
 
 /// The tree of a git ref, checked out in a temporary directory that is
 /// removed when the snapshot is dropped: the code `--previous-deployment`
-/// names, whose queries `breaks_deployed_queries` checks.
+/// names, whose queries `deployed_query_breakage` checks.
 pub struct Snapshot {
     dir: tempfile::TempDir,
     /// The root of the work tree the snapshot's paths map from.

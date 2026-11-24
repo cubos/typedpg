@@ -3,9 +3,9 @@
 A `serial`, `bigserial` or `smallserial` column instead of an identity
 column.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| off | the final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| pedantic | off | the final schema | — |
 
 ## Example
 
@@ -18,7 +18,7 @@ CREATE TABLE events (
 ```
 
 ```
-info[prefer_identity]: public.events.id is a serial column
+info[pedantic/prefer_identity]: public.events.id is a serial column
    ╭─[migrations/001_init.sql:1:1]
  1 │ CREATE TABLE events (
    · ─────────────────────
@@ -81,7 +81,7 @@ See [Configuring rules](README.md#configuring-rules).
 
 - [`prefer_bigint_pk`](prefer_bigint_pk.md): a `serial` key is also an
   `integer` key.
-- [`table_rewrite`](table_rewrite.md): adding a `serial` or identity column
+- [`alter_table_rewrite`](alter_table_rewrite.md): adding a `serial` or identity column
   to an existing table rewrites it.
 - [`prefer_timestamptz`](prefer_timestamptz.md),
   [`prefer_text`](prefer_text.md), [`prefer_jsonb`](prefer_jsonb.md): the

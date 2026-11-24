@@ -2,9 +2,9 @@
 
 A `WITH` query that nothing in the statement references.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | removes the `WITH` item |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the `WITH` item |
 
 ## Example
 
@@ -20,7 +20,7 @@ SELECT id FROM users;
 ```
 
 ```
-warning[unused_cte]: WITH query recent is never referenced
+info[redundant/unused_cte]: WITH query recent is never referenced
    ╭─[queries.sql:2:6]
  2 │ WITH recent AS (SELECT id FROM posts WHERE created_at > now() - interval '1 day')
    ·      ──────

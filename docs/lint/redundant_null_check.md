@@ -3,9 +3,9 @@
 An `IS [NOT] NULL` test or `COALESCE` on a value that is never `NULL`, and
 an `IS [NOT] NULL` test the rest of its condition already settles.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | `COALESCE` only: drops the unused arguments |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | `COALESCE` only: drops the unused arguments |
 
 ## Example
 
@@ -21,14 +21,14 @@ SELECT id FROM posts WHERE user_id = $user_id AND user_id IS NULL;
 ```
 
 ```
-warning[redundant_null_check]: `title` IS NOT NULL is always true: it is never NULL
+info[redundant/redundant_null_check]: `title` IS NOT NULL is always true: it is never NULL
    ╭─[queries.sql:2:28]
  2 │ SELECT id FROM posts WHERE title IS NOT NULL;
    ·                            ─────────────────
    ╰────
   help: remove the check, or find why the value was expected to be NULL (an outer join?)
 
-warning[redundant_null_check]: `user_id` IS NULL makes the condition never true: the rest of it is never true when `user_id` is NULL
+info[redundant/redundant_null_check]: `user_id` IS NULL makes the condition never true: the rest of it is never true when `user_id` is NULL
     ╭─[queries.sql:10:51]
  10 │ SELECT id FROM posts WHERE user_id = $user_id AND user_id IS NULL;
     ·                                                   ───────────────
@@ -103,7 +103,7 @@ text. See [Configuring rules](README.md#configuring-rules).
 - [`null_comparison`](null_comparison.md): comparing with a `NULL` literal.
 - [`left_join_nullified`](left_join_nullified.md): a `WHERE` that rejects an
   outer join's null-extended rows.
-- [`count_not_null`](count_not_null.md): `count(expr)` over a never-`NULL`
+- [`redundant_count_argument`](redundant_count_argument.md): `count(expr)` over a never-`NULL`
   value.
 - [`simplifiable_case`](simplifiable_case.md): a `CASE` that is a
   `COALESCE`.

@@ -3,9 +3,9 @@
 `JSON.stringify(…)` passed as the value of a `json` / `jsonb` parameter.
 TypeScript only.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| error | call sites | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | call sites | — |
 
 ## Example
 
@@ -22,7 +22,7 @@ await sql("INSERT INTO documents (id, body) VALUES ($id, $body)")
 ```
 
 ```
-error[json_stringify_param]: parameter $body is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value
+error[correctness/json_stringify_param]: parameter $body is jsonb, and `JSON.stringify(…)` stores a JSON string, not the value
    ╭─[src/documents.ts:5:33]
  5 │   .execute(pool, { id: 1, body: JSON.stringify(doc) });
    ·                                 ───────────────────

@@ -2,9 +2,9 @@
 
 An `INSERT … VALUES` or `INSERT … SELECT` without a column list.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | writes the column list the values go to now |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | writes the column list the values go to now |
 
 ## Example
 
@@ -17,7 +17,7 @@ INSERT INTO users SELECT * FROM old_users;
 ```
 
 ```
-warning[insert_without_columns]: INSERT into users without a column list depends on the table's column order
+warning[suspicious/insert_without_columns]: INSERT into users without a column list depends on the table's column order
    ╭─[queries.sql:2:1]
  2 │ INSERT INTO users VALUES ($id, $email, $name);
    · ─────────────────
@@ -76,5 +76,5 @@ text. See [Configuring rules](README.md#configuring-rules).
 
 - [`check_violation`](check_violation.md): an `INSERT` storing a constant a
   `CHECK` constraint rejects.
-- [`breaks_deployed_queries`](breaks_deployed_queries.md): a migration that
+- [`deployed_query_breakage`](deployed_query_breakage.md): a migration that
   breaks a deployed `INSERT`.

@@ -1,4 +1,4 @@
-//! The `breaks_deployed_queries` oracle (the `pg_sanity` feature): what the
+//! The `deployed_query_breakage` oracle (the `pg_sanity` feature): what the
 //! rule says of the deployed queries, checked by running them on a real
 //! PostgreSQL before and after the new migrations.
 //!
@@ -55,7 +55,7 @@
 //! not reach the value that breaks it. A query no call ran before bears
 //! nothing out.
 //!
-//! [`assert_agrees`] runs from `breaks_deployed_queries`' own tests (with
+//! [`assert_agrees`] runs from `deployed_query_breakage`' own tests (with
 //! the feature on, as `scripts/run-lint-oracle.sh` runs them) and panics on
 //! a missed break or a false claim; `tests/deployed_oracle.rs` runs a
 //! generated corpus. `TYPEDPG_DEPLOYED_ORACLE_VERBOSE=1` prints every
@@ -1025,15 +1025,15 @@ pub fn run(case: &Case<'_>) -> Report {
         let header = || case_header(case, target);
         // An allow comment, in the query or a new migration, accepts it.
         let allowed = crate::allowed_rules(&target.query.sql)
-            .contains(&crate::Rule::BreaksDeployedQueries)
+            .contains(&crate::Rule::DeployedQueryBreakage)
             || case
                 .new
                 .iter()
-                .any(|m| crate::allowed_rules(m).contains(&crate::Rule::BreaksDeployedQueries));
+                .any(|m| crate::allowed_rules(m).contains(&crate::Rule::DeployedQueryBreakage));
         if texts.is_empty() {
             if !breaks[index].is_empty() && !allowed {
                 report.missed.push(format!(
-                    "deployed oracle: breaks_deployed_queries misses a break: {}\n{}",
+                    "deployed oracle: deployed_query_breakage misses a break: {}\n{}",
                     breaks[index]
                         .iter()
                         .take(4)
@@ -1103,7 +1103,7 @@ pub fn run(case: &Case<'_>) -> Report {
                         Outcome::Failed { .. } => 0,
                     };
                     report.false_claims.push(format!(
-                        "deployed oracle: breaks_deployed_queries claims \"{text}\", but {} runs \
+                        "deployed oracle: deployed_query_breakage claims \"{text}\", but {} runs \
                          after the migrations ({phase}, {count} rows)\n{}",
                         describe_call(call),
                         header()

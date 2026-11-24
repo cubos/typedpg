@@ -2,9 +2,9 @@
 
 A cast to the type, and type modifier, the value already has.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the `::type` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the `::type` |
 
 ## Example
 
@@ -19,7 +19,7 @@ SELECT 1::int;
 ```
 
 ```
-info[redundant_cast]: cast to text has no effect: the value already is one
+info[redundant/redundant_cast]: cast to text has no effect: the value already is one
    ╭─[queries.sql:2:8]
  2 │ SELECT title::text AS label FROM posts;
    ·        ───────────

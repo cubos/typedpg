@@ -3,9 +3,9 @@
 An `ORDER BY` under `LIMIT`, `OFFSET`, `FETCH` or `DISTINCT ON` whose keys
 can tie, so which tied rows come back is arbitrary.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -24,7 +24,7 @@ SELECT DISTINCT ON (user_id) user_id, title FROM posts ORDER BY user_id, created
 ```
 
 ```
-warning[unstable_order]: the ORDER BY keys can tie: they don't determine a unique row of posts — under LIMIT, rows that tie come back in an arbitrary order, so pages may skip or repeat rows
+error[correctness/unstable_order]: the ORDER BY keys can tie: they don't determine a unique row of posts — under LIMIT, rows that tie come back in an arbitrary order, so pages may skip or repeat rows
    ╭─[queries.sql:2:29]
  2 │ SELECT id, title FROM posts ORDER BY created_at DESC LIMIT 20 OFFSET $offset;
    ·                             ────────────────────────
@@ -103,5 +103,5 @@ See [Configuring rules](README.md#configuring-rules).
   `ORDER BY`.
 - [`redundant_order_by`](redundant_order_by.md): `ORDER BY` keys after keys
   that already determine a unique row.
-- [`scalar_subquery_may_return_many`](scalar_subquery_may_return_many.md):
+- [`scalar_subquery_multiple_rows`](scalar_subquery_multiple_rows.md):
   suggests `ORDER BY … LIMIT 1`, which this rule then checks.

@@ -45,7 +45,7 @@ enum Commands {
         /// The git ref of the code and migrations deployed now (e.g.
         /// `origin/main`): migrations identical to it skip the statement
         /// rules (the schema rules still report on the statements that
-        /// created their objects), and `breaks_deployed_queries` checks the
+        /// created their objects), and `deployed_query_breakage` checks the
         /// queries of its code against the new migrations.
         #[arg(long, alias = "ignore-migrations-from")]
         previous_deployment: Option<String>,

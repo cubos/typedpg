@@ -1,11 +1,11 @@
-# `constraint_validating`
+# `add_constraint_scan`
 
 A `CHECK` or foreign key added to a table that already has rows, which
 PostgreSQL validates against every row under a lock.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -22,7 +22,7 @@ ALTER TABLE posts ADD COLUMN editor_id bigint DEFAULT 1 REFERENCES users (id);
 ```
 
 ```
-warning[constraint_validating]: adding a constraint validates every row of public.posts under a lock
+warning[locking/add_constraint_scan]: adding a constraint validates every row of public.posts under a lock
    ╭─[migrations/0002_constraints.sql:1:1]
  1 │ ALTER TABLE posts ADD CONSTRAINT posts_author_id_fkey FOREIGN KEY (author_id) REFERENCES users (id);
    · ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ ALTER TABLE posts VALIDATE CONSTRAINT posts_title_not_empty;
 `NOT VALID` records the constraint with a short lock and checks new rows
 from then on; `VALIDATE CONSTRAINT` checks the old rows without blocking
 reads or writes. Run it in a later transaction, not the one that added the
-constraint ([`validate_in_same_transaction`](validate_in_same_transaction.md)).
+constraint ([`validate_constraint_blocking`](validate_constraint_blocking.md)).
 
 ## Why
 
@@ -100,24 +100,24 @@ every row under a `SHARE` lock, blocking writes, and for a domain the
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-constraint_validating = "error"   # error | warning | info | off
+add_constraint_scan = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "constraintValidating": "error" } }
+{ "lint": { "addConstraintScan": "error" } }
 ```
 
-Allow one statement with `-- typedpg-lint: allow(constraint_validating)`
+Allow one statement with `-- typedpg-lint: allow(add_constraint_scan)`
 before it in the migration file.
 See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`validate_in_same_transaction`](validate_in_same_transaction.md): a
+- [`validate_constraint_blocking`](validate_constraint_blocking.md): a
   `VALIDATE` that undoes the split.
 - [`set_not_null_scan`](set_not_null_scan.md): the same scan for
   `SET NOT NULL`.
 - [`attach_partition_scan`](attach_partition_scan.md): a `CHECK` that lets
   `ATTACH PARTITION` skip its scan.
-- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+- [`lock_without_timeout`](lock_without_timeout.md): the same statement
   waiting for its lock with no timeout.

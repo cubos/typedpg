@@ -1,10 +1,10 @@
-# `security_definer_search_path`
+# `security_definer_without_search_path`
 
 A `SECURITY DEFINER` function or procedure without `SET search_path`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| security | error | final schema | — |
 
 ## Example
 
@@ -17,7 +17,7 @@ CREATE FUNCTION count_users() RETURNS bigint
 ```
 
 ```
-warning[security_definer_search_path]: SECURITY DEFINER function public.count_users has no SET search_path: it runs with its owner's privileges but resolves names along the caller's search_path, where the caller can shadow them
+error[security/security_definer_without_search_path]: SECURITY DEFINER function public.count_users has no SET search_path: it runs with its owner's privileges but resolves names along the caller's search_path, where the caller can shadow them
    ╭─[migrations/0001_init.sql:2:1]
  2 │ CREATE FUNCTION count_users() RETURNS bigint
    · ────────────────────────────────────────────
@@ -65,19 +65,19 @@ and schema-qualify the objects the body uses.
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-security_definer_search_path = "error"   # error | warning | info | off
+security_definer_without_search_path = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "securityDefinerSearchPath": "error" } }
+{ "lint": { "securityDefinerWithoutSearchPath": "error" } }
 ```
 
-Allow one routine with `-- typedpg-lint: allow(security_definer_search_path)`
+Allow one routine with `-- typedpg-lint: allow(security_definer_without_search_path)`
 before its `CREATE FUNCTION` or `CREATE PROCEDURE`. See
 [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`rls_policy_not_enforced`](rls_policy_not_enforced.md): policies on a
+- [`policy_without_rls`](policy_without_rls.md): policies on a
   table without row-level security.
-- [`rls_no_policy`](rls_no_policy.md): row-level security with no policy.
+- [`rls_without_policy`](rls_without_policy.md): row-level security with no policy.

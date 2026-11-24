@@ -1,11 +1,11 @@
-# `breaks_deployed_queries`
+# `deployed_query_breakage`
 
 A new migration breaks a query of the code deployed now, which keeps running
 while the migration is applied and until the new code has rolled out.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations, with `--previous-deployment <ref>` only | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | migrations, with `--previous-deployment <ref>` only | — |
 
 ## Example
 
@@ -39,7 +39,7 @@ ALTER TABLE users ADD CONSTRAINT users_status_active CHECK (status = 'active') N
 ```
 
 ```
-warning[breaks_deployed_queries]: this migration breaks the deployed query at queries.sql:2 (v1.4.0): it no longer runs: column "email" does not exist
+error[correctness/deployed_query_breakage]: this migration breaks the deployed query at queries.sql:2 (v1.4.0): it no longer runs: column "email" does not exist
    ╭─[migrations/0002_users.sql:2:1]
  2 │ ALTER TABLE users RENAME COLUMN email TO email_address;
    · ──────────────────────────────────────────────────────
@@ -50,9 +50,9 @@ warning[breaks_deployed_queries]: this migration breaks the deployed query at qu
 The same run also reports:
 
 ```
-warning[breaks_deployed_queries]: this migration breaks the deployed query at queries.sql:4 (v1.4.0): result column "status" may now be 'deleted', a value the deployed code does not know
-warning[breaks_deployed_queries]: this migration breaks the deployed query at queries.sql:6 (v1.4.0): its UPDATE of users writes column name, now character varying(40) instead of character varying(80): a longer value fails
-warning[breaks_deployed_queries]: this migration breaks the deployed query at queries.sql:8 (v1.4.0): its UPDATE of users writes column status, which CHECK constraint "users_status_active" now limits it to 'active': writing another value fails
+error[correctness/deployed_query_breakage]: this migration breaks the deployed query at queries.sql:4 (v1.4.0): result column "status" may now be 'deleted', a value the deployed code does not know
+error[correctness/deployed_query_breakage]: this migration breaks the deployed query at queries.sql:6 (v1.4.0): its UPDATE of users writes column name, now character varying(40) instead of character varying(80): a longer value fails
+error[correctness/deployed_query_breakage]: this migration breaks the deployed query at queries.sql:8 (v1.4.0): its UPDATE of users writes column status, which CHECK constraint "users_status_active" now limits it to 'active': writing another value fails
 ```
 
 Line 8 is not reported for `name`: `'anonymous'` fits a `varchar(40)`.
@@ -231,15 +231,15 @@ that command takes it over (then only the view's own columns are checked).
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-breaks_deployed_queries = "error"   # error | warning | info | off
+deployed_query_breakage = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "breaksDeployedQueries": "error" } }
+{ "lint": { "deployedQueryBreakage": "error" } }
 ```
 
 Accept a break (the code using the column is gone everywhere) with
-`-- typedpg-lint: allow(breaks_deployed_queries)` before the statement in
+`-- typedpg-lint: allow(deployed_query_breakage)` before the statement in
 the migration file, or in the deployed query's SQL at the ref.
 `--previous-deployment` also makes migration files unchanged at the ref skip
 the statement rules. See [Configuring rules](README.md#configuring-rules)
@@ -247,6 +247,6 @@ and [`--previous-deployment`](README.md#--previous-deployment-ref).
 
 ## Related
 
-- [`table_rewrite`](table_rewrite.md): the lock an `ALTER COLUMN … TYPE` holds.
+- [`alter_table_rewrite`](alter_table_rewrite.md): the lock an `ALTER COLUMN … TYPE` holds.
 - [`check_violation`](check_violation.md): a current query writing a constant a `CHECK` rejects.
-- [`rls_no_policy`](rls_no_policy.md): row-level security with no policy.
+- [`rls_without_policy`](rls_without_policy.md): row-level security with no policy.

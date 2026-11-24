@@ -17,30 +17,34 @@
 //!
 //! `lint` configures `typedpg lint` for every database: `failOn` is the
 //! severity the run fails on (`"error"`, the default, `"warning"` or
-//! `"info"`), and each rule is set to a level: `"error"`, `"warning"`,
-//! `"info"` or `"off"`. The query rules are `nullComparison`,
+//! `"info"`), and each rule — or each category: `correctness`, `security`,
+//! `suspicious`, `locking`, `performance`, `redundant`, `style`,
+//! `pedantic`, whose level sets every rule of it, a rule's own key winning —
+//! is set to a level: `"error"`, `"warning"`, `"info"` or `"off"`. The
+//! query rules are `nullComparison`,
 //! `unboundedWrite`, `notInNullable`, `redundantNullCheck`,
 //! `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`,
 //! `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`,
 //! `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`,
 //! `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`,
-//! `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMayReturnMany`,
+//! `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMultipleRows`,
 //! `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`,
-//! `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `countNotNull`,
-//! `nonSargablePredicate`, `floatEquality` and the call-site rules `fetchMayReturnMany`,
+//! `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `redundantCountArgument`,
+//! `nonSargablePredicate`, `floatEquality`, `commaJoin`, `ordinalReference`,
+//! `booleanComparison` and the call-site rules `fetchOneMultipleRows`,
 //! `fetchAllSingleRow`, `unusedReturning` and `jsonStringifyParam`; the migration rules
-//! `createIndexBlocking`, `constraintValidating`, `setNotNullScan`,
-//! `tableRewrite`, `missingLockTimeout`, `dropIndexBlocking`,
-//! `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`
+//! `createIndexBlocking`, `addConstraintScan`, `setNotNullScan`,
+//! `alterTableRewrite`, `lockWithoutTimeout`, `dropIndexBlocking`,
+//! `rebuildBlocking`, `detachPartitionBlocking`, `validateConstraintBlocking`
 //! and `attachPartitionScan`; the schema rules `fkWithoutIndex`,
-//! `redundantIndex`, `fkTypeMismatch`, `missingPrimaryKey`,
-//! `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`,
+//! `redundantIndex`, `fkTypeMismatch`, `tableWithoutPrimaryKey`,
+//! `policyWithoutRls`, `rlsWithoutPolicy`, `securityDefinerWithoutSearchPath`,
 //! `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk` and
-//! `preferJsonb`; and `breaksDeployedQueries`, which runs with
+//! `preferJsonb`; and `deployedQueryBreakage`, which runs with
 //! `--previous-deployment <ref>` only, and reports on a new migration the
-//! queries of the code at that ref it breaks. `likeUnescapedParam`
-//! and the `prefer*` rules are off by default; set them to a level to enable
-//! them. The call-site rules check how a query is called (`fetchOne`,
+//! queries of the code at that ref it breaks. The `prefer*` rules are the
+//! `pedantic` category: off by default, enabled by a level. The call-site
+//! rules check how a query is called (`fetchOne`,
 //! `fetchValue`, `fetchOptional`, `fetchAll`, `execute`) against what the
 //! schema proves about its rows, in the same file or through an export from
 //! a `.sql` file or another source. Rules without an override keep their
@@ -88,8 +92,8 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use typedpg_core::QualifiedName;
 use typedpg_core::config::{
-    LINT_RULES, LintConfig, LintLevel, LintSeverity, MigrationsConfig, SimplifyConfig,
-    TS_LINT_RULES,
+    LINT_CATEGORIES, LINT_RULES, LintConfig, LintLevel, LintSeverity, MigrationsConfig,
+    SimplifyConfig, TS_LINT_RULES,
 };
 
 pub const CONFIG_FILE: &str = "typedpg.config.json";
@@ -200,12 +204,22 @@ fn lint_config(raw: Option<RawLint>) -> Result<LintConfig, String> {
     };
     let mut levels = BTreeMap::new();
     for (key, value) in raw.rules {
-        // The shared rules, then the TypeScript-only ones.
-        let mut rules = LINT_RULES.iter().chain(TS_LINT_RULES);
-        let Some(rule) = rules.find(|r| camel_key(r) == key) else {
+        // A category's key, then the shared rules, then the TypeScript-only
+        // ones. `LintOptions` reads a category key from the levels map.
+        let mut names = LINT_CATEGORIES
+            .iter()
+            .chain(LINT_RULES)
+            .chain(TS_LINT_RULES);
+        let Some(name) = names.find(|r| camel_key(r) == key) else {
             let keys = std::iter::once("failOn".to_owned())
                 .chain(std::iter::once("ignore".to_owned()))
-                .chain(LINT_RULES.iter().chain(TS_LINT_RULES).map(|r| camel_key(r)))
+                .chain(
+                    LINT_CATEGORIES
+                        .iter()
+                        .chain(LINT_RULES)
+                        .chain(TS_LINT_RULES)
+                        .map(|r| camel_key(r)),
+                )
                 .map(|k| format!("`{k}`"))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -219,7 +233,7 @@ fn lint_config(raw: Option<RawLint>) -> Result<LintConfig, String> {
                  `info`, `off`"
             )
         })?;
-        levels.insert((*rule).to_owned(), level);
+        levels.insert((*name).to_owned(), level);
     }
     Ok(LintConfig {
         fail_on,
@@ -866,6 +880,16 @@ mod tests {
         assert_eq!(lint.levels["unbounded_write"], LintLevel::Info);
         assert_eq!(lint.ignore, ["tests/**"]);
 
+        // A category key is accepted, and kept as written for `LintOptions`.
+        let lint = parse(
+            r#", "lint": { "style": "off", "correctness": "warning",
+                           "fkWithoutIndex": "info" }"#,
+        )
+        .unwrap();
+        assert_eq!(lint.levels["style"], LintLevel::Off);
+        assert_eq!(lint.levels["correctness"], LintLevel::Warning);
+        assert_eq!(lint.levels["fk_without_index"], LintLevel::Info);
+
         let err = parse(r#", "lint": { "ignore": ["tests/**", 1] }"#).unwrap_err();
         assert!(err.contains("expected a string"), "{err}");
         let err = parse(r#", "lint": { "nullComparison": "fatal" }"#).unwrap_err();
@@ -879,7 +903,11 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.contains("`failOn`, `ignore`, `nullComparison`, `unboundedWrite`"),
+            err.contains(
+                "`failOn`, `ignore`, `correctness`, `security`, `suspicious`, `locking`, \
+                 `performance`, `redundant`, `style`, `pedantic`, `nullComparison`, \
+                 `unboundedWrite`"
+            ),
             "{err}"
         );
         let err = parse(r#", "lint": { "failOn": "off" }"#).unwrap_err();
@@ -896,9 +924,9 @@ mod tests {
             r#", "lint": { "redundantNullCheck": "warning", "limitWithoutOrder": "off",
                            "redundantLimit": "info", "redundantDistinct": "info",
                            "likeUnescapedParam": "off", "fkTypeMismatch": "warning",
-                           "missingLockTimeout": "warning", "preferTimestamptz": "off",
+                           "lockWithoutTimeout": "warning", "preferTimestamptz": "off",
                            "preferIdentity": "off", "preferText": "off",
-                           "preferBigintPk": "info", "fetchMayReturnMany": "warning",
+                           "preferBigintPk": "info", "fetchOneMultipleRows": "warning",
                            "fetchAllSingleRow": "info", "unusedReturning": "off",
                            "jsonStringifyParam": "warning" }"#,
         )
@@ -908,8 +936,8 @@ mod tests {
         assert_eq!(lint.levels["redundant_null_check"], LintLevel::Warning);
         assert_eq!(lint.levels["like_unescaped_param"], LintLevel::Off);
         assert_eq!(lint.levels["prefer_bigint_pk"], LintLevel::Info);
-        assert_eq!(lint.levels["missing_lock_timeout"], LintLevel::Warning);
-        assert_eq!(lint.levels["fetch_may_return_many"], LintLevel::Warning);
+        assert_eq!(lint.levels["lock_without_timeout"], LintLevel::Warning);
+        assert_eq!(lint.levels["fetch_one_multiple_rows"], LintLevel::Warning);
         assert_eq!(lint.levels["fetch_all_single_row"], LintLevel::Info);
         assert_eq!(lint.levels["unused_returning"], LintLevel::Off);
         // The Rust-only binding rules are not TS rules.

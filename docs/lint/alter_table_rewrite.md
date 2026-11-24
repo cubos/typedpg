@@ -1,11 +1,11 @@
-# `table_rewrite`
+# `alter_table_rewrite`
 
 An `ALTER TABLE` that rewrites every row of an existing table under an
 `ACCESS EXCLUSIVE` lock.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -26,14 +26,14 @@ ALTER TABLE posts SET TABLESPACE fast;
 ```
 
 ```
-warning[table_rewrite]: ALTER TABLE rewrites every row of public.posts under an ACCESS EXCLUSIVE lock
+warning[locking/alter_table_rewrite]: ALTER TABLE rewrites every row of public.posts under an ACCESS EXCLUSIVE lock
    ╭─[migrations/0002_rewrites.sql:1:1]
  1 │ ALTER TABLE posts ALTER COLUMN views TYPE bigint;
    · ────────────────────────────────────────────────
    ╰────
   help: rewrite in steps: add a new column, backfill it in batches, then swap
 
-warning[table_rewrite]: SET TABLESPACE copies every block of public.posts under an ACCESS EXCLUSIVE lock
+warning[locking/alter_table_rewrite]: SET TABLESPACE copies every block of public.posts under an ACCESS EXCLUSIVE lock
    ╭─[migrations/0002_rewrites.sql:5:1]
  5 │ ALTER TABLE posts SET TABLESPACE fast;
    · ─────────────────────────────────────
@@ -89,28 +89,28 @@ To change a column's type without a rewrite: add a nullable column, backfill
 it in batches, prove it `NOT NULL` as in
 [`set_not_null_scan`](set_not_null_scan.md), then drop the old column and
 rename the new one once no deployed code reads the old one
-([`breaks_deployed_queries`](breaks_deployed_queries.md) checks that).
+([`deployed_query_breakage`](deployed_query_breakage.md) checks that).
 
 ## Configuration
 
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-table_rewrite = "error"   # error | warning | info | off
+alter_table_rewrite = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "tableRewrite": "error" } }
+{ "lint": { "alterTableRewrite": "error" } }
 ```
 
-Allow one statement with `-- typedpg-lint: allow(table_rewrite)` before it
+Allow one statement with `-- typedpg-lint: allow(alter_table_rewrite)` before it
 in the migration. See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`blocking_rebuild`](blocking_rebuild.md): `VACUUM FULL`, `CLUSTER`,
+- [`rebuild_blocking`](rebuild_blocking.md): `VACUUM FULL`, `CLUSTER`,
   `REPACK`.
 - [`set_not_null_scan`](set_not_null_scan.md): `SET NOT NULL` scanning the
   table.
-- [`missing_lock_timeout`](missing_lock_timeout.md): a blocking lock without
+- [`lock_without_timeout`](lock_without_timeout.md): a blocking lock without
   `lock_timeout`.

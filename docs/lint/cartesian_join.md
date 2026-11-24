@@ -3,9 +3,9 @@
 `FROM` items of one `SELECT` that no condition connects, so every row of one
 pairs with every row of the other.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -19,7 +19,7 @@ SELECT u.email, p.title FROM users u JOIN posts p ON p.status = 'published';
 ```
 
 ```
-warning[cartesian_join]: p is joined to u with no condition connecting them: every row of one pairs with every row of the other
+warning[suspicious/cartesian_join]: p is joined to u with no condition connecting them: every row of one pairs with every row of the other
    ╭─[queries.sql:2:39]
  2 │ SELECT u.email, p.title FROM users u, posts p WHERE p.status = 'published';
    ·                                       ───────

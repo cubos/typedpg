@@ -710,6 +710,11 @@ fn distinct_on_must_match_leading_order_by() {
     for sql in [
         "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
         "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY b, a, id",
+        // A bare output-column name and a qualified reference to the same
+        // column are one sort key, as PostgreSQL's transformed expressions
+        // are equal.
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY t.a, b",
+        "SELECT DISTINCT ON (a) a, b FROM t ORDER BY t.a",
         "SELECT DISTINCT ON (a, b) a, b FROM t ORDER BY a",
         "SELECT DISTINCT ON (1) a, b FROM t ORDER BY a",
         // An item sorting a target sorted already is dropped (in either

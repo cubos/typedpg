@@ -11,11 +11,12 @@ use typedpg_pg_query::ast::{
 
 use crate::{Ctx, RawFinding, Rule};
 
+mod boolean_comparison;
 mod cartesian_join;
 mod case_without_else;
 mod check_violation;
+mod comma_join;
 mod constant_condition;
-mod count_not_null;
 mod float_equality;
 mod insert_without_columns;
 mod integer_division;
@@ -25,16 +26,18 @@ mod limit_without_order;
 mod non_sargable_predicate;
 #[cfg(feature = "pg_sanity")]
 pub(crate) mod oracle;
+mod ordinal_reference;
 mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
+mod redundant_count_argument;
 mod redundant_distinct;
 mod redundant_group_by;
 mod redundant_join;
 mod redundant_limit;
 mod redundant_null_check;
 mod redundant_order_by;
-mod scalar_subquery_may_return_many;
+mod scalar_subquery_multiple_rows;
 mod self_assignment;
 mod simplifiable_case;
 mod timestamp_timezone_mix;
@@ -69,7 +72,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::SimplifiableCase => simplifiable_case::findings(ctx),
         Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
         Rule::RedundantJoin => redundant_join::findings(ctx),
-        Rule::ScalarSubqueryMayReturnMany => scalar_subquery_may_return_many::findings(ctx),
+        Rule::ScalarSubqueryMultipleRows => scalar_subquery_multiple_rows::findings(ctx),
         Rule::TimestampTimezoneMix => timestamp_timezone_mix::findings(ctx),
         Rule::IntegerDivision => integer_division::findings(ctx),
         Rule::LeftJoinNullified => left_join_nullified::findings(ctx),
@@ -77,28 +80,31 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::UnstableOrder => unstable_order::findings(ctx),
         Rule::RedundantOrderBy => redundant_order_by::findings(ctx),
         Rule::RedundantGroupBy => redundant_group_by::findings(ctx),
-        Rule::CountNotNull => count_not_null::findings(ctx),
+        Rule::RedundantCountArgument => redundant_count_argument::findings(ctx),
+        Rule::CommaJoin => comma_join::findings(ctx),
+        Rule::OrdinalReference => ordinal_reference::findings(ctx),
+        Rule::BooleanComparison => boolean_comparison::findings(ctx),
         Rule::NonSargablePredicate => non_sargable_predicate::findings(ctx),
         Rule::FloatEquality => float_equality::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
-        | Rule::ConstraintValidating
+        | Rule::AddConstraintScan
         | Rule::SetNotNullScan
-        | Rule::TableRewrite
+        | Rule::AlterTableRewrite
         | Rule::FkWithoutIndex
         | Rule::RedundantIndex
         | Rule::FkTypeMismatch
-        | Rule::MissingLockTimeout
+        | Rule::LockWithoutTimeout
         | Rule::DropIndexBlocking
-        | Rule::BlockingRebuild
+        | Rule::RebuildBlocking
         | Rule::DetachPartitionBlocking
-        | Rule::ValidateInSameTransaction
+        | Rule::ValidateConstraintBlocking
         | Rule::AttachPartitionScan
-        | Rule::MissingPrimaryKey
-        | Rule::RlsPolicyNotEnforced
-        | Rule::RlsNoPolicy
-        | Rule::SecurityDefinerSearchPath
+        | Rule::TableWithoutPrimaryKey
+        | Rule::PolicyWithoutRls
+        | Rule::RlsWithoutPolicy
+        | Rule::SecurityDefinerWithoutSearchPath
         | Rule::PreferTimestamptz
         | Rule::PreferIdentity
         | Rule::PreferText
@@ -108,13 +114,13 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         // invocation, in `typedpg_cli`, which alone sees it.
         | Rule::RedundantBinding
         | Rule::RenamingBinding
-        | Rule::FetchMayReturnMany
+        | Rule::FetchOneMultipleRows
         | Rule::FetchAllSingleRow
         | Rule::UnusedReturning
         | Rule::JsonStringifyParam
         // It compares the deployed code's queries across two schemas, in
         // `deployed`.
-        | Rule::BreaksDeployedQueries
+        | Rule::DeployedQueryBreakage
         | Rule::InvalidAllow
         | Rule::InternalError => Vec::new(),
     }

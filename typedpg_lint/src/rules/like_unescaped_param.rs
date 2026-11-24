@@ -438,11 +438,13 @@ mod tests {
     }
 
     #[test]
-    fn the_rule_is_off_by_default() {
+    fn the_rule_is_on_by_default_as_a_correctness_error() {
         let db = catalog();
         let sql = "SELECT id FROM users WHERE name LIKE '%' || $q || '%'";
         let findings = lint_query(&db, sql, &LintOptions::default()).unwrap();
-        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].rule, Rule::LikeUnescapedParam);
+        assert_eq!(findings[0].severity, Severity::Error);
     }
 
     #[test]

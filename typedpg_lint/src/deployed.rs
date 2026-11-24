@@ -1,4 +1,4 @@
-//! The `breaks_deployed_queries` rule: a migration that breaks a query of
+//! The `deployed_query_breakage` rule: a migration that breaks a query of
 //! the code already deployed.
 //!
 //! A deploy applies the new migrations while the code of the previous
@@ -288,15 +288,15 @@ struct Change {
     text: String,
 }
 
-/// The findings of `breaks_deployed_queries`: every deployed query that
+/// The findings of `deployed_query_breakage`: every deployed query that
 /// analyzed against the deployed schema and breaks against the new one,
 /// placed on the statement of `schema.files` that breaks it.
-pub fn breaks_deployed_queries(
+pub fn deployed_query_breakage(
     deployment: &Deployment<'_>,
     schema: &NewSchema<'_>,
     options: &LintOptions,
 ) -> Vec<MigrationFinding> {
-    let rule = Rule::BreaksDeployedQueries;
+    let rule = Rule::DeployedQueryBreakage;
     let Some(severity) = options.level(rule) else {
         return Vec::new();
     };
@@ -515,7 +515,7 @@ impl MigrationObserver for Replay<'_, '_> {
         let suppressed = self.comments.iter().any(|(range, rules)| {
             range.start >= lead_in.start
                 && range.end <= lead_in.end
-                && rules.contains(&Rule::BreaksDeployedQueries)
+                && rules.contains(&Rule::DeployedQueryBreakage)
         });
         let placement = Placement {
             file: self.file,
@@ -3260,7 +3260,7 @@ mod tests {
                 kind,
             })
             .collect();
-        let findings = breaks_deployed_queries(
+        let findings = deployed_query_breakage(
             &Deployment {
                 reference: "origin/main",
                 catalog: &old_catalog,
@@ -3315,7 +3315,7 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         let finding = &findings[0];
         assert_eq!(finding.file, 1);
-        assert_eq!(finding.finding.rule, Rule::BreaksDeployedQueries);
+        assert_eq!(finding.finding.rule, Rule::DeployedQueryBreakage);
         // Placed on the statement that drops it, not the first one.
         assert_eq!(
             &"SELECT 1;\nALTER TABLE users DROP COLUMN email;"[finding.finding.span.clone()],
@@ -3499,7 +3499,7 @@ mod tests {
         let findings = check(
             &[USERS],
             &[
-                "-- typedpg-lint: allow(breaks_deployed_queries)\nALTER TABLE users DROP COLUMN email;",
+                "-- typedpg-lint: allow(deployed_query_breakage)\nALTER TABLE users DROP COLUMN email;",
             ],
             &["SELECT email FROM users"],
         );
@@ -3507,7 +3507,7 @@ mod tests {
         let findings = check(
             &[USERS],
             &["ALTER TABLE users DROP COLUMN email;"],
-            &["-- typedpg-lint: allow(breaks_deployed_queries)\nSELECT email FROM users"],
+            &["-- typedpg-lint: allow(deployed_query_breakage)\nSELECT email FROM users"],
         );
         assert!(findings.is_empty(), "{findings:?}");
     }

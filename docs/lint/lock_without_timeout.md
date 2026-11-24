@@ -1,11 +1,11 @@
-# `missing_lock_timeout`
+# `lock_without_timeout`
 
 A migration waits for a write-blocking lock on an existing table without
 `SET lock_timeout` first.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -19,7 +19,7 @@ ALTER TABLE users ADD COLUMN bio text;
 ```
 
 ```
-warning[missing_lock_timeout]: ALTER TABLE waits for a lock on public.users with no lock_timeout: queued behind a long transaction, it blocks every query on the table
+warning[locking/lock_without_timeout]: ALTER TABLE waits for a lock on public.users with no lock_timeout: queued behind a long transaction, it blocks every query on the table
    ╭─[migrations/0002_nickname.sql:1:1]
  1 │ ALTER TABLE users ADD COLUMN nickname text;
    · ──────────────────────────────────────────
@@ -101,14 +101,14 @@ foreign keys).
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-missing_lock_timeout = "error"   # error | warning | info | off
+lock_without_timeout = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "missingLockTimeout": "error" } }
+{ "lint": { "lockWithoutTimeout": "error" } }
 ```
 
-Allow one statement with `-- typedpg-lint: allow(missing_lock_timeout)`
+Allow one statement with `-- typedpg-lint: allow(lock_without_timeout)`
 before it in the migration file; the file's next blocking statement is then
 reported instead. See [Configuring rules](README.md#configuring-rules).
 
@@ -116,10 +116,10 @@ reported instead. See [Configuring rules](README.md#configuring-rules).
 
 Each of these reports a statement that also needs a timeout:
 [`create_index_blocking`](create_index_blocking.md),
-[`constraint_validating`](constraint_validating.md),
+[`add_constraint_scan`](add_constraint_scan.md),
 [`set_not_null_scan`](set_not_null_scan.md),
-[`table_rewrite`](table_rewrite.md),
+[`alter_table_rewrite`](alter_table_rewrite.md),
 [`drop_index_blocking`](drop_index_blocking.md),
-[`blocking_rebuild`](blocking_rebuild.md),
+[`rebuild_blocking`](rebuild_blocking.md),
 [`detach_partition_blocking`](detach_partition_blocking.md),
 [`attach_partition_scan`](attach_partition_scan.md).

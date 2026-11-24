@@ -70,7 +70,7 @@ fn types_match_group_by_multiple_aggregates() {
 }
 
 #[test]
-fn count_not_null() {
+fn redundant_count_argument() {
     let db = setup();
     let sql = "SELECT COUNT(*) as cnt FROM users";
     let info = db.analyze(sql).unwrap();

@@ -2,9 +2,9 @@
 
 A join that can't change the rows and whose table nothing in the query reads.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the join |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the join |
 
 ## Example
 
@@ -22,7 +22,7 @@ SELECT p.id, p.title FROM posts p JOIN users u ON u.id = p.user_id;
 ```
 
 ```
-info[redundant_join]: the LEFT JOIN of e can't change the rows (each row matches at most one row of it, on a unique key) and none of its columns are used
+info[redundant/redundant_join]: the LEFT JOIN of e can't change the rows (each row matches at most one row of it, on a unique key) and none of its columns are used
    ╭─[queries.sql:2:35]
  2 │ SELECT p.id, p.title FROM posts p LEFT JOIN users e ON e.id = p.editor_id;
    ·                                   ───────────────────────────────────────

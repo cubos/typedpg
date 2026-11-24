@@ -2,9 +2,9 @@
 
 A foreign key whose referencing columns no index can look up.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| performance | warning | final schema | — |
 
 ## Example
 
@@ -16,7 +16,7 @@ CREATE TABLE memberships (org_id bigint NOT NULL, user_id bigint NOT NULL REFERE
 ```
 
 ```
-warning[fk_without_index]: foreign key posts_author_id_fkey on public.posts (author_id) has no index
+warning[performance/fk_without_index]: foreign key posts_author_id_fkey on public.posts (author_id) has no index
    ╭─[migrations/0001_init.sql:2:1]
  2 │ CREATE TABLE posts (id bigint PRIMARY KEY, author_id bigint NOT NULL REFERENCES users (id), title text NOT NULL);
    · ────────────────────────────────────────────────────────────────────────────────────────────────────────────────

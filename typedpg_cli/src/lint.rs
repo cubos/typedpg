@@ -28,7 +28,7 @@ use typedpg_lint::report::{
 use typedpg_lint::{
     Call as LintCall, CallFinding, CallMethod, Decoding, DeployedKind, DeployedQuery, Deployment,
     Finding, IgnoreSet, Language, LintOptions, MigrationFile, MigrationLint, NewSchema, Rule,
-    breaks_deployed_queries, lint_migrations, lint_query_called_as,
+    deployed_query_breakage, lint_migrations, lint_query_called_as,
 };
 
 /// The directories under the manifest's directory that hold Rust sources.
@@ -100,7 +100,7 @@ type CopyResult = Result<(), AnalysisError>;
 /// have their statement rules skipped; the schema rules still report on the
 /// statements that created the schema's objects. The queries of the code at
 /// that ref are checked against the new migrations
-/// (`breaks_deployed_queries`).
+/// (`deployed_query_breakage`).
 ///
 /// With `fix`, the findings that have edits are applied to their files, and
 /// the report is built again from the fixed text so its positions match.
@@ -232,7 +232,7 @@ fn build(
     }
 
     if let Some(reference) = previous_deployment
-        && options.level(Rule::BreaksDeployedQueries).is_some()
+        && options.level(Rule::DeployedQueryBreakage).is_some()
     {
         match deployed(reference, manifest, &options) {
             Ok(deployed) => {
@@ -257,7 +257,7 @@ fn build(
                         continue;
                     };
                     let finite = &new.finite;
-                    let findings = breaks_deployed_queries(
+                    let findings = deployed_query_breakage(
                         &Deployment {
                             reference,
                             catalog: old_catalog,
@@ -888,7 +888,7 @@ fn deployed(reference: &str, manifest: &Path, options: &LintOptions) -> Result<D
     Ok(deployed)
 }
 
-/// A database's migrations as `breaks_deployed_queries` replays them.
+/// A database's migrations as `deployed_query_breakage` replays them.
 struct NewMigrations {
     /// Every file, as linted.
     files: Vec<MigrationFile>,

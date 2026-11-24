@@ -3,9 +3,9 @@
 A foreign key whose referencing column has a different type than the column
 it references.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| performance | warning | final schema | — |
 
 ## Example
 
@@ -17,7 +17,7 @@ CREATE INDEX ON posts (author_id);
 ```
 
 ```
-warning[fk_type_mismatch]: foreign key posts_author_id_fkey compares public.posts.author_id (int4) with public.users.id (int8)
+warning[performance/fk_type_mismatch]: foreign key posts_author_id_fkey compares public.posts.author_id (int4) with public.users.id (int8)
    ╭─[migrations/0001_init.sql:2:1]
  2 │ CREATE TABLE posts (id bigint PRIMARY KEY, author_id integer NOT NULL REFERENCES users (id));
    · ────────────────────────────────────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ When that statement's file can't change any more (unchanged from
 `in a new migration, give author_id …`.
 
 Changing `integer` to `bigint` rewrites the table
-([`table_rewrite`](table_rewrite.md)); on a large table, add a new column,
+([`alter_table_rewrite`](alter_table_rewrite.md)); on a large table, add a new column,
 backfill it and swap.
 
 ## Not reported
@@ -76,4 +76,4 @@ See [Configuring rules](README.md#configuring-rules).
 
 - [`fk_without_index`](fk_without_index.md): a foreign key with no index on
   its referencing columns.
-- [`table_rewrite`](table_rewrite.md): the rewrite a type change causes.
+- [`alter_table_rewrite`](alter_table_rewrite.md): the rewrite a type change causes.

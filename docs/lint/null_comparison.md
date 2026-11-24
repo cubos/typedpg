@@ -2,9 +2,9 @@
 
 A comparison with a `NULL` literal, which is never true.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| error | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -17,21 +17,21 @@ SELECT id, CASE name WHEN NULL THEN 'anonymous' ELSE name END AS label FROM user
 ```
 
 ```
-error[null_comparison]: comparison with NULL is never true
+error[correctness/null_comparison]: comparison with NULL is never true
    ╭─[queries.sql:2:28]
  2 │ SELECT id FROM users WHERE deleted_at = NULL;
    ·                            ─────────────────
    ╰────
   help: use IS NULL / IS NOT NULL
 
-error[null_comparison]: NOT IN with a NULL in the list is never true
+error[correctness/null_comparison]: NOT IN with a NULL in the list is never true
    ╭─[queries.sql:4:28]
  4 │ SELECT id FROM users WHERE id NOT IN (1, 2, NULL);
    ·                            ──────────────────────
    ╰────
   help: remove the NULL from the list
 
-error[null_comparison]: CASE ... WHEN NULL never matches
+error[correctness/null_comparison]: CASE ... WHEN NULL never matches
    ╭─[queries.sql:6:22]
  6 │ SELECT id, CASE name WHEN NULL THEN 'anonymous' ELSE name END AS label FROM users;
    ·                      ─────────

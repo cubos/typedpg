@@ -3,9 +3,9 @@
 A `CASE` without `ELSE` whose `WHEN`s may all be false for some row, which
 makes it `NULL` there.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | writes `ELSE NULL` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| style | info | queries | writes `ELSE NULL` |
 
 ## Example
 
@@ -21,7 +21,7 @@ SELECT id, CASE status WHEN 'draft' THEN 1 WHEN 'published' THEN 2 END AS rank F
 ```
 
 ```
-warning[case_without_else]: CASE without ELSE is NULL when no WHEN matches
+info[style/case_without_else]: CASE without ELSE is NULL when no WHEN matches
    ╭─[queries.sql:4:12]
  4 │ SELECT id, CASE status WHEN 'draft' THEN 1 WHEN 'published' THEN 2 END AS rank FROM posts;
    ·            ───────────────────────────────────────────────────────────

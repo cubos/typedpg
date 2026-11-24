@@ -270,7 +270,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         let finding = &findings[0].finding;
         assert_eq!(finding.rule, Rule::RedundantBinding);
-        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.severity, Severity::Info);
         assert_eq!(
             finding.message,
             "`principal = principal` binds `$principal` to the variable it captures without a \

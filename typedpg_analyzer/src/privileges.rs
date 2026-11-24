@@ -6348,7 +6348,7 @@ impl PgCatalog {
                 .any(|policy| clause(policy).is_some_and(|c| never_true(&c)))
     }
 
-    /// For the lint (`breaks_deployed_queries`): what row-level security
+    /// For the lint (`deployed_query_breakage`): what row-level security
     /// checks a row against when role `role` writes it into relation
     /// `relid` by command `cmd` — `a` INSERT: the new row against the INSERT
     /// policies' WITH CHECK (their USING without one); `w` UPDATE: the new

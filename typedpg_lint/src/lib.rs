@@ -5,7 +5,10 @@
 //! runs every enabled [`Rule`] over it. Findings carry the configured
 //! severity, a message and an optional help line; a query finding is placed
 //! at a byte range in the original query text, a call-site finding at the
-//! method identifier the caller saw (see [`lint_query_called`]).
+//! method identifier the caller saw (see [`lint_query_called`]). Every rule
+//! but the two meta rules belongs to a [`Category`], whose level is the
+//! rule's default level and which the configuration can set as a whole; a
+//! finding's [`Finding::label`] shows it (`error[correctness/null_comparison]`).
 //!
 //! A comment `-- typedpg-lint: allow(rule_a, rule_b)` (or the `/* … */`
 //! form) in the query suppresses those rules for the whole query. An
@@ -43,7 +46,7 @@ pub mod oracle {
 }
 
 pub use deployed::{
-    Decoding, DeployedKind, DeployedQuery, Deployment, NewSchema, breaks_deployed_queries,
+    Decoding, DeployedKind, DeployedQuery, Deployment, NewSchema, deployed_query_breakage,
 };
 pub use ignore::IgnoreSet;
 pub use json_stringify::lint_copy_in_called;
@@ -91,6 +94,85 @@ impl std::fmt::Display for Severity {
     }
 }
 
+/// What kind of problem a rule reports. Every rule but the two meta rules
+/// belongs to exactly one category, and the category's level is the rule's
+/// default level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Category {
+    /// The query or migration is wrong: it fails, or returns the wrong rows.
+    Correctness,
+    /// A privilege, a row-level security policy or a search path lets
+    /// someone do, or see, what they shouldn't.
+    Security,
+    /// The statement probably doesn't do what its author meant.
+    Suspicious,
+    /// A migration statement blocks, locks or scans the table it changes.
+    Locking,
+    /// The statement is slower than it needs to be.
+    Performance,
+    /// The statement repeats, or leaves in place, something the schema or
+    /// the query already settles.
+    Redundant,
+    /// The statement works, but is harder to read than it needs to be.
+    Style,
+    /// A matter of taste: off by default, enabled with a level.
+    Pedantic,
+}
+
+impl Category {
+    /// Every category, in the order the docs list them.
+    pub const ALL: [Category; 8] = [
+        Category::Correctness,
+        Category::Security,
+        Category::Suspicious,
+        Category::Locking,
+        Category::Performance,
+        Category::Redundant,
+        Category::Style,
+        Category::Pedantic,
+    ];
+
+    /// The category's configuration key and rendered name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Category::Correctness => "correctness",
+            Category::Security => "security",
+            Category::Suspicious => "suspicious",
+            Category::Locking => "locking",
+            Category::Performance => "performance",
+            Category::Redundant => "redundant",
+            Category::Style => "style",
+            Category::Pedantic => "pedantic",
+        }
+    }
+
+    /// The category named `name` (see [`Category::name`]).
+    pub fn from_name(name: &str) -> Option<Category> {
+        Category::ALL
+            .into_iter()
+            .find(|category| category.name() == name)
+    }
+
+    /// The severity the category's rules report unless the configuration
+    /// overrides it, or `None` when the category is off by default.
+    pub fn default_level(self) -> Option<Severity> {
+        match self {
+            Category::Correctness | Category::Security => Some(Severity::Error),
+            Category::Suspicious | Category::Locking | Category::Performance => {
+                Some(Severity::Warning)
+            }
+            Category::Redundant | Category::Style => Some(Severity::Info),
+            Category::Pedantic => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Category {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// A lint rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Rule {
@@ -103,11 +185,11 @@ pub enum Rule {
     /// A `CREATE INDEX` without `CONCURRENTLY` on an existing table.
     CreateIndexBlocking,
     /// An `ADD CONSTRAINT` / `ADD COLUMN` that validates existing rows.
-    ConstraintValidating,
+    AddConstraintScan,
     /// An `ALTER COLUMN … SET NOT NULL` that scans the table.
     SetNotNullScan,
     /// An `ALTER TABLE` that rewrites the whole table under a lock.
-    TableRewrite,
+    AlterTableRewrite,
     /// A foreign key whose referencing columns have no index.
     FkWithoutIndex,
     /// An index another index on the table already covers.
@@ -155,7 +237,7 @@ pub enum Rule {
     /// A join that can't change the rows and whose table nothing reads.
     RedundantJoin,
     /// A scalar subquery used as a value that may return more than one row.
-    ScalarSubqueryMayReturnMany,
+    ScalarSubqueryMultipleRows,
     /// An implicit conversion between `timestamp` (or `date`) and
     /// `timestamptz`, whose result depends on the session's `TimeZone`.
     TimestampTimezoneMix,
@@ -179,7 +261,7 @@ pub enum Rule {
     /// table) or pinned to a constant by `WHERE`.
     RedundantGroupBy,
     /// `count(expr)` over a value that is never NULL: it is `count(*)`.
-    CountNotNull,
+    RedundantCountArgument,
     /// A comparison that wraps an indexed column in a cast, function or
     /// arithmetic (or converts it implicitly), so its index can't serve it.
     NonSargablePredicate,
@@ -188,27 +270,27 @@ pub enum Rule {
     /// A foreign key whose column types differ from the referenced columns.
     FkTypeMismatch,
     /// A migration taking a blocking lock without `SET lock_timeout`.
-    MissingLockTimeout,
+    LockWithoutTimeout,
     /// A `DROP INDEX` without `CONCURRENTLY` on an existing table.
     DropIndexBlocking,
     /// A `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or
     /// `REPACK` without `CONCURRENTLY` on an existing table.
-    BlockingRebuild,
+    RebuildBlocking,
     /// A `DETACH PARTITION` without `CONCURRENTLY` on an existing table.
     DetachPartitionBlocking,
     /// A `VALIDATE CONSTRAINT` in the transaction that added the constraint
     /// `NOT VALID`.
-    ValidateInSameTransaction,
+    ValidateConstraintBlocking,
     /// An `ATTACH PARTITION` that scans the partition to check its bound.
     AttachPartitionScan,
     /// A table without a primary key.
-    MissingPrimaryKey,
+    TableWithoutPrimaryKey,
     /// Row-level security policies on a table that does not enable it.
-    RlsPolicyNotEnforced,
+    PolicyWithoutRls,
     /// Row-level security enabled on a table with no policy.
-    RlsNoPolicy,
+    RlsWithoutPolicy,
     /// A `SECURITY DEFINER` routine without `SET search_path`.
-    SecurityDefinerSearchPath,
+    SecurityDefinerWithoutSearchPath,
     /// A `timestamp without time zone` column.
     PreferTimestamptz,
     /// A `serial` column instead of an identity column.
@@ -221,18 +303,26 @@ pub enum Rule {
     PreferJsonb,
     /// `fetch_one` / `fetch_optional` on a query not proven to return at most
     /// one row.
-    FetchMayReturnMany,
+    FetchOneMultipleRows,
     /// `fetch_all` on a query that returns at most one row.
     FetchAllSingleRow,
     /// `execute()` on a statement whose `RETURNING` rows are discarded.
     UnusedReturning,
     /// A migration that breaks a query of the code deployed at
     /// `--previous-deployment`, which keeps running while it is applied.
-    BreaksDeployedQueries,
+    DeployedQueryBreakage,
     /// A `JSON.stringify(…)` passed as the value of a `json` / `jsonb`
     /// parameter, which the TypeScript runtime encodes again: a JSON string
     /// is stored instead of the value. TypeScript only.
     JsonStringifyParam,
+    /// A `FROM` list that joins relations with commas instead of `JOIN …
+    /// ON`.
+    CommaJoin,
+    /// `ORDER BY`, `GROUP BY` or `DISTINCT ON` by an output column's
+    /// position.
+    OrdinalReference,
+    /// A comparison of a boolean value with the literal `true` or `false`.
+    BooleanComparison,
     /// A malformed or unknown rule name in an allow comment. Never
     /// configurable and never suppressible: it is always an error.
     InvalidAllow,
@@ -244,14 +334,14 @@ pub enum Rule {
 
 impl Rule {
     /// Every configurable rule.
-    pub const ALL: [Rule; 60] = [
+    pub const ALL: [Rule; 63] = [
         Rule::NullComparison,
         Rule::UnboundedWrite,
         Rule::NotInNullable,
         Rule::CreateIndexBlocking,
-        Rule::ConstraintValidating,
+        Rule::AddConstraintScan,
         Rule::SetNotNullScan,
-        Rule::TableRewrite,
+        Rule::AlterTableRewrite,
         Rule::FkWithoutIndex,
         Rule::RedundantIndex,
         Rule::RedundantBinding,
@@ -273,7 +363,7 @@ impl Rule {
         Rule::SimplifiableCase,
         Rule::LikeUnescapedParam,
         Rule::RedundantJoin,
-        Rule::ScalarSubqueryMayReturnMany,
+        Rule::ScalarSubqueryMultipleRows,
         Rule::TimestampTimezoneMix,
         Rule::IntegerDivision,
         Rule::LeftJoinNullified,
@@ -281,30 +371,33 @@ impl Rule {
         Rule::UnstableOrder,
         Rule::RedundantOrderBy,
         Rule::RedundantGroupBy,
-        Rule::CountNotNull,
+        Rule::RedundantCountArgument,
         Rule::NonSargablePredicate,
         Rule::FloatEquality,
         Rule::FkTypeMismatch,
-        Rule::MissingLockTimeout,
+        Rule::LockWithoutTimeout,
         Rule::DropIndexBlocking,
-        Rule::BlockingRebuild,
+        Rule::RebuildBlocking,
         Rule::DetachPartitionBlocking,
-        Rule::ValidateInSameTransaction,
+        Rule::ValidateConstraintBlocking,
         Rule::AttachPartitionScan,
-        Rule::MissingPrimaryKey,
-        Rule::RlsPolicyNotEnforced,
-        Rule::RlsNoPolicy,
-        Rule::SecurityDefinerSearchPath,
+        Rule::TableWithoutPrimaryKey,
+        Rule::PolicyWithoutRls,
+        Rule::RlsWithoutPolicy,
+        Rule::SecurityDefinerWithoutSearchPath,
         Rule::PreferTimestamptz,
         Rule::PreferIdentity,
         Rule::PreferText,
         Rule::PreferBigintPk,
         Rule::PreferJsonb,
-        Rule::FetchMayReturnMany,
+        Rule::FetchOneMultipleRows,
         Rule::FetchAllSingleRow,
         Rule::UnusedReturning,
-        Rule::BreaksDeployedQueries,
+        Rule::DeployedQueryBreakage,
         Rule::JsonStringifyParam,
+        Rule::CommaJoin,
+        Rule::OrdinalReference,
+        Rule::BooleanComparison,
     ];
 
     /// The rule's configuration key (`[package.metadata.typedpg.lint]`, and
@@ -315,9 +408,9 @@ impl Rule {
             Rule::UnboundedWrite => "unbounded_write",
             Rule::NotInNullable => "not_in_nullable",
             Rule::CreateIndexBlocking => "create_index_blocking",
-            Rule::ConstraintValidating => "constraint_validating",
+            Rule::AddConstraintScan => "add_constraint_scan",
             Rule::SetNotNullScan => "set_not_null_scan",
-            Rule::TableRewrite => "table_rewrite",
+            Rule::AlterTableRewrite => "alter_table_rewrite",
             Rule::FkWithoutIndex => "fk_without_index",
             Rule::RedundantIndex => "redundant_index",
             Rule::RedundantBinding => "redundant_binding",
@@ -339,7 +432,7 @@ impl Rule {
             Rule::SimplifiableCase => "simplifiable_case",
             Rule::LikeUnescapedParam => "like_unescaped_param",
             Rule::RedundantJoin => "redundant_join",
-            Rule::ScalarSubqueryMayReturnMany => "scalar_subquery_may_return_many",
+            Rule::ScalarSubqueryMultipleRows => "scalar_subquery_multiple_rows",
             Rule::TimestampTimezoneMix => "timestamp_timezone_mix",
             Rule::IntegerDivision => "integer_division",
             Rule::LeftJoinNullified => "left_join_nullified",
@@ -347,30 +440,33 @@ impl Rule {
             Rule::UnstableOrder => "unstable_order",
             Rule::RedundantOrderBy => "redundant_order_by",
             Rule::RedundantGroupBy => "redundant_group_by",
-            Rule::CountNotNull => "count_not_null",
+            Rule::RedundantCountArgument => "redundant_count_argument",
             Rule::NonSargablePredicate => "non_sargable_predicate",
             Rule::FloatEquality => "float_equality",
             Rule::FkTypeMismatch => "fk_type_mismatch",
-            Rule::MissingLockTimeout => "missing_lock_timeout",
+            Rule::LockWithoutTimeout => "lock_without_timeout",
             Rule::DropIndexBlocking => "drop_index_blocking",
-            Rule::BlockingRebuild => "blocking_rebuild",
+            Rule::RebuildBlocking => "rebuild_blocking",
             Rule::DetachPartitionBlocking => "detach_partition_blocking",
-            Rule::ValidateInSameTransaction => "validate_in_same_transaction",
+            Rule::ValidateConstraintBlocking => "validate_constraint_blocking",
             Rule::AttachPartitionScan => "attach_partition_scan",
-            Rule::MissingPrimaryKey => "missing_primary_key",
-            Rule::RlsPolicyNotEnforced => "rls_policy_not_enforced",
-            Rule::RlsNoPolicy => "rls_no_policy",
-            Rule::SecurityDefinerSearchPath => "security_definer_search_path",
+            Rule::TableWithoutPrimaryKey => "table_without_primary_key",
+            Rule::PolicyWithoutRls => "policy_without_rls",
+            Rule::RlsWithoutPolicy => "rls_without_policy",
+            Rule::SecurityDefinerWithoutSearchPath => "security_definer_without_search_path",
             Rule::PreferTimestamptz => "prefer_timestamptz",
             Rule::PreferIdentity => "prefer_identity",
             Rule::PreferText => "prefer_text",
             Rule::PreferBigintPk => "prefer_bigint_pk",
             Rule::PreferJsonb => "prefer_jsonb",
-            Rule::FetchMayReturnMany => "fetch_may_return_many",
+            Rule::FetchOneMultipleRows => "fetch_one_multiple_rows",
             Rule::FetchAllSingleRow => "fetch_all_single_row",
             Rule::UnusedReturning => "unused_returning",
-            Rule::BreaksDeployedQueries => "breaks_deployed_queries",
+            Rule::DeployedQueryBreakage => "deployed_query_breakage",
             Rule::JsonStringifyParam => "json_stringify_param",
+            Rule::CommaJoin => "comma_join",
+            Rule::OrdinalReference => "ordinal_reference",
+            Rule::BooleanComparison => "boolean_comparison",
             Rule::InvalidAllow => "invalid_allow",
             Rule::InternalError => "internal_error",
         }
@@ -402,9 +498,9 @@ impl Rule {
             Rule::CreateIndexBlocking => {
                 "CREATE INDEX without CONCURRENTLY on a table that already has rows"
             }
-            Rule::ConstraintValidating => "a constraint that validates existing rows under a lock",
+            Rule::AddConstraintScan => "a constraint that validates existing rows under a lock",
             Rule::SetNotNullScan => "SET NOT NULL that scans every row of the table",
-            Rule::TableRewrite => "ALTER TABLE that rewrites every row under a lock",
+            Rule::AlterTableRewrite => "ALTER TABLE that rewrites every row under a lock",
             Rule::FkWithoutIndex => "a foreign key whose referencing columns have no index",
             Rule::RedundantIndex => "an index another index on the table already covers",
             Rule::RedundantBinding => "a `sql!` binding the parameter would capture without it",
@@ -438,7 +534,7 @@ impl Rule {
             Rule::RedundantJoin => {
                 "a join that can't change the rows and whose table nothing else reads"
             }
-            Rule::ScalarSubqueryMayReturnMany => {
+            Rule::ScalarSubqueryMultipleRows => {
                 "a scalar subquery used as a value that may return more than one row"
             }
             Rule::TimestampTimezoneMix => {
@@ -461,7 +557,9 @@ impl Rule {
             Rule::RedundantGroupBy => {
                 "GROUP BY keys determined by the other keys or pinned to a constant"
             }
-            Rule::CountNotNull => "count(expr) over a value that is never NULL, which is count(*)",
+            Rule::RedundantCountArgument => {
+                "count(expr) over a value that is never NULL, which is count(*)"
+            }
             Rule::NonSargablePredicate => {
                 "a comparison wrapping an indexed column so its index can't serve it"
             }
@@ -469,46 +567,55 @@ impl Rule {
             Rule::FkTypeMismatch => {
                 "a foreign key whose column types differ from the referenced columns"
             }
-            Rule::MissingLockTimeout => {
+            Rule::LockWithoutTimeout => {
                 "a migration taking a blocking lock on an existing table without SET lock_timeout"
             }
             Rule::DropIndexBlocking => {
                 "DROP INDEX without CONCURRENTLY on a table that already has rows"
             }
-            Rule::BlockingRebuild => {
+            Rule::RebuildBlocking => {
                 "REINDEX, VACUUM FULL, CLUSTER or REPACK holding a blocking lock for the whole rebuild"
             }
             Rule::DetachPartitionBlocking => {
                 "DETACH PARTITION without CONCURRENTLY on a table that already has rows"
             }
-            Rule::ValidateInSameTransaction => {
+            Rule::ValidateConstraintBlocking => {
                 "VALIDATE CONSTRAINT in the transaction that added the constraint NOT VALID"
             }
             Rule::AttachPartitionScan => {
                 "ATTACH PARTITION scanning the partition because its constraints don't imply its \
                  bound, or scanning the default partition"
             }
-            Rule::MissingPrimaryKey => "a table without a primary key",
-            Rule::RlsPolicyNotEnforced => {
+            Rule::TableWithoutPrimaryKey => "a table without a primary key",
+            Rule::PolicyWithoutRls => {
                 "row-level security policies on a table that does not enable row-level security"
             }
-            Rule::RlsNoPolicy => "row-level security enabled on a table with no policy",
-            Rule::SecurityDefinerSearchPath => "a SECURITY DEFINER routine without SET search_path",
+            Rule::RlsWithoutPolicy => "row-level security enabled on a table with no policy",
+            Rule::SecurityDefinerWithoutSearchPath => {
+                "a SECURITY DEFINER routine without SET search_path"
+            }
             Rule::PreferTimestamptz => "a timestamp without time zone column",
             Rule::PreferIdentity => "a serial column instead of an identity column",
             Rule::PreferText => "a varchar(n) or char(n) column instead of text",
             Rule::PreferBigintPk => "an int2 or int4 primary key",
             Rule::PreferJsonb => "a json column instead of jsonb",
-            Rule::FetchMayReturnMany => {
+            Rule::FetchOneMultipleRows => {
                 "fetch_one / fetch_optional on a query not proven to return at most one row"
             }
             Rule::FetchAllSingleRow => "fetch_all on a query that returns at most one row",
             Rule::UnusedReturning => "execute() on a statement whose RETURNING rows are discarded",
-            Rule::BreaksDeployedQueries => {
+            Rule::DeployedQueryBreakage => {
                 "a migration that breaks a query of the code deployed at --previous-deployment"
             }
             Rule::JsonStringifyParam => {
                 "JSON.stringify(…) passed as a json or jsonb value, which stores a JSON string"
+            }
+            Rule::CommaJoin => "a FROM list joining relations with commas instead of JOIN … ON",
+            Rule::OrdinalReference => {
+                "ORDER BY, GROUP BY or DISTINCT ON by an output column's position"
+            }
+            Rule::BooleanComparison => {
+                "a comparison of a boolean value with the literal true or false"
             }
             Rule::InvalidAllow => "a malformed or unknown rule name in a typedpg-lint comment",
             Rule::InternalError => "a typedpg bug: a fix that would have changed the query",
@@ -521,73 +628,85 @@ impl Rule {
         self.default_level().unwrap_or(Severity::Info)
     }
 
-    /// The severity the rule reports unless the configuration overrides it,
-    /// or `None` when the rule is off by default.
-    pub fn default_level(self) -> Option<Severity> {
+    /// The category the rule belongs to, or `None` for the two meta rules
+    /// (`invalid_allow` and `internal_error`).
+    pub fn category(self) -> Option<Category> {
         match self {
-            Rule::NullComparison
-            | Rule::UnboundedWrite
-            | Rule::RlsPolicyNotEnforced
-            | Rule::JsonStringifyParam
-            | Rule::InvalidAllow => Some(Severity::Error),
-            Rule::NotInNullable
-            | Rule::CreateIndexBlocking
-            | Rule::ConstraintValidating
-            | Rule::SetNotNullScan
-            | Rule::TableRewrite
-            | Rule::FkWithoutIndex
-            | Rule::RedundantBinding
-            | Rule::InternalError
-            | Rule::RedundantNullCheck
+            Rule::CheckViolation
+            | Rule::NullComparison
+            | Rule::NotInNullable
+            | Rule::ScalarSubqueryMultipleRows
+            | Rule::FetchOneMultipleRows
             | Rule::LimitWithoutOrder
-            | Rule::FkTypeMismatch
-            | Rule::MissingLockTimeout
-            | Rule::DropIndexBlocking
-            | Rule::BlockingRebuild
-            | Rule::DetachPartitionBlocking
-            | Rule::ValidateInSameTransaction
-            | Rule::AttachPartitionScan
-            | Rule::MissingPrimaryKey
-            | Rule::SecurityDefinerSearchPath
-            | Rule::FetchMayReturnMany
-            | Rule::ConstantCondition
-            | Rule::UnreachableCaseBranch
-            | Rule::CaseWithoutElse
-            | Rule::OuterReferenceInSubquery
-            | Rule::CartesianJoin
-            | Rule::InsertWithoutColumns
-            | Rule::SelfAssignment
-            | Rule::UnusedCte
-            | Rule::BreaksDeployedQueries
-            | Rule::ScalarSubqueryMayReturnMany
-            | Rule::TimestampTimezoneMix
+            | Rule::UnstableOrder
+            | Rule::JsonStringifyParam
+            | Rule::DeployedQueryBreakage
+            | Rule::LikeUnescapedParam => Some(Category::Correctness),
+            Rule::RlsWithoutPolicy
+            | Rule::PolicyWithoutRls
+            | Rule::SecurityDefinerWithoutSearchPath => Some(Category::Security),
+            Rule::TimestampTimezoneMix
+            | Rule::FloatEquality
             | Rule::IntegerDivision
             | Rule::LeftJoinNullified
-            | Rule::CheckViolation
-            | Rule::UnstableOrder
-            | Rule::FloatEquality => Some(Severity::Warning),
-            Rule::RedundantIndex
-            | Rule::RenamingBinding
-            | Rule::RedundantLimit
-            | Rule::RedundantDistinct
+            | Rule::OuterReferenceInSubquery
+            | Rule::CartesianJoin
+            | Rule::ConstantCondition
+            | Rule::SelfAssignment
+            | Rule::UnboundedWrite
+            | Rule::InsertWithoutColumns
+            | Rule::TableWithoutPrimaryKey => Some(Category::Suspicious),
+            Rule::LockWithoutTimeout
+            | Rule::CreateIndexBlocking
+            | Rule::DropIndexBlocking
+            | Rule::DetachPartitionBlocking
+            | Rule::RebuildBlocking
+            | Rule::AlterTableRewrite
+            | Rule::SetNotNullScan
+            | Rule::AttachPartitionScan
+            | Rule::AddConstraintScan
+            | Rule::ValidateConstraintBlocking => Some(Category::Locking),
+            Rule::FkWithoutIndex
+            | Rule::FkTypeMismatch
+            | Rule::NonSargablePredicate
+            | Rule::RedundantIndex
+            | Rule::PreferJsonb => Some(Category::Performance),
+            Rule::RedundantAlias
+            | Rule::RedundantBinding
             | Rule::RedundantCast
-            | Rule::RedundantAlias
-            | Rule::SimplifiableCase
-            | Rule::RedundantJoin
-            | Rule::FetchAllSingleRow
-            | Rule::RlsNoPolicy
-            | Rule::UnusedReturning
-            | Rule::RedundantOrderBy
+            | Rule::RedundantDistinct
             | Rule::RedundantGroupBy
-            | Rule::CountNotNull
-            | Rule::NonSargablePredicate => Some(Severity::Info),
-            // Off by default: enabled with a level, they report at info.
-            Rule::LikeUnescapedParam
-            | Rule::PreferTimestamptz
+            | Rule::RedundantJoin
+            | Rule::RedundantLimit
+            | Rule::RedundantNullCheck
+            | Rule::RedundantOrderBy
+            | Rule::RenamingBinding
+            | Rule::UnusedCte
+            | Rule::UnusedReturning
+            | Rule::UnreachableCaseBranch
+            | Rule::RedundantCountArgument
+            | Rule::SimplifiableCase
+            | Rule::FetchAllSingleRow => Some(Category::Redundant),
+            Rule::CaseWithoutElse
+            | Rule::CommaJoin
+            | Rule::OrdinalReference
+            | Rule::BooleanComparison => Some(Category::Style),
+            Rule::PreferBigintPk
             | Rule::PreferIdentity
             | Rule::PreferText
-            | Rule::PreferBigintPk
-            | Rule::PreferJsonb => None,
+            | Rule::PreferTimestamptz => Some(Category::Pedantic),
+            Rule::InvalidAllow | Rule::InternalError => None,
+        }
+    }
+
+    /// The severity the rule reports unless the configuration overrides it:
+    /// its category's default level, or `None` when that level is off. The
+    /// two meta rules keep their own levels.
+    pub fn default_level(self) -> Option<Severity> {
+        match self {
+            Rule::InvalidAllow => Some(Severity::Error),
+            Rule::InternalError => Some(Severity::Warning),
+            _ => self.category().and_then(Category::default_level),
         }
     }
 }
@@ -709,9 +828,13 @@ pub struct Finding {
 
 impl Finding {
     /// The severity's line in [`render`]'s format:
-    /// `error[null_comparison]`.
+    /// `error[correctness/null_comparison]`, or `error[invalid_allow]` for
+    /// the two rules without a category.
     pub fn label(&self) -> String {
-        format!("{}[{}]", self.severity, self.rule)
+        match self.rule.category() {
+            Some(category) => format!("{}[{category}/{}]", self.severity, self.rule),
+            None => format!("{}[{}]", self.severity, self.rule),
+        }
     }
 }
 
@@ -737,12 +860,24 @@ impl Default for LintOptions {
 impl LintOptions {
     /// The options `[package.metadata.typedpg.lint]` (or the TypeScript
     /// config's `lint` object) configures: rules without an override keep
-    /// their [`Rule::default_level`], and `fail_on` defaults to error.
+    /// their [`Rule::default_level`] — a category key sets every rule of the
+    /// category, a rule key its own rule — and `fail_on` defaults to error.
+    /// A rule's own key wins over its category's.
     pub fn from_config(config: &LintConfig) -> Self {
         let mut options = LintOptions {
             fail_on: severity(config.fail_on),
             ..LintOptions::default()
         };
+        for (name, level) in &config.levels {
+            if let Some(category) = Category::from_name(name) {
+                for rule in Rule::ALL
+                    .into_iter()
+                    .filter(|rule| rule.category() == Some(category))
+                {
+                    options.levels.insert(rule, level.severity().map(severity));
+                }
+            }
+        }
         for (name, level) in &config.levels {
             if let Some(rule) = Rule::from_name(name) {
                 options.levels.insert(rule, level.severity().map(severity));
@@ -839,7 +974,7 @@ pub fn lint_query(
 
 /// [`lint_query`], with the methods the caller saw called on the query.
 ///
-/// The call-site rules (`fetch_may_return_many`, `fetch_all_single_row`,
+/// The call-site rules (`fetch_one_multiple_rows`, `fetch_all_single_row`,
 /// `unused_returning` and `json_stringify_param`) read `calls` and the same
 /// [`QueryView`](typedpg_analyzer::QueryView) every other query rule uses,
 /// so no query is analyzed twice. Their findings carry the index in `calls`
@@ -1061,6 +1196,16 @@ pub fn lint_query_called_as(
         rules::oracle::check(&ctx, &records);
     }
     placed.extend(bugs);
+    // Every finding tells its reader what to do; a rule's test that misses
+    // one fails here rather than shipping a bare message.
+    #[cfg(test)]
+    for placed_finding in &placed {
+        assert!(
+            placed_finding.finding.help.is_some(),
+            "the {} finding has no help: {sql}",
+            placed_finding.finding.rule
+        );
+    }
     // A deterministic order: the query's own findings by position, then the
     // call-site findings by call.
     placed.sort_by(|a, b| {
@@ -1197,6 +1342,18 @@ pub fn fails(findings: &[Finding], options: &LintOptions) -> bool {
         .any(|finding| finding.severity >= options.fail_on)
 }
 
+/// The `help:` line of an [`Rule::InvalidAllow`] finding: the valid form,
+/// or where the valid rule names are.
+pub(crate) fn invalid_allow_help(malformed: bool) -> String {
+    if malformed {
+        "write `-- typedpg-lint: allow(rule_name, ...)`, with nothing after it".to_owned()
+    } else {
+        "use a rule's configuration key, e.g. `null_comparison` (docs/lint/README.md lists them \
+         all)"
+            .to_owned()
+    }
+}
+
 /// Find the allow comments of `sql`, returning the rules they suppress and
 /// the error findings for unknown rule names.
 fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
@@ -1224,7 +1381,7 @@ fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
                     message: "malformed typedpg-lint comment: expected \
                               `typedpg-lint: allow(rule, ...)` and nothing after it"
                         .to_owned(),
-                    help: None,
+                    help: Some(invalid_allow_help(true)),
                     fix: Vec::new(),
                 });
                 continue;
@@ -1249,7 +1406,7 @@ fn suppressions(sql: &str) -> (HashSet<Rule>, Vec<Finding>) {
                             "unknown lint rule `{name}` in a typedpg-lint allow comment: \
                              expected one of {valid}"
                         ),
-                        help: None,
+                        help: Some(invalid_allow_help(false)),
                         fix: Vec::new(),
                     });
                 }
@@ -1358,11 +1515,11 @@ fn allow_comment(comment: &str) -> AllowComment {
     }
 }
 
-/// `path:line:column: severity[rule]: message`, and the help line when the
-/// finding has one:
+/// `path:line:column: severity[category/rule]: message`, and the help line
+/// when the finding has one:
 ///
 /// ```text
-/// src/users.ts:12:30: error[null_comparison]: comparison with NULL is never true
+/// src/users.ts:12:30: error[correctness/null_comparison]: comparison with NULL is never true
 ///   help: use IS NULL / IS NOT NULL
 /// ```
 pub fn render(path: &Path, line: u32, column: u32, finding: &Finding) -> String {
@@ -2075,7 +2232,7 @@ mod tests {
         };
         assert_eq!(
             render(Path::new("src/users.ts"), 12, 30, &finding),
-            "src/users.ts:12:30: error[null_comparison]: comparison with NULL is never true\n  \
+            "src/users.ts:12:30: error[correctness/null_comparison]: comparison with NULL is never true\n  \
              help: use IS NULL / IS NOT NULL"
         );
         let mut warning = finding.clone();
@@ -2101,7 +2258,8 @@ mod tests {
         };
         assert_eq!(
             report.summary(),
-            "typedpg lint: 1 error, 1 warning, 1 info\n  checked 0 queries and 0 migrations in 0.00s\n  ✖ failed: 1 finding at or above fail_on (error)"
+            "typedpg lint: 1 error, 1 warning, 1 info\n  checked 0 queries and 0 migrations in \
+             0.00s\n  by category: correctness 3\n  ✖ failed: 1 finding at or above fail_on (error)"
         );
     }
 
@@ -2125,15 +2283,53 @@ mod tests {
     }
 
     #[test]
+    fn every_rule_has_exactly_one_category() {
+        let mut counts = BTreeMap::new();
+        for rule in Rule::ALL {
+            let category = rule
+                .category()
+                .unwrap_or_else(|| panic!("{rule} has no category"));
+            *counts.entry(category).or_insert(0) += 1;
+            assert_eq!(rule.default_level(), category.default_level(), "{rule}");
+            assert_eq!(Category::from_name(category.name()), Some(category));
+        }
+        for category in Category::ALL {
+            assert!(counts.contains_key(&category), "{category} has no rule");
+        }
+        assert_eq!(Rule::InvalidAllow.category(), None);
+        assert_eq!(Rule::InternalError.category(), None);
+    }
+
+    #[test]
+    fn a_category_key_sets_its_rules_and_a_rule_key_wins() {
+        let mut config = LintConfig::default();
+        config.levels.insert("style".to_owned(), LintLevel::Error);
+        config
+            .levels
+            .insert("boolean_comparison".to_owned(), LintLevel::Off);
+        config.levels.insert("pedantic".to_owned(), LintLevel::Info);
+        let options = LintOptions::from_config(&config);
+        // The category's level, at error for its other rules.
+        assert_eq!(options.level(Rule::CommaJoin), Some(Severity::Error));
+        assert_eq!(options.level(Rule::CaseWithoutElse), Some(Severity::Error));
+        assert_eq!(options.level(Rule::OrdinalReference), Some(Severity::Error));
+        // The rule's own key wins.
+        assert_eq!(options.level(Rule::BooleanComparison), None);
+        // A pedantic rule enabled through its category gets its level.
+        assert_eq!(options.level(Rule::PreferText), Some(Severity::Info));
+        // A rule the category doesn't name keeps its own default.
+        assert_eq!(options.level(Rule::NullComparison), Some(Severity::Error));
+        assert_eq!(options.level(Rule::RedundantLimit), Some(Severity::Info));
+    }
+
+    #[test]
     fn off_rules_default_off_and_enable_with_a_level() {
         let options = LintOptions::default();
         for rule in [
-            Rule::LikeUnescapedParam,
             Rule::PreferTimestamptz,
             Rule::PreferIdentity,
             Rule::PreferText,
             Rule::PreferBigintPk,
-            Rule::PreferJsonb,
         ] {
             assert_eq!(rule.default_level(), None, "{rule}");
             assert_eq!(rule.default_severity(), Severity::Info, "{rule}");
@@ -2142,10 +2338,10 @@ mod tests {
         let mut config = LintConfig::default();
         config
             .levels
-            .insert("like_unescaped_param".to_owned(), LintLevel::Warning);
+            .insert("prefer_timestamptz".to_owned(), LintLevel::Warning);
         let options = LintOptions::from_config(&config);
         assert_eq!(
-            options.level(Rule::LikeUnescapedParam),
+            options.level(Rule::PreferTimestamptz),
             Some(Severity::Warning)
         );
     }
@@ -2181,7 +2377,7 @@ mod tests {
         for (sql, message) in cases {
             let findings = not_in_findings(&db, sql);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
-            assert_eq!(findings[0].severity, Severity::Warning);
+            assert_eq!(findings[0].severity, Severity::Error);
             assert_eq!(findings[0].message, message);
             assert_eq!(
                 findings[0].help.as_deref(),
@@ -2429,9 +2625,9 @@ mod tests {
         );
         for rule in [
             Rule::CreateIndexBlocking,
-            Rule::ConstraintValidating,
+            Rule::AddConstraintScan,
             Rule::SetNotNullScan,
-            Rule::TableRewrite,
+            Rule::AlterTableRewrite,
         ] {
             assert!(only(&findings, rule).is_empty(), "{rule}: {findings:?}");
         }
@@ -2474,7 +2670,7 @@ mod tests {
     }
 
     #[test]
-    fn constraint_validating_reports_foreign_keys_and_checks() {
+    fn add_constraint_scan_reports_foreign_keys_and_checks() {
         for sql in [
             "ALTER TABLE posts ADD CONSTRAINT posts_author_fk FOREIGN KEY (author_id) REFERENCES users (id);",
             "ALTER TABLE posts ADD CONSTRAINT posts_title_check CHECK (title <> '');",
@@ -2498,7 +2694,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert_eq!(
-                only(&findings, Rule::ConstraintValidating).len(),
+                only(&findings, Rule::AddConstraintScan).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -2522,7 +2718,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert!(
-                only(&findings, Rule::ConstraintValidating).is_empty(),
+                only(&findings, Rule::AddConstraintScan).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
@@ -2532,7 +2728,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert!(
-                only(&findings, Rule::ConstraintValidating).is_empty(),
+                only(&findings, Rule::AddConstraintScan).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
@@ -2578,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn table_rewrite_reports_rewriting_changes() {
+    fn alter_table_rewrite_reports_rewriting_changes() {
         for sql in [
             "ALTER TABLE users ALTER COLUMN i TYPE bigint;",
             "ALTER TABLE users ALTER COLUMN v TYPE varchar(5) USING v::varchar(5);",
@@ -2587,7 +2783,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert_eq!(
-                only(&findings, Rule::TableRewrite).len(),
+                only(&findings, Rule::AlterTableRewrite).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -2595,7 +2791,7 @@ mod tests {
     }
 
     #[test]
-    fn table_rewrite_ignores_no_rewrite_changes() {
+    fn alter_table_rewrite_ignores_no_rewrite_changes() {
         for sql in [
             "ALTER TABLE users ALTER COLUMN v TYPE varchar(20);",
             "ALTER TABLE users ALTER COLUMN v TYPE varchar;",
@@ -2613,17 +2809,17 @@ mod tests {
         ] {
             let findings = second(sql);
             assert!(
-                only(&findings, Rule::TableRewrite).is_empty(),
+                only(&findings, Rule::AlterTableRewrite).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
         // A narrower numeric precision does rewrite.
         let findings = second("ALTER TABLE users ALTER COLUMN n TYPE numeric(8,2);");
-        assert_eq!(only(&findings, Rule::TableRewrite).len(), 1);
+        assert_eq!(only(&findings, Rule::AlterTableRewrite).len(), 1);
     }
 
     #[test]
-    fn table_rewrite_ignores_an_add_column_if_not_exists_that_added_nothing() {
+    fn alter_table_rewrite_ignores_an_add_column_if_not_exists_that_added_nothing() {
         let findings = migrations(
             &[
                 (
@@ -2641,7 +2837,7 @@ mod tests {
             true,
         );
         assert!(
-            only(&findings, Rule::TableRewrite).is_empty(),
+            only(&findings, Rule::AlterTableRewrite).is_empty(),
             "{findings:?}"
         );
 
@@ -2663,7 +2859,7 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(only(&findings, Rule::TableRewrite).len(), 1);
+        assert_eq!(only(&findings, Rule::AlterTableRewrite).len(), 1);
     }
 
     #[test]
@@ -2933,7 +3129,7 @@ mod tests {
         );
         assert_eq!(
             only(&prefix, Rule::RedundantIndex)[0].finding.severity,
-            Severity::Info
+            Severity::Warning
         );
 
         let exact = second(
@@ -3398,9 +3594,9 @@ mod tests {
     #[test]
     fn migration_findings_are_trimmed_statements_in_their_file() {
         // This test pins `create_index_blocking`'s span; the newer
-        // `missing_lock_timeout` also reports a non-concurrent CREATE INDEX,
+        // `lock_without_timeout` also reports a non-concurrent CREATE INDEX,
         // so keep it out of this count.
-        let text = "-- typedpg-lint: allow(missing_lock_timeout)\n  CREATE INDEX users_email_idx ON users (email);  ";
+        let text = "-- typedpg-lint: allow(lock_without_timeout)\n  CREATE INDEX users_email_idx ON users (email);  ";
         let findings = second(text);
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(
@@ -3413,22 +3609,22 @@ mod tests {
     fn migration_rule_names_and_defaults() {
         assert_rule_lists_match();
         for (rule, severity) in [
-            (Rule::NotInNullable, Severity::Warning),
+            (Rule::NotInNullable, Severity::Error),
             (Rule::CreateIndexBlocking, Severity::Warning),
-            (Rule::ConstraintValidating, Severity::Warning),
+            (Rule::AddConstraintScan, Severity::Warning),
             (Rule::SetNotNullScan, Severity::Warning),
-            (Rule::TableRewrite, Severity::Warning),
+            (Rule::AlterTableRewrite, Severity::Warning),
             (Rule::FkWithoutIndex, Severity::Warning),
-            (Rule::RedundantIndex, Severity::Info),
+            (Rule::RedundantIndex, Severity::Warning),
             (Rule::DropIndexBlocking, Severity::Warning),
-            (Rule::BlockingRebuild, Severity::Warning),
+            (Rule::RebuildBlocking, Severity::Warning),
             (Rule::DetachPartitionBlocking, Severity::Warning),
-            (Rule::ValidateInSameTransaction, Severity::Warning),
+            (Rule::ValidateConstraintBlocking, Severity::Warning),
             (Rule::AttachPartitionScan, Severity::Warning),
-            (Rule::MissingPrimaryKey, Severity::Warning),
-            (Rule::RlsPolicyNotEnforced, Severity::Error),
-            (Rule::RlsNoPolicy, Severity::Info),
-            (Rule::SecurityDefinerSearchPath, Severity::Warning),
+            (Rule::TableWithoutPrimaryKey, Severity::Warning),
+            (Rule::PolicyWithoutRls, Severity::Error),
+            (Rule::RlsWithoutPolicy, Severity::Error),
+            (Rule::SecurityDefinerWithoutSearchPath, Severity::Error),
         ] {
             assert_eq!(rule.default_severity(), severity, "{rule}");
         }
@@ -3676,5 +3872,313 @@ mod tests {
             relations_named(&view, "t"),
             vec![Some(relid(&catalog, "public", "t"))]
         );
+    }
+}
+
+#[cfg(test)]
+mod every_finding_has_help {
+    use super::*;
+    use typedpg_analyzer::PgCatalog;
+
+    fn catalog() -> PgCatalog {
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE TABLE users (
+                    id bigint PRIMARY KEY,
+                    name text,
+                    email varchar(100) NOT NULL UNIQUE,
+                    code char(3),
+                    created_at timestamp,
+                    price double precision,
+                    active boolean,
+                    score integer CHECK (score >= 0)
+                 );
+                 CREATE TABLE posts (
+                    id bigint PRIMARY KEY,
+                    user_id bigint NOT NULL REFERENCES users,
+                    title text NOT NULL
+                 );
+                 CREATE INDEX users_created_at_idx ON users (created_at);",
+            )
+            .unwrap();
+        catalog
+    }
+
+    fn call(method: CallMethod, name: &str) -> Call {
+        Call {
+            method,
+            name: name.to_owned(),
+            language: Language::TypeScript,
+            stringified: Vec::new(),
+        }
+    }
+
+    /// The default-on query and call-site rules, with a query each reports.
+    #[test]
+    fn every_query_and_call_site_rule_has_help() {
+        let db = catalog();
+        let stringified = Call {
+            stringified: vec![StringifiedValue::Param("doc".to_owned())],
+            ..call(CallMethod::Execute, "execute")
+        };
+        let fetch_one = [call(CallMethod::FetchOne, "fetchOne")];
+        let fetch_all = [call(CallMethod::FetchAll, "fetchAll")];
+        let execute = [call(CallMethod::Execute, "execute")];
+        let json = [stringified];
+        let case: Vec<(&str, Rule, &[Call])> = vec![
+            ("UPDATE users SET score = -1", Rule::CheckViolation, &[]),
+            (
+                "SELECT id FROM users WHERE name = NULL",
+                Rule::NullComparison,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE name NOT IN (SELECT title FROM posts)",
+                Rule::NotInNullable,
+                &[],
+            ),
+            (
+                "SELECT (SELECT title FROM posts) FROM users",
+                Rule::ScalarSubqueryMultipleRows,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE name = $name",
+                Rule::FetchOneMultipleRows,
+                &fetch_one,
+            ),
+            ("SELECT id FROM users LIMIT 1", Rule::LimitWithoutOrder, &[]),
+            (
+                "SELECT id FROM users ORDER BY name LIMIT 1",
+                Rule::UnstableOrder,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE name LIKE '%' || $q || '%'",
+                Rule::LikeUnescapedParam,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE created_at > now()",
+                Rule::TimestampTimezoneMix,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE price = 0.1",
+                Rule::FloatEquality,
+                &[],
+            ),
+            (
+                "SELECT (id / 2)::numeric FROM users",
+                Rule::IntegerDivision,
+                &[],
+            ),
+            (
+                "SELECT u.id FROM users u LEFT JOIN posts p ON p.user_id = u.id \
+                 WHERE p.title = 'x'",
+                Rule::LeftJoinNullified,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM posts WHERE email = 'x')",
+                Rule::OuterReferenceInSubquery,
+                &[],
+            ),
+            ("SELECT 1 FROM users, posts", Rule::CartesianJoin, &[]),
+            (
+                "SELECT 1 FROM users u, posts p WHERE u.id = p.user_id",
+                Rule::CommaJoin,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE 1 = 1",
+                Rule::ConstantCondition,
+                &[],
+            ),
+            ("UPDATE users SET name = name", Rule::SelfAssignment, &[]),
+            ("DELETE FROM users", Rule::UnboundedWrite, &[]),
+            (
+                "INSERT INTO users VALUES (1, 'a', 'a@b', 'x', NULL, NULL, NULL, NULL)",
+                Rule::InsertWithoutColumns,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE created_at::date = $d",
+                Rule::NonSargablePredicate,
+                &[],
+            ),
+            ("SELECT name AS name FROM users", Rule::RedundantAlias, &[]),
+            ("SELECT name::text FROM users", Rule::RedundantCast, &[]),
+            (
+                "SELECT DISTINCT id FROM users",
+                Rule::RedundantDistinct,
+                &[],
+            ),
+            (
+                "SELECT id, name FROM users GROUP BY id, name",
+                Rule::RedundantGroupBy,
+                &[],
+            ),
+            (
+                "SELECT p.id FROM posts p JOIN users u ON p.user_id = u.id",
+                Rule::RedundantJoin,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE id = $id LIMIT 1",
+                Rule::RedundantLimit,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE email IS NOT NULL",
+                Rule::RedundantNullCheck,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE id = $id ORDER BY id",
+                Rule::RedundantOrderBy,
+                &[],
+            ),
+            (
+                "WITH x AS (SELECT 1 AS n) SELECT id FROM users",
+                Rule::UnusedCte,
+                &[],
+            ),
+            (
+                "UPDATE users SET name = $name RETURNING id",
+                Rule::UnusedReturning,
+                &execute,
+            ),
+            (
+                "SELECT CASE WHEN true THEN 1 WHEN false THEN 2 END FROM users",
+                Rule::UnreachableCaseBranch,
+                &[],
+            ),
+            (
+                "SELECT count(email) FROM users",
+                Rule::RedundantCountArgument,
+                &[],
+            ),
+            (
+                "SELECT CASE WHEN name IS NULL THEN 'x' ELSE name END FROM users",
+                Rule::SimplifiableCase,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE id = $id",
+                Rule::FetchAllSingleRow,
+                &fetch_all,
+            ),
+            (
+                "SELECT CASE WHEN id > 0 THEN name END FROM users",
+                Rule::CaseWithoutElse,
+                &[],
+            ),
+            (
+                "SELECT id, name FROM users ORDER BY 1",
+                Rule::OrdinalReference,
+                &[],
+            ),
+            (
+                "SELECT id FROM users WHERE active = true",
+                Rule::BooleanComparison,
+                &[],
+            ),
+            (
+                "UPDATE users SET name = ($doc::jsonb)->>'k' WHERE id = $id",
+                Rule::JsonStringifyParam,
+                &json,
+            ),
+        ];
+        let mut seen = HashSet::new();
+        for (sql, rule, calls) in &case {
+            let findings = lint_query_called(&db, sql, calls, &LintOptions::default())
+                .unwrap_or_else(|error| panic!("{sql}: {}", error.error));
+            assert!(
+                findings.iter().any(|finding| finding.finding.rule == *rule),
+                "{sql} doesn't report {rule}: {findings:?}"
+            );
+            for finding in findings {
+                assert!(
+                    finding.finding.help.is_some(),
+                    "{sql}: the {} finding has no help",
+                    finding.finding.rule
+                );
+                seen.insert(finding.finding.rule);
+            }
+        }
+        let expected = [
+            Rule::CheckViolation,
+            Rule::NullComparison,
+            Rule::NotInNullable,
+            Rule::ScalarSubqueryMultipleRows,
+            Rule::FetchOneMultipleRows,
+            Rule::LimitWithoutOrder,
+            Rule::UnstableOrder,
+            Rule::LikeUnescapedParam,
+            Rule::TimestampTimezoneMix,
+            Rule::FloatEquality,
+            Rule::IntegerDivision,
+            Rule::LeftJoinNullified,
+            Rule::OuterReferenceInSubquery,
+            Rule::CartesianJoin,
+            Rule::CommaJoin,
+            Rule::ConstantCondition,
+            Rule::SelfAssignment,
+            Rule::UnboundedWrite,
+            Rule::InsertWithoutColumns,
+            Rule::NonSargablePredicate,
+            Rule::RedundantAlias,
+            Rule::RedundantCast,
+            Rule::RedundantDistinct,
+            Rule::RedundantGroupBy,
+            Rule::RedundantJoin,
+            Rule::RedundantLimit,
+            Rule::RedundantNullCheck,
+            Rule::RedundantOrderBy,
+            Rule::UnusedCte,
+            Rule::UnusedReturning,
+            Rule::UnreachableCaseBranch,
+            Rule::RedundantCountArgument,
+            Rule::SimplifiableCase,
+            Rule::FetchAllSingleRow,
+            Rule::CaseWithoutElse,
+            Rule::OrdinalReference,
+            Rule::BooleanComparison,
+            Rule::JsonStringifyParam,
+        ];
+        for rule in expected {
+            assert!(seen.contains(&rule), "{rule} is never reported");
+        }
+    }
+
+    /// The `invalid_allow` findings, which no rule's own tests produce
+    /// through the query pipeline, have a help line too.
+    #[test]
+    fn invalid_allow_findings_have_help() {
+        let db = catalog();
+        let findings = lint_query(
+            &db,
+            "-- typedpg-lint: allow create_index_blocking\nSELECT 1",
+            &LintOptions::default(),
+        )
+        .unwrap();
+        let invalid = findings
+            .iter()
+            .find(|finding| finding.rule == Rule::InvalidAllow)
+            .expect("a malformed allow comment");
+        assert!(invalid.help.is_some(), "{invalid:?}");
+        let findings = lint_query(
+            &db,
+            "-- typedpg-lint: allow(nope)\nSELECT 1",
+            &LintOptions::default(),
+        )
+        .unwrap();
+        let invalid = findings
+            .iter()
+            .find(|finding| finding.rule == Rule::InvalidAllow)
+            .expect("an unknown rule");
+        assert!(invalid.help.is_some(), "{invalid:?}");
     }
 }

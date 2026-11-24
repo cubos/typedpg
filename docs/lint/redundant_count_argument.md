@@ -1,11 +1,11 @@
-# `count_not_null`
+# `redundant_count_argument`
 
 `count(expr)` over a value that is never `NULL`, which counts every row:
 that is `count(*)`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | rewrites the argument to `*` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | rewrites the argument to `*` |
 
 ## Example
 
@@ -20,7 +20,7 @@ SELECT count(id / 2) FROM users;
 ```
 
 ```
-info[count_not_null]: count(u.email) counts every row: its argument is never NULL here
+info[redundant/redundant_count_argument]: count(u.email) counts every row: its argument is never NULL here
    ╭─[queries.sql:4:14]
  4 │ SELECT u.id, count(u.email) FROM users u LEFT JOIN posts p ON p.user_id = u.id GROUP BY u.id;
    ·              ──────────────
@@ -73,14 +73,14 @@ it may raise.
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-count_not_null = "warning"   # error | warning | info | off
+redundant_count_argument = "warning"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "countNotNull": "warning" } }
+{ "lint": { "redundantCountArgument": "warning" } }
 ```
 
-Allow one query with `-- typedpg-lint: allow(count_not_null)` in its text.
+Allow one query with `-- typedpg-lint: allow(redundant_count_argument)` in its text.
 See [Configuring rules](README.md#configuring-rules).
 
 ## Related

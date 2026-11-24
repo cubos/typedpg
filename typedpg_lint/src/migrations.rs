@@ -249,7 +249,7 @@ struct MigrationLinter<'a> {
     /// The `(session, local)` state at each open `SAVEPOINT`, innermost last:
     /// `ROLLBACK TO` restores it and `RELEASE` drops it.
     savepoints: Vec<(String, (bool, Option<bool>))>,
-    /// Whether `missing_lock_timeout` already reported a statement of the
+    /// Whether `lock_without_timeout` already reported a statement of the
     /// current file: at most one finding per file.
     lock_timeout_reported: bool,
     /// The statement that created each table (`CREATE TABLE`, `CREATE
@@ -394,7 +394,10 @@ impl MigrationLinter<'_> {
                 severity: Severity::Error,
                 span: comment.start..comment.end,
                 message,
-                help: None,
+                help: Some(crate::invalid_allow_help(matches!(
+                    comment.kind,
+                    CommentKind::Malformed
+                ))),
                 fix: Vec::new(),
             },
         });
@@ -474,6 +477,10 @@ impl MigrationLinter<'_> {
         let Some(severity) = self.options.level(rule) else {
             return;
         };
+        // Every finding tells its reader what to do; a rule's test that
+        // misses one fails here rather than shipping a bare message.
+        #[cfg(test)]
+        assert!(raw.help.is_some(), "the {rule} finding has no help");
         if self.current_suppressed.contains(&rule) {
             return;
         }
@@ -519,14 +526,14 @@ impl MigrationLinter<'_> {
         self.track_lock_timeout(catalog, statement.node);
         for rule in [
             Rule::CreateIndexBlocking,
-            Rule::ConstraintValidating,
+            Rule::AddConstraintScan,
             Rule::SetNotNullScan,
-            Rule::TableRewrite,
-            Rule::MissingLockTimeout,
+            Rule::AlterTableRewrite,
+            Rule::LockWithoutTimeout,
             Rule::DropIndexBlocking,
-            Rule::BlockingRebuild,
+            Rule::RebuildBlocking,
             Rule::DetachPartitionBlocking,
-            Rule::ValidateInSameTransaction,
+            Rule::ValidateConstraintBlocking,
             Rule::AttachPartitionScan,
         ] {
             if self.options.level(rule).is_none() || self.current_suppressed.contains(&rule) {
@@ -541,28 +548,28 @@ impl MigrationLinter<'_> {
                     found.extend(self.alter_type_index_rebuilds(catalog, alter));
                     found
                 }
-                (Rule::ConstraintValidating, N::AlterTableStmt(alter)) => {
-                    self.constraint_validating(catalog, alter)
+                (Rule::AddConstraintScan, N::AlterTableStmt(alter)) => {
+                    self.add_constraint_scan(catalog, alter)
                 }
-                (Rule::ConstraintValidating, N::AlterDomainStmt(alter)) => {
+                (Rule::AddConstraintScan, N::AlterDomainStmt(alter)) => {
                     self.domain_validating(catalog, alter)
                 }
                 (Rule::SetNotNullScan, N::AlterTableStmt(alter)) => {
                     self.set_not_null_scan(catalog, alter)
                 }
-                (Rule::TableRewrite, N::AlterTableStmt(alter)) => {
-                    self.table_rewrite(catalog, alter)
+                (Rule::AlterTableRewrite, N::AlterTableStmt(alter)) => {
+                    self.alter_table_rewrite(catalog, alter)
                 }
-                (Rule::MissingLockTimeout, _) => self.missing_lock_timeout(catalog, statement.node),
+                (Rule::LockWithoutTimeout, _) => self.lock_without_timeout(catalog, statement.node),
                 (Rule::DropIndexBlocking, N::DropStmt(drop)) => {
                     self.drop_index_blocking(catalog, drop)
                 }
-                (Rule::BlockingRebuild, _) => self.blocking_rebuild(catalog, statement.node),
+                (Rule::RebuildBlocking, _) => self.rebuild_blocking(catalog, statement.node),
                 (Rule::DetachPartitionBlocking, N::AlterTableStmt(alter)) => {
                     self.detach_partition_blocking(catalog, alter)
                 }
-                (Rule::ValidateInSameTransaction, N::AlterTableStmt(alter)) => {
-                    self.validate_in_same_transaction(catalog, alter)
+                (Rule::ValidateConstraintBlocking, N::AlterTableStmt(alter)) => {
+                    self.validate_constraint_blocking(catalog, alter)
                 }
                 (Rule::AttachPartitionScan, N::AlterTableStmt(alter)) => {
                     self.attach_partition_scan(catalog, alter)
@@ -752,7 +759,7 @@ impl MigrationLinter<'_> {
             let Some(type_name) = column.type_name.as_ref() else {
                 continue;
             };
-            // A rewrite builds every index anyway: table_rewrite reports it.
+            // A rewrite builds every index anyway: alter_table_rewrite reports it.
             if catalog.column_type_rewrites(
                 relid,
                 &command.name,
@@ -848,7 +855,7 @@ impl MigrationLinter<'_> {
         }]
     }
 
-    fn constraint_validating(
+    fn add_constraint_scan(
         &self,
         catalog: &PgCatalog,
         alter: &typedpg_pg_query::ast::AlterTableStmt,
@@ -1057,7 +1064,7 @@ impl MigrationLinter<'_> {
         // ALTER COLUMN TYPE drops and re-adds the constraints that read the
         // column (ATPostAlterTypeCleanup): a validated CHECK is validated
         // again, scanning the table even when the type change rewrites
-        // nothing (a rewrite checks it as it goes: table_rewrite reports
+        // nothing (a rewrite checks it as it goes: alter_table_rewrite reports
         // that). A NOT VALID or NOT ENFORCED one is re-added as it was.
         let mut rechecked = Vec::new();
         for command in &alter.cmds {
@@ -1288,7 +1295,7 @@ impl MigrationLinter<'_> {
         out
     }
 
-    fn table_rewrite(
+    fn alter_table_rewrite(
         &self,
         catalog: &PgCatalog,
         alter: &typedpg_pg_query::ast::AlterTableStmt,
@@ -1573,7 +1580,7 @@ impl MigrationLinter<'_> {
     /// EXCLUSIVE on each index), `VACUUM FULL`, `CLUSTER` and `REPACK`
     /// without `CONCURRENTLY` (ACCESS EXCLUSIVE on the table) hold their
     /// lock for the whole rebuild.
-    fn blocking_rebuild(&self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
+    fn rebuild_blocking(&self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
         let (kind, target) = match node {
             N::ReindexStmt(reindex) => {
                 if option_enabled(&reindex.params, "concurrently") {
@@ -1765,7 +1772,7 @@ impl MigrationLinter<'_> {
     /// ROW EXCLUSIVE for a foreign key) is held until the transaction ends,
     /// so the validation scan runs under it, as a plain `ADD CONSTRAINT`'s
     /// would.
-    fn validate_in_same_transaction(
+    fn validate_constraint_blocking(
         &self,
         catalog: &PgCatalog,
         alter: &typedpg_pg_query::ast::AlterTableStmt,
@@ -2107,7 +2114,7 @@ impl MigrationLinter<'_> {
         }
     }
 
-    fn missing_lock_timeout(&mut self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
+    fn lock_without_timeout(&mut self, catalog: &PgCatalog, node: &N) -> Vec<RawFinding> {
         // `statement_rules` already followed the statement's own `SET` /
         // `BEGIN` / `COMMIT`.
         if self.lock_timeout_effective() || self.lock_timeout_reported {
@@ -2196,8 +2203,8 @@ impl MigrationLinter<'_> {
         // DROP INDEX CONCURRENTLY takes no lock that blocks writes.
         if drop.concurrent
             || self.files[self.current].lint != MigrationLint::All
-            || self.options.level(Rule::MissingLockTimeout).is_none()
-            || self.current_suppressed.contains(&Rule::MissingLockTimeout)
+            || self.options.level(Rule::LockWithoutTimeout).is_none()
+            || self.current_suppressed.contains(&Rule::LockWithoutTimeout)
             || self.lock_timeout_reported
             || self.lock_timeout_effective()
         {
@@ -2231,7 +2238,7 @@ impl MigrationLinter<'_> {
         };
         self.lock_timeout_reported = true;
         let finding = self.lock_timeout_finding(kind, name, true);
-        self.report(Rule::MissingLockTimeout, self.current_span.clone(), finding);
+        self.report(Rule::LockWithoutTimeout, self.current_span.clone(), finding);
     }
 
     /// Follow the `lock_timeout` and transaction state changes of `node`.
@@ -2532,19 +2539,19 @@ impl MigrationLinter<'_> {
         self.schema_rule(catalog, Rule::PreferJsonb, |linter, catalog| {
             linter.prefer_jsonb(catalog)
         });
-        self.schema_rule(catalog, Rule::MissingPrimaryKey, |linter, catalog| {
-            linter.missing_primary_key(catalog)
+        self.schema_rule(catalog, Rule::TableWithoutPrimaryKey, |linter, catalog| {
+            linter.table_without_primary_key(catalog)
         });
-        self.schema_rule(catalog, Rule::RlsPolicyNotEnforced, |linter, catalog| {
-            linter.rls_policy_not_enforced(catalog)
+        self.schema_rule(catalog, Rule::PolicyWithoutRls, |linter, catalog| {
+            linter.policy_without_rls(catalog)
         });
-        self.schema_rule(catalog, Rule::RlsNoPolicy, |linter, catalog| {
-            linter.rls_no_policy(catalog)
+        self.schema_rule(catalog, Rule::RlsWithoutPolicy, |linter, catalog| {
+            linter.rls_without_policy(catalog)
         });
         self.schema_rule(
             catalog,
-            Rule::SecurityDefinerSearchPath,
-            |linter, catalog| linter.security_definer_search_path(catalog),
+            Rule::SecurityDefinerWithoutSearchPath,
+            |linter, catalog| linter.security_definer_without_search_path(catalog),
         );
     }
 
@@ -2589,6 +2596,8 @@ impl MigrationLinter<'_> {
             } else {
                 raw.help
             };
+            #[cfg(test)]
+            assert!(help.is_some(), "the {rule} finding has no help");
             self.findings.push(MigrationFinding {
                 file: creator.file,
                 finding: Finding {
@@ -2971,7 +2980,7 @@ impl MigrationLinter<'_> {
     /// is the one reported. An inheritance child is reported: a primary key
     /// is not inherited (only partitions clone their parent's). Temporary
     /// tables are skipped.
-    fn missing_primary_key(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+    fn table_without_primary_key(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let with_primary_key: HashSet<PgClassOid> = catalog
             .iter_constraints()
             .filter(|constraint| constraint.contype == ConType::PrimaryKey)
@@ -3021,7 +3030,7 @@ impl MigrationLinter<'_> {
 
     /// Policies on a table whose row-level security is off: PostgreSQL
     /// ignores them.
-    fn rls_policy_not_enforced(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+    fn policy_without_rls(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut out = Vec::new();
         for class in policy_tables(catalog) {
             if catalog.lint_relation_has_row_security(class.oid) {
@@ -3060,7 +3069,7 @@ impl MigrationLinter<'_> {
 
     /// Row-level security enabled on a table with no policy: PostgreSQL
     /// then applies a default-deny policy (`get_row_security_policies`).
-    fn rls_no_policy(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+    fn rls_without_policy(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut tables: Vec<&PgClass> = catalog
             .iter_classes()
             .filter(|class| {
@@ -3106,7 +3115,7 @@ impl MigrationLinter<'_> {
     /// search path: a caller who can create objects in a schema on it (or
     /// in `pg_temp`) can shadow a table, function or operator the body uses,
     /// and run code with the owner's privileges.
-    fn security_definer_search_path(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
+    fn security_definer_without_search_path(&self, catalog: &PgCatalog) -> Vec<SchemaFinding> {
         let mut out = Vec::new();
         for (oid, security_definer, caller_search_path) in catalog.lint_routine_security() {
             if !security_definer || !caller_search_path {
@@ -3232,7 +3241,10 @@ impl MigrationLinter<'_> {
                         quote_identifier(&name.relname),
                         quote_identifier(&other_name.relname)
                     ),
-                    help: None,
+                    help: Some(format!(
+                        "drop the index; {} serves the same lookups",
+                        quote_identifier(&other_name.relname)
+                    )),
                     fix: Vec::new(),
                 },
                 help_in_new_migration: Some(format!(
@@ -5467,13 +5479,13 @@ mod tests {
         assert!(found[0].finding.message.contains("(varchar)"));
     }
 
-    // ── missing_lock_timeout ───────────────────────────────────────────────
+    // ── lock_without_timeout ───────────────────────────────────────────────
 
     #[test]
-    fn missing_lock_timeout_reports_the_first_blocking_statement() {
+    fn lock_without_timeout_reports_the_first_blocking_statement() {
         let text = "ALTER TABLE users ADD COLUMN nickname text;";
         let findings = second(text);
-        let found = only(&findings, Rule::MissingLockTimeout);
+        let found = only(&findings, Rule::LockWithoutTimeout);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert_eq!(
             found[0].finding.message,
@@ -5491,7 +5503,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_ignores_tables_created_in_the_same_file() {
+    fn lock_without_timeout_ignores_tables_created_in_the_same_file() {
         let findings = lint(
             &[(
                 "001_all.sql",
@@ -5502,13 +5514,13 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_reads_set_lock_timeout() {
+    fn lock_without_timeout_reads_set_lock_timeout() {
         for sql in [
             "SET LOCAL lock_timeout = '3s';
              ALTER TABLE users ADD COLUMN nickname text;",
@@ -5527,7 +5539,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert!(
-                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                only(&findings, Rule::LockWithoutTimeout).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
@@ -5545,7 +5557,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert_eq!(
-                only(&findings, Rule::MissingLockTimeout).len(),
+                only(&findings, Rule::LockWithoutTimeout).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -5572,7 +5584,7 @@ mod tests {
         ] {
             let findings = second(sql);
             assert_eq!(
-                only(&findings, Rule::MissingLockTimeout).len(),
+                only(&findings, Rule::LockWithoutTimeout).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -5580,7 +5592,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_ignores_set_local_outside_a_transaction() {
+    fn lock_without_timeout_ignores_set_local_outside_a_transaction() {
         let sql = "SET LOCAL lock_timeout = '3s';
                    ALTER TABLE users ADD COLUMN nickname text;";
         for findings in [
@@ -5592,7 +5604,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                only(&findings, Rule::MissingLockTimeout).len(),
+                only(&findings, Rule::LockWithoutTimeout).len(),
                 1,
                 "{findings:?}"
             );
@@ -5600,7 +5612,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_tracks_an_explicit_transaction() {
+    fn lock_without_timeout_tracks_an_explicit_transaction() {
         // An explicit transaction lets SET LOCAL / set_config(…, true) hold
         // until its end, even in a -- no-transaction file.
         for sql in [
@@ -5624,7 +5636,7 @@ mod tests {
                     &LintOptions::default(),
                 );
                 assert!(
-                    only(&findings, Rule::MissingLockTimeout).is_empty(),
+                    only(&findings, Rule::LockWithoutTimeout).is_empty(),
                     "{sql}: {findings:?}"
                 );
             }
@@ -5642,7 +5654,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert_eq!(
-            only(&findings, Rule::MissingLockTimeout).len(),
+            only(&findings, Rule::LockWithoutTimeout).len(),
             1,
             "{findings:?}"
         );
@@ -5656,7 +5668,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
         // A LOCAL zero overrides the session value inside the transaction.
@@ -5671,14 +5683,14 @@ mod tests {
             &LintOptions::default(),
         );
         assert_eq!(
-            only(&findings, Rule::MissingLockTimeout).len(),
+            only(&findings, Rule::LockWithoutTimeout).len(),
             1,
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_tracks_savepoints_and_rollbacks() {
+    fn lock_without_timeout_tracks_savepoints_and_rollbacks() {
         // `-- no-transaction`: the explicit `BEGIN` and its savepoints are
         // the only transaction state.
         let reported = [
@@ -5711,7 +5723,7 @@ mod tests {
                 &LintOptions::default(),
             );
             assert_eq!(
-                only(&findings, Rule::MissingLockTimeout).len(),
+                only(&findings, Rule::LockWithoutTimeout).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -5735,14 +5747,14 @@ mod tests {
                 &LintOptions::default(),
             );
             assert!(
-                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                only(&findings, Rule::LockWithoutTimeout).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
     }
 
     #[test]
-    fn missing_lock_timeout_evaluates_set_config_values_strictly() {
+    fn lock_without_timeout_evaluates_set_config_values_strictly() {
         // NULL resets the setting to its default (0, disabled).
         let reported = [
             "SELECT set_config('lock_timeout', NULL, false);
@@ -5769,7 +5781,7 @@ mod tests {
         for sql in reported {
             let findings = second(sql);
             assert_eq!(
-                only(&findings, Rule::MissingLockTimeout).len(),
+                only(&findings, Rule::LockWithoutTimeout).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -5784,14 +5796,14 @@ mod tests {
         ] {
             let findings = second(sql);
             assert!(
-                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                only(&findings, Rule::LockWithoutTimeout).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
     }
 
     #[test]
-    fn missing_lock_timeout_does_not_trust_a_shadowed_set_config() {
+    fn lock_without_timeout_does_not_trust_a_shadowed_set_config() {
         let findings = second(
             "CREATE FUNCTION public.set_config(text, text, boolean) RETURNS text
                  LANGUAGE sql AS 'SELECT $2';
@@ -5800,17 +5812,17 @@ mod tests {
              ALTER TABLE users ADD COLUMN nickname text;",
         );
         assert_eq!(
-            only(&findings, Rule::MissingLockTimeout).len(),
+            only(&findings, Rule::LockWithoutTimeout).len(),
             1,
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_reports_at_most_once_per_file() {
+    fn lock_without_timeout_reports_at_most_once_per_file() {
         let text = "ALTER TABLE users ADD COLUMN first text;
                     ALTER TABLE users ADD COLUMN second text;";
-        let found = only(&second(text), Rule::MissingLockTimeout);
+        let found = only(&second(text), Rule::LockWithoutTimeout);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
             &text[found[0].finding.span.clone()],
@@ -5819,14 +5831,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_handles_create_table_foreign_keys() {
+    fn lock_without_timeout_handles_create_table_foreign_keys() {
         let findings = second(
             "CREATE TABLE new_posts (
                  id integer PRIMARY KEY,
                  author_id integer REFERENCES users (id)
              );",
         );
-        let found = only(&findings, Rule::MissingLockTimeout);
+        let found = only(&findings, Rule::LockWithoutTimeout);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert!(
             found[0]
@@ -5838,7 +5850,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_ignores_share_update_exclusive_subcommands() {
+    fn lock_without_timeout_ignores_share_update_exclusive_subcommands() {
         for sql in [
             "ALTER TABLE users VALIDATE CONSTRAINT users_email_nn;",
             "ALTER TABLE users ALTER COLUMN email SET STATISTICS 100;",
@@ -5851,24 +5863,24 @@ mod tests {
         ] {
             let findings = second(sql);
             assert!(
-                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                only(&findings, Rule::LockWithoutTimeout).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
     }
 
     #[test]
-    fn missing_lock_timeout_reports_access_exclusive_storage_options() {
+    fn lock_without_timeout_reports_access_exclusive_storage_options() {
         let findings = second("ALTER TABLE users SET (user_catalog_table = true);");
         assert_eq!(
-            only(&findings, Rule::MissingLockTimeout).len(),
+            only(&findings, Rule::LockWithoutTimeout).len(),
             1,
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_honors_the_lock_table_mode() {
+    fn lock_without_timeout_honors_the_lock_table_mode() {
         for mode in [
             "ACCESS SHARE",
             "ROW SHARE",
@@ -5878,7 +5890,7 @@ mod tests {
             let sql = format!("LOCK TABLE users IN {mode} MODE;");
             let findings = second(&sql);
             assert!(
-                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                only(&findings, Rule::LockWithoutTimeout).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
@@ -5890,7 +5902,7 @@ mod tests {
         ] {
             let sql = format!("LOCK TABLE users IN {mode} MODE;");
             let findings = second(&sql);
-            let found = only(&findings, Rule::MissingLockTimeout);
+            let found = only(&findings, Rule::LockWithoutTimeout);
             assert_eq!(found.len(), 1, "{sql}: {findings:?}");
             assert!(
                 found[0]
@@ -5909,7 +5921,7 @@ mod tests {
     "#;
 
     #[test]
-    fn missing_lock_timeout_reports_an_attached_partition() {
+    fn lock_without_timeout_reports_an_attached_partition() {
         let text = "ALTER TABLE measurements ATTACH PARTITION measurements_new \
                     FOR VALUES FROM (100) TO (200);";
         let findings = lint(
@@ -5920,7 +5932,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::MissingLockTimeout);
+        let found = only(&findings, Rule::LockWithoutTimeout);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert_eq!(
             found[0].finding.message,
@@ -5935,7 +5947,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_reports_a_detached_partition() {
+    fn lock_without_timeout_reports_a_detached_partition() {
         let text = "ALTER TABLE measurements DETACH PARTITION measurements_1;";
         let findings = lint(
             &[
@@ -5945,7 +5957,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::MissingLockTimeout);
+        let found = only(&findings, Rule::LockWithoutTimeout);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert_eq!(
             found[0].finding.message,
@@ -5955,7 +5967,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_ignores_a_concurrent_detach() {
+    fn lock_without_timeout_ignores_a_concurrent_detach() {
         let findings = lint(
             &[
                 ("001_base.sql", PARTITIONED, MigrationLint::All),
@@ -5969,13 +5981,13 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_ignores_a_detach_finalize() {
+    fn lock_without_timeout_ignores_a_detach_finalize() {
         let parsed = typedpg_pg_query::parse(
             "ALTER TABLE measurements DETACH PARTITION measurements_1 FINALIZE",
         )
@@ -5993,7 +6005,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_reports_the_statement_kind() {
+    fn lock_without_timeout_reports_the_statement_kind() {
         for (sql, kind) in [
             ("DROP TABLE posts;", "DROP TABLE"),
             ("DROP INDEX users_email_idx;", "DROP INDEX"),
@@ -6009,7 +6021,7 @@ mod tests {
             } else {
                 second(sql)
             };
-            let found = only(&findings, Rule::MissingLockTimeout);
+            let found = only(&findings, Rule::LockWithoutTimeout);
             assert_eq!(found.len(), 1, "{sql}: {findings:?}");
             assert!(
                 found[0]
@@ -6022,7 +6034,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_names_the_table_and_what_queues_behind_it() {
+    fn lock_without_timeout_names_the_table_and_what_queues_behind_it() {
         let reads = "queued behind a long transaction, it blocks every query on the table";
         let writes = "queued behind a long transaction, it blocks every write to the table";
         for (sql, message) in [
@@ -6097,7 +6109,7 @@ mod tests {
             ),
         ] {
             let findings = second(sql);
-            let found = only(&findings, Rule::MissingLockTimeout);
+            let found = only(&findings, Rule::LockWithoutTimeout);
             assert_eq!(found.len(), 1, "{sql}: {findings:?}");
             assert_eq!(found[0].finding.message, message, "{sql}");
         }
@@ -6201,7 +6213,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_ignores_concurrent_operations() {
+    fn lock_without_timeout_ignores_concurrent_operations() {
         let findings = lint(
             &[
                 ("001_base.sql", BASE, MigrationLint::All),
@@ -6215,17 +6227,17 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_help_depends_on_the_transaction() {
+    fn lock_without_timeout_help_depends_on_the_transaction() {
         let sql = "ALTER TABLE users ADD COLUMN nickname text;";
         let inside = second(sql);
         assert_eq!(
-            only(&inside, Rule::MissingLockTimeout)[0]
+            only(&inside, Rule::LockWithoutTimeout)[0]
                 .finding
                 .help
                 .as_deref(),
@@ -6234,7 +6246,7 @@ mod tests {
 
         let outside = second_with(sql, false, &LintOptions::default());
         assert_eq!(
-            only(&outside, Rule::MissingLockTimeout)[0]
+            only(&outside, Rule::LockWithoutTimeout)[0]
                 .finding
                 .help
                 .as_deref(),
@@ -6247,7 +6259,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert_eq!(
-            only(&marker, Rule::MissingLockTimeout)[0]
+            only(&marker, Rule::LockWithoutTimeout)[0]
                 .finding
                 .help
                 .as_deref(),
@@ -6566,7 +6578,7 @@ mod tests {
                 base,
                 (
                     "002_lock.sql",
-                    "-- typedpg-lint: allow(missing_lock_timeout)
+                    "-- typedpg-lint: allow(lock_without_timeout)
                      ALTER TABLE users ADD COLUMN nickname text;",
                     MigrationLint::All,
                 ),
@@ -6575,7 +6587,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
 
@@ -6634,7 +6646,7 @@ mod tests {
                 Rule::PreferBigintPk,
             ]),
         );
-        assert!(only(&findings, Rule::MissingLockTimeout).is_empty());
+        assert!(only(&findings, Rule::LockWithoutTimeout).is_empty());
         for rule in [
             Rule::PreferTimestamptz,
             Rule::PreferText,
@@ -6649,13 +6661,13 @@ mod tests {
         }
     }
 
-    // ── table_rewrite: storage changes and filled columns ──────────────────
+    // ── alter_table_rewrite: storage changes and filled columns ──────────────────
 
     #[test]
-    fn table_rewrite_reports_persistence_changes() {
+    fn alter_table_rewrite_reports_persistence_changes() {
         let found = only(
             &second("ALTER TABLE users SET UNLOGGED;"),
-            Rule::TableRewrite,
+            Rule::AlterTableRewrite,
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
@@ -6669,7 +6681,13 @@ mod tests {
             )
         );
         // Setting the persistence the table already has does nothing.
-        assert!(only(&second("ALTER TABLE users SET LOGGED;"), Rule::TableRewrite).is_empty());
+        assert!(
+            only(
+                &second("ALTER TABLE users SET LOGGED;"),
+                Rule::AlterTableRewrite
+            )
+            .is_empty()
+        );
         let findings = lint(
             &[
                 (
@@ -6691,7 +6709,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::TableRewrite);
+        let found = only(&findings, Rule::AlterTableRewrite);
         assert_eq!(found.len(), 2, "{findings:?}");
         assert_eq!((found[0].file, found[1].file), (1, 2), "{findings:?}");
         let findings = lint(
@@ -6711,29 +6729,36 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::TableRewrite).is_empty(),
+            only(&findings, Rule::AlterTableRewrite).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn table_rewrite_reports_a_new_access_method_and_tablespace() {
+    fn alter_table_rewrite_reports_a_new_access_method_and_tablespace() {
         // Tables are taken to use heap, the default access method.
         for sql in [
             "ALTER TABLE users SET ACCESS METHOD heap;",
             "ALTER TABLE users SET ACCESS METHOD DEFAULT;",
         ] {
-            assert!(only(&second(sql), Rule::TableRewrite).is_empty(), "{sql}");
+            assert!(
+                only(&second(sql), Rule::AlterTableRewrite).is_empty(),
+                "{sql}"
+            );
         }
         let findings = second(
             "CREATE ACCESS METHOD heap2 TYPE TABLE HANDLER heap_tableam_handler;
              ALTER TABLE users SET ACCESS METHOD heap2;",
         );
-        assert_eq!(only(&findings, Rule::TableRewrite).len(), 1, "{findings:?}");
+        assert_eq!(
+            only(&findings, Rule::AlterTableRewrite).len(),
+            1,
+            "{findings:?}"
+        );
 
         let found = only(
             &second("ALTER TABLE users SET TABLESPACE fast;"),
-            Rule::TableRewrite,
+            Rule::AlterTableRewrite,
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
@@ -6755,13 +6780,13 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::TableRewrite).is_empty(),
+            only(&findings, Rule::AlterTableRewrite).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn table_rewrite_reports_identity_and_serial_columns() {
+    fn alter_table_rewrite_reports_identity_and_serial_columns() {
         for sql in [
             "ALTER TABLE users ADD COLUMN seq integer GENERATED ALWAYS AS IDENTITY;",
             "ALTER TABLE users ADD COLUMN seq bigint GENERATED BY DEFAULT AS IDENTITY;",
@@ -6776,7 +6801,7 @@ mod tests {
             };
             let findings = second(&sql);
             assert_eq!(
-                only(&findings, Rule::TableRewrite).len(),
+                only(&findings, Rule::AlterTableRewrite).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -6788,7 +6813,10 @@ mod tests {
             "ALTER TABLE users ADD COLUMN seq integer DEFAULT 7;",
             "ALTER TABLE users ADD COLUMN twice integer GENERATED ALWAYS AS (id * 2) VIRTUAL;",
         ] {
-            assert!(only(&second(sql), Rule::TableRewrite).is_empty(), "{sql}");
+            assert!(
+                only(&second(sql), Rule::AlterTableRewrite).is_empty(),
+                "{sql}"
+            );
         }
         // A table created in the same file has no rows to rewrite.
         let findings = second(
@@ -6796,7 +6824,7 @@ mod tests {
              ALTER TABLE fresh ADD COLUMN seq serial, SET UNLOGGED, SET TABLESPACE fast;",
         );
         assert!(
-            only(&findings, Rule::TableRewrite).is_empty(),
+            only(&findings, Rule::AlterTableRewrite).is_empty(),
             "{findings:?}"
         );
     }
@@ -6877,10 +6905,10 @@ mod tests {
         );
     }
 
-    // ── blocking_rebuild ───────────────────────────────────────────────────
+    // ── rebuild_blocking ───────────────────────────────────────────────────
 
     #[test]
-    fn blocking_rebuild_reports_rebuilds_of_existing_tables() {
+    fn rebuild_blocking_reports_rebuilds_of_existing_tables() {
         for (sql, message) in [
             (
                 "REINDEX TABLE users;",
@@ -6924,14 +6952,14 @@ mod tests {
             ),
         ] {
             let findings = second_with(sql, false, &LintOptions::default());
-            let found = only(&findings, Rule::BlockingRebuild);
+            let found = only(&findings, Rule::RebuildBlocking);
             assert_eq!(found.len(), 1, "{sql}: {findings:?}");
             assert_eq!(found[0].finding.message, message, "{sql}");
         }
     }
 
     #[test]
-    fn blocking_rebuild_ignores_concurrent_and_new_rebuilds() {
+    fn rebuild_blocking_ignores_concurrent_and_new_rebuilds() {
         for sql in [
             "REINDEX (CONCURRENTLY) TABLE users;",
             "REINDEX TABLE CONCURRENTLY users;",
@@ -6943,7 +6971,7 @@ mod tests {
         ] {
             let findings = second_with(sql, false, &LintOptions::default());
             assert!(
-                only(&findings, Rule::BlockingRebuild).is_empty(),
+                only(&findings, Rule::RebuildBlocking).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
@@ -6960,7 +6988,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::BlockingRebuild).is_empty(),
+            only(&findings, Rule::RebuildBlocking).is_empty(),
             "{findings:?}"
         );
     }
@@ -7056,13 +7084,13 @@ mod tests {
         );
     }
 
-    // ── validate_in_same_transaction ───────────────────────────────────────
+    // ── validate_constraint_blocking ───────────────────────────────────────
 
     #[test]
-    fn validate_in_same_transaction_reports_a_validate_under_the_add_lock() {
+    fn validate_constraint_blocking_reports_a_validate_under_the_add_lock() {
         let text = "ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0) NOT VALID;
                     ALTER TABLE users VALIDATE CONSTRAINT users_id_positive;";
-        let found = only(&second(text), Rule::ValidateInSameTransaction);
+        let found = only(&second(text), Rule::ValidateConstraintBlocking);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
             &text[found[0].finding.span.clone()],
@@ -7099,27 +7127,27 @@ mod tests {
         ] {
             let findings = second_with(sql, use_transaction, &LintOptions::default());
             assert_eq!(
-                only(&findings, Rule::ValidateInSameTransaction).len(),
+                only(&findings, Rule::ValidateConstraintBlocking).len(),
                 1,
                 "{sql}: {findings:?}"
             );
         }
-        // The transaction is tracked whether or not missing_lock_timeout
+        // The transaction is tracked whether or not lock_without_timeout
         // runs.
         let mut config = LintConfig::default();
         config
             .levels
-            .insert("missing_lock_timeout".to_owned(), LintLevel::Off);
+            .insert("lock_without_timeout".to_owned(), LintLevel::Off);
         let findings = second_with(text, true, &LintOptions::from_config(&config));
         assert_eq!(
-            only(&findings, Rule::ValidateInSameTransaction).len(),
+            only(&findings, Rule::ValidateConstraintBlocking).len(),
             1,
             "{findings:?}"
         );
     }
 
     #[test]
-    fn validate_in_same_transaction_ignores_a_validate_after_the_commit() {
+    fn validate_constraint_blocking_ignores_a_validate_after_the_commit() {
         let add = "ALTER TABLE users ADD CONSTRAINT users_id_positive CHECK (id > 0) NOT VALID;";
         let validate = "ALTER TABLE users VALIDATE CONSTRAINT users_id_positive;";
         // A later migration.
@@ -7133,7 +7161,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::ValidateInSameTransaction).is_empty(),
+            only(&findings, Rule::ValidateConstraintBlocking).is_empty(),
             "{findings:?}"
         );
         for (sql, use_transaction) in [
@@ -7160,7 +7188,7 @@ mod tests {
         ] {
             let findings = second_with(&sql, use_transaction, &LintOptions::default());
             assert!(
-                only(&findings, Rule::ValidateInSameTransaction).is_empty(),
+                only(&findings, Rule::ValidateConstraintBlocking).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
@@ -8157,10 +8185,10 @@ mod tests {
         );
     }
 
-    // ── missing_primary_key ────────────────────────────────────────────────
+    // ── table_without_primary_key ────────────────────────────────────────────────
 
     #[test]
-    fn missing_primary_key_reports_tables_without_one() {
+    fn table_without_primary_key_reports_tables_without_one() {
         let text = "CREATE TABLE events (id integer, at timestamptz);
                     CREATE TABLE later (id integer);
                     ALTER TABLE later ADD PRIMARY KEY (id);
@@ -8174,7 +8202,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::MissingPrimaryKey);
+        let found = only(&findings, Rule::TableWithoutPrimaryKey);
         let spans: Vec<&str> = found
             .iter()
             .map(|f| &text[f.finding.span.clone()])
@@ -8193,7 +8221,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_primary_key_points_schema_only_files_at_a_new_migration() {
+    fn table_without_primary_key_points_schema_only_files_at_a_new_migration() {
         let findings = lint(
             &[
                 ("001_base.sql", BASE, MigrationLint::All),
@@ -8206,7 +8234,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::MissingPrimaryKey);
+        let found = only(&findings, Rule::TableWithoutPrimaryKey);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert_eq!(found[0].file, 1);
         assert_eq!(
@@ -8218,22 +8246,22 @@ mod tests {
         let findings = lint(
             &[(
                 "001_all.sql",
-                "-- typedpg-lint: allow(missing_primary_key)\nCREATE TABLE events (id integer);",
+                "-- typedpg-lint: allow(table_without_primary_key)\nCREATE TABLE events (id integer);",
                 MigrationLint::All,
             )],
             true,
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingPrimaryKey).is_empty(),
+            only(&findings, Rule::TableWithoutPrimaryKey).is_empty(),
             "{findings:?}"
         );
     }
 
-    // ── rls_policy_not_enforced / rls_no_policy ────────────────────────────
+    // ── policy_without_rls / rls_without_policy ────────────────────────────
 
     #[test]
-    fn rls_policy_not_enforced_reports_policies_on_a_table_without_rls() {
+    fn policy_without_rls_reports_policies_on_a_table_without_rls() {
         let text = "CREATE TABLE notes (id integer PRIMARY KEY, owner text);
                     CREATE POLICY notes_owner ON notes USING (owner = current_user);
                     CREATE POLICY notes_read ON notes FOR SELECT USING (true);";
@@ -8242,7 +8270,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::RlsPolicyNotEnforced);
+        let found = only(&findings, Rule::PolicyWithoutRls);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert_eq!(found[0].finding.severity, Severity::Error);
         assert_eq!(
@@ -8268,17 +8296,17 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::RlsPolicyNotEnforced).is_empty(),
+            only(&findings, Rule::PolicyWithoutRls).is_empty(),
             "{findings:?}"
         );
         assert!(
-            only(&findings, Rule::RlsNoPolicy).is_empty(),
+            only(&findings, Rule::RlsWithoutPolicy).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn rls_no_policy_reports_rls_without_a_policy() {
+    fn rls_without_policy_reports_rls_without_a_policy() {
         let text = "CREATE TABLE notes (id integer PRIMARY KEY);
                     ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
                     CREATE TABLE secrets (id integer PRIMARY KEY);
@@ -8288,9 +8316,9 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::RlsNoPolicy);
+        let found = only(&findings, Rule::RlsWithoutPolicy);
         assert_eq!(found.len(), 2, "{findings:?}");
-        assert_eq!(found[0].finding.severity, Severity::Info);
+        assert_eq!(found[0].finding.severity, Severity::Error);
         assert_eq!(
             &text[found[0].finding.span.clone()],
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY"
@@ -8320,15 +8348,15 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::RlsNoPolicy).is_empty(),
+            only(&findings, Rule::RlsWithoutPolicy).is_empty(),
             "{findings:?}"
         );
     }
 
-    // ── security_definer_search_path ───────────────────────────────────────
+    // ── security_definer_without_search_path ───────────────────────────────────────
 
     #[test]
-    fn security_definer_search_path_reports_definers_without_a_search_path() {
+    fn security_definer_without_search_path_reports_definers_without_a_search_path() {
         let text = "CREATE FUNCTION count_users() RETURNS bigint SECURITY DEFINER
                         LANGUAGE sql AS $$ SELECT count(*) FROM users $$;
                     CREATE FUNCTION pinned() RETURNS bigint SECURITY DEFINER
@@ -8351,7 +8379,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::SecurityDefinerSearchPath);
+        let found = only(&findings, Rule::SecurityDefinerWithoutSearchPath);
         let messages: Vec<&str> = found.iter().map(|f| f.finding.message.as_str()).collect();
         assert_eq!(
             messages,
@@ -8372,7 +8400,7 @@ mod tests {
     }
 
     #[test]
-    fn security_definer_search_path_follows_create_or_replace() {
+    fn security_definer_without_search_path_follows_create_or_replace() {
         let findings = lint(
             &[
                 (
@@ -8390,7 +8418,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::SecurityDefinerSearchPath);
+        let found = only(&findings, Rule::SecurityDefinerWithoutSearchPath);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert_eq!(found[0].file, 1, "{findings:?}");
     }
@@ -8398,7 +8426,7 @@ mod tests {
     // ── prefer_jsonb ───────────────────────────────────────────────────────
 
     #[test]
-    fn prefer_jsonb_reports_json_columns_when_enabled() {
+    fn prefer_jsonb_reports_json_columns_by_default() {
         let text =
             "CREATE TABLE docs (id integer PRIMARY KEY, body json, bodies json[], fine jsonb);";
         let findings = lint(
@@ -8406,21 +8434,27 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        assert!(
-            only(&findings, Rule::PreferJsonb).is_empty(),
-            "{findings:?}"
-        );
-        let findings = lint(
-            &[("001_docs.sql", text, MigrationLint::All)],
-            true,
-            &opinion_options(&[Rule::PreferJsonb]),
-        );
         let found = only(&findings, Rule::PreferJsonb);
         assert_eq!(found.len(), 2, "{findings:?}");
+        assert_eq!(found[0].finding.severity, Severity::Warning);
         assert_eq!(
             found[0].finding.message,
             "public.docs.body is json: it has no equality operator, so DISTINCT, GROUP BY, UNION \
              and = fail on it, and every read parses the text again"
+        );
+        // Off, it reports nothing.
+        let mut config = LintConfig::default();
+        config
+            .levels
+            .insert("prefer_jsonb".to_owned(), LintLevel::Off);
+        let findings = lint(
+            &[("001_docs.sql", text, MigrationLint::All)],
+            true,
+            &LintOptions::from_config(&config),
+        );
+        assert!(
+            only(&findings, Rule::PreferJsonb).is_empty(),
+            "{findings:?}"
         );
     }
 
@@ -8568,7 +8602,7 @@ mod tests {
     }
 
     #[test]
-    fn table_rewrite_reports_what_the_oracle_saw_rewrite() {
+    fn alter_table_rewrite_reports_what_the_oracle_saw_rewrite() {
         for (sql, table) in [
             // A domain with a constraint is checked on every row.
             ("ALTER TABLE t ADD COLUMN x posint;", "public.t"),
@@ -8586,7 +8620,7 @@ mod tests {
         ] {
             let findings = oracle_second(sql);
             assert_eq!(
-                messages(&findings, Rule::TableRewrite),
+                messages(&findings, Rule::AlterTableRewrite),
                 [format!(
                     "ALTER TABLE rewrites every row of {table} under an ACCESS EXCLUSIVE lock"
                 )],
@@ -8599,14 +8633,14 @@ mod tests {
         ] {
             let findings = oracle_second(sql);
             assert!(
-                only(&findings, Rule::TableRewrite).is_empty(),
+                only(&findings, Rule::AlterTableRewrite).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
     }
 
     #[test]
-    fn constraint_validating_reports_domains_and_rechecked_columns() {
+    fn add_constraint_scan_reports_domains_and_rechecked_columns() {
         for sql in [
             "ALTER DOMAIN plain_int ADD CONSTRAINT p_pos CHECK (VALUE > 0);",
             "ALTER DOMAIN plain_int SET NOT NULL;",
@@ -8617,7 +8651,7 @@ mod tests {
         ] {
             let findings = oracle_second(sql);
             assert_eq!(
-                messages(&findings, Rule::ConstraintValidating),
+                messages(&findings, Rule::AddConstraintScan),
                 [
                     "ALTER DOMAIN public.plain_int validates every row of public.t under a SHARE \
                   lock, blocking writes"
@@ -8627,7 +8661,7 @@ mod tests {
         }
         let findings = oracle_second("ALTER TABLE t ALTER COLUMN chk TYPE integer;");
         assert_eq!(
-            messages(&findings, Rule::ConstraintValidating),
+            messages(&findings, Rule::AddConstraintScan),
             [
                 "ALTER COLUMN … TYPE adds the CHECK constraints on chk again, which validates \
               every row of public.t under a lock"
@@ -8635,7 +8669,7 @@ mod tests {
         );
         // A domain no table uses has nothing to check.
         let findings = oracle_second("ALTER DOMAIN posint ADD CONSTRAINT small CHECK (VALUE < 9);");
-        assert!(only(&findings, Rule::ConstraintValidating).is_empty());
+        assert!(only(&findings, Rule::AddConstraintScan).is_empty());
     }
 
     #[test]
@@ -8685,7 +8719,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_reports_what_the_oracle_saw_lock() {
+    fn lock_without_timeout_reports_what_the_oracle_saw_lock() {
         for (sql, message) in [
             (
                 "CREATE TABLE parted_2 PARTITION OF parted FOR VALUES FROM (10) TO (20);",
@@ -8737,7 +8771,7 @@ mod tests {
             ),
         ] {
             let findings = oracle_second(sql);
-            let found = messages(&findings, Rule::MissingLockTimeout);
+            let found = messages(&findings, Rule::LockWithoutTimeout);
             assert_eq!(found.len(), 1, "{sql}: {findings:?}");
             assert!(
                 found[0].starts_with(message)
@@ -8748,7 +8782,7 @@ mod tests {
         }
         let findings = oracle_second("ALTER DOMAIN plain_int SET NOT NULL;");
         assert_eq!(
-            messages(&findings, Rule::MissingLockTimeout),
+            messages(&findings, Rule::LockWithoutTimeout),
             [
                 "ALTER DOMAIN waits for a lock on public.t with no lock_timeout: queued behind a \
               long transaction, it blocks every write to the table"
@@ -8763,14 +8797,14 @@ mod tests {
         ] {
             let findings = oracle_second(sql);
             assert!(
-                only(&findings, Rule::MissingLockTimeout).is_empty(),
+                only(&findings, Rule::LockWithoutTimeout).is_empty(),
                 "{sql}: {findings:?}"
             );
         }
     }
 
     #[test]
-    fn table_rewrite_inlines_simple_sql_functions() {
+    fn alter_table_rewrite_inlines_simple_sql_functions() {
         // A VOLATILE SQL function whose body is `SELECT 1` is inlined to a
         // constant before ATExecAddColumn looks: no rewrite. One that calls
         // random(), or a PL/pgSQL one, rewrites.
@@ -8789,7 +8823,7 @@ mod tests {
                  ALTER TABLE users ADD COLUMN d int DEFAULT {default};"
             ));
             assert_eq!(
-                only(&findings, Rule::TableRewrite).len(),
+                only(&findings, Rule::AlterTableRewrite).len(),
                 usize::from(rewrites),
                 "{default}: {findings:?}"
             );
@@ -8818,8 +8852,8 @@ mod tests {
             );
             for rule in [
                 Rule::CreateIndexBlocking,
-                Rule::ConstraintValidating,
-                Rule::TableRewrite,
+                Rule::AddConstraintScan,
+                Rule::AlterTableRewrite,
             ] {
                 assert!(only(&findings, rule).is_empty(), "{sql}: {findings:?}");
             }
@@ -8882,7 +8916,7 @@ mod tests {
             (
                 "CREATE TABLE t (a int, CONSTRAINT c CHECK (a > 0) NOT ENFORCED);",
                 "ALTER TABLE t ALTER CONSTRAINT c ENFORCED;",
-                Rule::ConstraintValidating,
+                Rule::AddConstraintScan,
             ),
             // Detaching a referenced partition checks the referencing rows.
             (
@@ -8890,7 +8924,7 @@ mod tests {
                  CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);
                  CREATE TABLE r (pid int REFERENCES p);",
                 "ALTER TABLE p DETACH PARTITION p1;",
-                Rule::ConstraintValidating,
+                Rule::AddConstraintScan,
             ),
         ] {
             let findings = lint(
@@ -8927,7 +8961,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_primary_key_reports_tables_any_statement_creates() {
+    fn table_without_primary_key_reports_tables_any_statement_creates() {
         for sql in [
             "CREATE TABLE src (a int PRIMARY KEY); SELECT a INTO dst FROM src;",
             "CREATE SCHEMA s CREATE TABLE dst (a int);",
@@ -8938,7 +8972,7 @@ mod tests {
                 &LintOptions::default(),
             );
             assert_eq!(
-                only(&findings, Rule::MissingPrimaryKey).len(),
+                only(&findings, Rule::TableWithoutPrimaryKey).len(),
                 1,
                 "{sql}: {findings:?}"
             );
@@ -8946,7 +8980,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_lock_timeout_reports_what_a_drop_cascades_to() {
+    fn lock_without_timeout_reports_what_a_drop_cascades_to() {
         let base = "CREATE FUNCTION trf() RETURNS trigger LANGUAGE plpgsql
                         AS 'BEGIN RETURN NEW; END';
                     CREATE TABLE t (a int);
@@ -8982,7 +9016,7 @@ mod tests {
                 true,
                 &LintOptions::default(),
             );
-            let found = only(&findings, Rule::MissingLockTimeout);
+            let found = only(&findings, Rule::LockWithoutTimeout);
             assert_eq!(found.len(), 1, "{sql}: {findings:?}");
             assert!(
                 found[0].finding.message.starts_with(message),
@@ -9003,7 +9037,7 @@ mod tests {
             &LintOptions::default(),
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
     }
@@ -9026,7 +9060,7 @@ mod tests {
             "ALTER TABLE t ALTER COLUMN b SET EXPRESSION AS (a * 2);",
         );
         assert_eq!(
-            only(&findings, Rule::ConstraintValidating).len(),
+            only(&findings, Rule::AddConstraintScan).len(),
             1,
             "{findings:?}"
         );
@@ -9037,7 +9071,7 @@ mod tests {
                     CREATE TABLE a (x int REFERENCES r2 (id));";
         let findings = run(base, "ALTER TABLE r DETACH PARTITION r2;");
         assert!(
-            only(&findings, Rule::ConstraintValidating).is_empty(),
+            only(&findings, Rule::AddConstraintScan).is_empty(),
             "{findings:?}"
         );
         let findings = run(
@@ -9050,7 +9084,7 @@ mod tests {
             "ALTER TABLE r DETACH PARTITION r2;",
         );
         assert_eq!(
-            only(&findings, Rule::ConstraintValidating).len(),
+            only(&findings, Rule::AddConstraintScan).len(),
             1,
             "{findings:?}"
         );
@@ -9063,7 +9097,7 @@ mod tests {
             "ALTER TABLE p ADD CONSTRAINT f FOREIGN KEY (a) REFERENCES ref;",
         );
         assert!(
-            only(&findings, Rule::ConstraintValidating).is_empty(),
+            only(&findings, Rule::AddConstraintScan).is_empty(),
             "{findings:?}"
         );
         // ADD COLUMN IF NOT EXISTS of an existing column builds no index.
@@ -9081,7 +9115,7 @@ mod tests {
             "DROP SEQUENCE s CASCADE;",
         );
         assert_eq!(
-            only(&findings, Rule::MissingLockTimeout)
+            only(&findings, Rule::LockWithoutTimeout)
                 .first()
                 .map(|finding| finding.finding.message.as_str()),
             Some(
@@ -9099,13 +9133,13 @@ mod tests {
             "ALTER TRIGGER tg ON u DEPENDS ON EXTENSION hstore;",
         );
         assert!(
-            only(&findings, Rule::MissingLockTimeout).is_empty(),
+            only(&findings, Rule::LockWithoutTimeout).is_empty(),
             "{findings:?}"
         );
     }
 
     #[test]
-    fn missing_lock_timeout_sees_an_adopted_self_reference_block_reads() {
+    fn lock_without_timeout_sees_an_adopted_self_reference_block_reads() {
         // The partition's own foreign key to t2 is adopted: its triggers on
         // t2 are dropped, under ACCESS EXCLUSIVE.
         let findings = lint(
@@ -9127,7 +9161,7 @@ mod tests {
             true,
             &LintOptions::default(),
         );
-        let found = only(&findings, Rule::MissingLockTimeout);
+        let found = only(&findings, Rule::LockWithoutTimeout);
         assert_eq!(found.len(), 1, "{findings:?}");
         assert!(
             found[0]

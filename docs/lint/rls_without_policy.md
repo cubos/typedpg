@@ -1,11 +1,11 @@
-# `rls_no_policy`
+# `rls_without_policy`
 
 Row-level security enabled on a table that has no policy, so every role it
 applies to sees no rows.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | the final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| security | error | the final schema | — |
 
 ## Example
 
@@ -18,7 +18,7 @@ ALTER TABLE secrets ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;
 ```
 
 ```
-info[rls_no_policy]: row-level security is enabled on public.notes, which has no policy: every role but its owner, superusers and BYPASSRLS roles sees no rows and can write none
+error[security/rls_without_policy]: row-level security is enabled on public.notes, which has no policy: every role but its owner, superusers and BYPASSRLS roles sees no rows and can write none
    ╭─[migrations/001_init.sql:2:1]
  2 │ ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
    · ───────────────────────────────────────────
@@ -57,19 +57,19 @@ policy. The finding is placed on the table's last
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-rls_no_policy = "warning"   # error | warning | info | off
+rls_without_policy = "warning"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "rlsNoPolicy": "warning" } }
+{ "lint": { "rlsWithoutPolicy": "warning" } }
 ```
 
 When denying everyone is the intent, put
-`-- typedpg-lint: allow(rls_no_policy)` before the `ENABLE ROW LEVEL
+`-- typedpg-lint: allow(rls_without_policy)` before the `ENABLE ROW LEVEL
 SECURITY` statement in the migration file.
 See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`rls_policy_not_enforced`](rls_policy_not_enforced.md): policies on a
+- [`policy_without_rls`](policy_without_rls.md): policies on a
   table without row-level security.

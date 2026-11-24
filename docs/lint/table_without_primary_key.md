@@ -1,10 +1,10 @@
-# `missing_primary_key`
+# `table_without_primary_key`
 
 A table without a primary key.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | final schema | — |
 
 ## Example
 
@@ -14,7 +14,7 @@ CREATE TABLE events (id bigint NOT NULL, happened_at timestamptz NOT NULL);
 ```
 
 ```
-warning[missing_primary_key]: public.events has no primary key
+warning[suspicious/table_without_primary_key]: public.events has no primary key
    ╭─[migrations/0001_init.sql:1:1]
  1 │ CREATE TABLE events (id bigint NOT NULL, happened_at timestamptz NOT NULL);
    · ──────────────────────────────────────────────────────────────────────────
@@ -59,14 +59,14 @@ reported.
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-missing_primary_key = "off"   # error | warning | info | off
+table_without_primary_key = "off"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "missingPrimaryKey": "off" } }
+{ "lint": { "tableWithoutPrimaryKey": "off" } }
 ```
 
-Allow one table with `-- typedpg-lint: allow(missing_primary_key)` before
+Allow one table with `-- typedpg-lint: allow(table_without_primary_key)` before
 its `CREATE TABLE` in the migration file.
 See [Configuring rules](README.md#configuring-rules).
 

@@ -1,11 +1,11 @@
-# `validate_in_same_transaction`
+# `validate_constraint_blocking`
 
 `VALIDATE CONSTRAINT` in the transaction that added the constraint
 `NOT VALID`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -19,7 +19,7 @@ ALTER TABLE posts VALIDATE CONSTRAINT posts_views_positive;
 ```
 
 ```
-warning[validate_in_same_transaction]: VALIDATE CONSTRAINT posts_views_positive runs in the transaction that added it NOT VALID: ADD CONSTRAINT's lock on public.posts is still held, so the scan blocks writes on the table
+warning[locking/validate_constraint_blocking]: VALIDATE CONSTRAINT posts_views_positive runs in the transaction that added it NOT VALID: ADD CONSTRAINT's lock on public.posts is still held, so the scan blocks writes on the table
    ╭─[migrations/0002_positive_views.sql:2:1]
  2 │ ALTER TABLE posts VALIDATE CONSTRAINT posts_views_positive;
    · ──────────────────────────────────────────────────────────
@@ -63,22 +63,22 @@ line is `-- no-transaction` or `use_transaction` is off; explicit `BEGIN`,
 ```toml
 # Cargo.toml
 [package.metadata.typedpg.lint]
-validate_in_same_transaction = "error"   # error | warning | info | off
+validate_constraint_blocking = "error"   # error | warning | info | off
 ```
 ```json
 // typedpg.config.json
-{ "lint": { "validateInSameTransaction": "error" } }
+{ "lint": { "validateConstraintBlocking": "error" } }
 ```
 
 Allow one statement with
-`-- typedpg-lint: allow(validate_in_same_transaction)` before it in the
+`-- typedpg-lint: allow(validate_constraint_blocking)` before it in the
 migration. See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`constraint_validating`](constraint_validating.md): why to split
+- [`add_constraint_scan`](add_constraint_scan.md): why to split
   `NOT VALID` and `VALIDATE`.
 - [`set_not_null_scan`](set_not_null_scan.md): the same split proves a
   column `NOT NULL`.
-- [`missing_lock_timeout`](missing_lock_timeout.md): a blocking lock without
+- [`lock_without_timeout`](lock_without_timeout.md): a blocking lock without
   `lock_timeout`.
