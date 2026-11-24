@@ -71,7 +71,12 @@ A query proven to return at most one row:
   column reading the row on its left, the merged column of a chain of
   `USING` joins, or a scalar subquery that doesn't read the row (a bare
   table name in it is that subquery's own whole row);
-  `id IN (SELECT … LIMIT 1)` counts as `id = (SELECT …)`;
+  `id IN (SELECT … LIMIT 1)` counts as `id = (SELECT …)`. A value may also
+  be a column of a `FROM` subquery around the query, `(row).*` fields
+  included. A key column cast to `text` counts as the column when its text
+  tells its values apart: an integer, `numeric`, `uuid`, `boolean`, enum or
+  string column (`WHERE n.id::text = $id`), not a float, date or time one,
+  whose text depends on session settings;
 - a partial unique index whose predicate the `WHERE` implies
   (`… WHERE state IN ('queued', 'done')` by `state = 'done'`), and a unique
   index on a function of columns matched by the same call
@@ -86,7 +91,13 @@ A query proven to return at most one row:
   `INSERT … SELECT` of one row, whatever its `ON CONFLICT`;
 - an `UPDATE` / `DELETE` whose `WHERE` (with its `FROM` / `USING` joins)
   pins a key of the target: `UPDATE users SET … WHERE id = $id RETURNING id`;
-- a `MERGE` whose `ON` pins a key of the target and whose source is one row.
+- a `MERGE` whose `ON` pins a key of the target and whose source is one row;
+- a `UNION ALL` of two such queries that can't both return a row: one only
+  when a CTE of the statement has a row (it reads the CTE, tests
+  `EXISTS (SELECT … FROM cte)` or compares with `(SELECT … FROM cte)`), the
+  other only when it has none (`WHERE NOT EXISTS (SELECT 1 FROM cte)`), as
+  in a find-or-create:
+  `WITH found AS (…), updated AS (UPDATE … WHERE id = (SELECT id FROM found) RETURNING …), inserted AS (INSERT … SELECT … WHERE NOT EXISTS (SELECT 1 FROM found) RETURNING …) SELECT … FROM updated UNION ALL SELECT … FROM inserted`.
 
 Also not reported:
 

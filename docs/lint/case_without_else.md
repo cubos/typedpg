@@ -36,7 +36,7 @@ add the missing case instead (here, `'archived'`).
 ## Why
 
 The implicit `ELSE NULL` is easy to miss: a badge that is `NULL` for most
-rows, a sum that skips them, a comparison that drops the row.
+rows, a comparison that drops the row.
 
 ## Not reported
 
@@ -48,6 +48,11 @@ rows, a sum that skips them, a comparison that drops the row.
   - `WHEN name IS NULL … WHEN name IS NOT NULL …`;
   - `CASE WHEN views > 1000 …` in a query with `WHERE views > 2000`.
 - A `WHEN` that is always true, such as `WHEN true`.
+- A `CASE` that is the whole argument (casts aside) of PostgreSQL's own
+  `count`, `sum`, `avg`, `min` or `max`, which skip `NULL`s:
+  `count(CASE WHEN views > 1000 THEN 1 END)` counts the popular posts.
+  Other aggregates keep the `NULL`s (`array_agg`, `json_agg`, …) and are
+  reported.
 
 ## Configuration
 

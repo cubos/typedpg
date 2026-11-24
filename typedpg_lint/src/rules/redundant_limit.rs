@@ -526,6 +526,67 @@ mod tests {
     }
 
     #[test]
+    fn a_key_pinned_through_an_injective_cast_to_text_makes_the_limit_redundant() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+             CREATE TABLE nodes (
+                id bigint PRIMARY KEY,
+                version_id uuid NOT NULL,
+                lineage_id uuid NOT NULL,
+                amount numeric UNIQUE,
+                flag boolean UNIQUE,
+                mood mood UNIQUE,
+                label varchar(20) UNIQUE,
+                code char(4) UNIQUE,
+                ratio float8 UNIQUE,
+                day date UNIQUE,
+                UNIQUE (version_id, lineage_id)
+             );",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT id FROM nodes WHERE version_id::text = $v AND lineage_id::text = $l LIMIT 1",
+            "SELECT id FROM nodes WHERE id::text = $i LIMIT 1",
+            "SELECT id FROM nodes WHERE amount::text = '1.50' LIMIT 1",
+            "SELECT id FROM nodes WHERE flag::text = 'false' LIMIT 1",
+            "SELECT id FROM nodes WHERE mood::text = $m LIMIT 1",
+            "SELECT id FROM nodes WHERE label::text = $s LIMIT 1",
+            "SELECT id FROM nodes WHERE code::text = 'ab' LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        }
+        for sql in [
+            // Session-dependent text forms.
+            "SELECT id FROM nodes WHERE ratio::text = $s LIMIT 1",
+            "SELECT id FROM nodes WHERE day::text = $s LIMIT 1",
+            // A cast that rounds, or a typmod that truncates.
+            "SELECT id FROM nodes WHERE amount::int4 = 2 LIMIT 1",
+            "SELECT id FROM nodes WHERE label::varchar(1) = 'a' LIMIT 1",
+            // Half of the composite key.
+            "SELECT id FROM nodes WHERE version_id::text = $v LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_on_a_union_all_of_mutually_exclusive_rows_is_redundant() {
+        let db = catalog();
+        let sql = "WITH found AS (SELECT id FROM users WHERE email = $1) \
+                   SELECT id FROM users WHERE id = $2 AND EXISTS (SELECT 1 FROM found) \
+                   UNION ALL \
+                   SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM found) \
+                   LIMIT 1";
+        assert_eq!(limit_findings(&db, sql).len(), 1);
+        // Both branches may return their row.
+        let both = sql.replace("NOT EXISTS", "EXISTS");
+        assert!(limit_findings(&db, &both).is_empty());
+    }
+
+    #[test]
     fn an_allow_comment_suppresses_the_rule() {
         let db = catalog();
         let sql = "-- typedpg-lint: allow(redundant_limit)\nSELECT 1 LIMIT 1";

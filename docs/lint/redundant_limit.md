@@ -40,7 +40,9 @@ model.
 The query is known to return at most one row through:
 
 - a primary or unique key fully equated to constants, parameters or columns
-  of other such rows (also across joins);
+  of other such rows (also across joins), or through a cast to `text` that
+  tells the key's values apart (`WHERE id::text = $id`, see
+  [`fetch_may_return_many`](fetch_may_return_many.md#not-reported));
 - an aggregate without `GROUP BY`, or `GROUP BY` columns pinned by `WHERE`;
 - no `FROM`, or a one-row `VALUES`.
 
@@ -48,7 +50,9 @@ The query is known to return at most one row through:
 
 - `LIMIT` with `OFFSET`, a parameter count, `0`, `ALL`, `NULL`, or
   `FETCH … WITH TIES`.
-- The `LIMIT` of a `UNION`/`INTERSECT`/`EXCEPT`.
+- The `LIMIT` of a `UNION`/`INTERSECT`/`EXCEPT`, except a `UNION ALL` of
+  two one-row queries that can't both return a row (see
+  [`fetch_may_return_many`](fetch_may_return_many.md#not-reported)).
 - Queries over views (other than `pg_catalog` ones), inheritance parents,
   foreign tables, set-returning functions or `FULL JOIN`.
 

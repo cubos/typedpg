@@ -879,8 +879,17 @@ pub(super) fn select_output_columns(
         let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        if target.val.is_none() || composite_star(target.val.as_ref()) {
+        if target.val.is_none() {
             return Vec::new();
+        }
+        if composite_star(target.val.as_ref()) {
+            match composite_star_columns(ctx, scope.as_ref(), parent, target.val.as_ref()) {
+                Some(columns) => {
+                    out.extend(columns);
+                    continue;
+                }
+                None => return Vec::new(),
+            }
         }
         let value = &target.val;
         if let Some(Node::ColumnRef(column)) = value
@@ -1090,6 +1099,13 @@ fn value_type(
                     if qualifier.is_some_and(|q| scope.rel_named(q).is_some()) {
                         return (None, false);
                     }
+                    if let [name] = names.as_slice()
+                        && let Some(typ) = whole_row_type(ctx, scope, outer, name)
+                    {
+                        // A row's equality compares its fields under their
+                        // own collations: not known to be bytewise.
+                        return (Some(typ), false);
+                    }
                     outer
                         .and_then(|outer| outer.resolve_value(ctx, column))
                         .map_or((None, false), |(typ, deterministic)| {
@@ -1199,6 +1215,74 @@ fn composite_star(value: Option<&ast::Node>) -> bool {
         if matches!(indirection.indirection.last(), Some(Some(Node::AStar(_)))))
 }
 
+/// The row type of a bare `name` that PG reads as a whole-row reference to
+/// a base table of `scope`: no column of this level or of a level around it
+/// may be called `name` (PG's `transformColumnRef` tries a column first, at
+/// every level), and the level's relation named `name` is a table.
+fn whole_row_type(
+    ctx: &Ctx<'_>,
+    scope: &Scope<'_>,
+    outer: Option<&FromScope<'_>>,
+    name: &str,
+) -> Option<crate::oid::PgTypeOid> {
+    let column_here = scope
+        .rels
+        .iter()
+        .any(|rel| !rel.columns_known || rel.columns.iter().any(|(column, _)| column == name));
+    if column_here || outer.is_some_and(|outer| outer.may_bind_column(name)) {
+        return None;
+    }
+    let relid = scope.rels[scope.rel_named(name)?].oid?;
+    let class = ctx.catalog.pg_class.get(&relid)?;
+    if !matches!(class.relkind, RelKind::Table | RelKind::Partitioned) {
+        return None;
+    }
+    class.reltype
+}
+
+/// The fields `(value).*` expands to, by name, type and whether their
+/// collation compares bytewise, when `value` is a column reference whose
+/// type ([`value_type`]) is a composite type: its live attributes in order.
+pub(super) fn composite_star_columns(
+    ctx: &Ctx<'_>,
+    scope: Option<&Scope<'_>>,
+    outer: Option<&FromScope<'_>>,
+    value: Option<&ast::Node>,
+) -> Option<Vec<CteColumn>> {
+    let Some(Node::AIndirection(indirection)) = value else {
+        return None;
+    };
+    if !matches!(indirection.indirection.as_slice(), [Some(Node::AStar(_))]) {
+        return None;
+    }
+    let arg = indirection.arg.as_ref()?;
+    if !matches!(arg, Node::ColumnRef(_)) {
+        return None;
+    }
+    let typ = value_type(ctx, scope, outer, Some(arg)).0?;
+    let ty = ctx.catalog.pg_type.get(&typ)?;
+    if ty.typtype != crate::pg_catalog::TypType::Composite {
+        return None;
+    }
+    let relid = ty.typrelid?;
+    let mut attributes: Vec<_> = ctx
+        .catalog
+        .attributes_of(relid)
+        .iter()
+        .filter(|attribute| attribute.attnum > 0)
+        .collect();
+    attributes.sort_by_key(|attribute| attribute.attnum);
+    let columns: Vec<CteColumn> = attributes
+        .into_iter()
+        .map(|attribute| CteColumn {
+            name: Some(attribute.attname.clone()),
+            typ: Some(attribute.atttypid),
+            deterministic: dedup::deterministic(ctx.catalog, attribute.attcollation),
+        })
+        .collect();
+    (!columns.is_empty()).then_some(columns)
+}
+
 /// The column name PG gives a target that has none written, when it is
 /// certain (see [`crate::resolve::certain_colname`]).
 fn output_name(value: Option<&ast::Node>) -> Option<String> {
@@ -1294,7 +1378,17 @@ fn find_select(
                 }
                 return;
             }
-            let scope = FromScope::of_select(ctx, select, parent);
+            let mut scope = FromScope::of_select(ctx, select, parent);
+            // A nested level's proof reads this level's columns as fixed
+            // values: a FROM subquery's or CTE's typed output columns too,
+            // as the cardinality scope lists them.
+            if matches!(check, SelectCheck::OneRow)
+                && let Some(items) =
+                    Scope::build_env(ctx, &visible.after, &select.from_clause, &scope)
+                        .map(|level| level.items(ctx))
+            {
+                scope = scope.with_items(items);
+            }
             for child in select_children(select) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
@@ -1720,8 +1814,11 @@ pub(super) fn select_at_most_one_row_in(
     outer: &FromScope<'_>,
     env: &CteEnv,
 ) -> bool {
-    if select.op != SetOperation::SetopNone || select.into_clause.is_some() {
+    if select.into_clause.is_some() {
         return false;
+    }
+    if select.op != SetOperation::SetopNone {
+        return exclusive_union_all(ctx, select, outer, env);
     }
     // `GROUP BY ()` is a single empty grouping set: one group, like an
     // aggregate without `GROUP BY`. Any other grouping construct —
@@ -1814,6 +1911,387 @@ pub(super) fn select_at_most_one_row_in(
         }
     }
     all_relations_determined(ctx, select, &scope, outer, env)
+}
+
+// ── Mutually exclusive UNION ALL branches ──────────────────────────────────
+
+/// What a statement yielding a row implies about one CTE of the `WITH`
+/// clause around it, by position: that the CTE yields a row (`true`), or
+/// that it yields none (`false`).
+type Guard = (usize, bool);
+
+/// Whether `select` is a `UNION ALL` of two branches of at most one row each
+/// that never both yield one: a row of one implies that a CTE of the
+/// statement's own `WITH` yields a row, and a row of the other that the same
+/// CTE yields none.
+///
+/// The CTE must be read once for the whole statement, so every reference
+/// sees the same rows: it is not `NOT MATERIALIZED` (two references, one per
+/// branch, make PG materialize it otherwise) and its name names no other CTE
+/// of the statement. Data-modifying CTEs all run once, on the same
+/// snapshot, so a branch reading one inherits what its rows imply.
+fn exclusive_union_all(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    outer: &FromScope<'_>,
+    env: &CteEnv,
+) -> bool {
+    if select.op != SetOperation::SetopUnion || !select.all {
+        return false;
+    }
+    let (Some(left), Some(right)) = (select.larg.as_deref(), select.rarg.as_deref()) else {
+        return false;
+    };
+    let Some(with) = select.with_clause.as_deref() else {
+        return false;
+    };
+    if with.recursive {
+        return false;
+    }
+    // A branch's own `WITH` isn't in `env`: it would shadow names.
+    let one_row = |branch: &SelectStmt| {
+        branch.with_clause.is_none() && {
+            let scope = FromScope::of_select(ctx, branch, Some(outer));
+            select_at_most_one_row_in(ctx, branch, &scope, env) || limit_bounds_one(branch)
+        }
+    };
+    if !one_row(left) || !one_row(right) {
+        return false;
+    }
+    let Some(guards) = Guards::of(ctx, with, env) else {
+        return false;
+    };
+    let visible = guards.ctes.len();
+    let right = guards.select(ctx, right, visible, env);
+    guards
+        .select(ctx, left, visible, env)
+        .iter()
+        .any(|&(cte, rows)| guards.read_once(cte) && right.contains(&(cte, !rows)))
+}
+
+/// A `WITH` clause's CTEs, with what a row of each body implies.
+struct Guards<'q> {
+    ctes: Vec<&'q CommonTableExpr>,
+    /// The CTE's name is defined once in the whole statement: a reference
+    /// spelling it can't be to a nested `WITH`'s CTE.
+    unique: Vec<bool>,
+    implied: Vec<Vec<Guard>>,
+}
+
+impl<'q> Guards<'q> {
+    /// `env` is the environment after the clause: each body is judged with
+    /// the CTEs from its own on given up on (a reference to a later one is to
+    /// a table of that name).
+    fn of(ctx: &Ctx<'_>, with: &'q WithClause, env: &CteEnv) -> Option<Guards<'q>> {
+        let mut ctes = Vec::with_capacity(with.ctes.len());
+        for node in &with.ctes {
+            let Some(Node::CommonTableExpr(cte)) = node else {
+                return None;
+            };
+            ctes.push(&**cte);
+        }
+        let unique = ctes
+            .iter()
+            .map(|cte| {
+                ctx.tree
+                    .nodes()
+                    .filter(|(node, _)| {
+                        matches!(node, NodeRef::CommonTableExpr(other) if other.ctename == cte.ctename)
+                    })
+                    .count()
+                    == 1
+            })
+            .collect();
+        let mut guards = Guards {
+            ctes,
+            unique,
+            implied: Vec::new(),
+        };
+        for i in 0..guards.ctes.len() {
+            let mut body_env = env.clone();
+            for later in &guards.ctes[i..] {
+                body_env.insert(later.ctename.clone(), None);
+            }
+            let implied = match guards.ctes[i].ctequery.as_ref() {
+                Some(body) => guards.statement(ctx, body.to_ref(), i, &body_env),
+                None => Vec::new(),
+            };
+            guards.implied.push(implied);
+        }
+        Some(guards)
+    }
+
+    /// Whether every reference to CTE `cte` reads the same rows: PG
+    /// evaluates it once (see [`exclusive_union_all`]).
+    fn read_once(&self, cte: usize) -> bool {
+        let expr = self.ctes[cte];
+        self.unique[cte] && !expr.cterecursive && expr.ctematerialized != ast::CteMaterialize::Never
+    }
+
+    /// The CTE among the first `visible` that an unqualified `name` reads.
+    fn cte_named(&self, name: &str, visible: usize) -> Option<usize> {
+        (0..visible).find(|&i| self.unique[i] && self.ctes[i].ctename == name)
+    }
+
+    /// What `statement` yielding a row implies, the first `visible` CTEs
+    /// being in scope.
+    fn statement(
+        &self,
+        ctx: &Ctx<'_>,
+        statement: NodeRef<'_>,
+        visible: usize,
+        env: &CteEnv,
+    ) -> Vec<Guard> {
+        match statement {
+            NodeRef::SelectStmt(select) => self.select(ctx, select, visible, env),
+            // A returned row is a row of the source query, inserted or (`ON
+            // CONFLICT DO UPDATE`) updated.
+            NodeRef::InsertStmt(insert) => {
+                let writable = insert
+                    .relation
+                    .as_deref()
+                    .is_some_and(|relation| dml_target_without_rules(ctx, relation));
+                match insert.select_stmt.as_ref() {
+                    Some(Node::SelectStmt(select)) if writable && insert.with_clause.is_none() => {
+                        self.select(ctx, select, visible, env)
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            NodeRef::UpdateStmt(update) if update.with_clause.is_none() => self.dml(
+                ctx,
+                update.relation.as_deref(),
+                &update.from_clause,
+                update.where_clause.as_ref(),
+                visible,
+                env,
+            ),
+            NodeRef::DeleteStmt(delete) if delete.with_clause.is_none() => self.dml(
+                ctx,
+                delete.relation.as_deref(),
+                &delete.using_clause,
+                delete.where_clause.as_ref(),
+                visible,
+                env,
+            ),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What a plain `SELECT` yielding a row implies: a row of each CTE its
+    /// `FROM` reads where no outer join null-extends it, and what each
+    /// `WHERE` conjunct (see [`Self::conjunct`]) implies. An aggregate,
+    /// `GROUP BY` or `HAVING` query is refused: an aggregate yields its row
+    /// from no input row at all.
+    fn select(
+        &self,
+        ctx: &Ctx<'_>,
+        select: &SelectStmt,
+        visible: usize,
+        env: &CteEnv,
+    ) -> Vec<Guard> {
+        if select.op != SetOperation::SetopNone
+            || !select.values_lists.is_empty()
+            || select.with_clause.is_some()
+            || !select.group_clause.is_empty()
+            || select.having_clause.is_some()
+            || [
+                &select.target_list,
+                &select.sort_clause,
+                &select.distinct_clause,
+                &select.window_clause,
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|node| may_aggregate(ctx, node))
+        {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for item in &select.from_clause {
+            self.item_guards(item.as_ref(), visible, &mut out);
+        }
+        let root = FromScope::opaque(None);
+        let scope = Scope::build_env(ctx, env, &select.from_clause, &root);
+        for conjunct in dedup::conjuncts(select.where_clause.as_ref()) {
+            self.conjunct(ctx, conjunct, scope.as_ref(), visible, env, &mut out);
+        }
+        out
+    }
+
+    /// What an `UPDATE` / `DELETE` returning a row implies: a target row
+    /// matched its `WHERE` and its `FROM` / `USING` items (every one an
+    /// inner join with the target).
+    fn dml(
+        &self,
+        ctx: &Ctx<'_>,
+        relation: Option<&ast::RangeVar>,
+        from: &[Option<Node>],
+        where_clause: Option<&Node>,
+        visible: usize,
+        env: &CteEnv,
+    ) -> Vec<Guard> {
+        let Some(relation) = relation else {
+            return Vec::new();
+        };
+        if !dml_target_without_rules(ctx, relation) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for item in from {
+            self.item_guards(item.as_ref(), visible, &mut out);
+        }
+        let scope = Scope::dml(ctx, env, relation, from);
+        for conjunct in dedup::conjuncts(where_clause) {
+            self.conjunct(ctx, conjunct, scope.as_ref(), visible, env, &mut out);
+        }
+        out
+    }
+
+    /// The CTEs a `FROM` item reads on every row it yields: a CTE reference,
+    /// and the sides of a join no outer join null-extends.
+    fn item_guards(&self, item: Option<&Node>, visible: usize, out: &mut Vec<Guard>) {
+        match item {
+            Some(Node::RangeVar(range))
+                if range.schemaname.is_empty() && range.catalogname.is_empty() =>
+            {
+                if let Some(cte) = self.cte_named(&range.relname, visible) {
+                    out.push((cte, true));
+                    out.extend(self.implied[cte].iter().copied());
+                }
+            }
+            Some(Node::JoinExpr(join)) => match join.jointype {
+                JoinType::JoinInner => {
+                    self.item_guards(join.larg.as_ref(), visible, out);
+                    self.item_guards(join.rarg.as_ref(), visible, out);
+                }
+                JoinType::JoinLeft => self.item_guards(join.larg.as_ref(), visible, out),
+                JoinType::JoinRight => self.item_guards(join.rarg.as_ref(), visible, out),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// What a `WHERE` conjunct holding implies: `EXISTS (q)` that `q`
+    /// yields a row; `NOT EXISTS (SELECT … FROM c)` reading all of CTE `c`
+    /// that `c` yields none; and a comparison through a strict operator
+    /// (one the cardinality proof reads as an equality fact) with a scalar
+    /// subquery operand that the subquery yields a row, since an empty one
+    /// is NULL.
+    fn conjunct(
+        &self,
+        ctx: &Ctx<'_>,
+        conjunct: Option<&Node>,
+        scope: Option<&Scope<'_>>,
+        visible: usize,
+        env: &CteEnv,
+        out: &mut Vec<Guard>,
+    ) {
+        match conjunct {
+            Some(Node::SubLink(sub)) if sub.sub_link_type == ast::SubLinkType::ExistsSublink => {
+                if let Some(Node::SelectStmt(select)) = sub.subselect.as_ref() {
+                    out.extend(self.select(ctx, select, visible, env));
+                }
+            }
+            Some(Node::BoolExpr(not))
+                if not.boolop == ast::BoolExprType::NotExpr && not.args.len() == 1 =>
+            {
+                if let Some(Node::SubLink(sub)) = not.args[0].as_ref()
+                    && sub.sub_link_type == ast::SubLinkType::ExistsSublink
+                    && let Some(Node::SelectStmt(select)) = sub.subselect.as_ref()
+                    && let Some(cte) = self.reads_whole_cte(select, visible)
+                {
+                    out.push((cte, false));
+                }
+            }
+            Some(Node::AExpr(expr)) if expr.kind == ast::AExprKind::AexprOp => {
+                let Some(scope) = scope else {
+                    return;
+                };
+                for side in [expr.lexpr.as_ref(), expr.rexpr.as_ref()] {
+                    let Some(Node::SubLink(sub)) = side else {
+                        continue;
+                    };
+                    let Some(Node::SelectStmt(select)) = sub.subselect.as_ref() else {
+                        continue;
+                    };
+                    let root = FromScope::opaque(None);
+                    if sub.sub_link_type == ast::SubLinkType::ExprSublink
+                        && !scope
+                            .cardinality_facts(ctx, conjunct, Some(&root), env)
+                            .is_empty()
+                    {
+                        out.extend(self.select(ctx, select, visible, env));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The CTE `select` yields a row of whenever the CTE has one: `SELECT
+    /// <constants or columns> FROM c` with no `WHERE`, grouping, ordering,
+    /// window, `LIMIT`, `OFFSET` or locking.
+    fn reads_whole_cte(&self, select: &SelectStmt, visible: usize) -> Option<usize> {
+        if select.op != SetOperation::SetopNone
+            || !select.values_lists.is_empty()
+            || select.with_clause.is_some()
+            || select.where_clause.is_some()
+            || !select.group_clause.is_empty()
+            || select.having_clause.is_some()
+            || !select.sort_clause.is_empty()
+            || select.limit_count.is_some()
+            || select.limit_offset.is_some()
+            || !select.locking_clause.is_empty()
+            || !select.window_clause.is_empty()
+        {
+            return None;
+        }
+        let plain_targets = select.target_list.iter().all(|target| {
+            matches!(
+                target,
+                Some(Node::ResTarget(target))
+                    if matches!(target.val.as_ref(), Some(Node::AConst(_) | Node::ColumnRef(_)))
+            )
+        });
+        if !plain_targets {
+            return None;
+        }
+        match select.from_clause.as_slice() {
+            [Some(Node::RangeVar(range))]
+                if range.schemaname.is_empty() && range.catalogname.is_empty() =>
+            {
+                self.cte_named(&range.relname, visible)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether `node` may contain a call that makes its query level an
+/// aggregate one: an aggregate syntax, a `GROUPING` call, or a call to a
+/// name some routine of which is not a plain function. Nested subqueries
+/// count too (an aggregate there can belong to this level).
+fn may_aggregate(ctx: &Ctx<'_>, node: &Node) -> bool {
+    node.nodes().any(|(node, _)| match node {
+        NodeRef::GroupingFunc(_) => true,
+        NodeRef::FuncCall(call) => {
+            call.agg_star
+                || call.agg_distinct
+                || call.agg_within_group
+                || call.agg_filter.is_some()
+                || !call.agg_order.is_empty()
+                || function_name(&call.funcname).is_none_or(|(schema, name)| {
+                    ctx.catalog
+                        .find_functions(schema, name)
+                        .iter()
+                        .any(|proc| proc.prokind != ProKind::Function)
+                })
+        }
+        _ => false,
+    })
 }
 
 /// Whether a plain `GROUP BY` / `DISTINCT ON` item is one value per
@@ -2985,11 +3463,15 @@ mod tests {
         ));
         // Only part of the key: not one row.
         assert!(!select_one(&db, "SELECT id FROM paints WHERE shop = $1"));
-        // Comparing the enum as text is not the key's own operator family:
-        // the key equality isn't there.
-        assert!(!select_one(
+        // Comparing the enum as text pins it too: a label names one value.
+        assert!(select_one(
             &db,
             "SELECT id FROM paints WHERE shop = $1 AND color::text = 'red'"
+        ));
+        // A text comparison that isn't the text type's equality does not.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM paints WHERE shop = $1 AND color::text LIKE 'red'"
         ));
     }
 

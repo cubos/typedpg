@@ -666,6 +666,10 @@ struct Operand {
     rels: u64,
     /// The operand is an [`IndexCall`] over relation `.0`'s columns.
     call: Option<(usize, IndexCall)>,
+    /// The operand is relation `.0`'s column `.1`, of type `.2`, through a
+    /// cast that tells its values apart (see [`injective_cast`]): an
+    /// equality on the operand fixes the column as `col = value` would.
+    cast_column: Option<(usize, i16, PgTypeOid)>,
 }
 
 impl<'a> Scope<'a> {
@@ -1157,8 +1161,14 @@ impl<'a> Scope<'a> {
     /// a CTE reference, FROM subquery, VALUES list or FROM function is a
     /// [`Item::Value`] with the types its relation lists.
     fn lateral_scope<'s>(&self, ctx: &Ctx<'_>, outer: &'s FromScope<'s>) -> FromScope<'s> {
-        let items = self
-            .rels
+        FromScope::level(self.items(ctx), outer.parent(), true)
+    }
+
+    /// This scope's relations as [`FromScope`] items: a base table keeps its
+    /// columns and attnums; a CTE reference, FROM subquery, VALUES list or
+    /// FROM function is an [`Item::Value`] with the types its relation lists.
+    pub(super) fn items(&self, ctx: &Ctx<'_>) -> Vec<Item> {
+        self.rels
             .iter()
             .map(|rel| match rel.oid {
                 Some(relid) if rel.columns_known => Item::Table {
@@ -1186,8 +1196,7 @@ impl<'a> Scope<'a> {
                     refname: (!rel.refname.is_empty()).then(|| rel.refname.clone()),
                 },
             })
-            .collect();
-        FromScope::level(items, outer.parent(), true)
+            .collect()
     }
 
     /// Add one FROM subquery — `LATERAL` or not — with its output columns,
@@ -1254,7 +1263,25 @@ impl<'a> Scope<'a> {
         let single_row =
             super::cardinality::select_at_most_one_row_in(ctx, select.as_ref(), &scope, &env)
                 || super::cardinality::limit_bounds_one(select);
-        let (names, mut columns_known) = subquery_output_names(select)?;
+        let output = super::cardinality::select_output_columns(ctx, select, &env, parent);
+        let (mut names, mut columns_known) = subquery_output_names(select)?;
+        // A star whose columns the output list spells out, every name
+        // certain (a `(row).*` of a known composite type, a table's `t.*`),
+        // counts as those columns.
+        let mut has_star = target_list_has_star(select);
+        if has_star
+            && select.op == SetOperation::SetopNone
+            && select.values_lists.is_empty()
+            && !output.is_empty()
+            && let Some(listed) = output
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Option<Vec<String>>>()
+        {
+            names = listed;
+            columns_known = true;
+            has_star = false;
+        }
         let mut columns: Vec<(String, i16)> = Vec::with_capacity(names.len());
         for (index, name) in names.into_iter().enumerate() {
             columns.push((name, i16::try_from(index).ok()?.checked_add(1)?));
@@ -1273,7 +1300,6 @@ impl<'a> Scope<'a> {
         // the names certain again.
         // (Not past a `*` target: it expands to columns this can't count,
         // so the list may rename only some of them.)
-        let has_star = target_list_has_star(select);
         if renames.len() == columns.len() && !has_star {
             columns_known = true;
         }
@@ -1281,7 +1307,7 @@ impl<'a> Scope<'a> {
             columns_known = false;
         }
         let alias = sub.alias.as_ref().map(|a| a.aliasname.clone());
-        let cte_columns = super::cardinality::select_output_columns(ctx, select, &env, parent)
+        let cte_columns = output
             .into_iter()
             .map(|column| (column.typ, column.deterministic))
             .collect();
@@ -1690,6 +1716,7 @@ impl<'a> Scope<'a> {
                     column: rel.map(|r| (r, attnum)),
                     rels: rel.map_or(0, |r| 1 << r),
                     call: None,
+                    cast_column: None,
                 })
             }
             Node::SubLink(sub) if scalar_sublinks => {
@@ -1707,6 +1734,7 @@ impl<'a> Scope<'a> {
                     column: None,
                     rels: 0,
                     call: None,
+                    cast_column: None,
                 })
             }
             Node::AConst(c) if !c.isnull => Some(Operand {
@@ -1719,6 +1747,7 @@ impl<'a> Scope<'a> {
                 column: None,
                 rels: 0,
                 call: None,
+                cast_column: None,
             }),
             Node::TypeCast(cast) if scalar_sublinks => {
                 let type_name = cast.type_name.as_ref()?;
@@ -1736,12 +1765,17 @@ impl<'a> Scope<'a> {
                 // A conversion that runs a volatile function could yield
                 // another value each time the row pair is evaluated.
                 let deterministic_collation = deterministic_type(ctx, typ);
+                let cast_column = arg
+                    .column
+                    .filter(|_| injective_cast(ctx, arg.typ, typ))
+                    .map(|(rel, attnum)| (rel, attnum, arg.typ));
                 (deterministic_collation && coercion_is_nonvolatile(ctx, arg.typ, typ)).then_some(
                     Operand {
                         typ,
                         column: None,
                         rels: arg.rels,
                         call: None,
+                        cast_column,
                     },
                 )
             }
@@ -1761,6 +1795,7 @@ impl<'a> Scope<'a> {
                     column: None,
                     rels: arg.rels,
                     call: None,
+                    cast_column: None,
                 })
             }
             Node::BooleanTest(test) if scalar_sublinks => {
@@ -1770,6 +1805,7 @@ impl<'a> Scope<'a> {
                     column: None,
                     rels: arg.rels,
                     call: None,
+                    cast_column: None,
                 })
             }
             Node::BoolExpr(expr) if scalar_sublinks => {
@@ -1784,6 +1820,7 @@ impl<'a> Scope<'a> {
                     column: None,
                     rels,
                     call: None,
+                    cast_column: None,
                 })
             }
             Node::CoalesceExpr(expr) if scalar_sublinks => {
@@ -1814,12 +1851,14 @@ impl<'a> Scope<'a> {
                 column: None,
                 rels: 0,
                 call: None,
+                cast_column: None,
             }),
             Some(Node::AConst(c)) if c.isnull => Some(Operand {
                 typ: oid::UNKNOWN,
                 column: None,
                 rels: 0,
                 call: None,
+                cast_column: None,
             }),
             _ => self.operand(ctx, expr, outer, true, env),
         }
@@ -1847,6 +1886,7 @@ impl<'a> Scope<'a> {
             column: None,
             rels: values.iter().fold(rels, |rels, value| rels | value.rels),
             call: None,
+            cast_column: None,
         })
     }
 
@@ -1995,6 +2035,7 @@ impl<'a> Scope<'a> {
             column: None,
             rels: operands.iter().fold(0, |rels, operand| rels | operand.rels),
             call,
+            cast_column: None,
         })
     }
 
@@ -2039,6 +2080,7 @@ impl<'a> Scope<'a> {
             column: None,
             rels: left.map_or(0, |operand| operand.rels) | right.rels,
             call: None,
+            cast_column: None,
         })
     }
 
@@ -2151,6 +2193,7 @@ impl<'a> Scope<'a> {
             column: None,
             rels: 0,
             call: None,
+            cast_column: None,
         })
     }
 
@@ -2518,6 +2561,7 @@ impl<'a> Scope<'a> {
                 column: Some((r, attnum)),
                 rels: 1 << r,
                 call: None,
+                cast_column: None,
             })
         };
         match (side(left), side(right)) {
@@ -2581,6 +2625,30 @@ impl<'a> Scope<'a> {
                 other: l.rels,
                 call: None,
             });
+        }
+        // A column through a cast that tells its values apart: `t.a::text =
+        // value` fixes `t.a` to the one value whose text is `value`, as `t.a
+        // = value'` would. The operator must equate only values the cast's
+        // output type itself tells apart (its default btree equality on one
+        // type), so two rows matching `value` have the same text, hence the
+        // same column value under the column type's own default equality.
+        for (side, other) in [(l, r), (r, l)] {
+            if let Some((rel, attnum, column_type)) = side.cast_column
+                && other.rels & (1 << rel) == 0
+                && let Some(family) = default_btree_family(ctx.catalog, side.typ)
+                && in_btree_equality(ctx, &family, op.oid)
+                && grouping_equality(ctx, op.oid)
+                && let Some((equality, declared)) = default_equality(ctx, column_type)
+            {
+                out.push(EqFact {
+                    rel,
+                    attnum,
+                    op: equality,
+                    declared: Some(declared),
+                    other: other.rels,
+                    call: None,
+                });
+            }
         }
         // An expression index key: `f(t.a) = value`, attnum `0`.
         if let Some((rel, call)) = &l.call
@@ -2712,6 +2780,85 @@ fn io_functions_nonvolatile(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
             .pg_type
             .get(&typ)
             .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Enum)
+}
+
+/// Whether casting a value of `source` to `target` keeps values its default
+/// equality tells apart apart, whatever the session: two values whose casts
+/// are equal under `target`'s default equality are equal under `source`'s.
+/// Only casts to `text` from types whose text form is canonical are listed:
+///
+/// - `int2`, `int4`, `int8`, `numeric`: the decimal digits of the exact
+///   value (`numeric` keeps its scale, so `1.0` and `1.00` print apart while
+///   being equal — the direction that doesn't matter here);
+/// - `uuid`: always lowercase hex with dashes;
+/// - `boolean`: `true` / `false`;
+/// - an enum: its label, unique within the type;
+/// - `text`, `varchar`: the string itself; `bpchar`: the string without its
+///   trailing spaces, which `bpchar`'s own equality ignores too.
+///
+/// Types whose text form depends on session settings (`float4` / `float8`
+/// under `extra_float_digits`, dates and times under `DateStyle`,
+/// `TimeZone` or `IntervalStyle`) or that print equal values of different
+/// kinds alike are left out. A domain casts as its base type. The cast must
+/// be PG's own: a binary coercion, the types' built-in I/O functions, or a
+/// built-in cast function.
+fn injective_cast(ctx: &Ctx<'_>, source: PgTypeOid, target: PgTypeOid) -> bool {
+    if target != oid::TEXT {
+        return false;
+    }
+    let base = ctx.catalog.unwrap_domain(source);
+    if base == oid::TEXT {
+        return true;
+    }
+    let listed = [
+        oid::INT2,
+        oid::INT4,
+        oid::INT8,
+        oid::NUMERIC,
+        oid::UUID,
+        oid::BOOL,
+        oid::VARCHAR,
+        oid::BPCHAR,
+    ]
+    .contains(&base)
+        || ctx
+            .catalog
+            .pg_type
+            .get(&base)
+            .is_some_and(|ty| ty.typtype == crate::pg_catalog::TypType::Enum);
+    if !listed {
+        return false;
+    }
+    use crate::coerce::{CoercionContext, CoercionPath, coercion_pathway};
+    match coercion_pathway(target, base, CoercionContext::Explicit, ctx.catalog) {
+        Some(CoercionPath::Relabel | CoercionPath::CoerceViaIo) => true,
+        Some(CoercionPath::Func) => ctx
+            .catalog
+            .cast_by_pair
+            .get(&(base, target))
+            .and_then(|oid| ctx.catalog.pg_cast.get(oid))
+            .and_then(|cast| cast.castfunc)
+            .is_some_and(|func| func.get() < FIRST_NORMAL_OBJECT_ID),
+        _ => false,
+    }
+}
+
+/// The default btree equality of `typ` on itself, with its declared operand
+/// type: what `col = value` of the column's own type compares with.
+fn default_equality(ctx: &Ctx<'_>, typ: PgTypeOid) -> Option<(PgOperatorOid, PgTypeOid)> {
+    let family = default_btree_family(ctx.catalog, typ)?;
+    ctx.catalog
+        .pg_amop
+        .iter()
+        .find(|a| {
+            a.amopmethod == "btree"
+                && a.amopstrategy == 3
+                && a.amopfamily == family.0
+                && a.amopfamilynamespace == family.1
+                && a.amoplefttype == a.amoprighttype
+                && operand_type_matches(ctx, typ, Some(a.amoplefttype))
+        })
+        .map(|a| (a.amopopr, a.amoplefttype))
 }
 
 /// The conjuncts a set of equality facts was read from, for matching a
@@ -3828,7 +3975,7 @@ fn fixed_literal(catalog: &PgCatalog, node: Option<&ast::Node>, ty: PgTypeOid) -
 /// `POSIX`, a locale or ICU collation, or a user collation copied from them.
 /// A collation the catalog doesn't know, and a nondeterministic one (ICU
 /// with a non-binary level), are refused.
-fn deterministic(catalog: &PgCatalog, collation: Option<PgCollationOid>) -> bool {
+pub(super) fn deterministic(catalog: &PgCatalog, collation: Option<PgCollationOid>) -> bool {
     collation.is_none_or(|c| {
         catalog
             .pg_collation

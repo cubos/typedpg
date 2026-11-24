@@ -61,6 +61,7 @@ pub(crate) mod oid {
     pub const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
     pub const TIMETZ: PgTypeOid = PgTypeOid::from_raw(1266);
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
+    pub const UUID: PgTypeOid = PgTypeOid::from_raw(2950);
     pub const JSONB: PgTypeOid = PgTypeOid::from_raw(3802);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
     /// `record[]` (`_record`): an array of anonymous records.

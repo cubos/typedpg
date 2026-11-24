@@ -186,6 +186,27 @@ impl<'a> FromScope<'a> {
         }
     }
 
+    /// This level's items in place of `of_select`'s: the same `FROM`
+    /// clause described with what the cardinality proof knows of its items
+    /// (a FROM subquery's or CTE's typed output columns as a value item),
+    /// keeping `of_select`'s grouping-sets flag and parent.
+    pub(crate) fn with_items(self, items: Vec<Item>) -> FromScope<'a> {
+        FromScope { items, ..self }
+    }
+
+    /// Whether an unqualified `column` may bind to an item of this level or
+    /// of a level around it (an item whose columns aren't known may hold it).
+    pub(crate) fn may_bind_column(&self, column: &str) -> bool {
+        let mut level = Some(self);
+        while let Some(scope) = level {
+            if scope.items.iter().any(|item| item.has_column(column)) {
+                return true;
+            }
+            level = scope.parent;
+        }
+        false
+    }
+
     /// A level with no items (a `FROM` subquery that could not resolve
     /// anything against the levels around it), parented by `parent`.
     pub(crate) fn empty(parent: Option<&'a FromScope<'a>>) -> FromScope<'a> {

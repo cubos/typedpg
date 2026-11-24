@@ -835,6 +835,134 @@ mod tests {
         );
     }
 
+    fn accounts() -> PgCatalog {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE accounts (
+                id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                name text,
+                email text NOT NULL UNIQUE
+             );",
+        )
+        .unwrap();
+        db
+    }
+
+    /// Find-or-create: one branch returns the updated row when the lookup
+    /// found one, the other the inserted row when it found none.
+    const FIND_OR_CREATE: &str = "WITH existing AS (
+            SELECT id FROM accounts WHERE lower(email) = $1 LIMIT 1
+        ), updated AS (
+            UPDATE accounts a SET name = COALESCE(a.name, $2)
+            WHERE a.id = (SELECT id FROM existing)
+            RETURNING a.id, false AS created
+        ), inserted AS (
+            INSERT INTO accounts (name, email) SELECT $2, $1
+            WHERE NOT EXISTS (SELECT 1 FROM existing)
+            ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+            RETURNING id, (xmax = 0) AS created
+        )
+        SELECT id, created FROM updated
+        UNION ALL
+        SELECT id, created FROM inserted";
+
+    #[test]
+    fn a_union_all_of_mutually_exclusive_single_row_branches_is_one_row() {
+        let db = accounts();
+        for sql in [
+            FIND_OR_CREATE.to_owned(),
+            // EXISTS and NOT EXISTS on the same CTE, in plain selects.
+            "WITH found AS (SELECT id FROM accounts WHERE email = $1)
+             SELECT id FROM accounts WHERE id = $2 AND EXISTS (SELECT 1 FROM found)
+             UNION ALL
+             SELECT $3::text WHERE NOT EXISTS (SELECT FROM found)"
+                .to_owned(),
+            // A branch reading the CTE itself, the other its absence.
+            "WITH found AS (SELECT id FROM accounts WHERE id = $1)
+             SELECT id FROM found
+             UNION ALL
+             SELECT 'new' WHERE NOT EXISTS (SELECT id FROM found)"
+                .to_owned(),
+        ] {
+            let sql = sql.as_str();
+            assert!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                    Rule::FetchMayReturnMany
+                )
+                .is_empty(),
+                "{sql}"
+            );
+            // The claim the lint oracle checks against PostgreSQL.
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[ts(CallMethod::FetchAll, "fetchAll")]),
+                    Rule::FetchAllSingleRow
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_union_all_whose_branches_may_both_return_a_row_may_return_many() {
+        let db = accounts();
+        for sql in [
+            // Both branches on the CTE having a row.
+            FIND_OR_CREATE.replace(
+                "WHERE NOT EXISTS (SELECT 1 FROM existing)",
+                "WHERE EXISTS (SELECT 1 FROM existing)",
+            ),
+            // A filtered NOT EXISTS: the CTE may have rows it doesn't see.
+            FIND_OR_CREATE.replace(
+                "WHERE NOT EXISTS (SELECT 1 FROM existing)",
+                "WHERE NOT EXISTS (SELECT 1 FROM existing WHERE id = $2)",
+            ),
+            // `NOT MATERIALIZED`: each reference may be evaluated apart.
+            FIND_OR_CREATE.replace("existing AS (", "existing AS NOT MATERIALIZED ("),
+            // `IS NOT DISTINCT FROM` is no strict operator: it compares the
+            // NULL an empty subquery gives.
+            FIND_OR_CREATE.replace(
+                "WHERE a.id = (SELECT id FROM existing)",
+                "WHERE a.id IS NOT DISTINCT FROM (SELECT id FROM existing) AND a.email = $1",
+            ),
+            // Guards on two different CTEs.
+            "WITH a AS (SELECT id FROM accounts WHERE email = $1),
+                  b AS (SELECT id FROM accounts WHERE email = $2)
+             SELECT id FROM accounts WHERE id = $3 AND EXISTS (SELECT 1 FROM a)
+             UNION ALL
+             SELECT $4::text WHERE NOT EXISTS (SELECT FROM b)"
+                .to_owned(),
+            // An aggregate yields its row whatever the CTE holds.
+            "WITH found AS (SELECT id FROM accounts WHERE email = $1)
+             SELECT max(id) FROM found
+             UNION ALL
+             SELECT 'new' WHERE NOT EXISTS (SELECT id FROM found)"
+                .to_owned(),
+            // A UNION ALL without a WITH, and a branch that may be many.
+            "SELECT id FROM accounts WHERE id = $1 UNION ALL SELECT id FROM accounts WHERE id = $2"
+                .to_owned(),
+            "WITH found AS (SELECT id FROM accounts WHERE id = $1)
+             SELECT id FROM accounts WHERE name = $2 AND EXISTS (SELECT 1 FROM found)
+             UNION ALL
+             SELECT 'new' WHERE NOT EXISTS (SELECT id FROM found)"
+                .to_owned(),
+        ] {
+            let sql = sql.as_str();
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                    Rule::FetchMayReturnMany
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
     #[test]
     fn fetch_all_on_a_non_unique_query_is_fine() {
         let db = catalog();
@@ -1480,10 +1608,16 @@ mod tests {
                    (SELECT id, (SELECT agent_id) FROM ch WHERE id = $1) n \
                    JOIN ag a ON a.id = n.agent_id";
         assert_eq!(optional_findings(&db, sql), 1, "{sql}");
-        // `(p).*` expands to several columns: `agent_id`'s position is not
-        // the one listed.
+        // `(p).*` expands to the composite's fields, `x` and `y`:
+        // `agent_id` is the fourth column.
         let sql = "SELECT n.id, a.slug FROM \
                    (SELECT id, (p).*, agent_id FROM ch WHERE id = $1) n \
+                   JOIN ag a ON a.id = n.agent_id";
+        assert_eq!(optional_findings(&db, sql), 0, "{sql}");
+        // A star over a value this doesn't type expands to columns it can't
+        // count: `agent_id`'s position is not known.
+        let sql = "SELECT n.id, a.slug FROM \
+                   (SELECT id, (SELECT p FROM ch LIMIT 1).*, agent_id FROM ch WHERE id = $1) n \
                    JOIN ag a ON a.id = n.agent_id";
         assert_eq!(optional_findings(&db, sql), 1, "{sql}");
     }

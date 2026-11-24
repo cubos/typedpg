@@ -394,6 +394,128 @@ mod tests {
         assert_eq!(lint_rule(&db, many, RULE).len(), 1);
     }
 
+    /// A key column compared as text through a cast that keeps its values
+    /// apart is pinned like the column itself.
+    fn cast_db() -> typedpg_analyzer::PgCatalog {
+        let mut db = db();
+        db.apply_sql(
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+             CREATE TABLE nodes (
+                id bigint PRIMARY KEY,
+                version_id uuid NOT NULL,
+                lineage_id uuid NOT NULL,
+                seq int4 NOT NULL UNIQUE,
+                small int2 UNIQUE,
+                amount numeric UNIQUE,
+                flag boolean UNIQUE,
+                mood mood UNIQUE,
+                label varchar(20) UNIQUE,
+                code char(4) UNIQUE,
+                ratio float8 UNIQUE,
+                day date UNIQUE,
+                at timestamptz UNIQUE,
+                UNIQUE (version_id, lineage_id)
+             );
+             CREATE TABLE competencies (id bigint PRIMARY KEY, external_id text, metadata jsonb);
+             CREATE TABLE exercises (id bigint PRIMARY KEY, competency_id bigint);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn a_key_compared_through_an_injective_cast_to_text_is_one_row() {
+        let db = cast_db();
+        for sql in [
+            // The real-world shape: a composite uuid key pinned as text.
+            "SELECT c.id, (SELECT n.id FROM nodes n \
+             WHERE n.lineage_id::text = c.external_id \
+               AND n.version_id::text = c.metadata ->> 'versionId') AS node \
+             FROM competencies c",
+            // The same against a LATERAL subquery's columns, and against the
+            // fields of a row a LATERAL subquery picks, expanded by `.*`.
+            "SELECT e.id, (SELECT n.id FROM nodes n \
+             WHERE n.lineage_id::text = shown.external_id \
+               AND n.version_id::text = shown.metadata ->> 'versionId') AS node \
+             FROM exercises e \
+             LEFT JOIN LATERAL (SELECT c.external_id, c.metadata FROM competencies c \
+                 WHERE c.id = e.competency_id) shown ON true",
+            "SELECT e.id, (SELECT n.id FROM nodes n \
+             WHERE n.lineage_id::text = shown.external_id \
+               AND n.version_id::text = shown.metadata ->> 'versionId') AS node \
+             FROM exercises e \
+             LEFT JOIN LATERAL (SELECT CASE WHEN c.id > 0 THEN c ELSE p END AS competency \
+                 FROM competencies c LEFT JOIN competencies p ON p.id = c.id + 1 \
+                 WHERE c.id = e.competency_id ORDER BY c.id LIMIT 1) top ON true \
+             LEFT JOIN LATERAL (SELECT (top.competency).*) shown ON true",
+            "SELECT (SELECT id FROM nodes WHERE seq::text = $s) AS id",
+            "SELECT (SELECT id FROM nodes WHERE $s = small::text) AS id",
+            "SELECT (SELECT id FROM nodes WHERE amount::text = $s) AS id",
+            "SELECT (SELECT id FROM nodes WHERE flag::text = 'true') AS id",
+            "SELECT (SELECT id FROM nodes WHERE mood::text = $s) AS id",
+            "SELECT (SELECT id FROM nodes WHERE label::text = $s) AS id",
+            "SELECT (SELECT id FROM nodes WHERE code::text = $s) AS id",
+            "SELECT (SELECT id FROM nodes WHERE CAST(seq AS text) = $s) AS id",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_compared_through_a_cast_that_may_merge_values_is_reported() {
+        let db = cast_db();
+        for (sql, subquery) in [
+            // `float8`'s text depends on `extra_float_digits`; a date's and a
+            // timestamp's on `DateStyle` / `TimeZone`.
+            (
+                "SELECT (SELECT id FROM nodes WHERE ratio::text = $s) AS id",
+                "(SELECT id FROM nodes WHERE ratio::text = $s)",
+            ),
+            (
+                "SELECT (SELECT id FROM nodes WHERE day::text = $s) AS id",
+                "(SELECT id FROM nodes WHERE day::text = $s)",
+            ),
+            (
+                "SELECT (SELECT id FROM nodes WHERE at::text = $s) AS id",
+                "(SELECT id FROM nodes WHERE at::text = $s)",
+            ),
+            // A cast to a type other than text: `numeric` -> `int4` rounds.
+            (
+                "SELECT (SELECT id FROM nodes WHERE amount::int4 = $i) AS id",
+                "(SELECT id FROM nodes WHERE amount::int4 = $i)",
+            ),
+            // A typmod truncates: `varchar(2)` keeps two characters.
+            (
+                "SELECT (SELECT id FROM nodes WHERE label::varchar(2) = $s) AS id",
+                "(SELECT id FROM nodes WHERE label::varchar(2) = $s)",
+            ),
+            // Not an equality.
+            (
+                "SELECT (SELECT id FROM nodes WHERE seq::text LIKE $s) AS id",
+                "(SELECT id FROM nodes WHERE seq::text LIKE $s)",
+            ),
+            // One column of the composite key only.
+            (
+                "SELECT (SELECT id FROM nodes WHERE lineage_id::text = $s) AS id",
+                "(SELECT id FROM nodes WHERE lineage_id::text = $s)",
+            ),
+            (
+                "SELECT e.id, (SELECT n.id FROM nodes n \
+                 WHERE n.lineage_id::text = shown.external_id) AS node \
+                 FROM exercises e \
+                 LEFT JOIN LATERAL (SELECT (c).* FROM competencies c \
+                     WHERE c.id = e.competency_id) shown ON true",
+                "(SELECT n.id FROM nodes n \
+                 WHERE n.lineage_id::text = shown.external_id)",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], subquery, "{sql}");
+        }
+    }
+
     #[test]
     fn an_allow_comment_suppresses_the_rule() {
         assert_clean(
