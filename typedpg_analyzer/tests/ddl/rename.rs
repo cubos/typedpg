@@ -980,3 +980,133 @@ fn a_later_search_path_does_not_rebind_a_stored_expression() {
     )
     .unwrap();
 }
+
+#[test]
+fn a_retyped_column_rebuilds_the_indexes_selecting_it_as_a_field() {
+    // `(atconst()).a` records a dependency on attbl2.a: ALTER COLUMN TYPE
+    // rebuilds atref's index and atchk's CHECK from their text, the field
+    // now bigint (PG prints `((atconst()).a)::numeric` after it).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE attbl2 (a numeric, b text);
+         CREATE FUNCTION atconst() RETURNS attbl2 LANGUAGE sql IMMUTABLE
+             AS $$ SELECT 1::numeric, 'x'::text $$;
+         CREATE TABLE atref (data text);
+         CREATE INDEX ON atref (((atconst()).a + length(data)));
+         CREATE TABLE atchk (n numeric, CHECK ((atconst()).a < n));",
+    )]);
+    db.apply_sql("ALTER TABLE attbl2 ALTER a TYPE bigint;")
+        .unwrap();
+    // The rebuilt texts cast the field to numeric now.
+    expect_failure(
+        &mut db,
+        "ALTER TABLE attbl2 ALTER a TYPE point USING point(a, a);",
+        "cannot cast type point to numeric",
+    );
+    db.apply_sql("DROP INDEX atref_expr_idx; ALTER TABLE attbl2 ALTER a TYPE text;")
+        .unwrap();
+}
+
+#[test]
+fn a_rename_under_a_shadowing_path_rebinds_nothing() {
+    // The renames run with another schema's `g` and `=` first on the path:
+    // the stored expressions still call `public.g` and `pg_catalog.=`.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE FUNCTION f(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+         CREATE TABLE t (a int CHECK (f(a) = 1));
+         CREATE INDEX ON t (f(a)) WHERE f(a) = 1;
+         CREATE POLICY p ON t USING (f(a) = 1);
+         CREATE SCHEMA loose;
+         CREATE FUNCTION loose.g(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 2';
+         CREATE FUNCTION loose.eq(int, int) RETURNS boolean LANGUAGE sql IMMUTABLE
+             AS 'SELECT true';
+         CREATE OPERATOR loose.= (LEFTARG = int, RIGHTARG = int, FUNCTION = loose.eq);",
+    )]);
+    db.apply_sql(
+        "SET search_path = loose, pg_catalog, public;
+         ALTER FUNCTION public.f(int) RENAME TO g;
+         ALTER TABLE public.t RENAME TO u;
+         ALTER SCHEMA public RENAME TO pub;
+         ALTER SCHEMA pub RENAME TO public;
+         DROP POLICY p ON public.u;",
+    )
+    .unwrap();
+    // The CHECK's rebuild calls `public.g(bigint)`, not `loose.g`.
+    expect_failure(
+        &mut db,
+        "ALTER TABLE u ALTER a TYPE bigint;",
+        "function public.g(bigint) does not exist",
+    );
+}
+
+#[test]
+fn stored_constants_print_through_their_output_functions() {
+    // get_const_expr prints a constant through its type's output function:
+    // the pg_sanity mirror compares every one of these with pg_get_expr
+    // (PG 19 prints `'1.5'::double precision`, `'1 day 02:00:00'::interval`,
+    // `'[2,6)'::int4range`, `'{"a": [1.50, 200, 0], …}'::jsonb`…).
+    let mut db = build_db(&[(
+        "0001.sql",
+        r#"CREATE TABLE k (
+  f8 float8 CHECK (f8 <> '1.50' AND f8 <> '1e20' AND f8 <> '-0.00001' AND f8 <> 'NaN'
+      AND f8 <> '-inf' AND f8 <> '123456789012345678' AND f8 <> '0.1'),
+  f4 float4 CHECK (f4 <> '3.14159265358979' AND f4 <> '1000000' AND f4 <> '100000'),
+  n numeric CHECK (n <> '1.50' AND n <> '1e3' AND n <> '-0.0' AND n <> 'NaN' AND n <> 1.5e-3
+      AND n <> '-12.50' AND n <> '-inf'),
+  d date CHECK (d <> '2024-01-05' AND d <> '0044-03-15 BC' AND d <> 'infinity' AND d > 'epoch'),
+  ts timestamp CHECK (ts <> '2024-01-05 10:30' AND ts <> '2024-01-05 10:30:00.250'
+      AND ts <> '-infinity'),
+  tz timestamptz CHECK (tz <> '2024-01-05 10:30+02' AND tz <> '2024-01-05 10:30:00.5-03:30'),
+  tm time CHECK (tm <> '10:30' AND tm <> '23:59:59.5'),
+  iv interval CHECK (iv <> '1 day 2 hours' AND iv <> '-1 day +2 hours' AND iv <> '14 months'
+      AND iv <> '1.5 seconds' AND iv <> '0' AND iv <> '-1 mons -1.5 seconds'),
+  byt bytea CHECK (byt <> '\xDEADbeef' AND byt <> 'abc\\d\001'),
+  u uuid CHECK (u <> '{A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}'
+      AND u <> 'a0eebc999c0b4ef8bb6d6bb9bd380a11'),
+  ip inet CHECK (ip <> '192.168.1.5/24' AND ip <> '10.0.0.1/32' AND ip <> '2001:DB8::1'
+      AND ip <> '::ffff:1.2.3.4' AND ip <> '2001:db8:0:0:1:0:0:1' AND ip <> '::1'),
+  cn cidr CHECK (cn <> '192.168.0.0/16' AND cn <> '2001:db8::/32' AND cn <> '10.1.2.3/32'),
+  ma macaddr CHECK (ma <> '08-00-2B-01-02-03' AND ma <> '0800.2b01.0203'),
+  m8 macaddr8 CHECK (m8 <> '08:00:2b:01:02:03' AND m8 <> '08002b0102030405'),
+  bt bit(3) CHECK (bt <> B'101' AND bt <> '110'),
+  vb varbit CHECK (vb <> X'1F' AND vb <> '1011'),
+  mo money CHECK (mo <> '12.345' AND mo <> '-1234.5' AND mo <> '$1,000,000.00'),
+  js jsonb CHECK (js <> '{"b": 1, "a": [1.50, 2e2, -0], "b": "xé\n", "aa": null, "c": {}}'
+      AND js <> '1E2' AND js <> '"s"' AND js <> '[]'),
+  pt point CHECK (pt ~= '(1.50, -2)'),
+  bx box CHECK (bx = '(0,0),(2,3)' AND bx = '(5,1),(2,3)'),
+  ls lseg CHECK (ls = '[(0,0),(1.5,2)]'),
+  ci circle CHECK (ci = '<(1,2),3.5>' AND ci = '((1,2),3.5)'),
+  ln line CHECK (ln = '{1,-1,0}'),
+  pa path CHECK (pa = '[(0,0),(1,1)]' AND pa = '((0,0),(1,1),(2,0))'),
+  pg polygon CHECK (pg ~= '((0,0),(1,0),(1,1))'),
+  ar int[] CHECK (ar <> '{1,2,NULL}' AND ar <> '[0:1]={3,4}' AND ar <> '{{1,2},{3,4}}'
+      AND ar <> '{}'),
+  ta text[] CHECK (ta <> '{"a b", "", "NULL", "q\"x", plain}'),
+  fa float8[] CHECK (fa <> '{1.50,1e20}'),
+  r4 int4range CHECK (r4 <> '(1,5]' AND r4 <> '[3,3)' AND r4 <> '(,10)' AND r4 <> 'empty'),
+  nr numrange CHECK (nr <> '[1.50,2.0)' AND nr <> '(1,1]'),
+  dr daterange CHECK (dr <> '[2024-01-01,2024-01-31]'),
+  tr tsrange CHECK (tr <> '[2024-01-01 10:00,2024-01-02)'),
+  lsn pg_lsn CHECK (lsn <> '16/B374D848' AND lsn <> '0/1'),
+  nm name CHECK (nm <> 'abc'),
+  ch "char" CHECK (ch <> 'x'),
+  o oid CHECK (o <> '42'),
+  bo bool CHECK (bo <> 'yes'),
+  i8 int8 CHECK (i8 <> ' 007')
+);
+CREATE INDEX ON k (f8) WHERE f8 > '2.50' AND iv < '1 day';"#,
+    )]);
+    // Dates and intervals print in the session's styles.
+    db.apply_sql(
+        "SET DateStyle = 'German';
+         SET IntervalStyle = 'sql_standard';
+         ALTER TABLE k ADD CHECK (d <> '2024-02-03' AND iv <> '2 hours');
+         SET DateStyle = 'ISO';
+         ALTER TABLE k ADD CHECK (d <> '2024-02-04');
+         RESET IntervalStyle;
+         ALTER TABLE k ADD CHECK (iv <> '3 hours');",
+    )
+    .unwrap();
+}

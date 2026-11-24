@@ -319,6 +319,12 @@ pub struct PgCatalog {
     /// servers, and the pg_sanity mirror's), until a `SET TIME ZONE` /
     /// `SET timezone` / `set_config('TimeZone', ...)` says otherwise.
     pub(crate) timezone_utc: crate::ddl::session::BoolGuc,
+    /// Whether `DateStyle` writes dates ISO-style (`ISO, MDY` is the
+    /// server's default and the mirror's), for the stored constants the
+    /// analyzer prints as `pg_get_expr` would.
+    pub(crate) datestyle_iso: crate::ddl::session::BoolGuc,
+    /// Whether `IntervalStyle` is `postgres` (the default).
+    pub(crate) intervalstyle_postgres: crate::ddl::session::BoolGuc,
     /// The custom (placeholder, `prefix.name`) settings the migrations'
     /// session set, for `current_setting` in a body the analyzer runs.
     pub(crate) custom_settings: crate::ddl::session::CustomSettings,
@@ -981,6 +987,8 @@ impl PgCatalog {
             row_security_guc: crate::ddl::session::BoolGuc::new(true),
             database_row_security: None,
             timezone_utc: crate::ddl::session::BoolGuc::new(true),
+            datestyle_iso: crate::ddl::session::BoolGuc::new(true),
+            intervalstyle_postgres: crate::ddl::session::BoolGuc::new(true),
             custom_settings: Default::default(),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),

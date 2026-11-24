@@ -2239,7 +2239,8 @@ pub(crate) fn alter_column_type(
 
     // The CHECK constraints and indexes reading the column are rebuilt
     // from the text ruleutils prints for them now.
-    crate::ddl::stored_exprs::deparse_for_rebuild(interp, relid, attr.attnum, &cmd.name);
+    let field_dependents =
+        crate::ddl::stored_exprs::deparse_for_rebuild(interp, relid, attr.attnum, &cmd.name);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
         && let Some(col) = attrs.iter_mut().find(|c| c.attname == cmd.name)
     {
@@ -2270,6 +2271,7 @@ pub(crate) fn alter_column_type(
         relid,
         attr,
         old_type: old_type_oid,
+        field_dependents: std::rc::Rc::new(field_dependents),
     };
     let deferred = RETYPE_BATCH.with(|b| match b.borrow_mut().as_mut() {
         Some(batch) => {
@@ -2291,6 +2293,8 @@ struct Retyped {
     relid: PgClassOid,
     attr: PgAttribute,
     old_type: crate::oid::PgTypeOid,
+    /// Other relations' expressions selecting the column as a field.
+    field_dependents: std::rc::Rc<crate::ddl::stored_exprs::FieldDependents>,
 }
 
 thread_local! {
@@ -2313,7 +2317,7 @@ fn rebuild_after_retype(interp: &mut PgCatalog, r: &Retyped) -> Result<(), DdlEr
     super::foreign_keys::repick_indexes_after_retype(interp, r.relid, r.attr.attnum);
     recheck_dependents_of_retyped_column(interp, r.relid, &r.attr)?;
     super::check_inherit::recook_checks_reading(interp, r.relid, r.attr.attnum);
-    Ok(())
+    crate::ddl::stored_exprs::rebuild_field_dependents(interp, &r.field_dependents)
 }
 
 /// The ALTER TYPE subcommands of one ALTER TABLE, run together as PG's

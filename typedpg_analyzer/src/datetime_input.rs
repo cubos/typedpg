@@ -377,7 +377,7 @@ fn date2j(year: i32, month: i32, day: i32) -> i32 {
 }
 
 /// `j2date` (datetime.c), with its unsigned arithmetic.
-fn j2date(jd: i32) -> (i32, i32, i32) {
+pub(crate) fn j2date(jd: i32) -> (i32, i32, i32) {
     let mut julian = jd as u32;
     julian = julian.wrapping_add(32044);
     let mut quad = julian / 146_097;

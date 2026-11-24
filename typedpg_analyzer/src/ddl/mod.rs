@@ -12,6 +12,7 @@ pub(crate) mod cmdtag;
 pub(crate) mod coldeps;
 pub mod collations;
 mod comment;
+pub(crate) mod const_output;
 mod conversion_procs;
 pub(crate) mod conversions;
 pub(crate) mod cooked;
@@ -524,6 +525,15 @@ fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError>
     if let Err(e) = dispatch_statement(db, stmt) {
         stored_exprs::discard_pending_reg_constants();
         return Err(e);
+    }
+    // A rename or a move writes no stored expression of its own: what it
+    // rewrote (a policy's, a CHECK's names) is still bound.
+    if matches!(
+        stmt,
+        ast::Node::RenameStmt(_) | ast::Node::AlterObjectSchemaStmt(_)
+    ) || matches!(stmt, ast::Node::AlterEnumStmt(e) if !e.old_val.is_empty())
+    {
+        stored_exprs::note_all_bound(db);
     }
     // The stored expressions it wrote are bound to the objects their names
     // find under the search path it ran with.

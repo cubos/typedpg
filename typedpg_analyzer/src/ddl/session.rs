@@ -475,6 +475,8 @@ impl PgCatalog {
         self.allow_system_table_mods.local = None;
         self.row_security_guc.local = None;
         self.timezone_utc.local = None;
+        self.datestyle_iso.local = None;
+        self.intervalstyle_postgres.local = None;
         self.custom_settings.local.clear();
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
@@ -616,6 +618,8 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         interp.check_function_bodies = BoolGuc::new(true);
         interp.allow_system_table_mods = BoolGuc::new(false);
         interp.timezone_utc = BoolGuc::new(true);
+        interp.datestyle_iso = BoolGuc::new(true);
+        interp.intervalstyle_postgres = BoolGuc::new(true);
         interp.custom_settings = CustomSettings::default();
         return Ok(());
     }
@@ -676,6 +680,31 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
             }
             VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
                 interp.timezone_utc.set(None, stmt.is_local);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if stmt.name.eq_ignore_ascii_case("datestyle")
+        || stmt.name.eq_ignore_ascii_case("intervalstyle")
+    {
+        match kind {
+            VariableSetKind::VarSetValue => {
+                let value: Option<Vec<String>> = stmt
+                    .args
+                    .iter()
+                    .map(|a| const_arg_string(a.as_ref()))
+                    .collect();
+                // A value not known here: printed styles are not known either.
+                let value = value.map(|v| v.join(","));
+                set_output_style(interp, &stmt.name, value.as_deref(), stmt.is_local);
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                if stmt.name.eq_ignore_ascii_case("datestyle") {
+                    interp.datestyle_iso.set(None, stmt.is_local);
+                } else {
+                    interp.intervalstyle_postgres.set(None, stmt.is_local);
+                }
             }
             _ => {}
         }
@@ -877,6 +906,11 @@ pub(crate) fn select_side_effects(
                 .timezone_utc
                 .set(Some(timezone_is_utc(&value)), is_local);
         }
+        for name in ["DateStyle", "IntervalStyle"] {
+            if let Some((value, is_local)) = constant_named_set_config(fc, name) {
+                set_output_style(interp, name, Some(&value), is_local);
+            }
+        }
         for name in ["check_function_bodies", "allow_system_table_mods"] {
             if let Some((value, is_local)) = constant_named_set_config(fc, name)
                 && let Some(value) = parse_bool(&value)
@@ -1074,6 +1108,26 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
         _ => return None,
     };
     Some((setting.sval, value.sval, is_local))
+}
+
+/// `SET DateStyle` / `SET IntervalStyle` to `value` (`None`: not known):
+/// whether dates print ISO-style (check_datestyle: a value naming only the
+/// field order keeps the style), and intervals `postgres`-style.
+fn set_output_style(interp: &mut PgCatalog, name: &str, value: Option<&str>, is_local: bool) {
+    if name.eq_ignore_ascii_case("datestyle") {
+        let mut iso = value.is_some() && interp.datestyle_iso.get();
+        for token in value.unwrap_or_default().split(',') {
+            match token.trim().to_ascii_lowercase().as_str() {
+                "iso" | "default" => iso = true,
+                "sql" | "postgres" | "german" => iso = false,
+                _ => {}
+            }
+        }
+        interp.datestyle_iso.set(Some(iso), is_local);
+    } else {
+        let postgres = value.is_some_and(|v| v.trim().eq_ignore_ascii_case("postgres"));
+        interp.intervalstyle_postgres.set(Some(postgres), is_local);
+    }
 }
 
 /// `set_config('<setting>', '<value>', <is_local>)` with constant

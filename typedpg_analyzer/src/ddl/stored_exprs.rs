@@ -186,7 +186,7 @@ pub(crate) fn rename_column(interp: &mut PgCatalog, relid: PgClassOid, old: &str
 
 /// The stored expressions as they are now are bound (a rename rewrote
 /// some of them).
-fn note_all_bound(interp: &mut PgCatalog) {
+pub(crate) fn note_all_bound(interp: &mut PgCatalog) {
     let hashes: Vec<u64> = stored_expressions(interp, true)
         .iter()
         .map(|(_, _, e)| tree_hash(e.as_ref()))
@@ -1681,7 +1681,8 @@ pub(crate) fn deparse_for_rebuild(
     relid: PgClassOid,
     attnum: i16,
     attname: &str,
-) {
+) -> FieldDependents {
+    let others = deparse_field_dependents(interp, relid, attnum);
     // An expression an earlier subcommand of the statement remembered is
     // left as it was remembered then.
     let first_time = |oid: u32| {
@@ -1753,6 +1754,142 @@ pub(crate) fn deparse_for_rebuild(
         }
         interp.pg_index.insert(index, row);
     }
+    others
+}
+
+/// The CHECK constraints and indexes of other relations an ALTER COLUMN
+/// TYPE rebuilds: they select the column as a field of the relation's row
+/// type (`(f()).a`, a routine returning it), which records a dependency on
+/// it (find_expr_references_walker's FieldSelect).
+pub(crate) struct FieldDependents(Vec<(PgClassOid, Slot)>);
+
+/// [`deparse_for_rebuild`] for the expressions of other relations
+/// depending on column `relid.attnum`: their text before the change.
+fn deparse_field_dependents(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    attnum: i16,
+) -> FieldDependents {
+    use crate::pg_catalog::PG_CLASS_RELID;
+    let dependents: Vec<(u32, u32)> = interp
+        .iter_pg_depend()
+        .filter(|d| {
+            d.refclassid == PG_CLASS_RELID
+                && d.refobjid.get() == relid.get()
+                && d.refobjsubid == attnum
+                && d.deptype == crate::pg_catalog::DepType::Normal
+        })
+        .map(|d| (d.classid.get(), d.objid.get()))
+        .collect();
+    let mut out = Vec::new();
+    for (classid, objid) in dependents {
+        let found: Vec<(PgClassOid, Slot)> =
+            if classid == crate::ddl::depend::PG_CONSTRAINT_RELID.get() {
+                crate::oid::PgConstraintOid::new(objid)
+                    .and_then(|oid| {
+                        let con = interp.pg_constraint.get(&oid)?;
+                        (con.contype == ConType::Check && con.conrelid != relid)
+                            .then(|| vec![(con.conrelid, Slot::Check(oid))])
+                    })
+                    .unwrap_or_default()
+            } else if classid == PG_CLASS_RELID.get() {
+                PgClassOid::new(objid)
+                    .and_then(|index| {
+                        let row = interp.pg_index.get(&index)?;
+                        (row.indrelid != relid).then(|| {
+                            (0..row.indexprs.len())
+                                .map(|i| (row.indrelid, Slot::IndexExpr(index, i)))
+                                .chain(
+                                    row.indpred
+                                        .iter()
+                                        .map(|_| (row.indrelid, Slot::IndexPred(index))),
+                                )
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+        for (rel, slot) in found {
+            let key = match &slot {
+                Slot::Check(oid) => oid.get(),
+                Slot::IndexExpr(index, _) | Slot::IndexPred(index) => index.get(),
+                _ => continue,
+            };
+            let fresh = REMEMBERED.with(|r| match r.borrow_mut().as_mut() {
+                Some(seen) => !seen.contains(&key),
+                None => true,
+            });
+            if !fresh {
+                continue;
+            }
+            let Some(expr) = read_slot(interp, &slot) else {
+                continue;
+            };
+            if let Some(text) = crate::ddl::cooked::deparse(interp, rel, expr.as_ref()) {
+                // A rebuilt index names its columns anew.
+                if let Slot::IndexExpr(index, _) | Slot::IndexPred(index) = slot {
+                    interp.index_attnames.remove(&index);
+                    interp.relcache_index_attnames.remove(&index);
+                }
+                write_slot(interp, slot.clone(), Some(text));
+            }
+            out.push((rel, slot));
+        }
+    }
+    REMEMBERED.with(|r| {
+        if let Some(seen) = r.borrow_mut().as_mut() {
+            for (_, slot) in &out {
+                if let Slot::Check(oid) = slot {
+                    seen.insert(oid.get());
+                }
+                if let Slot::IndexExpr(index, _) | Slot::IndexPred(index) = slot {
+                    seen.insert(index.get());
+                }
+            }
+        }
+    });
+    FieldDependents(out)
+}
+
+/// ATPostAlterTypeCleanup for [`FieldDependents`]: each rebuilt from its
+/// text over the column's new type — refused where it no longer analyzes.
+pub(crate) fn rebuild_field_dependents(
+    interp: &PgCatalog,
+    dependents: &FieldDependents,
+) -> Result<(), super::DdlError> {
+    for (rel, slot) in &dependents.0 {
+        let Some(expr) = read_slot(interp, slot) else {
+            continue;
+        };
+        let Some(class) = interp.pg_class.get(rel) else {
+            continue;
+        };
+        let nspname = interp
+            .namespace_name(class.relnamespace)
+            .unwrap_or("public")
+            .to_owned();
+        let attrs = interp.attributes_of(*rel).to_vec();
+        let mut scope = crate::scope::Scope::default();
+        scope.add_dml_target(
+            interp,
+            &class.relname,
+            crate::qualified_name::QualifiedName::new(nspname, class.relname.clone()),
+            &attrs,
+        );
+        let null_ctx = crate::nullability::NullabilityContext::default();
+        let mut params = crate::param_collector::ParamCollector::default();
+        let analyzed = over_own_row(interp, *rel, expr.as_ref());
+        crate::expr::infer_expr(
+            analyzed.as_ref(),
+            crate::expr::Ctx::new(&scope, &null_ctx, interp),
+            &mut params,
+            crate::expr::TypeGoal::NONE,
+        )
+        .map_err(|e| super::DdlError::UnsupportedDdl(e.to_string()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

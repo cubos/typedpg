@@ -610,12 +610,13 @@ impl Cooker<'_> {
                 _ => (oid::NUMERIC, f.fval.clone()),
             },
             ast::AConstValue::Boolean(b) => (oid::BOOL, if b.boolval { "t" } else { "f" }.into()),
+            // `B'101'` / `X'1F'`: a `bit` constant of that many bits.
+            ast::AConstValue::BitString(b) => (BIT, b.bsval.clone()),
             ast::AConstValue::String(s) => {
                 let t = recorded(&self.log.literals, &NodeKey::of(ac))
                     .filter(|t| *t != oid::UNKNOWN)?;
                 return self.literal(t, Some(&s.sval));
             }
-            _ => return None,
         };
         Some(Cooked {
             kind: Kind::Const(t, Some(value)),
@@ -1190,6 +1191,9 @@ struct Folder<'a> {
 /// `bool <> bool`).
 const BOOLEAN_EQUAL: u32 = 91;
 const BOOLEAN_NOT_EQUAL: u32 = 85;
+
+/// `bit`.
+const BIT: PgTypeOid = PgTypeOid::from_raw(1560);
 
 /// `FirstNormalObjectId`: below, what initdb made.
 const FIRST_NORMAL_OBJECT_ID: u32 = 16384;
@@ -1953,18 +1957,28 @@ impl<'a> Printer<'a> {
         let Some(ty) = self.interp.pg_type.get(&t) else {
             return String::new();
         };
-        if ty.typname == "bpchar" {
-            return "bpchar".to_owned();
+        // `bit` with no modifier is printed quoted (BIT alone would mean
+        // `bit(1)`).
+        let unmodified = |t: &crate::pg_catalog::PgType| match t.typname.as_str() {
+            "bpchar" => Some("bpchar"),
+            "bit" => Some("\"bit\""),
+            _ => None,
+        };
+        let catalog = |t: &crate::pg_catalog::PgType| {
+            self.interp.namespace_name(t.typnamespace) == Some("pg_catalog")
+        };
+        if catalog(ty)
+            && let Some(name) = unmodified(ty)
+        {
+            return name.to_owned();
         }
         if let Some(elem) = ty.typelem
             && self.interp.array_type_of(elem) == Some(t)
-            && self
-                .interp
-                .pg_type
-                .get(&elem)
-                .is_some_and(|e| e.typname == "bpchar")
+            && let Some(e) = self.interp.pg_type.get(&elem)
+            && catalog(e)
+            && let Some(name) = unmodified(e)
         {
-            return "bpchar[]".to_owned();
+            return format!("{name}[]");
         }
         crate::ddl::util::format_type_for_message(self.interp, t)
     }
@@ -2171,6 +2185,23 @@ impl<'a> Printer<'a> {
             };
         };
         let quoted = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        if t == oid::BOOL {
+            let text = if v == "t" { "true" } else { "false" }.to_owned();
+            return text;
+        }
+        let out = match crate::ddl::stored_exprs::reg_output(self.interp, t, v) {
+            Some(out) => out,
+            None => match crate::ddl::const_output::output(self.interp, t, v) {
+                Some(out) => out,
+                // The output function isn't reproduced: the literal as
+                // written stands in (the value it reads as is the same).
+                None => {
+                    self.exact.set(false);
+                    v.to_owned()
+                }
+            },
+        };
+        let v = out.as_str();
         let (text, needlabel) = if t == oid::INT4 {
             if v.starts_with('-') {
                 (quoted(v), true)
@@ -2183,14 +2214,7 @@ impl<'a> Printer<'a> {
             } else {
                 (quoted(v), true)
             }
-        } else if t == oid::BOOL {
-            (if v == "t" { "true" } else { "false" }.to_owned(), false)
-        } else if let Some(out) = crate::ddl::stored_exprs::reg_output(self.interp, t, v) {
-            (quoted(&out), true)
         } else {
-            if !self.output_is_input(t, v) {
-                self.exact.set(false);
-            }
             (quoted(v), t != oid::UNKNOWN)
         };
         if label && needlabel {
@@ -2198,31 +2222,6 @@ impl<'a> Printer<'a> {
         } else {
             text
         }
-    }
-
-    /// Whether the output function of type `t` prints `v` back as written:
-    /// for the string types and enums (a label is its own output), and
-    /// for an integer the cooker canonicalized.
-    fn output_is_input(&self, t: PgTypeOid, v: &str) -> bool {
-        let base = self.interp.unwrap_domain(t);
-        [oid::TEXT, oid::VARCHAR, oid::BPCHAR, oid::NAME, oid::INT2, oid::INT8].contains(&base)
-            || self
-                .interp
-                .get_type(base)
-                .is_some_and(|ty| ty.typtype == TypType::Enum)
-            || (base == oid::NUMERIC
-                && !v.starts_with(['0', '+', '.'])
-                && v.chars().all(|c| c.is_ascii_digit() || c == '.'))
-            // A date in the ISO form `date_out` writes (DateStyle ISO).
-            || (self.interp.pg_type.get(&base).is_some_and(|t| t.typname == "date")
-                && v.len() == 10
-                && v.char_indices().all(|(i, c)| {
-                    if i == 4 || i == 7 {
-                        c == '-'
-                    } else {
-                        c.is_ascii_digit()
-                    }
-                }))
     }
 
     /// `appendContextKeyword` with `PRETTYFLAG_INDENT` (which even the
@@ -2503,13 +2502,6 @@ impl<'a> Printer<'a> {
                 }
             }
             Kind::Field(arg, field) => {
-                // PG keeps the field's type from when the expression was
-                // stored; the row type a routine returns can change since
-                // (ALTER TABLE of the table it is), and the analyzer reads
-                // today's.
-                if matches!(arg.kind, Kind::Func(..) | Kind::Call(..)) {
-                    self.exact.set(false);
-                }
                 let parens = !matches!(arg.kind, Kind::Subscript(..) | Kind::Field(..));
                 if parens {
                     buf.push('(');
