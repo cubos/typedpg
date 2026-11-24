@@ -1467,9 +1467,10 @@ fn foreign_key_expectations(
             typedpg_core::quote_identifier(&column)
         ));
     }
-    // An index serves the check when it is a btree whose leading key
-    // columns are the foreign key's (in any order), or a hash index on its
-    // one column.
+    // An index serves the check when it is a btree or hash index whose
+    // leading key columns are foreign-key columns: all of them (in any
+    // order), or some that reference columns a non-partial unique index of
+    // the referenced table makes unique by themselves.
     let mut unindexed = HashMap::new();
     for row in scratch.client().query(
         "SELECT k.conname::text, n.nspname::text, c.relname::text, \
@@ -1479,13 +1480,23 @@ fn foreign_key_expectations(
                 (SELECT bool_or(i.indpred IS NULL) FROM pg_catalog.pg_index i \
                  JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
                  JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                 CROSS JOIN LATERAL (SELECT ARRAY( \
+                     SELECT u.x FROM unnest((i.indkey::int2[])[0:i.indnkeyatts - 1]) \
+                         WITH ORDINALITY u(x, ord) \
+                     WHERE u.ord < coalesce((SELECT min(v.ord) \
+                         FROM unnest((i.indkey::int2[])[0:i.indnkeyatts - 1]) \
+                             WITH ORDINALITY v(y, ord) \
+                         WHERE NOT (v.y = ANY (k.conkey))), 2147483647)) AS lead) l \
                  WHERE i.indrelid = k.conrelid \
-                   AND (am.amname = 'btree' \
-                        OR (am.amname = 'hash' AND cardinality(k.conkey) = 1)) \
-                   AND i.indnkeyatts >= cardinality(k.conkey) \
-                   AND (SELECT array_agg(x ORDER BY x) FROM unnest(k.conkey) x) \
-                     = (SELECT array_agg(x ORDER BY x) FROM unnest( \
-                          (i.indkey::int2[])[0:cardinality(k.conkey) - 1]) x)) \
+                   AND am.amname IN ('btree', 'hash') \
+                   AND cardinality(l.lead) > 0 \
+                   AND (k.conkey <@ l.lead \
+                        OR EXISTS (SELECT FROM pg_catalog.pg_index ui \
+                            WHERE ui.indrelid = k.confrelid AND ui.indisunique \
+                              AND ui.indpred IS NULL AND ui.indnkeyatts > 0 \
+                              AND (ui.indkey::int2[])[0:ui.indnkeyatts - 1] <@ ARRAY( \
+                                  SELECT p.pk FROM unnest(k.conkey, k.confkey) p(fk, pk) \
+                                  WHERE p.fk = ANY (l.lead))))) \
          FROM pg_catalog.pg_constraint k \
          JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
