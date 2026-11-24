@@ -1064,9 +1064,10 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
 }
 
 /// The type of a value an output column exposes, when it is a column, a
-/// parameter, a constant or a cast of one: a cast's target type is known
-/// even when it is collatable, but only a non-collatable one compares
-/// bytewise (`bigint`, `int`, `uuid` — not `text`).
+/// parameter, a constant, a cast or a call of them: a collatable one
+/// compares bytewise when its input's — a call's collatable arguments' —
+/// collation does, and a type without collation always does (`bigint`,
+/// `int`, `uuid`).
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
@@ -1157,14 +1158,73 @@ fn value_type(
             if typ == Some(oid::UNKNOWN) {
                 return (None, false);
             }
-            // A cast to a collatable type keeps its input's collation (a
+            // A cast to a collatable type keeps its input's collation (PG's
+            // `exprCollation` reads a `TypeCast`'s from its argument, a
             // nondeterministic one included, which then wins over a
-            // column's default), so only a type without collation is known
-            // to compare bytewise.
-            (
-                typ,
-                typ.is_some_and(|typ| !dedup::collatable_type(ctx, typ)),
-            )
+            // column's default), so it compares bytewise exactly when the
+            // input does. A type without collation compares bytewise
+            // whatever the input.
+            match typ {
+                Some(typ) if dedup::collatable_type(ctx, typ) => {
+                    let (_, deterministic) = value_type(ctx, scope, outer, cast.arg.as_ref());
+                    (Some(typ), deterministic)
+                }
+                Some(typ) => (Some(typ), true),
+                None => (None, false),
+            }
+        }
+        // A call's result: the routine its argument types resolve to. Its
+        // collation is its collatable arguments' (PG derives a call's from
+        // them), so it compares bytewise exactly when theirs do; a type
+        // without collation does so whatever they are. An aggregate, window
+        // or set-returning call is still one output column — of the
+        // aggregate's, the window function's or the element's type.
+        Some(Node::FuncCall(call)) => {
+            let Some((schema, name)) = function_name(&call.funcname) else {
+                return (None, false);
+            };
+            let Ok(notation) = crate::functions::CallNotation::of(call) else {
+                return (None, false);
+            };
+            let mut types = Vec::with_capacity(call.args.len());
+            let mut deterministic = true;
+            for arg in &call.args {
+                let arg_value = crate::functions::call_arg_value(arg.as_ref());
+                let (arg_type, arg_deterministic) = value_type(ctx, scope, outer, arg_value);
+                // An untyped literal argument is `unknown` to PG's function
+                // resolution, whatever type it takes in an output column.
+                let arg_type = match arg_value {
+                    Some(Node::AConst(constant))
+                        if matches!(constant.val, Some(AConstValue::String(_))) =>
+                    {
+                        oid::UNKNOWN
+                    }
+                    _ => match arg_type {
+                        Some(arg_type) => arg_type,
+                        None => return (None, false),
+                    },
+                };
+                deterministic &= arg_deterministic || !dedup::collatable_type(ctx, arg_type);
+                types.push(arg_type);
+            }
+            let Ok(resolved) = crate::functions::resolve_function(
+                ctx.catalog,
+                schema,
+                name,
+                &types,
+                &notation,
+                call.agg_star,
+                None,
+            ) else {
+                return (None, false);
+            };
+            let typ = resolved.return_type_oid;
+            // A polymorphic pseudo-type is no value's type.
+            if crate::polymorphic::is_polymorphic(typ) {
+                return (None, false);
+            }
+            let deterministic = deterministic || !dedup::collatable_type(ctx, typ);
+            (Some(typ), deterministic)
         }
         // A `CASE` is its results' common type: known when every result
         // that isn't a bare NULL has the same known type (all-literal
@@ -3873,6 +3933,134 @@ mod tests {
             })
             .collect();
         assert!(!select_at_most_one_row(&db, &inner, selects[1]));
+    }
+
+    /// Whether the first scalar sublink's select of `sql` is one row.
+    #[track_caller]
+    fn sublink_one(db: &PgCatalog, sql: &str) -> bool {
+        let view = view(db, sql);
+        let select = view
+            .tree
+            .nodes()
+            .find_map(|(node, _)| match node {
+                NodeRef::SubLink(sub) if sub.sub_link_type == ast::SubLinkType::ExprSublink => {
+                    match sub.subselect.as_ref() {
+                        Some(Node::SelectStmt(select)) => Some(&**select),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("a scalar sublink");
+        select_at_most_one_row(db, &view, select)
+    }
+
+    #[test]
+    fn an_outer_expression_column_pins_a_key() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE accounts (id uuid PRIMARY KEY, gid text);
+             CREATE TABLE grant_renewals (
+                grant_id text PRIMARY KEY,
+                acquired_at timestamptz,
+                note text
+             );
+             CREATE FUNCTION grant_of(a uuid) RETURNS text STABLE LANGUAGE sql
+                AS $$ SELECT a::text $$;",
+        )
+        .unwrap();
+        // A CTE's or a FROM subquery's column holding an expression is one
+        // value per evaluation like a plain column: the subquery's key
+        // equality to it pins the key.
+        for sql in [
+            "WITH standing AS (SELECT id, grant_of(id) AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) FROM standing s",
+            "SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) \
+             FROM (SELECT id, grant_of(id) AS grant_id FROM accounts WHERE id = $1) s",
+            // A cast to `text` keeps its input's (the default) collation.
+            "WITH standing AS (SELECT id, gid::text AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) FROM standing s",
+        ] {
+            assert!(sublink_one(&db, sql), "{sql}");
+        }
+        // An expression whose type the proof doesn't resolve still gives up.
+        assert!(!sublink_one(
+            &db,
+            "WITH standing AS (SELECT id, (grant_of(id) || '-x') AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) FROM standing s",
+        ));
+        // So does an equality on a column that is no key.
+        assert!(!sublink_one(
+            &db,
+            "WITH standing AS (SELECT id, grant_of(id) AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.note = s.grant_id) FROM standing s",
+        ));
+    }
+
+    #[test]
+    fn a_join_onto_a_single_row_side_is_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE users (principal text PRIMARY KEY, disabled_at timestamptz);
+             CREATE TABLE memberships (
+                org_id uuid NOT NULL,
+                principal text NOT NULL,
+                PRIMARY KEY (org_id, principal)
+             );
+             CREATE FUNCTION principal_of(p text) RETURNS text STABLE LANGUAGE sql
+                AS $$ SELECT p $$;",
+        )
+        .unwrap();
+        // A one-row side and a table whose key its columns pin: the join
+        // matches at most one row of the table per row of that side.
+        for sql in [
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             JOIN users u ON u.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             LEFT JOIN users u ON u.principal = q.p",
+            // The fact written in WHERE, over a comma join.
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q, users u \
+             WHERE u.principal = q.p",
+            // A call of the one-row side's column.
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             JOIN users u ON u.principal = principal_of(q.p)",
+            // A RIGHT join whose preserved side is the one-row subquery: the
+            // pinned table is the nullable side.
+            "SELECT q.p FROM users u RIGHT JOIN (SELECT $1::text AS p) q \
+             ON u.principal = q.p",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        // One column of a composite key, a side that may have many rows, a
+        // non-unique column, a FULL join and a set-returning function on the
+        // one-row side all keep the proof away.
+        for sql in [
+            "SELECT m.principal FROM (SELECT $1::text AS p) q \
+             JOIN memberships m ON m.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT principal AS p FROM users) q \
+             JOIN users u ON u.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT $1::timestamptz AS p) q \
+             JOIN users u ON u.disabled_at = q.p",
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             FULL JOIN users u ON u.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT unnest(ARRAY[$1::text]) AS p) q \
+             JOIN users u ON u.principal = q.p",
+            // The preserved (right) side is the many-row table: each of its
+            // rows is emitted.
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             RIGHT JOIN users u ON u.principal = q.p",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
     }
 
     #[test]

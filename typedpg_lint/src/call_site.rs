@@ -964,6 +964,57 @@ mod tests {
     }
 
     #[test]
+    fn fetch_all_on_a_join_onto_a_single_row_side_is_single_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE accounts (principal text PRIMARY KEY, disabled_at timestamptz);",
+        )
+        .unwrap();
+        let sql = "SELECT a.disabled_at FROM (SELECT $1::text AS p) q \
+                   LEFT JOIN accounts a ON a.principal = q.p";
+        // The one-row side pins the joined table's key: at most one row.
+        for call in [
+            rust(CallMethod::FetchOne, "fetch_one"),
+            rust(CallMethod::FetchOptional, "fetch_optional"),
+        ] {
+            assert!(
+                only(lint(&db, sql, &[call]), Rule::FetchOneMultipleRows).is_empty(),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            only(
+                lint(&db, sql, &[rust(CallMethod::FetchAll, "fetch_all")]),
+                Rule::FetchAllSingleRow
+            )
+            .len(),
+            1,
+            "{sql}"
+        );
+        // An equality on a non-unique column pins nothing.
+        let many = "SELECT a.principal FROM (SELECT $1::timestamptz AS p) q \
+                    JOIN accounts a ON a.disabled_at = q.p";
+        assert_eq!(
+            only(
+                lint(&db, many, &[rust(CallMethod::FetchAll, "fetch_all")]),
+                Rule::FetchAllSingleRow
+            )
+            .len(),
+            0,
+            "{many}"
+        );
+        assert_eq!(
+            only(
+                lint(&db, many, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                Rule::FetchOneMultipleRows
+            )
+            .len(),
+            1,
+            "{many}"
+        );
+    }
+
+    #[test]
     fn fetch_all_on_a_non_unique_query_is_fine() {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE org_id = $1";

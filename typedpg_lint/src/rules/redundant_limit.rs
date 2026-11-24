@@ -337,6 +337,54 @@ mod tests {
     }
 
     #[test]
+    fn a_join_onto_a_single_row_side_is_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE memberships (
+                org text NOT NULL,
+                email text NOT NULL,
+                PRIMARY KEY (org, email)
+             );",
+        )
+        .unwrap();
+        // A one-row side, and the joined table's key pinned by its column:
+        // the join adds at most one row.
+        for sql in [
+            "SELECT u.id FROM (SELECT $email::text AS p) q \
+             LEFT JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $email::text AS p) q \
+             JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $email::text AS p) q, users u \
+             WHERE u.email = q.p LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], "LIMIT 1", "{sql}");
+            assert_eq!(
+                findings[0].message, "LIMIT 1 has no effect: the query returns at most one row",
+                "{sql}"
+            );
+        }
+        // One column of a composite key, a side that may have many rows, a
+        // non-unique column, a FULL join and a set-returning function on the
+        // one-row side keep the LIMIT.
+        for sql in [
+            "SELECT m.email FROM (SELECT $email::text AS p) q \
+             JOIN memberships m ON m.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT email AS p FROM users) q \
+             JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $name::text AS p) q \
+             JOIN users u ON u.name = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $email::text AS p) q \
+             FULL JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT unnest(ARRAY[$email::text]) AS p) q \
+             JOIN users u ON u.email = q.p LIMIT 1",
+        ] {
+            assert!(limit_findings(&db, sql).is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
     fn aggregates_and_from_less_selects_are_one_row() {
         let db = catalog();
         let sql = "SELECT count(*) FROM users LIMIT 10";

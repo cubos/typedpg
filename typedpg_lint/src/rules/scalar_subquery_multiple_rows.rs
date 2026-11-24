@@ -344,6 +344,52 @@ mod tests {
     }
 
     #[test]
+    fn an_outer_expression_column_pins_a_key() {
+        let mut db = db();
+        db.apply_sql(
+            "CREATE TABLE accounts (id uuid PRIMARY KEY, gid text);
+             CREATE TABLE grant_renewals (
+                grant_id text PRIMARY KEY,
+                acquired_at timestamptz
+             );
+             CREATE FUNCTION grant_of(a uuid) RETURNS text LANGUAGE sql STABLE
+                AS $$ SELECT a::text $$;",
+        )
+        .unwrap();
+        // A CTE's and a FROM subquery's column holding an expression is one
+        // value per evaluation like a plain column: the subquery's key
+        // equality to it pins the key.
+        for sql in [
+            "WITH standing AS (SELECT id, grant_of(id) AS grant_id \
+                               FROM accounts WHERE id = $account) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) AS held FROM standing s",
+            "SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) AS held \
+             FROM (SELECT id, grant_of(id) AS grant_id FROM accounts WHERE id = $account) s",
+            "WITH standing AS (SELECT id, gid::text AS grant_id \
+                               FROM accounts WHERE id = $account) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) AS held FROM standing s",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // An expression whose type the proof doesn't resolve still gives up.
+        let sql = "WITH standing AS (SELECT id, (grant_of(id) || '-x') AS grant_id \
+                           FROM accounts WHERE id = $account) \
+         SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                 WHERE g.grant_id = s.grant_id) AS held FROM standing s";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        assert_eq!(
+            &sql[findings[0].span.clone()],
+            "(SELECT g.acquired_at FROM grant_renewals g WHERE g.grant_id = s.grant_id)",
+            "{sql}"
+        );
+    }
+
+    #[test]
     fn subqueries_taking_any_number_of_rows_are_fine() {
         for sql in [
             "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts)",
