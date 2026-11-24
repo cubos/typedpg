@@ -112,6 +112,20 @@ pub(crate) fn key_column_names(interp: &PgCatalog, relid: PgClassOid) -> Option<
 }
 
 /// The partition key's collations (`partcollation`), in key order.
+/// Each partition key column's operator class (`partclass`), where known
+/// (for the catalog oracle).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn partition_key_opclasses(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+) -> Vec<crate::oid::PgOpclassOid> {
+    interp
+        .partition_specs
+        .get(&relid)
+        .map(|s| s.keys.iter().filter_map(|k| k.opclass).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn partition_key_collations(
     interp: &PgCatalog,
     relid: PgClassOid,
@@ -446,6 +460,69 @@ pub(super) fn add_partition_bound(
     check_new_bound(interp, parent, part, &bound)?;
     interp.partition_bounds.insert(part, bound);
     Ok(())
+}
+
+/// The bound `spec` of a partition of `parent` as the analyzer keeps it
+/// (for the catalog oracle, which reads PG's `relpartbound`).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn bound_of(
+    interp: &PgCatalog,
+    parent: PgClassOid,
+    spec: &PartitionBoundSpec,
+) -> Option<Bound> {
+    let pspec = interp.partition_specs.get(&parent)?.clone();
+    transform_bound(interp, &pspec, spec).ok()
+}
+
+/// Whether two bounds are the same — a value the analyzer can't model
+/// (`Datum::Opaque`) is taken to be any value (for the catalog oracle).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn same_bound(a: &Bound, b: &Bound) -> bool {
+    fn datum(a: &Datum, b: &Datum) -> bool {
+        matches!(a, Datum::Opaque) || matches!(b, Datum::Opaque) || a == b
+    }
+    fn range(a: &[RangeDatum], b: &[RangeDatum]) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| match (x, y) {
+                (RangeDatum::Value(x), RangeDatum::Value(y)) => datum(x, y),
+                _ => x == y,
+            })
+    }
+    match (a, b) {
+        (Bound::Default, Bound::Default) => true,
+        (Bound::List(x), Bound::List(y)) => {
+            // A set of values, in no particular order.
+            x.len() == y.len()
+                && x.iter().all(|v| {
+                    y.iter().any(|w| match (v, w) {
+                        (Some(v), Some(w)) => datum(v, w),
+                        (None, None) => true,
+                        _ => false,
+                    })
+                })
+        }
+        (
+            Bound::Range {
+                lower: l1,
+                upper: u1,
+            },
+            Bound::Range {
+                lower: l2,
+                upper: u2,
+            },
+        ) => range(l1, l2) && range(u1, u2),
+        (
+            Bound::Hash {
+                modulus: m1,
+                remainder: r1,
+            },
+            Bound::Hash {
+                modulus: m2,
+                remainder: r2,
+            },
+        ) => m1 == m2 && r1 == r2,
+        _ => false,
+    }
 }
 
 fn transform_bound(

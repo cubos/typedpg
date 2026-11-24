@@ -595,6 +595,98 @@ fn stored_expressions_keep_the_objects_their_search_path_found() {
 }
 
 #[test]
+fn a_reg_constant_follows_the_object_it_names() {
+    // PG keeps a `regconfig` constant as the configuration's OID: renamed
+    // and moved, an index expression still uses it — ALTER COLUMN TYPE
+    // rebuilds it — and depends on it.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TEXT SEARCH CONFIGURATION cfg (COPY = simple);
+         CREATE TABLE t (d text);
+         CREATE INDEX ON t (to_tsvector('cfg', d));
+         ALTER TEXT SEARCH CONFIGURATION cfg RENAME TO cfg2;
+         CREATE SCHEMA s;
+         ALTER TEXT SEARCH CONFIGURATION cfg2 SET SCHEMA s;
+         ALTER TABLE t ALTER d TYPE varchar;",
+    )]);
+    expect_failure(
+        &mut db,
+        "DROP TEXT SEARCH CONFIGURATION s.cfg2;",
+        "cannot drop text search configuration s.cfg2 because other objects depend on it",
+    );
+}
+
+#[test]
+fn an_extensions_members_moved_by_set_schema_stay_bound() {
+    // ALTER EXTENSION ... SET SCHEMA moves the extension's functions: a
+    // CHECK calling one still does, and its rebuild names it there.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE EXTENSION cube;
+         CREATE TABLE t (c cube CHECK (cube_dim(c) <= 3));
+         CREATE SCHEMA x;
+         ALTER EXTENSION cube SET SCHEMA x;",
+    )]);
+    expect_failure(
+        &mut db,
+        "ALTER TABLE t ALTER c TYPE text;",
+        "function x.cube_dim(text) does not exist",
+    );
+}
+
+#[test]
+fn a_reg_column_default_is_bound_to_its_object() {
+    // `DEFAULT 'spos'` of a `regproc` column is a `regproc` constant (the
+    // literal is coerced to the column's type), bound to the routine the
+    // search path found — and a `regconfig` default to its configuration:
+    // under another search path, retyping the column keeps the defaults'
+    // dependencies.
+    let setup = "CREATE SCHEMA s;
+         CREATE FUNCTION s.spos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+         CREATE TEXT SEARCH CONFIGURATION s.myconf (COPY = simple);
+         SET search_path = s, public;
+         CREATE TABLE public.r (p regproc DEFAULT 'spos', cf regconfig DEFAULT 'myconf');
+         RESET search_path;
+         ALTER TABLE r ALTER p TYPE regproc, ALTER cf TYPE regconfig;";
+    for (sql, message) in [
+        (
+            "DROP FUNCTION s.spos(int);",
+            "cannot drop function s.spos(integer) because other objects depend on it",
+        ),
+        (
+            "DROP TEXT SEARCH CONFIGURATION s.myconf;",
+            "cannot drop text search configuration s.myconf because other objects depend on it",
+        ),
+    ] {
+        let mut db = build_db(&[("0001.sql", setup)]);
+        expect_failure(&mut db, sql, message);
+    }
+}
+
+#[test]
+fn a_stored_expression_is_bound_once_when_written() {
+    // A CHECK stored before an operator of the same name existed keeps the
+    // built-in one: a later statement run under a search path that finds
+    // the new operator first doesn't bind it again (its rebuild names `=`).
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE plain (id int CHECK (id = 1));
+         CREATE SCHEMA loose;
+         CREATE FUNCTION loose.eq(int, int) RETURNS boolean LANGUAGE sql IMMUTABLE
+             AS 'SELECT true';
+         CREATE OPERATOR loose.= (LEFTARG = int, RIGHTARG = int, FUNCTION = loose.eq);
+         SET search_path = loose, pg_catalog, public;
+         CREATE TABLE public.other (id int);
+         RESET search_path;",
+    )]);
+    expect_failure(
+        &mut db,
+        "ALTER TABLE plain ALTER id TYPE text;",
+        "operator does not exist: text = integer",
+    );
+}
+
+#[test]
 fn an_object_created_earlier_on_the_search_path_does_not_capture_a_stored_name() {
     // A function or type created later in a schema that comes first on the
     // search path takes the name over for new statements, not for the

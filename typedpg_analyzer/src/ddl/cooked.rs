@@ -205,6 +205,136 @@ struct CallForm {
     sql_syntax: bool,
 }
 
+#[cfg(feature = "pg_sanity")]
+impl Cooked {
+    /// Whether every part of it is transformed: nothing is left as written
+    /// (`Kind::Raw`), so equality is `equal()`'s.
+    /// This tree as a deparse of it parses back: an array coercion of an
+    /// `ArrayExpr` — which ruleutils prints as a cast of the `ARRAY[…]`,
+    /// and transformTypeCast pushes into its elements — as the `ArrayExpr`
+    /// of the elements coerced. The same values either way.
+    pub(crate) fn round_tripped(&self, interp: &PgCatalog) -> Cooked {
+        let map = |args: &[Cooked]| args.iter().map(|a| a.round_tripped(interp)).collect();
+        let boxed = |a: &Cooked| Box::new(a.round_tripped(interp));
+        let kind = match &self.kind {
+            Kind::Coerce(t, arg, _) => {
+                let elem = crate::coerce::element_type(*t, interp);
+                match (&arg.kind, elem) {
+                    (Kind::Array(_, items), Some(elem)) => Kind::Array(
+                        elem,
+                        items
+                            .iter()
+                            .map(|i| Cooked {
+                                kind: Kind::Coerce(elem, Box::new(i.round_tripped(interp)), true),
+                                ty: Some(Ty {
+                                    oid: elem,
+                                    typmod: None,
+                                }),
+                            })
+                            .collect(),
+                    ),
+                    _ => Kind::Coerce(*t, boxed(arg), true),
+                }
+            }
+            Kind::Op(o, a) => Kind::Op(*o, map(a)),
+            Kind::ScalarArrayOp(o, u, a) => Kind::ScalarArrayOp(*o, *u, map(a)),
+            Kind::Func(p, a) => Kind::Func(*p, map(a)),
+            Kind::Array(t, a) => Kind::Array(*t, map(a)),
+            // makeAndExpr / makeOrExpr: an AND (OR) whose left operand is
+            // an AND (OR) — `BETWEEN`'s, printed parenthesized — parses
+            // back as one, its operands first.
+            Kind::Bool(k, a) => {
+                let mut args: Vec<Cooked> = map(a);
+                let and_or =
+                    *k == ast::BoolExprType::AndExpr as u8 || *k == ast::BoolExprType::OrExpr as u8;
+                while and_or
+                    && let Some(Cooked {
+                        kind: Kind::Bool(inner, _),
+                        ..
+                    }) = args.first()
+                    && inner == k
+                {
+                    let Kind::Bool(_, first) = args.remove(0).kind else {
+                        unreachable!()
+                    };
+                    args.splice(0..0, first);
+                }
+                Kind::Bool(*k, args)
+            }
+            Kind::NullTest(n, a) => Kind::NullTest(*n, boxed(a)),
+            Kind::Coalesce(a) => Kind::Coalesce(map(a)),
+            Kind::MinMax(g, a) => Kind::MinMax(*g, map(a)),
+            Kind::NullIf(o, a) => Kind::NullIf(*o, map(a)),
+            Kind::Distinct(o, a) => Kind::Distinct(*o, map(a)),
+            Kind::Row(a, t) => Kind::Row(map(a), *t),
+            Kind::BoolTest(k, a) => Kind::BoolTest(*k, boxed(a)),
+            Kind::Collate(c, a) => Kind::Collate(*c, boxed(a)),
+            Kind::Field(a, f) => Kind::Field(boxed(a), f.clone()),
+            Kind::Case(test, arms, default) => Kind::Case(
+                test.as_deref().map(boxed),
+                arms.iter()
+                    .map(|(w, t)| (w.round_tripped(interp), t.round_tripped(interp)))
+                    .collect(),
+                boxed(default),
+            ),
+            other => other.clone(),
+        };
+        Cooked { kind, ty: self.ty }
+    }
+
+    pub(crate) fn fully_cooked(&self) -> bool {
+        let all = |args: &[Cooked]| args.iter().all(Cooked::fully_cooked);
+        match &self.kind {
+            Kind::Raw(_) => false,
+            Kind::Var(_) => true,
+            // A constant is canonical only where `literal` knows the
+            // input function's canonical form: NULL, an integer, a
+            // boolean, a string.
+            Kind::Const(_, None) => true,
+            Kind::Const(t, Some(_)) => [
+                oid::INT2,
+                oid::INT4,
+                oid::INT8,
+                oid::BOOL,
+                oid::TEXT,
+                oid::VARCHAR,
+                oid::NAME,
+            ]
+            .contains(t),
+            Kind::Op(_, args)
+            | Kind::ScalarArrayOp(_, _, args)
+            | Kind::Func(_, args)
+            | Kind::Array(_, args)
+            | Kind::Bool(_, args)
+            | Kind::Coalesce(args)
+            | Kind::MinMax(_, args)
+            | Kind::NullIf(_, args)
+            | Kind::Distinct(_, args)
+            | Kind::Row(args, _) => all(args),
+            Kind::Coerce(_, arg, _)
+            | Kind::NullTest(_, arg)
+            | Kind::BoolTest(_, arg)
+            | Kind::Collate(_, arg)
+            | Kind::Field(arg, _) => arg.fully_cooked(),
+            Kind::Case(test, arms, default) => {
+                test.as_ref().is_none_or(|t| t.fully_cooked())
+                    && arms
+                        .iter()
+                        .all(|(w, t)| w.fully_cooked() && t.fully_cooked())
+                    && default.fully_cooked()
+            }
+            Kind::Subscript(base, subs) => {
+                base.fully_cooked()
+                    && subs.iter().all(|(a, b, _)| {
+                        a.as_ref().is_none_or(Cooked::fully_cooked)
+                            && b.as_ref().is_none_or(Cooked::fully_cooked)
+                    })
+            }
+            Kind::Call(_, args, _) => args.iter().all(|(_, a)| a.fully_cooked()),
+        }
+    }
+}
+
 impl PartialEq for Cooked {
     fn eq(&self, other: &Self) -> bool {
         use typedpg_pg_query::Equal;
@@ -248,6 +378,30 @@ pub(crate) fn cook(
     expr: Option<&ast::Node>,
     target: Option<PgTypeOid>,
 ) -> Option<Cooked> {
+    // Its unqualified names are `pg_catalog`'s (see
+    // [`crate::lookup::catalog_first`]).
+    crate::lookup::catalog_first(|| cook_under_path(interp, relid, expr, target))
+}
+
+/// [`cook`] for a text ruleutils printed under the current search path (the
+/// catalog oracle's server deparse): an unqualified name in it is what the
+/// path finds, not `pg_catalog`'s.
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn cook_deparsed(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+    target: Option<PgTypeOid>,
+) -> Option<Cooked> {
+    cook_under_path(interp, relid, expr, target)
+}
+
+fn cook_under_path(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    expr: Option<&ast::Node>,
+    target: Option<PgTypeOid>,
+) -> Option<Cooked> {
     use crate::expr::{TypeGoal, infer_expr};
     let class = interp.pg_class.get(&relid)?;
     let nspname = interp
@@ -270,25 +424,21 @@ pub(crate) fn cook(
     // qualifies it.
     let expr = crate::ddl::stored_exprs::over_own_row(interp, relid, expr);
     let goal = target.map_or(TypeGoal::NONE, TypeGoal::assignment);
-    // Its unqualified names are `pg_catalog`'s (see
-    // [`crate::lookup::catalog_first`]).
-    crate::lookup::catalog_first(|| {
-        let (inferred, _) = crate::ddl::depend::collect(|| {
-            let _level = crate::resolve::QueryLevel::enter();
-            infer_expr(expr.as_ref(), ctx, &mut params, goal)
-        });
-        inferred.ok()?;
-        let cooker = Cooker {
-            interp,
-            relid,
-            log: &log,
-        };
-        let node = expr.as_ref()?;
-        Some(match target {
-            // coerce_to_target_type, as the default is stored.
-            Some(t) => cooker.arg(node, Some(t)),
-            None => cooker.cook(node),
-        })
+    let (inferred, _) = crate::ddl::depend::collect(|| {
+        let _level = crate::resolve::QueryLevel::enter();
+        infer_expr(expr.as_ref(), ctx, &mut params, goal)
+    });
+    inferred.ok()?;
+    let cooker = Cooker {
+        interp,
+        relid,
+        log: &log,
+    };
+    let node = expr.as_ref()?;
+    Some(match target {
+        // coerce_to_target_type, as the default is stored.
+        Some(t) => cooker.arg(node, Some(t)),
+        None => cooker.cook(node),
     })
 }
 
@@ -355,6 +505,19 @@ impl Cooker<'_> {
                 }
                 .to_owned(),
             ),
+            // A reg* input function: the object it names, however it is
+            // named (`'r'` and `'public.r'` are one `regclass` constant),
+            // as its bound text — valid input still, which a deparse prints.
+            Some(s) if reg_type_name(self.interp, base).is_some() => {
+                let typname = reg_type_name(self.interp, base).unwrap_or_default();
+                Some(
+                    crate::reg_input::resolve(typname, s, self.interp)
+                        .and_then(|o| {
+                            crate::ddl::stored_exprs::reg_text(self.interp, typname, &o, true)
+                        })
+                        .unwrap_or_else(|| s.to_owned()),
+                )
+            }
             Some(s) => Some(s.to_owned()),
         };
         let constant = Cooked {
@@ -1652,6 +1815,18 @@ impl Folder<'_> {
         let array = ty?.oid;
         Some(constant(array, Some(format!("{{{}}}", items.join(",")))))
     }
+}
+
+/// `t`'s name when it is one of the reg* types (of `pg_catalog`).
+fn reg_type_name(interp: &PgCatalog, t: PgTypeOid) -> Option<&'static str> {
+    let ty = interp.get_type(t)?;
+    if interp.namespace_name(ty.typnamespace) != Some("pg_catalog") {
+        return None;
+    }
+    crate::reg_input::REG_TYPES
+        .iter()
+        .find(|n| **n == ty.typname)
+        .copied()
 }
 
 /// Whether two stored expressions, over relations `rel_a` and `rel_b`, are

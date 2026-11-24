@@ -110,7 +110,11 @@ pub(crate) fn passthrough_cast_operand<'a>(
         if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
             return None;
         }
-        let target = resolve_type_name(Some(&**tn), snapshot).ok()?;
+        // (A peek at the target: what the cast refers to is noted where
+        // it is analyzed.)
+        let (target, _) =
+            crate::ddl::depend::collect_defined(|| resolve_type_name(Some(&**tn), snapshot));
+        let target = target.ok()?;
         if !keeps_unknown_operand(target) {
             return None;
         }
@@ -157,7 +161,11 @@ pub(crate) fn bare_param<'a>(
                 let tn = cast.type_name.as_ref()?;
                 if !tn.typmods.is_empty()
                     || !tn.array_bounds.is_empty()
-                    || !resolve_type_name(Some(&**tn), snapshot).is_ok_and(keeps_unknown_operand)
+                    || !crate::ddl::depend::collect_defined(|| {
+                        resolve_type_name(Some(&**tn), snapshot)
+                    })
+                    .0
+                    .is_ok_and(keeps_unknown_operand)
                 {
                     return None;
                 }
@@ -183,7 +191,13 @@ pub(crate) fn infer_type_cast(
     let inner =
         passthrough_cast_operand(inner.as_ref(), snapshot, params).unwrap_or(inner.as_ref());
 
-    let target_oid = resolve_type_name(cast.type_name.as_deref(), snapshot)?;
+    // The target type is a dependency of a stored expression only through
+    // a node of it the cast builds (find_expr_references_walker): noted
+    // below, once the operand's type is known.
+    let (target_oid, _) = crate::ddl::depend::collect_defined(|| {
+        resolve_type_name(cast.type_name.as_deref(), snapshot)
+    });
+    let target_oid = target_oid?;
     // typenameTypeIdAndMod: the target's typmod is resolved (and validated)
     // before the operand is transformed.
     let written_typmod = match cast.type_name.as_ref() {
@@ -325,6 +339,26 @@ pub(crate) fn infer_type_cast(
         } else {
             (inner_type, typed_alone)
         };
+    // What the cast builds: a constant of the target type (an untyped
+    // literal or parameter), a row of it, its cast function, or a
+    // relabeling / I/O conversion / domain coercion to it — nothing for a
+    // value already of the type.
+    let untyped = match inner {
+        Some(ast::Node::AConst(ac)) => {
+            ac.isnull || matches!(ac.val, Some(ast::AConstValue::String(_)))
+        }
+        Some(ast::Node::ParamRef(_) | ast::Node::RowExpr(_)) => true,
+        _ => inner_type.type_oid == oid::UNKNOWN,
+    };
+    if untyped || built_for_target {
+        // (A domain's constant is its base type's, coerced to the domain.)
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(target_oid));
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(
+            snapshot.unwrap_domain(target_oid),
+        ));
+    } else {
+        crate::ddl::depend::note_coercion(snapshot, inner_type.type_oid, target_oid);
+    }
 
     if let Some(ast::Node::ParamRef(p)) = inner
         && !pass_through

@@ -25,6 +25,11 @@ pub(crate) struct Publication {
     all_tables: bool,
     /// `puballsequences`: FOR ALL SEQUENCES (PostgreSQL 19).
     all_sequences: bool,
+    /// `pubinsert`, `pubupdate`, `pubdelete`, `pubtruncate`: the `publish`
+    /// option.
+    publish: [bool; 4],
+    /// `pubgencols`: `n` (none) or `s` (stored).
+    gencols: char,
 }
 
 /// A `pg_publication_rel` row: whether it has a row filter (`prqual`) and
@@ -55,6 +60,10 @@ fn missing(name: &str) -> DdlError {
 #[derive(Default)]
 struct Options {
     via_root: Option<bool>,
+    /// `publish`: insert, update, delete, truncate.
+    publish: Option<[bool; 4]>,
+    /// `publish_generated_columns`.
+    gencols: Option<char>,
 }
 
 /// defGetBoolean (define.c): no value means true; otherwise 0 / 1 or,
@@ -117,17 +126,26 @@ fn check_options(options: &[Option<typedpg_pg_query::ast::Node>]) -> Result<Opti
                     return Err(DdlError::Parse("publish requires a parameter".into()));
                 };
                 // SplitIdentifierString downcases the unquoted names.
+                let mut publish = [false; 4];
                 for part in value
                     .split(',')
                     .map(|p| p.trim().to_lowercase())
                     .filter(|p| !p.is_empty())
                 {
-                    if !matches!(part.as_str(), "insert" | "update" | "delete" | "truncate") {
-                        return Err(DdlError::Parse(format!(
-                            "unrecognized value for publication option \"publish\": \"{part}\""
-                        )));
-                    }
+                    let at = match part.as_str() {
+                        "insert" => 0,
+                        "update" => 1,
+                        "delete" => 2,
+                        "truncate" => 3,
+                        _ => {
+                            return Err(DdlError::Parse(format!(
+                                "unrecognized value for publication option \"publish\": \"{part}\""
+                            )));
+                        }
+                    };
+                    publish[at] = true;
                 }
+                out.publish = Some(publish);
             }
             "publish_via_partition_root" => {
                 out.via_root = Some(def_get_boolean(&de.defname, arg)?);
@@ -135,7 +153,11 @@ fn check_options(options: &[Option<typedpg_pg_query::ast::Node>]) -> Result<Opti
             // defGetGeneratedColsOption.
             "publish_generated_columns" => {
                 let value = value.unwrap_or_default();
-                if !value.eq_ignore_ascii_case("none") && !value.eq_ignore_ascii_case("stored") {
+                if value.eq_ignore_ascii_case("none") {
+                    out.gencols = Some('n');
+                } else if value.eq_ignore_ascii_case("stored") {
+                    out.gencols = Some('s');
+                } else {
                     return Err(DdlError::Parse(format!(
                         "invalid value for publication parameter \"publish_generated_columns\": \
                          \"{value}\" (Valid values are \"none\" and \"stored\".)"
@@ -730,6 +752,8 @@ pub fn create_publication(
         via_root,
         all_tables: stmt.for_all_tables,
         all_sequences: stmt.for_all_sequences,
+        publish: options.publish.unwrap_or([true; 4]),
+        gencols: options.gencols.unwrap_or('n'),
     };
     let mut tables = Vec::new();
     for object in objects {
@@ -806,6 +830,12 @@ pub fn alter_publication(
     }
     if let Some(via_root) = options.via_root {
         interp.publications[index].via_root = via_root;
+    }
+    if let Some(publish) = options.publish {
+        interp.publications[index].publish = publish;
+    }
+    if let Some(gencols) = options.gencols {
+        interp.publications[index].gencols = gencols;
     }
     let action = stmt.action;
     let objects = resolve_objects(interp, &stmt.pubobjects)?;
@@ -1022,6 +1052,39 @@ pub(crate) fn publication_all_tables(interp: &PgCatalog, name: &str) -> Option<b
 }
 
 impl Publication {
+    /// `puballtables`, `puballsequences`, `pubviaroot`, the `publish`
+    /// flags and `pubgencols` (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn flags(&self) -> (bool, bool, bool, [bool; 4], char) {
+        (
+            self.all_tables,
+            self.all_sequences,
+            self.via_root,
+            self.publish,
+            self.gencols,
+        )
+    }
+
+    /// Each `pg_publication_rel` row's table, whether it has a row filter
+    /// and a column list, and `prexcept` (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn relation_rows(&self) -> Vec<(PgClassOid, bool, bool, bool)> {
+        self.tables
+            .iter()
+            .map(|t| (t.relid, t.has_filter, t.has_columns, t.except))
+            .collect()
+    }
+
+    /// The `pg_publication_rel` rows (table, `prexcept`) and the
+    /// `pg_publication_namespace` rows' schemas (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn members(&self) -> (Vec<(PgClassOid, bool)>, &[PgNamespaceOid]) {
+        (
+            self.tables.iter().map(|t| (t.relid, t.except)).collect(),
+            &self.schemas,
+        )
+    }
+
     /// A dropped relation leaves the publication.
     pub(crate) fn forget_relation(&mut self, relid: PgClassOid) {
         self.tables.retain(|t| t.relid != relid);

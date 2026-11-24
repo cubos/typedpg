@@ -409,6 +409,36 @@ fn drop_table_referenced_by_fk_with_cascade_drops_fk_too() {
 // ── DROP COLUMN with constraints ───────────────────────────────────────────
 
 #[test]
+fn a_primary_key_using_an_index_reports_incompatible_not_nulls_as_set_not_null() {
+    // ADD PRIMARY KEY USING INDEX sets the columns' not-null constraints as
+    // SET NOT NULL does, and reports an incompatible one as it does.
+    for (setup, message) in [
+        (
+            "CREATE TABLE a (r int); ALTER TABLE a ADD CONSTRAINT k NOT NULL r NOT VALID;
+             CREATE UNIQUE INDEX ia ON a (r);",
+            "incompatible NOT VALID constraint \"k\" on relation \"a\" (You might need to \
+             validate it using ALTER TABLE ... VALIDATE CONSTRAINT.)",
+        ),
+        (
+            "CREATE TABLE a (r int CONSTRAINT k NOT NULL NO INHERIT);
+             CREATE UNIQUE INDEX ia ON a (r);",
+            "cannot change NO INHERIT status of NOT NULL constraint \"k\" on relation \"a\" (You \
+             might need to make the existing constraint inheritable using ALTER TABLE ... ALTER \
+             CONSTRAINT ... INHERIT.)",
+        ),
+    ] {
+        let result = try_apply(&[
+            ("0001.sql", setup),
+            (
+                "0002.sql",
+                "ALTER TABLE a ADD CONSTRAINT pa PRIMARY KEY USING INDEX ia;",
+            ),
+        ]);
+        assert_ddl_err!(result, DdlError::Parse(_), message);
+    }
+}
+
+#[test]
 fn drop_column_with_pkey_dependency_drops_pkey_silently() {
     // PG drops the PK constraint along with the column it covers (only
     // *external* dependencies block DROP COLUMN without CASCADE — local

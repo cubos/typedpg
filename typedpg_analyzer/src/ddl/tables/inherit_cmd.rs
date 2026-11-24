@@ -490,10 +490,12 @@ pub(super) fn attach_partition(
              \"{parent_name}\" (Partitioned table \"{parent_name}\" contains unique indexes.)"
         )));
     }
-    super::foreign_keys::clone_parent_fks(interp, parent, attach)?;
-    // AttachPartitionEnsureIndexes.
+    // AttachPartitionEnsureIndexes, CloneRowTriggersToPartition, then
+    // CloneForeignKeyConstraints — whose rows for a referenced partition
+    // depend on the partition's copy of the referenced index.
     super::partidx::clone_parent_indexes(interp, parent, attach)?;
-    crate::ddl::triggers::clone_row_triggers_to_partition(interp, parent, attach)
+    crate::ddl::triggers::clone_row_triggers_to_partition(interp, parent, attach)?;
+    super::foreign_keys::clone_parent_fks(interp, parent, attach)
 }
 
 /// `ALTER TABLE parent DETACH PARTITION name` (ATExecDetachPartition).

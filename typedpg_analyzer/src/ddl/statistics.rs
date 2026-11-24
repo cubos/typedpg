@@ -19,6 +19,20 @@ pub(crate) struct StatisticsObject {
     pub(crate) oid: crate::oid::PgGenericOid,
     /// The columns it reads (`stxkeys` and the expressions' columns).
     pub(crate) attnums: Vec<i16>,
+    /// `stxkeys`: its plain columns, in attnum order (for the catalog
+    /// oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) keys: Vec<i16>,
+    /// `stxkind`: the kinds it builds (`d`, `f`, `m`, `e`).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) kinds: Vec<char>,
+    /// How many expressions it has (`stxexprs`).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) exprs: usize,
+    /// The expressions, as written (a virtual generated column's is its
+    /// column reference).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) expressions: Vec<super::tables::check_inherit::StoredExpr>,
 }
 
 /// STATS_MAX_DIMENSIONS.
@@ -380,12 +394,44 @@ pub fn create_statistics(interp: &mut PgCatalog, stmt: &CreateStatsStmt) -> Resu
             results: expr_results.clone(),
         },
     );
+    // CreateStatistics: the kinds named, or all of them for several
+    // columns — and the expressions' statistics when there are some.
+    #[cfg(feature = "pg_sanity")]
+    let (keys, kinds) = {
+        let named: Vec<&str> = stmt
+            .stat_types
+            .iter()
+            .filter_map(|n| node_string(n.as_ref()))
+            .collect();
+        let mut kinds: Vec<char> = Vec::new();
+        if numcols > 1 {
+            for (kind, c) in [("ndistinct", 'd'), ("dependencies", 'f'), ("mcv", 'm')] {
+                if named.is_empty() || named.contains(&kind) {
+                    kinds.push(c);
+                }
+            }
+        }
+        if !exprs.is_empty() {
+            kinds.push('e');
+        }
+        let mut keys = columns.clone();
+        keys.sort_unstable();
+        (keys, kinds)
+    };
     interp.statistics.push(StatisticsObject {
         name: name.clone(),
         namespace,
         relid,
         oid,
         attnums,
+        #[cfg(feature = "pg_sanity")]
+        keys,
+        #[cfg(feature = "pg_sanity")]
+        kinds,
+        #[cfg(feature = "pg_sanity")]
+        exprs: exprs.len(),
+        #[cfg(feature = "pg_sanity")]
+        expressions: exprs.clone(),
     });
     // recordDependencyOnSingleRelExpr: what the expressions refer to
     // beyond the table (whose columns are dropped with the statistics,

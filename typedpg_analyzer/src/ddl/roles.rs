@@ -428,7 +428,10 @@ impl Roles {
 /// The role `spec` names (`get_rolespec_oid`). `None` for `PUBLIC`, which
 /// never is a role. `CURRENT_USER` / `CURRENT_ROLE` / `SESSION_USER` are the
 /// migrations' user while the session leaves them unnamed.
-fn role_spec_name(interp: &PgCatalog, spec: &typedpg_pg_query::ast::RoleSpec) -> Option<String> {
+pub(crate) fn role_spec_name(
+    interp: &PgCatalog,
+    spec: &typedpg_pg_query::ast::RoleSpec,
+) -> Option<String> {
     match spec.roletype {
         RoleSpecType::RolespecCstring => Some(spec.rolename.clone()),
         RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => Some(

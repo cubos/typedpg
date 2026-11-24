@@ -645,9 +645,68 @@ pub fn define(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), DdlError>
                 },
             );
         }
+        ("p" | "t", ..) => record_method_functions(interp, kind, stmt),
         _ => {}
     }
     Ok(())
+}
+
+/// DefineTSParser / DefineTSTemplate (makeParserDependencies,
+/// makeTSTemplateDependencies): a parser or template depends on its
+/// method functions, each looked up by its signature (get_ts_parser_func,
+/// get_ts_template_func).
+fn record_method_functions(interp: &mut PgCatalog, kind: &str, stmt: &DefineStmt) {
+    use crate::oid::PgTypeOid;
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
+    const TSQUERY: PgTypeOid = PgTypeOid::from_raw(3615);
+    let int4 = crate::pg_catalog::oid::INT4;
+    let signature = |method: &str| -> Option<Vec<PgTypeOid>> {
+        Some(match (kind, method) {
+            ("p", "start") => vec![INTERNAL, int4],
+            ("p", "gettoken") => vec![INTERNAL; 3],
+            ("p", "end" | "lextypes") => vec![INTERNAL],
+            ("p", "headline") => vec![INTERNAL, INTERNAL, TSQUERY],
+            ("t", "init") => vec![INTERNAL],
+            ("t", "lexize") => vec![INTERNAL; 4],
+            _ => return None,
+        })
+    };
+    let mut functions = Vec::new();
+    for opt in &stmt.definition {
+        let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
+            continue;
+        };
+        let Some(args) = signature(&de.defname) else {
+            continue;
+        };
+        let names = option_names(de);
+        let (schema, name) = match names.as_slice() {
+            [name] => (None, name.as_str()),
+            [schema, name] => (Some(schema.as_str()), name.as_str()),
+            _ => continue,
+        };
+        if let Some(p) = interp
+            .find_functions(schema, name)
+            .into_iter()
+            .find(|p| p.proargtypes == args)
+        {
+            functions.push(crate::ddl::depend::ObjectAddress::proc(p.oid));
+        }
+    }
+    let Some(object) = interp.pg_ts_objects.last() else {
+        return;
+    };
+    let classid = if kind == "p" {
+        crate::ddl::depend::PG_TS_PARSER_RELID
+    } else {
+        crate::ddl::depend::PG_TS_TEMPLATE_RELID
+    };
+    let me = crate::ddl::depend::ObjectAddress {
+        classid,
+        objid: object.oid,
+        objsubid: 0,
+    };
+    crate::ddl::depend::record(interp, me, functions, crate::pg_catalog::DepType::Normal);
 }
 
 /// Whether configuration `pg_ts_objects[at]` uses the built-in parser —

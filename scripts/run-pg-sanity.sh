@@ -33,6 +33,14 @@ set -euo pipefail
 # The release typedpg targets: the parser's and the seed's.
 PG_VERSION=$(tr -d '[:space:]' < "$(dirname "$0")/../typedpg_pg_query/POSTGRES_VERSION")
 PG_IMAGE="${PG_IMAGE:-postgres:$PG_VERSION}"
+# typedpg-pg-pl:<version> is that release's image with PL/Perl and
+# PL/Python (scripts/pg-pl/Dockerfile), for the extension oracle: built
+# here, cached by Docker afterwards.
+if [[ "$PG_IMAGE" == typedpg-pg-pl:* ]]; then
+    echo "pg_sanity: building $PG_IMAGE..."
+    docker build -q -t "$PG_IMAGE" --build-arg "PG_VERSION=${PG_IMAGE#typedpg-pg-pl:}" \
+        "$(dirname "$0")/pg-pl" >/dev/null
+fi
 CONTAINER_NAME="typedpg-pg-sanity-$$"
 PG_USER="postgres"
 PG_PASS="postgres"

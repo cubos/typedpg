@@ -151,7 +151,16 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
                 expr,
                 base_type_oid,
             ));
-            has_default = !is_null_constant(expr);
+            // DefineDomain stores no default that cooks to a NULL constant
+            // (coerced to the base type and its typmod: a length coercion
+            // keeps it an expression).
+            has_default =
+                !crate::ddl::defaults::is_null_default(interp, expr, base_type_oid, typtypmod);
+            // DefineDomain stores no default that is a NULL constant: it
+            // refers to nothing.
+            if !has_default {
+                default_refs.clear();
+            }
             if has_default {
                 default_expr = Some(crate::ddl::tables::check_inherit::StoredExpr::written(expr));
                 crate::ddl::defaults::sequence_function_refs(interp, expr, &mut default_sequences);
@@ -206,7 +215,11 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     super::depend::record(
         interp,
         super::depend::ObjectAddress::type_(oid),
-        [super::depend::ObjectAddress::type_(base_type_oid)],
+        std::iter::once(super::depend::ObjectAddress::type_(base_type_oid)).chain(
+            inherited_support_functions(interp, base_type_oid)
+                .into_iter()
+                .map(super::depend::ObjectAddress::proc),
+        ),
         crate::pg_catalog::DepType::Normal,
     );
     // ... and on what its default refers to.
@@ -225,6 +238,33 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
         },
     );
     register_array_type(interp, nsoid, &name, oid)?;
+    // DefineDomain: without a DEFAULT of its own, a domain over a domain
+    // takes a copy of its base's (`typdefaultbin`), and depends on what it
+    // refers to.
+    if !saw_default
+        && let Some(base_default) = interp.domain_default_exprs.get(&base_type_oid).cloned()
+    {
+        has_default = true;
+        if let Some(perms) = interp
+            .domain_default_sequence_perms
+            .get(&base_type_oid)
+            .cloned()
+        {
+            default_sequences = perms;
+        }
+        if let crate::ddl::tables::check_inherit::StoredExpr::Written(expr) = &base_default {
+            let (_, refs) = super::depend::collect(|| {
+                super::defaults::check_default(interp, (**expr).as_ref(), &name, base_type_oid)
+            });
+            super::depend::record_references(
+                interp,
+                super::depend::ObjectAddress::type_(oid),
+                &refs,
+                crate::pg_catalog::DepType::Normal,
+            );
+        }
+        default_expr = Some(base_default);
+    }
     if has_default {
         interp.domain_defaults.insert(oid);
         if let Some(expr) = default_expr {
@@ -241,13 +281,40 @@ pub fn create_domain(interp: &mut PgCatalog, stmt: &CreateDomainStmt) -> Result<
     Ok(())
 }
 
-/// A bare `NULL`, cast or not: a default that is no default.
-fn is_null_constant(expr: Option<&typedpg_pg_query::ast::Node>) -> bool {
-    match expr {
-        Some(ast::Node::AConst(c)) => c.isnull,
-        Some(ast::Node::TypeCast(tc)) => is_null_constant(tc.arg.as_ref()),
-        _ => false,
+/// The support functions a domain over `base` takes from it (DefineDomain:
+/// the base type's output, send, typmod and analyze functions and its
+/// subscripting handler — its input and receive are `domain_in` /
+/// `domain_recv`), which it depends on: the ones the base type depends on,
+/// but its input and receive functions.
+fn inherited_support_functions(interp: &PgCatalog, base: PgTypeOid) -> Vec<PgProcOid> {
+    use crate::pg_catalog::{DepType, PG_PROC_RELID, PG_TYPE_RELID};
+    const CSTRING: PgTypeOid = PgTypeOid::from_raw(2275);
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
+    let base = interp.unwrap_domain(base);
+    // (Only a base type's are its own: a range type's are its canonical
+    // and subtype-difference functions, an enum's or a composite's
+    // built-in.)
+    if interp.pg_type.get(&base).map(|t| t.typtype) != Some(TypType::Base) {
+        return Vec::new();
     }
+    let base_obj = crate::oid::PgGenericOid::from_nonzero(base.into_nonzero());
+    interp
+        .pg_depend
+        .iter()
+        .filter(|d| {
+            d.classid == PG_TYPE_RELID
+                && d.objid == base_obj
+                && d.refclassid == PG_PROC_RELID
+                && d.deptype == DepType::Normal
+        })
+        .filter_map(|d| interp.pg_proc.get(&PgProcOid::new(d.refobjid.get())?))
+        .filter(|p| {
+            let input = p.prorettype == base
+                && matches!(p.proargtypes.first(), Some(&t) if t == CSTRING || t == INTERNAL);
+            !input
+        })
+        .map(|p| p.oid)
+        .collect()
 }
 
 /// A named domain constraint (`pg_constraint` row with `contypid` set).
@@ -420,6 +487,19 @@ struct DomainCheck {
     allowed: Option<crate::refine::Refinement>,
     /// What its operators and functions resolved to.
     trusted: crate::nonnull::TrustedNodes,
+}
+
+/// What domain CHECK `expr` over `base_type` refers to, if it analyzes
+/// (for the catalog oracle).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn domain_check_references(
+    interp: &PgCatalog,
+    base_type: PgTypeOid,
+    expr: &typedpg_pg_query::ast::Node,
+) -> Option<Vec<super::depend::Reference>> {
+    check_domain_check_expression(interp, base_type, Some(expr))
+        .ok()
+        .map(|c| c.refs)
 }
 
 /// A domain CHECK expression sees `VALUE` as a value of the base type and
@@ -631,6 +711,7 @@ pub fn alter_domain(
         // SET DEFAULT: cooked like the domain's own DEFAULT
         // (AlterDomainDefault). DROP DEFAULT has no effect on typing.
         AlterDomainType::AdAlterDefault => {
+            let domain_typmod = interp.pg_type.get(&type_oid).and_then(|t| t.typtypmod);
             let mut default_refs = Vec::new();
             if stmt.def.is_some() {
                 let expr = &stmt.def;
@@ -644,6 +725,16 @@ pub fn alter_domain(
                     expr.as_ref(),
                     base_type,
                 ));
+                // AlterDomainDefault stores no default that is a NULL
+                // constant.
+                if crate::ddl::defaults::is_null_default(
+                    interp,
+                    expr.as_ref(),
+                    base_type,
+                    domain_typmod,
+                ) {
+                    default_refs.clear();
+                }
             }
             // GenerateTypeDependencies(rebuild): the domain's dependencies
             // are recorded anew — on its base type and what the new default
@@ -653,7 +744,11 @@ pub fn alter_domain(
             super::depend::record(
                 interp,
                 addr,
-                [super::depend::ObjectAddress::type_(base_type)],
+                std::iter::once(super::depend::ObjectAddress::type_(base_type)).chain(
+                    inherited_support_functions(interp, base_type)
+                        .into_iter()
+                        .map(super::depend::ObjectAddress::proc),
+                ),
                 crate::pg_catalog::DepType::Normal,
             );
             super::depend::record_references(
@@ -671,7 +766,14 @@ pub fn alter_domain(
                 },
             );
             match &stmt.def {
-                expr @ Some(_) if !is_null_constant(expr.as_ref()) => {
+                expr @ Some(_)
+                    if !crate::ddl::defaults::is_null_default(
+                        interp,
+                        expr.as_ref(),
+                        base_type,
+                        domain_typmod,
+                    ) =>
+                {
                     interp.domain_defaults.insert(type_oid);
                     interp.domain_default_exprs.insert(
                         type_oid,
@@ -1869,6 +1971,20 @@ fn define_base_type(
     if !has_array {
         register_array_type(interp, nsoid, name, oid)?;
     }
+    // DefineType: the array type takes the element's typmod functions, and
+    // depends on them.
+    if let Some(array) = interp.pg_type.get(&oid).and_then(|t| t.typarray) {
+        let typmod: Vec<PgProcOid> = ["typmod_in", "typmod_out"]
+            .into_iter()
+            .flat_map(|role| support_functions_in_role(interp, oid, role))
+            .collect();
+        super::depend::record(
+            interp,
+            super::depend::ObjectAddress::type_(array),
+            typmod.into_iter().map(super::depend::ObjectAddress::proc),
+            crate::pg_catalog::DepType::Normal,
+        );
+    }
     // DefineType's TypeCreate: the now-defined type takes the current role as
     // owner and the type default privileges (TypeShellMake leaves the ACL
     // NULL).
@@ -1978,6 +2094,8 @@ pub fn alter_type(
     };
     let mut storage = None;
     let mut subscript = None;
+    // The support functions set (or removed, NONE), by role.
+    let mut functions: Vec<(&'static str, Option<crate::oid::PgProcOid>)> = Vec::new();
     for opt in &stmt.options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
@@ -2012,7 +2130,8 @@ pub fn alter_type(
                 const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
                 const CSTRING_ARRAY: PgTypeOid = PgTypeOid::from_raw(1263);
                 let names = option_names(de);
-                match de.defname.as_str() {
+                let role = support_role(&de.defname);
+                let function = match de.defname.as_str() {
                     "receive" => find_type_support_function(
                         interp,
                         "receive",
@@ -2049,15 +2168,23 @@ pub fn alter_type(
                         builtin::BOOL,
                     ),
                 }?;
+                functions.push((role, Some(function)));
                 if de.defname == "typmod_in" {
                     interp.types_with_typmodin.insert(oid);
                 }
             }
             "typmod_in" => {
+                functions.push(("typmod_in", None));
                 interp.types_with_typmodin.remove(&oid);
             }
-            "receive" | "send" | "typmod_out" | "analyze" | "analyse" => {}
-            "subscript" => subscript = Some(subscript_handler(interp, de)?),
+            "receive" | "send" | "typmod_out" | "analyze" | "analyse" => {
+                functions.push((support_role(&de.defname), None));
+            }
+            "subscript" => {
+                let handler = subscript_handler(interp, de)?;
+                functions.push(("subscript", handler));
+                subscript = Some(handler);
+            }
             "internallength" | "input" | "output" | "category" | "preferred" | "default"
             | "element" | "delimiter" | "collatable" => {
                 return Err(DdlError::Parse(format!(
@@ -2089,7 +2216,109 @@ pub fn alter_type(
             row.typsubscript = subscript;
         }
     }
+    // AlterTypeRecurse's GenerateTypeDependencies (rebuild): the type
+    // depends on its support functions as they are now — its array type on
+    // the typmod ones too.
+    let array = interp.pg_type.get(&oid).and_then(|t| t.typarray);
+    for (role, function) in functions {
+        replace_support_function(interp, oid, role, function);
+        if let Some(array) = array
+            && matches!(role, "typmod_in" | "typmod_out")
+        {
+            replace_support_function(interp, array, role, function);
+        }
+    }
     Ok(())
+}
+
+/// The support functions of `role` type `typ` depends on (by their
+/// signature, see [`replace_support_function`]).
+fn support_functions_in_role(interp: &PgCatalog, typ: PgTypeOid, role: &str) -> Vec<PgProcOid> {
+    use crate::pg_catalog::{DepType, PG_PROC_RELID, PG_TYPE_RELID};
+    let type_obj = crate::oid::PgGenericOid::from_nonzero(typ.into_nonzero());
+    interp
+        .pg_depend
+        .iter()
+        .filter(|d| {
+            d.classid == PG_TYPE_RELID
+                && d.objid == type_obj
+                && d.refclassid == PG_PROC_RELID
+                && d.deptype == DepType::Normal
+        })
+        .filter_map(|d| interp.pg_proc.get(&PgProcOid::new(d.refobjid.get())?))
+        .filter(|p| support_role_fits(p, typ, role))
+        .map(|p| p.oid)
+        .collect()
+}
+
+/// Whether routine `p` has the signature of type `oid`'s `role` support
+/// function.
+fn support_role_fits(p: &crate::pg_catalog::PgProc, oid: PgTypeOid, role: &str) -> bool {
+    use crate::pg_catalog::oid as builtin;
+    const CSTRING: PgTypeOid = PgTypeOid::from_raw(2275);
+    const INTERNAL: PgTypeOid = PgTypeOid::from_raw(2281);
+    const CSTRING_ARRAY: PgTypeOid = PgTypeOid::from_raw(1263);
+    const BYTEA: PgTypeOid = PgTypeOid::from_raw(17);
+    match role {
+        "receive" => p.prorettype == oid && p.proargtypes.first() == Some(&INTERNAL),
+        "send" => p.proargtypes == [oid] && p.prorettype == BYTEA,
+        "typmod_in" => p.proargtypes == [CSTRING_ARRAY] && p.prorettype == builtin::INT4,
+        "typmod_out" => p.proargtypes == [builtin::INT4] && p.prorettype == CSTRING,
+        "analyze" => p.proargtypes == [INTERNAL] && p.prorettype == builtin::BOOL,
+        _ => p.proargtypes == [INTERNAL] && p.prorettype == INTERNAL,
+    }
+}
+
+/// The support function role an ALTER TYPE option names.
+fn support_role(option: &str) -> &'static str {
+    match option {
+        "receive" => "receive",
+        "send" => "send",
+        "typmod_in" => "typmod_in",
+        "typmod_out" => "typmod_out",
+        _ => "analyze",
+    }
+}
+
+/// Replace type `oid`'s dependency on its `role` support function — the
+/// one of the role's signature (findTypeReceiveFunction & co.) — with one
+/// on `function`.
+fn replace_support_function(
+    interp: &mut PgCatalog,
+    oid: PgTypeOid,
+    role: &str,
+    function: Option<crate::oid::PgProcOid>,
+) {
+    use crate::pg_catalog::{DepType, PG_PROC_RELID, PG_TYPE_RELID};
+    let fits = |p: &crate::pg_catalog::PgProc| support_role_fits(p, oid, role);
+    let type_obj = crate::oid::PgGenericOid::from_nonzero(oid.into_nonzero());
+    let old: Vec<crate::oid::PgGenericOid> = interp
+        .pg_depend
+        .iter()
+        .filter(|d| {
+            d.classid == PG_TYPE_RELID
+                && d.objid == type_obj
+                && d.refclassid == PG_PROC_RELID
+                && d.deptype == DepType::Normal
+                && crate::oid::PgProcOid::new(d.refobjid.get())
+                    .and_then(|p| interp.pg_proc.get(&p))
+                    .is_some_and(fits)
+        })
+        .map(|d| d.refobjid)
+        .collect();
+    interp.pg_depend.retain(|d| {
+        !(d.classid == PG_TYPE_RELID
+            && d.objid == type_obj
+            && d.refclassid == PG_PROC_RELID
+            && d.deptype == DepType::Normal
+            && old.contains(&d.refobjid))
+    });
+    super::depend::record(
+        interp,
+        super::depend::ObjectAddress::type_(oid),
+        function.map(super::depend::ObjectAddress::proc),
+        DepType::Normal,
+    );
 }
 
 /// Register a shell type (`CREATE TYPE name;`, or the not-yet-defined result

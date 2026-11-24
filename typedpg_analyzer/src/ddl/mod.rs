@@ -663,7 +663,7 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
             policies::alter_policy(db, s).and_then(|()| coldeps::record_policy_alter(db, s))
         }
         ast::Node::RuleStmt(s) => rules::create_rule(db, s)
-            .and_then(|refs| coldeps::record_rule(db, s, &refs))
+            .and_then(|(qual, actions)| coldeps::record_rule(db, s, &qual, &actions))
             .and_then(|()| {
                 stored_exprs::refuse_unstorable_constant_casts(
                     db,

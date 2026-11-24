@@ -171,8 +171,14 @@ impl<'a> Ctx<'a> {
     }
 
     /// Record that the untyped string literal at `location` was coerced to
-    /// `type_oid`.
+    /// `type_oid` — a `Const` of that type, which an expression stored in
+    /// the catalog depends on (find_expr_references_walker).
     pub fn note_literal_type(&self, literal: &ast::AConst, type_oid: PgTypeOid) {
+        // (A domain's constant is its base type's, coerced to the domain.)
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(type_oid));
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(
+            self.snapshot.unwrap_domain(type_oid),
+        ));
         if let Some(log) = self.strict_log {
             log.note_literal_type(literal.location, type_oid);
         }
@@ -283,6 +289,10 @@ impl<'a> Ctx<'a> {
     /// runs (an argument coerced to a function's / operator's declared
     /// type), if any.
     pub fn note_coercion(&self, from: PgTypeOid, to: PgTypeOid) {
+        // A stored expression depends on the node the coercion builds.
+        if !crate::polymorphic::is_polymorphic(to) && to != PgTypeOid::from_raw(2276) {
+            crate::ddl::depend::note_coercion(self.snapshot, from, to);
+        }
         if self.used_procs.is_none() || from == to || from == oid::UNKNOWN {
             return;
         }
@@ -2245,6 +2255,14 @@ fn infer_expr_unlocated(
         && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
         ctx.note_literal_type(ac, goal.type_oid);
+    }
+    // An untyped NULL coerced to a type is a `Const` of it too.
+    if goal.has_expectation()
+        && result.type_oid == oid::UNKNOWN
+        && let Some(ast::Node::AConst(ac)) = node
+        && ac.isnull
+    {
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(goal.type_oid));
     }
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN

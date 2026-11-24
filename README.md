@@ -814,11 +814,11 @@ Non-JSONB domains (e.g. `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)`) a
 
 ## PostgreSQL extensions
 
-`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, and the rest of the contrib bundle all work without extra setup, and so do these third-party extensions, each at the version below and the update chain shown:
+`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, and the rest of the contrib bundle all work without extra setup — the procedural languages built apart from the server, `plperl`, `plperlu` and `plpython3u`, and their transforms (`hstore_plperl`, `jsonb_plpython3u`, …) too — and so do these third-party extensions, each at the version below and the update chain shown:
 
 | Extension | Version |
 |-----------|---------|
-| `vector` (pgvector) | 0.8.7 (from 0.8.2) |
+| `vector` (pgvector) | 0.8.7 |
 | `postgis`, `postgis_raster`, `postgis_topology`, `postgis_sfcgal` | 3.7.0 |
 | `pg_cron` | 1.6 (from 1.0) |
 | `pgmq` | 1.13.2 |

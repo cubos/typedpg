@@ -663,6 +663,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 let mapped: Vec<i16> = refs
                     .iter()
                     .filter_map(|&r| {
+                        // A system column is the same one everywhere.
+                        if r < 0 {
+                            return Some(r);
+                        }
                         let name = interp
                             .attributes_of(src)
                             .iter()
@@ -674,9 +678,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     .collect();
                 interp.generated_refs.insert((class_oid, attnum), mapped);
             }
-            // The copied default expression names the same sequences.
+            // The copied default expression depends on what the source's
+            // does (its sequences, routines, types…).
             let src_obj = crate::oid::PgGenericOid::from_nonzero(src.into_nonzero());
-            let sequences: Vec<PgClassOid> = interp
+            let copied: Vec<crate::pg_catalog::PgDepend> = interp
                 .iter_pg_depend()
                 .filter(|d| {
                     d.classid == crate::pg_catalog::PG_CLASS_RELID
@@ -684,10 +689,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                         && d.objsubid == src_attnum
                         && d.deptype == crate::pg_catalog::DepType::Normal
                 })
-                .filter_map(|d| PgClassOid::new(d.refobjid.get()))
+                .map(|d| crate::pg_catalog::PgDepend {
+                    objid: crate::oid::PgGenericOid::from_nonzero(class_oid.into_nonzero()),
+                    objsubid: attnum,
+                    ..d.clone()
+                })
                 .collect();
-            for seq in sequences {
-                super::defaults::record_default_sequence(interp, class_oid, attnum, seq);
+            for row in copied {
+                interp.add_dependency(row);
             }
         }
     }
@@ -989,13 +998,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // expression must be assignable to the column's declared type.
     validate_constraint_expressions(interp, class_oid, &name, stmt)?;
 
-    // CloneForeignKeyConstraints: a partition gets its parent's foreign
-    // keys before its own constraints are added.
-    if stmt.partbound.is_some()
-        && let Some(&parent) = parents.first()
-    {
-        foreign_keys::clone_parent_fks(interp, parent, class_oid)?;
-    }
     // DefineRelation: a partition gets copies of its parent's indexes
     // before its own are created (so a PRIMARY KEY of its own is a second
     // one).
@@ -1007,6 +1009,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .filter(|_| stmt.partbound.is_some());
     if let Some(parent) = partition_parent {
         partidx::clone_parent_indexes(interp, parent, class_oid)?;
+    }
+    // CloneForeignKeyConstraints: a partition gets its parent's foreign
+    // keys before its own constraints are added — after its indexes, which
+    // the rows for a referenced partition depend on.
+    if stmt.partbound.is_some()
+        && let Some(&parent) = parents.first()
+    {
+        foreign_keys::clone_parent_fks(interp, parent, class_oid)?;
     }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.

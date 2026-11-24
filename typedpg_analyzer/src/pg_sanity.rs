@@ -31,6 +31,8 @@
 //! Every accepted query is also executed over adversarial data to check
 //! the analyzer's nullability: see [`soundness`].
 
+mod catalog_depend;
+mod catalog_exprs;
 mod catalog_extras;
 mod catalog_state;
 mod soundness;
@@ -1066,21 +1068,28 @@ impl PgSanityServer {
         let ignored = std::env::var("PG_SANITY_CATALOG_IGNORE").unwrap_or_default();
         let ignored: Vec<&str> = ignored.split('|').filter(|s| !s.is_empty()).collect();
         // Routines code the analyzer couldn't follow may have redefined
-        // (see `ddl::uncertain`) are compared only for existing; triggers
-        // it may have enabled or disabled, but for their state.
+        // (see `ddl::uncertain`) are compared only for existing — not their
+        // parameter defaults nor what they depend on (a language, a
+        // transform, a SQL-standard body's objects); triggers it may have
+        // enabled or disabled, but for their state; default privileges it
+        // may have altered, but for what their rows depend on.
         let routines_uncertain = db.roles.uncertain.routines;
         let triggers_uncertain = db.roles.uncertain.triggers;
+        let default_acls_uncertain = db.roles.uncertain.default_acls;
         let differences: Vec<String> = self
             .catalog_differences(db)
             .into_iter()
             .filter(|line| !ignored.iter().any(|s| line.contains(s)))
             .filter(|line| {
                 !(routines_uncertain
-                    && line.starts_with("pg_proc ")
-                    && line.contains(" in the analyzer, "))
+                    && (line.starts_with("pg_proc ")
+                        && (line.contains(" in the analyzer, ") || line.contains(") defaults"))
+                        || line.starts_with("pg_depend function ")))
                     && !(triggers_uncertain
                         && line.starts_with("pg_trigger ")
                         && line.contains(": tgenabled is "))
+                    && !(default_acls_uncertain
+                        && line.starts_with("pg_depend default privileges of "))
             })
             .collect();
         if differences.is_empty() {
@@ -1118,6 +1127,32 @@ impl PgSanityServer {
     /// The catalog oracle's comparison: every difference between the
     /// server's user rows and the analyzer's, normalized.
     fn catalog_differences(&mut self, db: &crate::pg_catalog::PgCatalog) -> Vec<String> {
+        let (ours, pg) = self.catalog_dumps(db);
+        let mut differences = catalog_state::diff(&ours, &pg);
+        differences.extend(
+            catalog_exprs::differences(&mut self.client, db).unwrap_or_else(|e| {
+                panic!("pg_sanity: catalog export failed: {}", render_pg_error(&e))
+            }),
+        );
+        differences.extend(self.stored_expression_text_differences(db));
+        differences
+    }
+
+    /// The server's user catalog rows, normalized as the catalog oracle
+    /// compares them, one line each (for the extension oracle, which also
+    /// compares two server states).
+    pub(crate) fn server_catalog_lines(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+    ) -> Vec<String> {
+        self.catalog_dumps(db).1.lines()
+    }
+
+    /// The analyzer's and the server's user catalog rows, normalized.
+    fn catalog_dumps(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+    ) -> (catalog_state::Dump, catalog_state::Dump) {
         let fail = |e: postgres::Error| -> ! {
             panic!("pg_sanity: catalog export failed: {}", render_pg_error(&e))
         };
@@ -1142,6 +1177,7 @@ impl PgSanityServer {
             .map(|r| r.get::<_, u32>(0))
             .collect();
         catalog_state::hide_namespaces(&mut pg, &hidden);
+        catalog_exprs::default_types(&mut self.client, db, &mut pg).unwrap_or_else(|e| fail(e));
         let mut pg_aux = catalog_state::Aux {
             extras: catalog_extras::from_server(&mut self.client).unwrap_or_else(|e| fail(e)),
             ..Default::default()
@@ -1184,6 +1220,9 @@ impl PgSanityServer {
             extras: catalog_extras::from_model(db, &|role| pg_role_name(db, role, &session_user)),
             ..Default::default()
         };
+        ours.pg_depend = catalog_depend::model_depend(db, &mut our_aux.extras, &|role| {
+            pg_role_name(db, role, &session_user)
+        });
         for (name, oid) in &db.access_method_oids {
             our_aux
                 .names
@@ -1194,12 +1233,10 @@ impl PgSanityServer {
                 .names
                 .insert((2328, oid.get()), format!("foreign-data wrapper {name}"));
         }
-        let mut differences = catalog_state::diff(
-            &catalog_state::normalize(&ours, db, &our_aux),
-            &catalog_state::normalize(&pg, db, &pg_aux),
-        );
-        differences.extend(self.stored_expression_text_differences(db));
-        differences
+        (
+            catalog_state::normalize(&ours, db, &our_aux),
+            catalog_state::normalize(&pg, db, &pg_aux),
+        )
     }
 
     /// The stored expressions' text: what the analyzer prints for each CHECK

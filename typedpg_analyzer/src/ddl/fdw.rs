@@ -27,6 +27,13 @@ pub(crate) struct ForeignData {
     /// Each wrapper's HANDLER function (`fdwhandler`), by the wrapper's
     /// OID; a wrapper without one is absent.
     handlers: std::collections::HashMap<crate::oid::PgGenericOid, crate::oid::PgProcOid>,
+    /// Each wrapper's VALIDATOR and CONNECTION functions (`fdwvalidator`,
+    /// `fdwconnection`), by the wrapper's OID: what its `pg_depend` rows
+    /// are rebuilt from when ALTER changes one.
+    other_functions: std::collections::HashMap<
+        crate::oid::PgGenericOid,
+        (Option<crate::oid::PgProcOid>, Option<crate::oid::PgProcOid>),
+    >,
     /// `(server, wrapper)`.
     servers: Vec<(String, String)>,
     /// `(user, server)`.
@@ -51,6 +58,18 @@ pub(crate) enum OptionsOwner {
 }
 
 impl ForeignData {
+    /// Each server's wrapper (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn server_wrappers(&self) -> &[(String, String)] {
+        &self.servers
+    }
+
+    /// Each user mapping's `(user, server)` (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn user_mapping_pairs(&self) -> &[(String, String)] {
+        &self.user_mappings
+    }
+
     /// Every wrapper, with its OID (for the catalog oracle).
     #[cfg(feature = "pg_sanity")]
     pub(crate) fn wrappers(
@@ -91,6 +110,7 @@ impl ForeignData {
         if let Some(oid) = self.wrapper_oids.remove(name) {
             self.with_connection.remove(&oid);
             self.handlers.remove(&oid);
+            self.other_functions.remove(&oid);
         }
         self.options
             .retain(|owner, _| !matches!(owner, OptionsOwner::Wrapper(w) if w == name));
@@ -295,6 +315,10 @@ struct FunctionOptions {
     connection: Option<bool>,
     /// `[NO] HANDLER`: the handler function, or none.
     handler: Option<Option<crate::oid::PgProcOid>>,
+    /// `[NO] VALIDATOR`: the validator function, or none.
+    validator: Option<Option<crate::oid::PgProcOid>>,
+    /// `[NO] CONNECTION`: the connection function, or none.
+    connection_fn: Option<Option<crate::oid::PgProcOid>>,
 }
 
 /// The HANDLER / VALIDATOR / CONNECTION functions (lookup_fdw_handler_func
@@ -310,9 +334,13 @@ fn check_functions(
             continue;
         };
         match de.defname.as_str() {
-            "connection" => set.connection = Some(de.arg.is_some()),
+            "connection" => {
+                set.connection = Some(de.arg.is_some());
+                set.connection_fn = Some(None);
+            }
             // `NO HANDLER` has no argument.
             "handler" if de.arg.is_none() => set.handler = Some(None),
+            "validator" => set.validator = Some(None),
             _ => {}
         }
         let Some(ast::Node::List(l)) = de.arg.as_ref() else {
@@ -354,11 +382,12 @@ fn check_functions(
                     crate::oid::PgTypeOid::from_raw(1009),
                     crate::pg_catalog::oid::OID,
                 ];
-                if !candidates.iter().any(|p| p.proargtypes == wanted) {
+                let Some(p) = candidates.iter().find(|p| p.proargtypes == wanted) else {
                     return Err(DdlError::TypeNotFound(format!(
                         "function {name}(text[], oid) does not exist"
                     )));
-                }
+                };
+                set.validator = Some(Some(p.oid));
             }
             "connection" => {
                 // lookup_fdw_connection_func (PostgreSQL 19): (oid, oid,
@@ -379,6 +408,7 @@ fn check_functions(
                         parts.join(".")
                     )));
                 }
+                set.connection_fn = Some(Some(p.oid));
             }
             _ => {}
         }
@@ -454,7 +484,46 @@ pub fn create_fdw(interp: &mut PgCatalog, stmt: &CreateFdwStmt) -> Result<(), Dd
     if let Some(Some(handler)) = functions.handler {
         interp.foreign_data.handlers.insert(oid, handler);
     }
+    interp.foreign_data.other_functions.insert(
+        oid,
+        (
+            functions.validator.flatten(),
+            functions.connection_fn.flatten(),
+        ),
+    );
+    record_wrapper_functions(interp, oid);
     Ok(())
+}
+
+/// CreateForeignDataWrapper / AlterForeignDataWrapper: the wrapper
+/// depends on its handler, validator and connection functions (its earlier
+/// ones forgotten).
+fn record_wrapper_functions(interp: &mut PgCatalog, oid: crate::oid::PgGenericOid) {
+    use super::depend::{ObjectAddress, PG_FOREIGN_DATA_WRAPPER_RELID};
+    use crate::pg_catalog::{DepType, PG_PROC_RELID};
+    interp.pg_depend.retain(|d| {
+        !(d.classid == PG_FOREIGN_DATA_WRAPPER_RELID
+            && d.objid == oid
+            && d.refclassid == PG_PROC_RELID
+            && d.deptype == DepType::Normal)
+    });
+    let fd = &interp.foreign_data;
+    let (validator, connection) = fd.other_functions.get(&oid).copied().unwrap_or_default();
+    let functions: Vec<ObjectAddress> = [fd.handlers.get(&oid).copied(), validator, connection]
+        .into_iter()
+        .flatten()
+        .map(ObjectAddress::proc)
+        .collect();
+    super::depend::record(
+        interp,
+        ObjectAddress {
+            classid: PG_FOREIGN_DATA_WRAPPER_RELID,
+            objid: oid,
+            objsubid: 0,
+        },
+        functions,
+        DepType::Normal,
+    );
 }
 
 pub fn alter_fdw(
@@ -491,6 +560,19 @@ pub fn alter_fdw(
             fd.handlers.remove(&oid);
         }
         None => {}
+    }
+    let others = fd.other_functions.entry(oid).or_default();
+    if let Some(validator) = functions.validator {
+        others.0 = validator;
+    }
+    if let Some(connection) = functions.connection_fn {
+        others.1 = connection;
+    }
+    if functions.handler.is_some()
+        || functions.validator.is_some()
+        || functions.connection_fn.is_some()
+    {
+        record_wrapper_functions(interp, oid);
     }
     Ok(())
 }
@@ -538,12 +620,26 @@ pub fn alter_server(
     )
 }
 
-/// The role a user mapping is for, as PG names it in messages.
-fn role_name(role: Option<&RoleSpec>) -> String {
+/// The role a user mapping is for (`umuser`): `public`, or the role's
+/// name — CURRENT_USER / SESSION_USER / CURRENT_ROLE resolved
+/// (get_rolespec_oid), the migrations' own user by its placeholder name.
+fn role_name(interp: &PgCatalog, role: Option<&RoleSpec>) -> String {
     match role.map(|r| r.roletype) {
         Some(RoleSpecType::RolespecPublic) | None => "public".to_owned(),
-        Some(RoleSpecType::RolespecCstring) => role.map(|r| r.rolename.clone()).unwrap_or_default(),
-        Some(_) => "current_user".to_owned(),
+        Some(_) => role
+            .and_then(|r| super::roles::role_spec_name(interp, r))
+            .unwrap_or_else(|| "public".to_owned()),
+    }
+}
+
+/// A user mapping's role as messages name it: MappingUserName's role name
+/// — the migrations' own user's, which the analyzer doesn't know, as
+/// `current_user`.
+fn role_display(user: &str) -> &str {
+    if user == PgCatalog::MIGRATIONS_USER {
+        "current_user"
+    } else {
+        user
     }
 }
 
@@ -552,14 +648,15 @@ pub fn create_user_mapping(
     stmt: &CreateUserMappingStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
-    let user = role_name(stmt.user.as_deref());
+    let user = role_name(interp, stmt.user.as_deref());
     let key = (user.clone(), stmt.servername.clone());
     if interp.foreign_data.user_mappings.contains(&key) {
         if stmt.if_not_exists {
             return Ok(());
         }
         return Err(DdlError::DuplicateObject(format!(
-            "user mapping for \"{user}\" already exists for server \"{}\"",
+            "user mapping for \"{}\" already exists for server \"{}\"",
+            role_display(&user),
             stmt.servername
         )));
     }
@@ -577,14 +674,15 @@ pub fn alter_user_mapping(
     stmt: &typedpg_pg_query::ast::AlterUserMappingStmt,
 ) -> Result<(), DdlError> {
     check_server(interp, &stmt.servername)?;
-    let user = role_name(stmt.user.as_deref());
+    let user = role_name(interp, stmt.user.as_deref());
     if !interp
         .foreign_data
         .user_mappings
         .contains(&(user.clone(), stmt.servername.clone()))
     {
         return Err(DdlError::TypeNotFound(format!(
-            "user mapping for \"{user}\" does not exist for server \"{}\"",
+            "user mapping for \"{}\" does not exist for server \"{}\"",
+            role_display(&user),
             stmt.servername
         )));
     }
@@ -605,7 +703,7 @@ pub fn drop_user_mapping(
         }
         return Err(server_missing(&stmt.servername));
     }
-    let user = role_name(stmt.user.as_deref());
+    let user = role_name(interp, stmt.user.as_deref());
     let key = (user.clone(), stmt.servername.clone());
     let before = interp.foreign_data.user_mappings.len();
     interp.foreign_data.user_mappings.retain(|m| *m != key);
@@ -615,7 +713,8 @@ pub fn drop_user_mapping(
         .remove(&OptionsOwner::UserMapping(key.0.clone(), key.1.clone()));
     if interp.foreign_data.user_mappings.len() == before && !stmt.missing_ok {
         return Err(DdlError::TypeNotFound(format!(
-            "user mapping for \"{user}\" does not exist for server \"{}\"",
+            "user mapping for \"{}\" does not exist for server \"{}\"",
+            role_display(&user),
             stmt.servername
         )));
     }

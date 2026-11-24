@@ -149,6 +149,38 @@ fn view_column_defaults_reach_the_base_relation() {
 
 /// view_col_is_auto_updatable: only plain user columns of the base
 /// relation can be written.
+/// view_col_is_auto_updatable reads the transformed query: a cast to the
+/// type and typmod a column already has builds nothing, and a field of the
+/// relation's whole row is its column (ParseComplexProjection) — both are
+/// the column's Var.
+#[test]
+fn a_column_cast_to_its_own_type_or_selected_from_the_row_is_updatable() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (a int, b varchar(5));
+         CREATE VIEW vc AS SELECT a::int AS a, b::varchar(5) AS b FROM t;
+         CREATE VIEW vf AS SELECT (t).a FROM t;
+         CREATE VIEW vn AS SELECT a::bigint AS a, b::varchar(3) AS b, a AS c FROM t;",
+    )
+    .unwrap();
+    assert_ok(&db, "INSERT INTO vc (a, b) VALUES (1, 'x')");
+    assert_ok(&db, "UPDATE vf SET a = 1");
+    for (sql, msg) in [
+        (
+            "INSERT INTO vn (a) VALUES (1)",
+            "cannot insert into column \"a\" of view \"vn\" (View columns that are not columns \
+             of their base relation are not updatable.)",
+        ),
+        (
+            "INSERT INTO vn (b) VALUES ('x')",
+            "cannot insert into column \"b\" of view \"vn\" (View columns that are not columns \
+             of their base relation are not updatable.)",
+        ),
+    ] {
+        assert_prefix(&db, sql, msg);
+    }
+}
+
 #[test]
 fn non_updatable_view_columns() {
     let db = setup();
@@ -291,6 +323,26 @@ fn instead_of_triggers() {
     assert!(
         matches!(err, AnalyzeError::FeatureNotSupported(_)),
         "{err:?}"
+    );
+}
+
+#[test]
+fn a_rule_action_writes_a_renamed_column() {
+    // PG keeps a rule action's target columns by attnum: renamed, the
+    // identity column is still the one the action writes, which
+    // rewriteTargetListIU refuses when the rule fires.
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE ta (a int GENERATED ALWAYS AS IDENTITY, b int);
+         CREATE TABLE tr (x int);
+         CREATE RULE r AS ON INSERT TO tr DO ALSO INSERT INTO ta (a, b) VALUES (new.x, 1);
+         ALTER TABLE ta RENAME a TO a2;",
+    )
+    .unwrap();
+    assert_prefix(
+        &db,
+        "INSERT INTO tr VALUES (1)",
+        "cannot insert a non-DEFAULT value into column \"a2\"",
     );
 }
 

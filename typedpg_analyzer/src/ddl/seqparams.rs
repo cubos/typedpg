@@ -17,6 +17,8 @@ pub(crate) struct SeqParams {
     pub(crate) max: i128,
     pub(crate) start: i128,
     pub(crate) cache: i128,
+    /// `seqcycle`: CYCLE.
+    pub(crate) cycle: bool,
 }
 
 fn type_range(typ: PgTypeOid) -> (i128, i128) {
@@ -40,6 +42,7 @@ impl SeqParams {
             max: type_max,
             start: 1,
             cache: 1,
+            cycle: false,
         }
     }
 }
@@ -68,8 +71,22 @@ impl SeqParams {
                 .into(),
             ))
         };
+        let cycle = Some(ast::Node::DefElem(
+            DefElem {
+                defname: "cycle".to_owned(),
+                arg: Some(ast::Node::Boolean(
+                    typedpg_pg_query::ast::Boolean {
+                        boolval: self.cycle,
+                    }
+                    .into(),
+                )),
+                ..Default::default()
+            }
+            .into(),
+        ));
         vec![
             def("cache", self.cache),
+            cycle,
             def("increment", self.increment),
             def("maxvalue", self.max),
             def("minvalue", self.min),
@@ -132,6 +149,7 @@ fn apply(
     let mut start = None;
     let mut restart: Option<Option<i128>> = None;
     let mut cache = None;
+    let mut cycle = None;
     for opt in options {
         let Some(ast::Node::DefElem(de)) = opt.as_ref() else {
             continue;
@@ -170,11 +188,23 @@ fn apply(
             "start" => start = numeric_arg(de)?,
             "restart" => restart = Some(numeric_arg(de)?),
             "cache" => cache = numeric_arg(de)?,
+            // defGetBoolean: `CYCLE` / `NO CYCLE`.
+            "cycle" => {
+                cycle = Some(match de.arg.as_ref() {
+                    Some(ast::Node::Boolean(b)) => b.boolval,
+                    Some(ast::Node::Integer(i)) => i.ival != 0,
+                    _ => true,
+                })
+            }
             _ => {}
         }
     }
+    let cycle = cycle;
 
     let mut p = old;
+    if let Some(cycle) = cycle {
+        p.cycle = cycle;
+    }
     if let Some(typ) = as_type {
         if typ != oid::INT2 && typ != oid::INT4 && typ != oid::INT8 {
             return Err(DdlError::UnsupportedDdl(

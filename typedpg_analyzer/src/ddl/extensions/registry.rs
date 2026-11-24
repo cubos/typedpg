@@ -809,6 +809,26 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             },
         ],
     },
+    // ── plperl (src/pl/plperl) ─────────────────────────────────────────
+    ExtensionDef {
+        name: "plperl",
+        default_version: "1.0",
+        versions: &[ExtensionVersion {
+            version: "1.0",
+            from: None,
+            sql: include_str!("../../extensions/plperl--1.0.sql"),
+        }],
+    },
+    // ── plperlu (src/pl/plperl) ────────────────────────────────────────
+    ExtensionDef {
+        name: "plperlu",
+        default_version: "1.0",
+        versions: &[ExtensionVersion {
+            version: "1.0",
+            from: None,
+            sql: include_str!("../../extensions/plperlu--1.0.sql"),
+        }],
+    },
     // ── plpgsql (src/pl/plpgsql, installed by initdb) ─────────────────
     ExtensionDef {
         name: "plpgsql",
@@ -817,6 +837,16 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
             version: "1.0",
             from: None,
             sql: include_str!("../../extensions/plpgsql--1.0.sql"),
+        }],
+    },
+    // ── plpython3u (src/pl/plpython) ───────────────────────────────────
+    ExtensionDef {
+        name: "plpython3u",
+        default_version: "1.0",
+        versions: &[ExtensionVersion {
+            version: "1.0",
+            from: None,
+            sql: include_str!("../../extensions/plpython3u--1.0.sql"),
         }],
     },
     // ── postgres_fdw ───────────────────────────────────────────────────
@@ -1044,77 +1074,136 @@ pub(super) static REGISTRY: &[ExtensionDef] = &[
     ExtensionDef {
         name: "postgis",
         default_version: "3.7.0",
-        versions: &[ExtensionVersion {
-            version: "3.7.0",
-            from: None,
-            sql: include_str!("../../extensions/postgis--3.7.0.sql"),
-        }],
+        versions: &[
+            ExtensionVersion {
+                version: "3.7.0",
+                from: None,
+                sql: include_str!("../../extensions/postgis--3.7.0.sql"),
+            },
+            // The pseudo-versions: `unpackaged` installs nothing, `ANY`
+            // only tags the version (their scripts back to 3.7.0, the full
+            // upgrade, are not bundled).
+            ExtensionVersion {
+                version: "unpackaged",
+                from: None,
+                sql: include_str!("../../extensions/postgis--unpackaged.sql"),
+            },
+            ExtensionVersion {
+                version: "ANY",
+                from: Some("3.7.0"),
+                sql: include_str!("../../extensions/postgis--3.7.0--ANY.sql"),
+            },
+        ],
+    },
+    // ── postgis-3: a control file alone, which nothing installs ──────────
+    ExtensionDef {
+        name: "postgis-3",
+        default_version: "3.7.0",
+        versions: &[],
     },
     // ── postgis_raster ────────────────────────────────────────────────
     ExtensionDef {
         name: "postgis_raster",
         default_version: "3.7.0",
-        versions: &[ExtensionVersion {
-            version: "3.7.0",
-            from: None,
-            sql: include_str!("../../extensions/postgis_raster--3.7.0.sql"),
-        }],
+        versions: &[
+            ExtensionVersion {
+                version: "3.7.0",
+                from: None,
+                sql: include_str!("../../extensions/postgis_raster--3.7.0.sql"),
+            },
+            // The pseudo-versions: `unpackaged` installs nothing, `ANY`
+            // only tags the version (their scripts back to 3.7.0, the full
+            // upgrade, are not bundled).
+            ExtensionVersion {
+                version: "unpackaged",
+                from: None,
+                sql: include_str!("../../extensions/postgis_raster--unpackaged.sql"),
+            },
+            ExtensionVersion {
+                version: "ANY",
+                from: Some("3.7.0"),
+                sql: include_str!("../../extensions/postgis_raster--3.7.0--ANY.sql"),
+            },
+        ],
+    },
+    // ── postgis_raster-3: a control file alone, which nothing installs ──────────
+    ExtensionDef {
+        name: "postgis_raster-3",
+        default_version: "3.7.0",
+        versions: &[],
     },
     // ── postgis_sfcgal ────────────────────────────────────────────────
     ExtensionDef {
         name: "postgis_sfcgal",
         default_version: "3.7.0",
-        versions: &[ExtensionVersion {
-            version: "3.7.0",
-            from: None,
-            sql: include_str!("../../extensions/postgis_sfcgal--3.7.0.sql"),
-        }],
+        versions: &[
+            ExtensionVersion {
+                version: "3.7.0",
+                from: None,
+                sql: include_str!("../../extensions/postgis_sfcgal--3.7.0.sql"),
+            },
+            // The pseudo-versions: `unpackaged` installs nothing, `ANY`
+            // only tags the version (their scripts back to 3.7.0, the full
+            // upgrade, are not bundled).
+            ExtensionVersion {
+                version: "unpackaged",
+                from: None,
+                sql: include_str!("../../extensions/postgis_sfcgal--unpackaged.sql"),
+            },
+            ExtensionVersion {
+                version: "ANY",
+                from: Some("3.7.0"),
+                sql: include_str!("../../extensions/postgis_sfcgal--3.7.0--ANY.sql"),
+            },
+        ],
+    },
+    // ── postgis_sfcgal-3: a control file alone, which nothing installs ──────────
+    ExtensionDef {
+        name: "postgis_sfcgal-3",
+        default_version: "3.7.0",
+        versions: &[],
     },
     // ── postgis_topology ──────────────────────────────────────────────
     ExtensionDef {
         name: "postgis_topology",
         default_version: "3.7.0",
-        versions: &[ExtensionVersion {
-            version: "3.7.0",
-            from: None,
-            sql: include_str!("../../extensions/postgis_topology--3.7.0.sql"),
-        }],
+        versions: &[
+            ExtensionVersion {
+                version: "3.7.0",
+                from: None,
+                sql: include_str!("../../extensions/postgis_topology--3.7.0.sql"),
+            },
+            // The pseudo-versions: `unpackaged` installs nothing, `ANY`
+            // only tags the version (their scripts back to 3.7.0, the full
+            // upgrade, are not bundled).
+            ExtensionVersion {
+                version: "unpackaged",
+                from: None,
+                sql: include_str!("../../extensions/postgis_topology--unpackaged.sql"),
+            },
+            ExtensionVersion {
+                version: "ANY",
+                from: Some("3.7.0"),
+                sql: include_str!("../../extensions/postgis_topology--3.7.0--ANY.sql"),
+            },
+        ],
+    },
+    // ── postgis_topology-3: a control file alone, which nothing installs ──────────
+    ExtensionDef {
+        name: "postgis_topology-3",
+        default_version: "3.7.0",
+        versions: &[],
     },
     // ── vector (pgvector) ──────────────────────────────────────────────
+    // What the pgvector/pgvector:pg19 image ships: 0.8.7's install script,
+    // no older version and no update script.
     ExtensionDef {
         name: "vector",
         default_version: "0.8.7",
-        versions: &[
-            ExtensionVersion {
-                version: "0.8.2",
-                from: None,
-                sql: include_str!("../../extensions/vector--0.8.2.sql"),
-            },
-            ExtensionVersion {
-                version: "0.8.3",
-                from: Some("0.8.2"),
-                sql: include_str!("../../extensions/vector--0.8.2--0.8.3.sql"),
-            },
-            ExtensionVersion {
-                version: "0.8.4",
-                from: Some("0.8.3"),
-                sql: include_str!("../../extensions/vector--0.8.3--0.8.4.sql"),
-            },
-            ExtensionVersion {
-                version: "0.8.5",
-                from: Some("0.8.4"),
-                sql: include_str!("../../extensions/vector--0.8.4--0.8.5.sql"),
-            },
-            ExtensionVersion {
-                version: "0.8.6",
-                from: Some("0.8.5"),
-                sql: include_str!("../../extensions/vector--0.8.5--0.8.6.sql"),
-            },
-            ExtensionVersion {
-                version: "0.8.7",
-                from: Some("0.8.6"),
-                sql: include_str!("../../extensions/vector--0.8.6--0.8.7.sql"),
-            },
-        ],
+        versions: &[ExtensionVersion {
+            version: "0.8.7",
+            from: None,
+            sql: include_str!("../../extensions/vector--0.8.7.sql"),
+        }],
     },
 ];

@@ -241,6 +241,23 @@ fn rename_column_refs_everywhere(interp: &mut PgCatalog, relid: PgClassOid, old:
         spec.rename_key_column(old, new);
         interp.partition_specs.insert(relid, spec);
     }
+    // The statistics objects' expressions (kept for the catalog oracle;
+    // PG's `stxexprs` reads the column by attnum).
+    #[cfg(feature = "pg_sanity")]
+    for st in interp.statistics.iter_mut().filter(|s| s.relid == relid) {
+        for e in &mut st.expressions {
+            if let StoredExpr::Written(expr) = e {
+                rename_column_refs(expr, &relname, &columns, old, new);
+            }
+        }
+    }
+    // The partition key's expressions.
+    if let Some(mut exprs) = interp.partition_key_exprs.get(&relid).cloned() {
+        for e in &mut exprs {
+            rename_column_refs(&mut e.ast, &relname, &columns, old, new);
+        }
+        interp.partition_key_exprs.insert(relid, exprs);
+    }
     // A trigger's UPDATE OF columns (`tgattr`, by attnum: the rename
     // reaches them).
     if let Some(triggers) = interp.triggers.get_mut(&relid) {
@@ -272,11 +289,89 @@ fn rename_column_refs_everywhere(interp: &mut PgCatalog, relid: PgClassOid, old:
     }
 }
 
+/// One-dimensional array literal `text` (`{a,"b c"}`) with its elements
+/// equal to `old` replaced by `new` (quoted as array_out would where it
+/// needs to); `None` for a literal this doesn't take apart (nested,
+/// dimension decorations, NULL spelled otherwise).
+fn rename_array_element(text: &str, old: &str, new: &str) -> Option<String> {
+    let inner = text.trim().strip_prefix('{')?.strip_suffix('}')?;
+    if inner.contains('{') || inner.contains('}') {
+        return None;
+    }
+    let mut elements: Vec<String> = Vec::new();
+    let mut chars = inner.chars().peekable();
+    if inner.trim().is_empty() {
+        return Some(text.to_owned());
+    }
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut element = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '\\' => element.push(chars.next()?),
+                    '"' => break,
+                    c => element.push(c),
+                }
+            }
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            if element == old {
+                element = new.to_owned();
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ',' {
+                    break;
+                }
+                if c == '"' || c == '\\' {
+                    return None;
+                }
+                element.push(c);
+                chars.next();
+            }
+            let trimmed = element.trim_end().to_owned();
+            element = if trimmed == old {
+                new.to_owned()
+            } else {
+                trimmed
+            };
+        }
+        elements.push(element);
+        match chars.next() {
+            Some(',') => continue,
+            None => break,
+            Some(_) => return None,
+        }
+    }
+    let quote = |e: &String| {
+        let plain = !e.is_empty()
+            && !e.eq_ignore_ascii_case("null")
+            && !e
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '"' | '\\' | ',' | '{' | '}'));
+        if plain {
+            e.clone()
+        } else {
+            format!("\"{}\"", e.replace('\\', "\\\\").replace('"', "\\\""))
+        }
+    };
+    Some(format!(
+        "{{{}}}",
+        elements.iter().map(quote).collect::<Vec<_>>().join(",")
+    ))
+}
+
 /// ALTER TYPE ... RENAME VALUE `old` TO `new` of enum `enum_oid`: the
 /// label constants of that type in CHECK constraints (by the types their
 /// literals were resolved to, see [`crate::nonnull::TrustedNodes`]) and in
-/// column defaults read the new label. A CHECK whose label can't be
-/// rewritten — inside an array literal — is no longer trusted for its
+/// column defaults read the new label — among an array literal's
+/// elements too. A CHECK whose label can't be rewritten — inside an array
+/// literal this doesn't take apart — is no longer trusted for its
 /// comparisons.
 pub(crate) fn rename_enum_label(interp: &mut PgCatalog, enum_oid: PgTypeOid, old: &str, new: &str) {
     rename_enum_label_everywhere(interp, enum_oid, old, new);
@@ -328,7 +423,16 @@ fn rename_enum_label_everywhere(interp: &mut PgCatalog, enum_oid: PgTypeOid, old
                     s.sval = new.to_owned();
                     changed = true;
                 }
-            } else if (is_enum_array(interp, t) || is_pseudo(interp, t)) && s.sval.contains(old) {
+            } else if is_enum_array(interp, t) && s.sval.contains(old) {
+                // The label among an array literal's elements.
+                match rename_array_element(&s.sval, old, new) {
+                    Some(text) => {
+                        changed |= text != s.sval;
+                        s.sval = text;
+                    }
+                    None => stale = true,
+                }
+            } else if is_pseudo(interp, t) && s.sval.contains(old) {
                 stale = true;
             }
         });
@@ -445,6 +549,9 @@ enum Slot {
     DomainCheck(PgTypeOid, usize),
     DomainDefault(PgTypeOid),
     TriggerWhen(PgClassOid, usize),
+    /// A routine's parameter DEFAULT, by its place among the routine's
+    /// defaults.
+    ArgDefault(crate::oid::PgProcOid, usize),
     /// A policy's USING (`false`) or WITH CHECK (`true`) expression.
     Policy(PgClassOid, String, bool),
 }
@@ -543,6 +650,13 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
             out.push((Slot::DomainDefault(domain), Over::Nothing, (**expr).clone()));
         }
     }
+    for (&proc, defaults) in interp.routine_defaults.iter() {
+        for (i, d) in defaults.iter().enumerate() {
+            if d.expr.is_some() {
+                out.push((Slot::ArgDefault(proc, i), Over::Nothing, d.expr.clone()));
+            }
+        }
+    }
     for (&relid, triggers) in interp.triggers.iter() {
         for (i, t) in triggers.iter().enumerate() {
             if t.when.is_some() {
@@ -559,7 +673,29 @@ fn stored_expressions(interp: &PgCatalog, policies: bool) -> Vec<(Slot, Over, Op
 
 /// The name slots of `expr`, analyzed over `over`, and what they resolved
 /// to.
-fn bindings_of(interp: &PgCatalog, over: Over, expr: Option<&ast::Node>) -> Bindings {
+/// The type a slot's expression is coerced to by assignment, which its
+/// untyped literals take (`DEFAULT 'f'` of a `regproc` column is a
+/// `regproc` constant): a column default's or generation expression's
+/// column type, a domain default's domain, a parameter default's
+/// parameter type (not a polymorphic one's).
+fn slot_target(interp: &PgCatalog, slot: &Slot) -> Option<PgTypeOid> {
+    match slot {
+        Slot::Default(relid, attnum) => interp
+            .attributes_of(*relid)
+            .iter()
+            .find(|a| a.attnum == *attnum)
+            .map(|a| a.atttypid),
+        Slot::DomainDefault(domain) => Some(*domain),
+        Slot::ArgDefault(proc, i) => {
+            let param = interp.routine_defaults.get(proc)?.get(*i)?.param;
+            let t = *interp.pg_proc.get(proc)?.proargtypes.get(param)?;
+            (!crate::polymorphic::is_polymorphic(t)).then_some(t)
+        }
+        _ => None,
+    }
+}
+
+fn bindings_of(interp: &PgCatalog, slot: &Slot, over: Over, expr: Option<&ast::Node>) -> Bindings {
     use crate::qualified_name::QualifiedName;
     let mut scope = crate::scope::Scope::default();
     let mut analyzed = expr.cloned();
@@ -627,7 +763,10 @@ fn bindings_of(interp: &PgCatalog, over: Over, expr: Option<&ast::Node>) -> Bind
             analyzed.as_ref(),
             crate::expr::Ctx::new(&scope, &null_ctx, interp).logging_strictness(&log),
             &mut params,
-            crate::expr::TypeGoal::NONE,
+            slot_target(interp, slot).map_or(
+                crate::expr::TypeGoal::NONE,
+                crate::expr::TypeGoal::assignment,
+            ),
         )
     });
     Bindings {
@@ -785,7 +924,7 @@ pub(crate) fn follow_rename(interp: &mut PgCatalog, renamed: Renamed<'_>) {
         .into_iter()
         .filter(|(_, _, expr)| names.as_ref().is_none_or(|n| mentions(expr.as_ref(), n)))
         .filter_map(|(slot, over, mut expr)| {
-            let refs = bindings_of(interp, over, expr.as_ref()).refs;
+            let refs = bindings_of(interp, &slot, over, expr.as_ref()).refs;
             let before = expr.clone();
             rewrite_slots(interp, &mut expr, &refs, renamed);
             (expr != before).then_some((slot, expr))
@@ -854,6 +993,14 @@ fn write_slot(interp: &mut PgCatalog, slot: Slot, expr: Option<ast::Node>) {
             interp
                 .domain_default_exprs
                 .insert(domain, StoredExpr::Written(Box::new(expr)));
+        }
+        Slot::ArgDefault(proc, i) => {
+            if let Some(mut defaults) = interp.routine_defaults.get(&proc).cloned()
+                && let Some(d) = defaults.get_mut(i)
+            {
+                d.expr = expr;
+                interp.routine_defaults.insert(proc, defaults);
+            }
         }
         Slot::TriggerWhen(relid, i) => {
             if let Some(t) = interp.triggers.get_mut(&relid).and_then(|ts| ts.get_mut(i)) {
@@ -944,6 +1091,14 @@ fn user_object_names(interp: &PgCatalog) -> std::collections::HashSet<String> {
             .values()
             .filter(|c| user(c.relnamespace))
             .map(|c| c.relname.clone()),
+    );
+    // A `regconfig` / `regdictionary` constant names a text search object.
+    names.extend(
+        interp
+            .pg_ts_objects
+            .iter()
+            .filter(|o| user(o.namespace))
+            .map(|o| o.name.clone()),
     );
     names
 }
@@ -1083,7 +1238,7 @@ pub(crate) fn bind_stored_expressions(interp: &mut PgCatalog) -> Result<(), supe
                 .contains(&tree_hash(expr.as_ref()))
         })
         .filter_map(|(slot, over, mut expr)| {
-            let bindings = bindings_of(interp, over, expr.as_ref());
+            let bindings = bindings_of(interp, &slot, over, expr.as_ref());
             let before = expr.clone();
             bind_slots(interp, &mut expr, &bindings);
             seen.push(tree_hash(expr.as_ref()));
@@ -1459,7 +1614,7 @@ fn note_reg_constants(interp: &PgCatalog, renamed: Renamed<'_>) {
         if !has_string {
             continue;
         }
-        let literals = bindings_of(interp, over, expr.as_ref()).literals;
+        let literals = bindings_of(interp, &slot, over, expr.as_ref()).literals;
         for (n, ..) in expr.iter().flat_map(|e| e.nodes()) {
             let typedpg_pg_query::NodeRef::AConst(c) = n else {
                 continue;
@@ -1641,7 +1796,7 @@ fn refuse_unstorable_constants(interp: &PgCatalog) -> Result<(), super::DdlError
         if !candidate {
             continue;
         }
-        let literals = bindings_of(interp, over, expr.as_ref()).literals;
+        let literals = bindings_of(interp, &slot, over, expr.as_ref()).literals;
         if let Some(typname) = literals.values().find_map(|&t| unstorable_type(interp, t)) {
             return refused(typname);
         }

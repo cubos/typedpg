@@ -16,6 +16,8 @@ mod common;
 mod alter_table;
 #[path = "ddl/casts.rs"]
 mod casts;
+#[path = "ddl/catalog_depend.rs"]
+mod catalog_depend;
 #[path = "ddl/catalog_state.rs"]
 mod catalog_state;
 #[path = "ddl/constraints.rs"]

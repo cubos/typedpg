@@ -15,36 +15,78 @@
 //!
 //! Compared, from the seed rows: `pg_namespace`, `pg_class` (relkind,
 //! reltype), `pg_type` (every column), `pg_enum` (order and sort values),
-//! `pg_range`, `pg_attribute`, `pg_proc`, `pg_aggregate`, `pg_operator`,
-//! `pg_cast`, `pg_extension`, `pg_language`, `pg_constraint` (table
-//! constraints: keys by column name, flags), `pg_index` (keys, classes,
-//! collations, flags), `pg_inherits` (index inheritance included),
-//! `pg_collation`, `pg_opfamily`, `pg_opclass`, text search objects,
-//! `pg_conversion`, and `pg_depend`'s extension memberships. From the side
-//! tables ([`super::catalog_extras`]): `pg_class`'s persistence, row
-//! security, replica identity, partition / typed-table / TOAST flags,
-//! `pg_trigger`, `pg_policy`, `pg_sequence`, constraints' deferrability and
-//! foreign-key actions, domain constraints, `pg_index`'s validity,
-//! immediacy, clustering, access method and column names,
-//! `pg_partitioned_table`, rules, and columns' storage and compression.
+//! `pg_range`, `pg_attribute`, `pg_proc` (`proargdefaulttypes` too: the
+//! server's from its deparsed `proargdefaults`), `pg_aggregate`,
+//! `pg_operator`, `pg_cast`, `pg_extension`, `pg_language`,
+//! `pg_constraint` (table constraints: keys by column name, flags),
+//! `pg_index` (keys, classes, collations, flags), `pg_inherits` (index
+//! inheritance included), `pg_collation`, `pg_opfamily`, `pg_opclass`, text
+//! search objects, `pg_conversion`. From the side tables
+//! ([`super::catalog_extras`]): `pg_class`'s persistence, row security,
+//! replica identity, partition / typed-table / TOAST flags, `pg_trigger`,
+//! `pg_policy`, `pg_sequence` (`seqcycle` included), constraints'
+//! deferrability and foreign-key actions, domain constraints, `pg_index`'s
+//! validity, immediacy, clustering, access method and column names,
+//! `pg_partitioned_table`, rules, columns' storage and compression,
+//! `pg_statistic_ext` (`stxkeys` by column name, `stxkind`, how many
+//! expressions), `pg_publication` (FOR ALL TABLES / SEQUENCES, via root,
+//! the `publish` flags, `pubgencols`), `pg_publication_rel` (whether it has
+//! a row filter and a column list, `prexcept`) and
+//! `pg_publication_namespace`.
+//!
+//! `pg_depend`: every row with an end the migrations created, both ends
+//! named — `(classid, objid, objsubid)` by the object's identity, an object
+//! of a catalog the seed rows don't cover (a column default, a rule, a
+//! trigger, a policy, a statistics object, a publication's member, a domain
+//! constraint, an operator family's member, a foreign server…) by what
+//! identifies it there ([`super::catalog_extras::DepObject`]) — and the
+//! deptype. The analyzer's side is its own `pg_depend` rows plus the ones
+//! PG records for facts it keeps as structure, derived from that structure
+//! ([`super::catalog_depend`]).
+//!
+//! Stored expressions ([`super::catalog_exprs`]): column defaults and
+//! generation expressions, CHECK constraints, index expressions and
+//! predicates, policies' USING and WITH CHECK, triggers' WHEN, partition
+//! bounds and key expressions, statistics expressions, domain defaults and
+//! CHECKs, routines' parameter defaults, compared as PG compares stored
+//! expressions — transformed, not as text. Views' queries: PG's, resolved
+//! by the analyzer as CREATE VIEW resolves one, must bind the objects the
+//! analyzer's view bound, produce its columns' types, typmods and
+//! collations, support the NOT NULL it infers, and make it updatable alike.
+//! Rules: PG's definition, analyzed as CREATE RULE is, must make the rule
+//! the analyzer keeps (event, INSTEAD, condition, RETURNING, actions and
+//! their rewrites, planning errors). A server deparse is read back as the
+//! migrations' session, whose deparse it is, reads it.
 //!
 //! Normalized, where the analyzer keeps a fact its own way: a temporary
 //! schema is `pg_temp` (and its row isn't compared), another session's is
-//! hidden; TOAST relations are a flag; index columns are names, not
-//! `pg_attribute` rows; a view column's `attnotnull` (the analyzer's
-//! inferred non-nullness) and an identity column's `atthasdef` (the
-//! analyzer's "filled when omitted") are not compared; `proallargtypes` /
-//! `proargmodes` / `proargnames` are compared as every parameter's type,
-//! mode and name (the analyzer stores them together); an index of a
-//! built-in relation (REINDEX CONCURRENTLY gives it a new OID) is skipped.
+//! hidden; TOAST relations are a flag (their `pg_depend` rows aren't
+//! compared); index columns are names, not `pg_attribute` rows; a view
+//! column's `attnotnull` (the analyzer's inferred non-nullness) and an
+//! identity column's `atthasdef` (the analyzer's "filled when omitted") are
+//! not compared; `proallargtypes` / `proargmodes` / `proargnames` are
+//! compared as every parameter's type, mode and name (the analyzer stores
+//! them together); an index of a built-in relation (REINDEX CONCURRENTLY
+//! gives it a new OID) is skipped. In `pg_depend`: the rows of a foreign
+//! key's internal triggers aren't compared — they only tie the triggers to
+//! their constraint (DEPENDENCY_INTERNAL; a partition's clones to their
+//! parent's too), nothing can depend on a trigger it creates internally,
+//! and the analyzer models the constraint, not its triggers; a row the
+//! analyzer keeps for an object a DROP removed is skipped — it forgets such
+//! rows lazily, the next time a DROP consults them, and none of them is
+//! read before.
 //!
-//! Not compared: stored expressions (`indexprs` / `indpred` by presence
-//! only; `conbin`, `adbin`, `ev_action`, `polqual`, `tgqual`…), `pg_depend`
-//! but extension membership (the analyzer records only the dependencies its
-//! DROPs need, in its own conventions), `pg_proc.proargdefaulttypes` (the
-//! export can't read it), ACLs and owners (the privilege oracle compares
-//! them), `pg_statistic_ext`, publications, sequences' `seqcycle`, and
-//! everything physical (relpages, relfilenode…).
+//! Uncertain state (`ddl::uncertain`): what code the analyzer couldn't
+//! follow may have changed is compared only as far as it is known — a
+//! routine it may have redefined for existing (not its definition, its
+//! parameter defaults or its `pg_depend` rows), a trigger it may have
+//! enabled or disabled but for its state, default privileges it may have
+//! altered but for their rows' dependencies; a catalog anything may have
+//! changed in ends the comparisons.
+//!
+//! Not compared: ACLs and owners (the privilege oracle compares them), and
+//! everything physical (relpages, relfilenode…), which the analyzer
+//! doesn't model.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -62,6 +104,19 @@ type Row = BTreeMap<&'static str, String>;
 /// The normalized user rows of one side: `(table, identity)` → fields.
 #[derive(Debug, Default)]
 pub(crate) struct Dump(BTreeMap<(&'static str, String), Row>);
+
+impl Dump {
+    /// Each row as a line: table, identity and fields.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|((table, identity), row)| {
+                let fields: Vec<String> = row.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("{table} {identity} {}", fields.join(" "))
+            })
+            .collect()
+    }
+}
 
 /// What one side's OIDs name.
 struct Names<'a> {
@@ -86,6 +141,9 @@ struct Names<'a> {
     /// Objects of catalogs the seed rows don't cover, `(classid, objid)` →
     /// identity: access methods, foreign-data wrappers.
     extra: &'a HashMap<(u32, u32), String>,
+    /// The objects of the catalogs the seed rows don't cover that
+    /// `pg_depend` rows name.
+    dep_objects: &'a HashMap<(u32, u32), super::catalog_extras::DepObject>,
 }
 
 /// What a side knows beyond its seed rows.
@@ -122,6 +180,7 @@ impl<'a> Names<'a> {
         Self {
             model,
             extra: &aux.names,
+            dep_objects: &aux.extras.dep_objects,
             ns: seed
                 .pg_namespace
                 .iter()
@@ -419,6 +478,14 @@ impl<'a> Names<'a> {
     }
 
     fn ext(&self, oid: u32) -> String {
+        if !is_user(oid) {
+            // initdb's (plpgsql), named through the analyzer's catalog.
+            return self
+                .model
+                .pg_extension
+                .get(&crate::oid::PgExtensionOid::from_raw(oid))
+                .map_or_else(|| Self::unknown(oid), |e| e.extname.clone());
+        }
         self.ext
             .get(&oid)
             .map(|e| e.extname.clone())
@@ -450,7 +517,9 @@ impl<'a> Names<'a> {
         use crate::ddl::depend as d;
         use crate::pg_catalog as c;
         let classid_oid = crate::oid::PgClassOid::from_raw(classid);
-        if classid_oid == c::PG_CLASS_RELID {
+        if let Some(object) = self.dep_objects.get(&(classid, objid)) {
+            self.dep_object(object)
+        } else if classid_oid == c::PG_CLASS_RELID {
             if objsubid != 0 {
                 format!("column {}.{}", self.rel(objid), self.att(objid, objsubid))
             } else {
@@ -489,12 +558,24 @@ impl<'a> Names<'a> {
         ]
         .contains(&classid_oid)
         {
-            match self.ts.get(&objid) {
+            let builtin = || {
+                self.model
+                    .pg_ts_objects
+                    .iter()
+                    .find(|t| !is_user(objid) && t.oid.get() == objid)
+            };
+            match self.ts.get(&objid).copied().or_else(builtin) {
                 Some(t) => format!("text search {}", self.ts(t)),
                 None => format!("text search object {}", Self::unknown(objid)),
             }
         } else if classid == 2607 {
-            match self.conv.get(&objid) {
+            let builtin = || {
+                self.model
+                    .conversions
+                    .iter()
+                    .find(|c| !is_user(objid) && c.oid.get() == objid)
+            };
+            match self.conv.get(&objid).copied().or_else(builtin) {
                 Some(conv) => format!(
                     "conversion {}",
                     self.qualified(conv.namespace.get(), &conv.name)
@@ -513,6 +594,84 @@ impl<'a> Names<'a> {
             // pg_rewrite, pg_policy…): its OIDs can't be normalized.
             format!("<catalog {classid}> {}", Self::unknown(objid))
         }
+    }
+}
+
+impl Names<'_> {
+    fn dep_object(&self, object: &super::catalog_extras::DepObject) -> String {
+        use super::catalog_extras::DepObject as O;
+        match object {
+            O::Attrdef { relid, attnum } => {
+                format!(
+                    "default of {}.{}",
+                    self.rel(*relid),
+                    self.att(*relid, *attnum)
+                )
+            }
+            O::Rule { relid, name } => format!("rule {name} on {}", self.rel(*relid)),
+            O::Trigger { relid, name } => format!("trigger {name} on {}", self.rel(*relid)),
+            O::InternalTrigger {
+                relid,
+                constraint,
+                function,
+            } => format!(
+                "internal trigger {} on {} of {}",
+                self.proc_(*function),
+                self.rel(*relid),
+                self.constraint(*constraint)
+            ),
+            O::Policy { relid, name } => format!("policy {name} on {}", self.rel(*relid)),
+            O::Statistics { nsp, name } => format!("statistics {}", self.qualified(*nsp, name)),
+            O::Publication(name) => format!("publication {name}"),
+            O::PublicationRel { publication, relid } => {
+                format!("publication {publication} of {}", self.rel(*relid))
+            }
+            O::PublicationNamespace { publication, nsp } => {
+                format!("publication {publication} of schema {}", self.nsp(*nsp))
+            }
+            O::DomainConstraint { typid, name } => {
+                format!("constraint {name} on domain {}", self.ty(*typid))
+            }
+            O::EventTrigger(name) => format!("event trigger {name}"),
+            O::Server(name) => format!("server {name}"),
+            O::Subscription(name) => format!("subscription {name}"),
+            O::UserMapping { user, server } => format!("user mapping for {user} on {server}"),
+            O::FamilyMember {
+                func,
+                family,
+                number,
+                left,
+                right,
+            } => format!(
+                "{} {number} ({}, {}) of {}",
+                if *func { "function" } else { "operator" },
+                self.ty(*left),
+                self.ty(*right),
+                self.opfamily(*family)
+            ),
+            O::Transform { typ, lang } => {
+                format!("transform for {} language {lang}", self.ty(*typ))
+            }
+            O::Conversion { nsp, name } => format!("conversion {}", self.qualified(*nsp, name)),
+            O::DefaultAcl { role, nsp, objtype } => format!(
+                "default privileges of {role} on {objtype} in {}",
+                if *nsp == 0 {
+                    "-".into()
+                } else {
+                    self.nsp(*nsp)
+                }
+            ),
+        }
+    }
+
+    /// Whether the object `(classid, objid)` is a TOAST relation (or one
+    /// of its columns): the analyzer models a TOAST table as a flag.
+    fn is_toast_object(&self, classid: u32, objid: u32) -> bool {
+        classid == crate::pg_catalog::PG_CLASS_RELID.get()
+            && self
+                .class
+                .get(&objid)
+                .is_some_and(|c| self.is_toast_schema(c.relnamespace.get()))
     }
 }
 
@@ -713,6 +872,10 @@ pub(crate) fn normalize(seed: &PgCatalogSeed, model: &PgCatalog, aux: &Aux) -> D
                 ("provariadic", n.ty(p.provariadic.map_or(0, |t| t.get()))),
                 ("proisstrict", b(p.proisstrict)),
                 ("pronargdefaults", p.pronargdefaults.to_string()),
+                (
+                    "proargdefaulttypes",
+                    n.types(p.proargdefaulttypes.iter().map(|t| t.get())),
+                ),
                 // PG stores proallargtypes / proargmodes only when some
                 // parameter is not IN, and proargnames when some parameter
                 // is named; the analyzer keeps the three together when
@@ -933,17 +1096,35 @@ pub(crate) fn normalize(seed: &PgCatalogSeed, model: &PgCatalog, aux: &Aux) -> D
             .pg_depend
             .iter()
             .filter(|d| is_user(d.objid.get()) || is_user(d.refobjid.get()))
-            // Only extension membership: the analyzer records the other
-            // dependencies its DROPs need where it has no structure that
-            // implies them (relnamespace, typrelid, conkey… stand for
-            // PG's structural edges), in its own conventions.
-            .filter(|d| d.deptype == crate::pg_catalog::DepType::Extension)
+            .filter(|d| {
+                // A foreign key's triggers are internal to it: their rows
+                // only tie them to it (DEPENDENCY_INTERNAL, partition clones
+                // to their parent's), and nothing can depend on them.
+                !matches!(
+                    n.dep_objects.get(&(d.classid.get(), d.objid.get())),
+                    Some(super::catalog_extras::DepObject::InternalTrigger { .. })
+                ) && !n.is_toast_object(d.classid.get(), d.objid.get())
+                    && !n.is_toast_object(d.refclassid.get(), d.refobjid.get())
+                    && !builtin_index.contains(&d.objid.get())
+            })
             .map(|d| {
+                let kind = aux.extras.partition_deps.get(&(
+                    d.classid.get(),
+                    d.objid.get(),
+                    d.objsubid,
+                    d.refclassid.get(),
+                    d.refobjid.get(),
+                    d.refobjsubid,
+                ));
                 format!(
-                    "{} -> {} ({:?})",
+                    "{} -> {} ({})",
                     n.object(d.classid.get(), d.objid.get(), d.objsubid),
                     n.object(d.refclassid.get(), d.refobjid.get(), d.refobjsubid),
-                    d.deptype
+                    match kind {
+                        Some(true) => "PartitionPri".to_owned(),
+                        Some(false) => "PartitionSec".to_owned(),
+                        None => format!("{:?}", d.deptype),
+                    }
                 )
             })
             .collect();
@@ -1026,6 +1207,50 @@ fn put_extras(
                 ("seqmax", s.max.to_string()),
                 ("seqmin", s.min.to_string()),
                 ("seqcache", s.cache.to_string()),
+                ("seqcycle", b(s.cycle)),
+            ]),
+        );
+    }
+    for p in &x.publications {
+        put(
+            "pg_publication",
+            p.name.clone(),
+            Row::from([
+                ("puballtables", b(p.alltables)),
+                ("puballsequences", b(p.allsequences)),
+                ("pubviaroot", b(p.viaroot)),
+                ("publish", format!("{:?}", p.publish)),
+                ("pubgencols", p.gencols.to_string()),
+            ]),
+        );
+        for &(relid, qual, cols, except) in p.relations.iter().filter(|r| has_rel(r.0)) {
+            put(
+                "pg_publication_rel",
+                format!("{} of {}", p.name, n.rel(relid)),
+                Row::from([
+                    ("prqual", b(qual)),
+                    ("prattrs", b(cols)),
+                    ("prexcept", b(except)),
+                ]),
+            );
+        }
+        for &nsp in &p.schemas {
+            put(
+                "pg_publication_namespace",
+                format!("{} of {}", p.name, n.nsp(nsp)),
+                Row::new(),
+            );
+        }
+    }
+    for s in x.statistics.iter().filter(|s| has_rel(s.relid)) {
+        put(
+            "pg_statistic_ext",
+            n.qualified(s.nsp, &s.name),
+            Row::from([
+                ("stxrelid", n.rel(s.relid)),
+                ("stxkeys", n.atts(s.relid, &s.keys)),
+                ("stxkind", s.kinds.iter().collect::<String>()),
+                ("stxexprs", s.exprs.to_string()),
             ]),
         );
     }

@@ -236,7 +236,7 @@ pub struct PgCatalog {
     /// Tablespaces, subscriptions and large objects migrations create.
     pub(crate) cluster_objects: crate::ddl::cluster::ClusterObjects,
     /// Transforms (`pg_transform`) migrations create: `(type, language)`.
-    pub(crate) transforms: Shared<Vec<(PgTypeOid, String)>>,
+    pub(crate) transforms: Shared<Vec<(PgTypeOid, String, crate::oid::PgGenericOid)>>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: Shared<HashMap<String, PgNamespaceOid>>,
@@ -2357,6 +2357,16 @@ impl PgCatalog {
         Some(f(&mut guard))
     }
 
+    /// The mirror's server catalog — its user rows, normalized as the
+    /// catalog oracle compares them, one line each — or `None` without a
+    /// mirror (the extension oracle compares two server states with it).
+    pub fn pg_sanity_server_catalog(&self) -> Option<Vec<String>> {
+        if self.pg_sanity_tainted {
+            return None;
+        }
+        self.with_pg_sanity(|server| server.server_catalog_lines(self))
+    }
+
     fn run_pg_sanity_apply_check(&self, sql: &str, result: &Result<(), DdlError>) {
         let roles = self.created_roles();
         self.with_pg_sanity::<()>(|server| {
@@ -2923,10 +2933,26 @@ impl PgCatalog {
         let index = row.indexrelid;
         self.pg_index.insert(index, row);
         crate::ddl::depend::record_index_opclasses(self, index);
+        // index_create: what its expressions and predicate refer to, for
+        // every index (a constraint's too).
+        crate::ddl::depend::record_index_expressions(self, index);
     }
 
     pub(crate) fn remove_pg_index(&mut self, indexrelid: PgClassOid) -> Option<PgIndex> {
         self.pg_index.remove(&indexrelid)
+    }
+
+    /// The `pg_rewrite` row whose OID is `oid` (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn pg_rewrite_row(&self, oid: u32) -> Option<&PgRewrite> {
+        self.pg_rewrite.values().find(|r| r.oid.get() == oid)
+    }
+
+    /// The `pg_rewrite` row of relation `relid`'s rule `name`.
+    pub(crate) fn pg_rewrite_of(&self, relid: PgClassOid, name: &str) -> Option<&PgRewrite> {
+        self.pg_rewrite
+            .values()
+            .find(|r| r.ev_class == relid && r.rulename == name)
     }
 
     pub(crate) fn insert_pg_rewrite(&mut self, row: PgRewrite) {

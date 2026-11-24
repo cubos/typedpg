@@ -343,7 +343,6 @@ pub fn create_index(db: &mut PgCatalog, stmt: &IndexStmt) -> Result<(), DdlError
         indcollation,
         indclass,
     });
-    crate::ddl::depend::record_index_expressions(db, indexrelid);
     // DefineIndex on a partitioned table recurses — not under ONLY, where
     // the index stays invalid while the table has partitions without one
     // attached (ALTER INDEX ... ATTACH PARTITION validates it).
@@ -1536,8 +1535,10 @@ pub(crate) fn rebuild_indexes_for_column_type(
                 row.indclass = index.indclass;
                 row.indcollation = index.indcollation;
             }
-            // The rebuilt index depends on its new classes.
+            // The rebuilt index depends on its new classes, and on what its
+            // expressions refer to now.
             crate::ddl::depend::record_index_opclasses(db, index.indexrelid);
+            crate::ddl::depend::record_index_expressions(db, index.indexrelid);
         }
     }
     Ok(())

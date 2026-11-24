@@ -427,6 +427,10 @@ pub(crate) struct RoutineDefault {
     /// evaluates the default still simplifies it (an `IMMUTABLE` call over
     /// constants in it runs, see `privileges::keep_default_simplified`).
     pub live: crate::privileges::Requirements,
+    /// The expression as written (`proargdefaults` keeps it cooked), bound
+    /// to the objects it found as the other stored expressions are
+    /// (`stored_exprs`).
+    pub expr: Option<typedpg_pg_query::ast::Node>,
 }
 
 /// The parameter list of a routine as `interpret_function_parameter_list`
@@ -636,6 +640,7 @@ pub(crate) fn interpret_function_parameter_list(
                     live_procs: live.routines.iter().map(|(oid, _)| *oid).collect(),
                     live_sequences: live.sequences.clone(),
                     live,
+                    expr: expr.clone(),
                 });
                 list.default_procs.extend(procs);
                 have_defaults = true;
@@ -680,7 +685,8 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     let prolang = super::languages::check(interp, &language)?;
 
     // TRANSFORM FOR TYPE t: a transform for t (or its element type) and
-    // the language must exist.
+    // the language must exist; the routine depends on it.
+    let mut transforms = Vec::new();
     if let Some(transform) = attrs.transform
         && let Some(ast::Node::List(types)) = transform.arg.as_ref()
     {
@@ -697,6 +703,7 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
                     format_type_for_message(interp, typeid)
                 )));
             }
+            transforms.push(typeid);
         }
     }
 
@@ -785,10 +792,22 @@ pub fn create_function(interp: &mut PgCatalog, stmt: &CreateFunctionStmt) -> Res
     record_routine_body(interp, stmt, &attrs, &proc, &language);
     // ProcedureCreate: the routine depends on its language (the pinned
     // built-in ones record nothing).
+    let transforms: Vec<super::depend::ObjectAddress> = transforms
+        .iter()
+        .filter_map(|t| {
+            super::depend::named_address_of(
+                interp,
+                &super::depend::NamedObject::Transform {
+                    typ: *t,
+                    lang: language.clone(),
+                },
+            )
+        })
+        .collect();
     super::depend::record(
         interp,
         super::depend::ObjectAddress::proc(proc.oid),
-        [super::depend::ObjectAddress::language(prolang)],
+        std::iter::once(super::depend::ObjectAddress::language(prolang)).chain(transforms),
         DepType::Normal,
     );
 

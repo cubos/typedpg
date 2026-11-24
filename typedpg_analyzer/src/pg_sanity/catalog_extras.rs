@@ -3,7 +3,9 @@
 //! side tables — `pg_class` flags, `pg_trigger`, `pg_policy`,
 //! `pg_sequence`, constraint deferrability and foreign-key actions, domain
 //! constraints, `pg_index` flags and access methods, index column names,
-//! `pg_partitioned_table`, rules, and column storage / compression.
+//! `pg_partitioned_table`, rules, column storage / compression, extended
+//! statistics and publications — and the identities of the objects of
+//! catalogs the seed rows don't cover that `pg_depend` rows name.
 //!
 //! Each side is read into [`Extras`], OIDs still raw; `catalog_state`
 //! names them like the seed rows' and compares them.
@@ -61,6 +63,32 @@ pub(crate) struct XSequence {
     pub(crate) max: i64,
     pub(crate) min: i64,
     pub(crate) cache: i64,
+    pub(crate) cycle: bool,
+}
+
+/// `pg_publication`.
+pub(crate) struct XPublication {
+    pub(crate) name: String,
+    pub(crate) alltables: bool,
+    pub(crate) allsequences: bool,
+    pub(crate) viaroot: bool,
+    /// `pubinsert`, `pubupdate`, `pubdelete`, `pubtruncate`.
+    pub(crate) publish: [bool; 4],
+    pub(crate) gencols: char,
+    /// `pg_publication_rel`: table, row filter, column list, `prexcept`.
+    pub(crate) relations: Vec<(u32, bool, bool, bool)>,
+    /// `pg_publication_namespace`.
+    pub(crate) schemas: Vec<u32>,
+}
+
+/// `pg_statistic_ext`.
+pub(crate) struct XStatistics {
+    pub(crate) nsp: u32,
+    pub(crate) name: String,
+    pub(crate) relid: u32,
+    pub(crate) keys: Vec<i16>,
+    pub(crate) kinds: Vec<char>,
+    pub(crate) exprs: usize,
 }
 
 /// A table constraint's deferrability and, for a foreign key, actions.
@@ -117,18 +145,102 @@ pub(crate) struct XAttribute {
     pub(crate) compression: char,
 }
 
+/// An object of a catalog the seed rows don't cover, which `pg_depend`
+/// rows name (by `(classid, objid)`): its identity, OIDs still raw.
+#[derive(Clone, Debug)]
+pub(crate) enum DepObject {
+    /// A column's `pg_attrdef` row (its default or generation expression).
+    Attrdef {
+        relid: u32,
+        attnum: i16,
+    },
+    Rule {
+        relid: u32,
+        name: String,
+    },
+    Trigger {
+        relid: u32,
+        name: String,
+    },
+    /// An internal trigger (a foreign key's): named after its OID, so
+    /// identified by its constraint, relation and function.
+    InternalTrigger {
+        relid: u32,
+        constraint: u32,
+        function: u32,
+    },
+    Policy {
+        relid: u32,
+        name: String,
+    },
+    Statistics {
+        nsp: u32,
+        name: String,
+    },
+    Publication(String),
+    PublicationRel {
+        publication: String,
+        relid: u32,
+    },
+    PublicationNamespace {
+        publication: String,
+        nsp: u32,
+    },
+    DomainConstraint {
+        typid: u32,
+        name: String,
+    },
+    EventTrigger(String),
+    Server(String),
+    Subscription(String),
+    UserMapping {
+        user: String,
+        server: String,
+    },
+    /// A `pg_amop` (`func` false) or `pg_amproc` row of a family.
+    FamilyMember {
+        func: bool,
+        family: u32,
+        number: i16,
+        left: u32,
+        right: u32,
+    },
+    Transform {
+        typ: u32,
+        lang: String,
+    },
+    Conversion {
+        nsp: u32,
+        name: String,
+    },
+    DefaultAcl {
+        role: String,
+        nsp: u32,
+        objtype: char,
+    },
+}
+
 #[derive(Default)]
 pub(crate) struct Extras {
+    /// The objects of the catalogs the seed rows don't cover, by
+    /// `(classid, objid)`.
+    pub(crate) dep_objects: std::collections::HashMap<(u32, u32), DepObject>,
     pub(crate) classes: Vec<XClass>,
     pub(crate) triggers: Vec<XTrigger>,
     pub(crate) policies: Vec<XPolicy>,
     pub(crate) sequences: Vec<XSequence>,
+    pub(crate) statistics: Vec<XStatistics>,
+    pub(crate) publications: Vec<XPublication>,
     pub(crate) constraints: Vec<XConstraint>,
     pub(crate) domain_constraints: Vec<XDomainConstraint>,
     pub(crate) indexes: Vec<XIndex>,
     pub(crate) partitioned: Vec<XPartitioned>,
     pub(crate) rules: Vec<XRule>,
     pub(crate) attributes: Vec<XAttribute>,
+    /// The `pg_depend` rows of kind `P` (`true`) or `S`, by `(classid,
+    /// objid, objsubid, refclassid, refobjid, refobjsubid)`: the seed rows
+    /// carry them as `Normal`.
+    pub(crate) partition_deps: std::collections::HashMap<(u32, u32, i16, u32, u32, i16), bool>,
 }
 
 const FIRST_NORMAL: u32 = crate::catalog_export::FIRST_NORMAL_OBJECT_ID;
@@ -140,6 +252,26 @@ fn ch(v: i8) -> char {
 /// The server's extras, of the objects initdb didn't create.
 pub(crate) fn from_server(client: &mut Client) -> Result<Extras, postgres::Error> {
     let mut x = Extras::default();
+    for r in client.query(
+        "SELECT classid::int4, objid::int4, objsubid, refclassid::int4, refobjid::int4, \
+                refobjsubid, deptype = 'P' \
+         FROM pg_catalog.pg_depend \
+         WHERE deptype IN ('P', 'S') AND (objid >= $1 OR refobjid >= $1)",
+        &[&FIRST_NORMAL],
+    )? {
+        let oid = |i: usize| r.get::<_, i32>(i) as u32;
+        x.partition_deps.insert(
+            (
+                oid(0),
+                oid(1),
+                r.get::<_, i32>(2) as i16,
+                oid(3),
+                oid(4),
+                r.get::<_, i32>(5) as i16,
+            ),
+            r.get(6),
+        );
+    }
     for r in client.query(
         "SELECT oid, relpersistence, relrowsecurity, relforcerowsecurity, relreplident, \
                 relispartition, reloftype, reltoastrelid <> 0 \
@@ -207,7 +339,8 @@ pub(crate) fn from_server(client: &mut Client) -> Result<Extras, postgres::Error
         });
     }
     for r in client.query(
-        "SELECT seqrelid, seqtypid, seqstart, seqincrement, seqmax, seqmin, seqcache \
+        "SELECT seqrelid, seqtypid, seqstart, seqincrement, seqmax, seqmin, seqcache, \
+                seqcycle \
          FROM pg_catalog.pg_sequence WHERE seqrelid >= $1",
         &[&FIRST_NORMAL],
     )? {
@@ -219,6 +352,23 @@ pub(crate) fn from_server(client: &mut Client) -> Result<Extras, postgres::Error
             max: r.get(4),
             min: r.get(5),
             cache: r.get(6),
+            cycle: r.get(7),
+        });
+    }
+    for r in client.query(
+        "SELECT stxnamespace, stxname::text, stxrelid, stxkeys::int2[], stxkind::text[], \
+                coalesce(cardinality(pg_catalog.pg_get_statisticsobjdef_expressions(oid)), 0) \
+         FROM pg_catalog.pg_statistic_ext WHERE oid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        let kinds: Vec<String> = r.get(4);
+        x.statistics.push(XStatistics {
+            nsp: r.get(0),
+            name: r.get(1),
+            relid: r.get(2),
+            keys: r.get(3),
+            kinds: kinds.iter().filter_map(|k| k.chars().next()).collect(),
+            exprs: r.get::<_, i32>(5) as usize,
         });
     }
     for r in client.query(
@@ -307,7 +457,282 @@ pub(crate) fn from_server(client: &mut Client) -> Result<Extras, postgres::Error
             compression: ch(r.get(3)),
         });
     }
+    for r in client.query(
+        "SELECT p.pubname::text, p.puballtables, p.puballsequences, p.pubviaroot, \
+                p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubgencols, \
+                ARRAY(SELECT u.v FROM pg_catalog.pg_publication_rel r, \
+                        LATERAL unnest(ARRAY[r.prrelid::int8, \
+                                             (r.prqual IS NOT NULL)::int::int8, \
+                                             (r.prattrs IS NOT NULL)::int::int8, \
+                                             r.prexcept::int::int8]) WITH ORDINALITY u(v, i) \
+                      WHERE r.prpubid = p.oid ORDER BY r.oid, u.i), \
+                ARRAY(SELECT n.pnnspid FROM pg_catalog.pg_publication_namespace n \
+                      WHERE n.pnpubid = p.oid) \
+         FROM pg_catalog.pg_publication p",
+        &[],
+    )? {
+        let flat: Vec<i64> = r.get(9);
+        let relations: Vec<&[i64]> = flat.chunks(4).collect();
+        x.publications.push(XPublication {
+            name: r.get(0),
+            alltables: r.get(1),
+            allsequences: r.get(2),
+            viaroot: r.get(3),
+            publish: [r.get(4), r.get(5), r.get(6), r.get(7)],
+            gencols: ch(r.get(8)),
+            relations: relations
+                .iter()
+                .map(|v| (v[0] as u32, v[1] != 0, v[2] != 0, v[3] != 0))
+                .collect(),
+            schemas: r.get(10),
+        });
+    }
+    server_dep_objects(client, &mut x)?;
     Ok(x)
+}
+
+/// The identities of the server's objects `pg_depend` rows may name in the
+/// catalogs the seed rows don't cover.
+fn server_dep_objects(client: &mut Client, x: &mut Extras) -> Result<(), postgres::Error> {
+    let mut put = |classid: u32, oid: u32, object: DepObject| {
+        x.dep_objects.insert((classid, oid), object);
+    };
+    for r in client.query(
+        "SELECT oid, adrelid, adnum FROM pg_catalog.pg_attrdef WHERE adrelid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            2604,
+            r.get(0),
+            DepObject::Attrdef {
+                relid: r.get(1),
+                attnum: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, ev_class, rulename::text FROM pg_catalog.pg_rewrite WHERE ev_class >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            2618,
+            r.get(0),
+            DepObject::Rule {
+                relid: r.get(1),
+                name: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, tgrelid, tgname::text, tgisinternal, tgconstraint, tgfoid \
+         FROM pg_catalog.pg_trigger WHERE oid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        let object = if r.get::<_, bool>(3) {
+            DepObject::InternalTrigger {
+                relid: r.get(1),
+                constraint: r.get(4),
+                function: r.get(5),
+            }
+        } else {
+            DepObject::Trigger {
+                relid: r.get(1),
+                name: r.get(2),
+            }
+        };
+        put(2620, r.get(0), object);
+    }
+    for r in client.query(
+        "SELECT oid, polrelid, polname::text FROM pg_catalog.pg_policy WHERE polrelid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            3256,
+            r.get(0),
+            DepObject::Policy {
+                relid: r.get(1),
+                name: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, stxnamespace, stxname::text FROM pg_catalog.pg_statistic_ext \
+         WHERE oid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            3381,
+            r.get(0),
+            DepObject::Statistics {
+                nsp: r.get(1),
+                name: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, pubname::text FROM pg_catalog.pg_publication",
+        &[],
+    )? {
+        put(6104, r.get(0), DepObject::Publication(r.get(1)));
+    }
+    for r in client.query(
+        "SELECT r.oid, p.pubname::text, r.prrelid FROM pg_catalog.pg_publication_rel r \
+         JOIN pg_catalog.pg_publication p ON p.oid = r.prpubid",
+        &[],
+    )? {
+        put(
+            6106,
+            r.get(0),
+            DepObject::PublicationRel {
+                publication: r.get(1),
+                relid: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT n.oid, p.pubname::text, n.pnnspid FROM pg_catalog.pg_publication_namespace n \
+         JOIN pg_catalog.pg_publication p ON p.oid = n.pnpubid",
+        &[],
+    )? {
+        put(
+            6237,
+            r.get(0),
+            DepObject::PublicationNamespace {
+                publication: r.get(1),
+                nsp: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, contypid, conname::text FROM pg_catalog.pg_constraint \
+         WHERE contypid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            2606,
+            r.get(0),
+            DepObject::DomainConstraint {
+                typid: r.get(1),
+                name: r.get(2),
+            },
+        );
+    }
+    // A built-in conversion moved to a schema of the migrations' (its OID
+    // the seed's, its schema not).
+    for r in client.query(
+        "SELECT oid, connamespace, conname::text FROM pg_catalog.pg_conversion \
+         WHERE oid < $1 AND connamespace >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            2607,
+            r.get(0),
+            DepObject::Conversion {
+                nsp: r.get(1),
+                name: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, evtname::text FROM pg_catalog.pg_event_trigger",
+        &[],
+    )? {
+        put(3466, r.get(0), DepObject::EventTrigger(r.get(1)));
+    }
+    for r in client.query(
+        "SELECT oid, subname::text FROM pg_catalog.pg_subscription",
+        &[],
+    )? {
+        put(6100, r.get(0), DepObject::Subscription(r.get(1)));
+    }
+    for r in client.query(
+        "SELECT oid, srvname::text FROM pg_catalog.pg_foreign_server",
+        &[],
+    )? {
+        put(1417, r.get(0), DepObject::Server(r.get(1)));
+    }
+    // The view, not `pg_user_mapping` (which only a superuser reads: the
+    // session may be under SET ROLE).
+    for r in client.query(
+        "SELECT umid, CASE WHEN umuser = 0 THEN 'public' \
+                            ELSE pg_catalog.pg_get_userbyid(umuser)::text END, \
+                srvname::text \
+         FROM pg_catalog.pg_user_mappings",
+        &[],
+    )? {
+        put(
+            1418,
+            r.get(0),
+            DepObject::UserMapping {
+                user: r.get(1),
+                server: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, amopfamily, amopstrategy, amoplefttype, amoprighttype \
+         FROM pg_catalog.pg_amop WHERE oid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            2602,
+            r.get(0),
+            DepObject::FamilyMember {
+                func: false,
+                family: r.get(1),
+                number: r.get(2),
+                left: r.get(3),
+                right: r.get(4),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, amprocfamily, amprocnum, amproclefttype, amprocrighttype \
+         FROM pg_catalog.pg_amproc WHERE oid >= $1",
+        &[&FIRST_NORMAL],
+    )? {
+        put(
+            2603,
+            r.get(0),
+            DepObject::FamilyMember {
+                func: true,
+                family: r.get(1),
+                number: r.get(2),
+                left: r.get(3),
+                right: r.get(4),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT t.oid, t.trftype, l.lanname::text FROM pg_catalog.pg_transform t \
+         JOIN pg_catalog.pg_language l ON l.oid = t.trflang",
+        &[],
+    )? {
+        put(
+            3576,
+            r.get(0),
+            DepObject::Transform {
+                typ: r.get(1),
+                lang: r.get(2),
+            },
+        );
+    }
+    for r in client.query(
+        "SELECT oid, pg_catalog.pg_get_userbyid(defaclrole)::text, defaclnamespace, \
+                defaclobjtype FROM pg_catalog.pg_default_acl",
+        &[],
+    )? {
+        put(
+            826,
+            r.get(0),
+            DepObject::DefaultAcl {
+                role: r.get(1),
+                nsp: r.get(2),
+                objtype: ch(r.get(3)),
+            },
+        );
+    }
+    Ok(())
 }
 
 /// The analyzer's extras, of its user objects; `role_name` names a role
@@ -421,6 +846,34 @@ pub(crate) fn from_model(
             max: s.max as i64,
             min: s.min as i64,
             cache: s.cache as i64,
+            cycle: s.cycle,
+        });
+    }
+    for p in db.publications.iter() {
+        let (alltables, allsequences, viaroot, publish, gencols) = p.flags();
+        x.publications.push(XPublication {
+            name: p.name.clone(),
+            alltables,
+            allsequences,
+            viaroot,
+            publish,
+            gencols,
+            relations: p
+                .relation_rows()
+                .into_iter()
+                .map(|(rel, q, c, e)| (rel.get(), q, c, e))
+                .collect(),
+            schemas: p.members().1.iter().map(|n| n.get()).collect(),
+        });
+    }
+    for s in db.statistics.iter() {
+        x.statistics.push(XStatistics {
+            nsp: s.namespace.get(),
+            name: s.name.clone(),
+            relid: s.relid.get(),
+            keys: s.keys.clone(),
+            kinds: s.kinds.clone(),
+            exprs: s.exprs,
         });
     }
     for c in db.pg_constraint.values().filter(|c| user(c.oid.get())) {

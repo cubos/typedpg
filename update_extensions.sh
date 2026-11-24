@@ -384,42 +384,51 @@ download_ext "xml2" \
 echo -e "\n--- plpgsql (1.0, src/pl/plpgsql) ---"
 fetch "${BASE_URL}/src/pl/plpgsql/src/plpgsql--1.0.sql" "plpgsql--1.0.sql"
 
+# Built apart from the server (the official image ships neither; the
+# extension oracle's typedpg-pg-pl image, scripts/pg-pl, does).
+echo -e "\n--- plperl, plperlu (1.0, src/pl/plperl) ---"
+fetch "${BASE_URL}/src/pl/plperl/plperl--1.0.sql" "plperl--1.0.sql"
+fetch "${BASE_URL}/src/pl/plperl/plperlu--1.0.sql" "plperlu--1.0.sql"
+
+echo -e "\n--- plpython3u (1.0, src/pl/plpython) ---"
+fetch "${BASE_URL}/src/pl/plpython/plpython3u--1.0.sql" "plpython3u--1.0.sql"
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Third-party extensions
 # ═══════════════════════════════════════════════════════════════════════════
 
-# The 0.8.2 install script plus the upgrades to 0.8.7, the version the
-# pgvector/pgvector:pg19 image ships.
-echo -e "\n--- vector / pgvector (0.8.2 -> 0.8.7) ---"
-fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.2/sql/vector.sql" \
-    "vector--0.8.2.sql"
-for step in 0.8.2--0.8.3 0.8.3--0.8.4 0.8.4--0.8.5 0.8.5--0.8.6 0.8.6--0.8.7; do
-    fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.7/sql/vector--${step}.sql" \
-        "vector--${step}.sql"
-done
+# What the pgvector/pgvector:pg19 image ships: 0.8.7's install script,
+# no older version and no update script.
+echo -e "\n--- vector / pgvector (0.8.7) ---"
+fetch "https://raw.githubusercontent.com/pgvector/pgvector/v0.8.7/sql/vector.sql" \
+    "vector--0.8.7.sql"
 
 # PostGIS's scripts are generated when it is built: they are taken from the
 # official image of PostGIS for PostgreSQL 19 (scripts/extensions-image builds
 # the oracle's server from the same image), as installed in its
 # share/extension. That image ships postgis, postgis_raster,
-# postgis_topology and postgis_sfcgal at 3.7.0, with installation scripts
-# alone for that version (the `--ANY--3.7.0` scripts serve databases upgraded
-# from an older PostGIS release). It has no postgis_tiger_geocoder or
-# address_standardizer.
+# postgis_topology and postgis_sfcgal at 3.7.0: their installation scripts,
+# and the two pseudo-versions' small scripts — `unpackaged` installs nothing,
+# `3.7.0--ANY` only tags the version. The scripts back to 3.7.0
+# (`--ANY--3.7.0`, `--unpackaged--3.7.0`, the full upgrade, for databases
+# upgraded from an older PostGIS release) are not bundled. It has no
+# postgis_tiger_geocoder or address_standardizer.
 POSTGIS_IMAGE="postgis/postgis:19-3.7"
 POSTGIS_VERSION="3.7.0"
 echo -e "\n--- postgis, postgis_raster, postgis_topology, postgis_sfcgal (${POSTGIS_VERSION}, ${POSTGIS_IMAGE}) ---"
 docker pull -q "$POSTGIS_IMAGE" >/dev/null
 for ext in postgis postgis_raster postgis_topology postgis_sfcgal; do
-    file="${ext}--${POSTGIS_VERSION}.sql"
-    echo "  ${file}..."
-    if ! docker run --rm --entrypoint cat "$POSTGIS_IMAGE" \
-        "/usr/share/postgresql/19/extension/${file}" > "${TMP_DIR}/raw.sql"; then
-        echo "error: ${POSTGIS_IMAGE} has no ${file}" >&2
-        exit 1
-    fi
-    grep -v '^\\\(echo\|quit\)' "${TMP_DIR}/raw.sql" > "${TMP_DIR}/${file}" || true
-    rm -f "${TMP_DIR}/raw.sql"
+    for file in "${ext}--${POSTGIS_VERSION}.sql" "${ext}--unpackaged.sql" \
+        "${ext}--${POSTGIS_VERSION}--ANY.sql"; do
+        echo "  ${file}..."
+        if ! docker run --rm --entrypoint cat "$POSTGIS_IMAGE" \
+            "/usr/share/postgresql/19/extension/${file}" > "${TMP_DIR}/raw.sql"; then
+            echo "error: ${POSTGIS_IMAGE} has no ${file}" >&2
+            exit 1
+        fi
+        grep -v '^\\\(echo\|quit\)' "${TMP_DIR}/raw.sql" > "${TMP_DIR}/${file}" || true
+        rm -f "${TMP_DIR}/raw.sql"
+    done
 done
 
 # pg_cron builds its 1.0 installation script from pg_cron.sql (its Makefile's

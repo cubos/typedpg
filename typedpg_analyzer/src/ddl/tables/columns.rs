@@ -2317,6 +2317,26 @@ fn rebuild_after_retype(interp: &mut PgCatalog, r: &Retyped) -> Result<(), DdlEr
     super::foreign_keys::repick_indexes_after_retype(interp, r.relid, r.attr.attnum);
     recheck_dependents_of_retyped_column(interp, r.relid, &r.attr)?;
     super::check_inherit::recook_checks_reading(interp, r.relid, r.attr.attnum);
+    // ATExecAlterColumnType: the default (or generation expression) is
+    // stored anew, coerced to the new type (StoreAttrDefault): its
+    // dependencies are recorded anew.
+    if let Some(super::check_inherit::StoredExpr::Written(expr)) = interp
+        .attr_default_exprs
+        .get(&(r.relid, r.attr.attnum))
+        .cloned()
+    {
+        if r.attr.attgenerated.is_none() {
+            crate::ddl::defaults::record_default_dependencies(
+                interp,
+                r.relid,
+                r.attr.attnum,
+                (*expr).as_ref(),
+            );
+        } else {
+            crate::ddl::defaults::forget_default_dependencies(interp, r.relid, r.attr.attnum);
+            crate::ddl::depend::record_column_expression(interp, r.relid, r.attr.attnum);
+        }
+    }
     crate::ddl::stored_exprs::rebuild_field_dependents(interp, &r.field_dependents)
 }
 

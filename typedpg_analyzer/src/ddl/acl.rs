@@ -728,6 +728,18 @@ pub(crate) struct Acls {
 }
 
 impl Acls {
+    /// The `pg_default_acl` rows of a schema (`ALTER DEFAULT PRIVILEGES IN
+    /// SCHEMA`), as `(role, schema, defaclobjtype)` (for the catalog
+    /// oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn schema_defaults(
+        &self,
+    ) -> impl Iterator<Item = (RoleId, PgNamespaceOid, char)> + '_ {
+        self.defaults
+            .keys()
+            .filter_map(|(role, ns, class)| Some((*role, (*ns)?, class.objtype())))
+    }
+
     pub(crate) fn forget_object(&mut self, object: AclObject) {
         self.owners.remove(&object);
         self.items.remove(&object);

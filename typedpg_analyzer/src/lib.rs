@@ -125,6 +125,8 @@ pub use condition::{
     WriteBase, WriteCommand, WriteConstraint, WriteStatement, WrittenColumn, WrittenValue,
 };
 pub use ddl::DdlError;
+#[cfg(feature = "pg_sanity")]
+pub use ddl::extensions::{ExtensionInfo, extension_registry};
 pub use error::AnalyzeError;
 pub use pg_catalog::{
     CoalesceFact, ColumnRefBinding, LintForeignKey, LocatedError, MigrationObserver,

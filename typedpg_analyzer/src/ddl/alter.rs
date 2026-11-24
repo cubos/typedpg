@@ -397,6 +397,8 @@ fn rename_column_in(
     // The expressions kept as written read the column by its new name
     // (PG's read it by attnum).
     super::stored_exprs::rename_column(interp, relid, old, new);
+    // So do the rule actions writing the relation.
+    super::rules::rename_action_columns(interp, relid, old, new);
     if let Some(attrs) = interp.pg_attribute.get_mut(&relid)
         && let Some(col) = attrs.iter_mut().find(|c| c.attname == old)
     {

@@ -81,7 +81,7 @@ fn store(
     dep: &Dependent,
     refs: Vec<(PgClassOid, i16)>,
     functions: Vec<PgProcOid>,
-    analyzed: Vec<ObjectAddress>,
+    analyzed: Vec<Vec<ObjectAddress>>,
 ) -> Result<(), DdlError> {
     let Some(named) = dep.named() else {
         return Ok(());
@@ -93,17 +93,34 @@ fn store(
         Dependent::Function(_) => return Ok(()),
     };
     let addr = super::depend::named_object(interp, named)?;
-    let referenced = refs
+    let policy = matches!(dep, Dependent::Policy { .. });
+    let mut referenced: Vec<ObjectAddress> = refs
         .into_iter()
         .filter(|&(r, a)| !(r == owner && a == 0))
         .map(|(r, a)| ObjectAddress::column(r, a))
         .chain(functions.into_iter().map(ObjectAddress::proc))
-        .chain(
+        .collect();
+    // A trigger's WHEN and a rule's actions are recorded at once with the
+    // rest (one recordDependencyOnExpr): their own relation is their owner.
+    if !policy {
+        referenced.extend(
             analyzed
-                .into_iter()
+                .iter()
+                .flatten()
+                .copied()
                 .filter(|a| *a != ObjectAddress::relation(owner)),
         );
+    }
     super::depend::record(interp, addr, referenced, DepType::Normal);
+    // A policy's clauses are recorded apart (recordDependencyOnExpr per
+    // clause: a relation one reads whole stays, whatever another reads of
+    // it); its own relation is among them only when a clause reads it whole
+    // in a sub-select (its range table).
+    if policy {
+        for group in analyzed {
+            super::depend::record(interp, addr, group, DepType::Normal);
+        }
+    }
     super::depend::record(
         interp,
         addr,
@@ -260,7 +277,23 @@ fn statement_refs(
     };
     match stmt {
         ast::Node::SelectStmt(sel) if !extra_from.is_empty() && sel.values_lists.is_empty() => {
+            // NEW and OLD are in scope, but no FROM item of the statement:
+            // an unqualified `*` reads the statement's own FROM items only.
+            let is_star = |t: &Option<Node>| {
+                matches!(t, Some(ast::Node::ResTarget(rt))
+                    if matches!(rt.val.as_ref(), Some(ast::Node::ColumnRef(cr))
+                        if cr.fields.len() == 1
+                            && matches!(cr.fields[0].as_ref(), Some(ast::Node::AStar(_)))))
+            };
+            if sel.target_list.iter().any(is_star) {
+                let mut star = sel.clone();
+                star.target_list.retain(is_star);
+                star.where_clause = None;
+                star.having_clause = None;
+                walk(&ast::Node::SelectStmt(star), &mut refs);
+            }
             let mut sel = sel.clone();
+            sel.target_list.retain(|t| !is_star(t));
             sel.from_clause.extend(extra_from.iter().cloned());
             walk(&ast::Node::SelectStmt(sel), &mut refs);
         }
@@ -457,33 +490,22 @@ fn policy_expression_refs(
     interp: &PgCatalog,
     table: &ast::RangeVar,
     quals: &(Option<Node>, Option<Node>),
-) -> Vec<ObjectAddress> {
+) -> Vec<Vec<ObjectAddress>> {
     let Some(relid) = relation_of(interp, table) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    // recordDependencyOnExpr, once per clause: everything it refers to.
+    let mut groups: Vec<Vec<ObjectAddress>> = Vec::new();
     for expr in quals.0.iter().chain(quals.1.iter()) {
-        for reference in super::depend::expression_references(interp, Some(expr), Some(relid)) {
-            // Its operators, and the types (a cast's, a typed literal's)
-            // and collations it names.
-            if let super::depend::Reference::Object(addr) = reference
-                && [
-                    crate::pg_catalog::PG_OPERATOR_RELID,
-                    crate::pg_catalog::PG_TYPE_RELID,
-                    crate::pg_catalog::PG_COLLATION_RELID,
-                ]
-                .contains(&addr.classid)
-                && !out.contains(&addr)
-            {
-                out.push(addr);
-            }
-        }
+        let refs = super::depend::expression_references(interp, Some(expr), Some(relid));
+        groups.push(super::depend::reference_addresses(interp, &refs));
     }
+    let mut out = Vec::new();
     // The cast functions the expressions run (an explicit `::type`, an
     // implicit argument coercion): `recordDependencyOnExpr` sees them as the
     // `FuncExpr`s the cast became.
     let Some(class) = interp.pg_class.get(&relid) else {
-        return out;
+        return groups;
     };
     let nspname = interp
         .namespace_name(class.relnamespace)
@@ -513,7 +535,8 @@ fn policy_expression_refs(
             }
         }
     }
-    out
+    groups.push(out);
+    groups
 }
 
 /// CREATE POLICY: the columns its USING / WITH CHECK read.
@@ -607,8 +630,8 @@ pub(crate) fn record_trigger(
         return Ok(());
     };
     let mut refs = names_of(interp, relid, &stmt.columns);
-    let mut functions = Vec::new();
-    let mut objects = Vec::new();
+    // recordDependencyOnExpr: everything the WHEN condition refers to.
+    let mut analyzed = Vec::new();
     if let Some(when) = stmt.when_clause.as_ref() {
         let from = vec![
             Some(range_var_node(rv, Some("new"))),
@@ -620,10 +643,10 @@ pub(crate) fn record_trigger(
                 .into_iter()
                 .filter(|&(_, attnum)| attnum != 0),
         );
-        // recordDependencyOnExpr over the condition: the functions it
-        // calls, its operators and the cast functions it runs.
-        functions = super::views::statement_functions(interp, &select);
-        objects = trigger_when_expression_refs(interp, relid, when);
+        analyzed = super::depend::reference_addresses(
+            interp,
+            &super::depend::trigger_when_references(interp, Some(when), relid),
+        );
     }
     store(
         interp,
@@ -632,69 +655,9 @@ pub(crate) fn record_trigger(
             name: stmt.trigname.clone(),
         },
         refs,
-        functions,
-        objects,
+        Vec::new(),
+        vec![analyzed],
     )
-}
-
-/// The operators and cast functions a trigger's WHEN condition runs, as
-/// [`policy_expression_refs`] finds a policy's — over the relation as
-/// `old` and `new`.
-fn trigger_when_expression_refs(
-    interp: &PgCatalog,
-    relid: PgClassOid,
-    when: &Node,
-) -> Vec<ObjectAddress> {
-    let Some(class) = interp.pg_class.get(&relid) else {
-        return Vec::new();
-    };
-    let nspname = interp
-        .namespace_name(class.relnamespace)
-        .unwrap_or("public")
-        .to_owned();
-    let attrs = interp.attributes_of(relid).to_vec();
-    let mut scope = crate::scope::Scope::default();
-    for alias in ["old", "new"] {
-        scope.add_dml_target(
-            interp,
-            alias,
-            crate::qualified_name::QualifiedName::new(nspname.clone(), class.relname.clone()),
-            &attrs,
-        );
-    }
-    let null_ctx = crate::nullability::NullabilityContext::default();
-    let used = std::cell::RefCell::new(Vec::new());
-    let mut params = crate::param_collector::ParamCollector::default();
-    let ctx = crate::expr::Ctx::new(&scope, &null_ctx, interp).recording(&used);
-    let (_, references) = super::depend::collect(|| {
-        crate::expr::infer_expr(Some(when), ctx, &mut params, crate::expr::TypeGoal::NONE)
-    });
-    let mut out = Vec::new();
-    for reference in references {
-        // Its operators, and the types (a cast's, a typed literal's) and
-        // collations it names.
-        if let super::depend::Reference::Object(addr) = reference
-            && [
-                crate::pg_catalog::PG_OPERATOR_RELID,
-                crate::pg_catalog::PG_TYPE_RELID,
-                crate::pg_catalog::PG_COLLATION_RELID,
-            ]
-            .contains(&addr.classid)
-            && !out.contains(&addr)
-        {
-            out.push(addr);
-        }
-    }
-    for oid in used.into_inner() {
-        if !interp.pg_cast.values().any(|c| c.castfunc == Some(oid)) {
-            continue;
-        }
-        let addr = ObjectAddress::proc(oid);
-        if !out.contains(&addr) {
-            out.push(addr);
-        }
-    }
-    out
 }
 
 /// CREATE RULE: what its WHERE condition and actions read, NEW and OLD
@@ -702,7 +665,8 @@ fn trigger_when_expression_refs(
 pub(crate) fn record_rule(
     interp: &mut PgCatalog,
     stmt: &ast::RuleStmt,
-    analyzed: &[super::depend::Reference],
+    qual_analyzed: &[super::depend::Reference],
+    actions_analyzed: &[super::depend::Reference],
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -752,6 +716,54 @@ pub(crate) fn record_rule(
         relid,
         name: stmt.rulename.clone(),
     };
-    let analyzed = super::depend::reference_addresses(interp, analyzed);
-    store(interp, &dep, refs, functions, analyzed)
+    let analyzed = super::depend::reference_addresses(
+        interp,
+        &qual_analyzed
+            .iter()
+            .chain(actions_analyzed)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    store(interp, &dep, refs, functions, vec![analyzed])?;
+    // Each action's range table holds OLD and NEW, the rule's relation
+    // (DO NOTHING's too; a NOTIFY's has none): the actions depend on it —
+    // on the columns they read of it, when they read some
+    // (eliminate_duplicate_dependencies).
+    // (What the actions read of it — `NEW.*` expanded, as their analysis
+    // tells.)
+    let action_columns = stmt
+        .actions
+        .iter()
+        .flatten()
+        .flat_map(|action| statement_refs(interp, action, &new_old))
+        .any(|(r, attnum)| r == relid && attnum != 0)
+        || super::depend::reference_addresses(interp, actions_analyzed)
+            .iter()
+            .any(|a| {
+                a.classid == PG_CLASS_RELID && a.objid.get() == relid.get() && a.objsubid != 0
+            });
+    let has_range_table = stmt.actions.is_empty()
+        || stmt
+            .actions
+            .iter()
+            .flatten()
+            .any(|a| !matches!(a, ast::Node::NotifyStmt(_)));
+    if has_range_table
+        && !action_columns
+        && let Some(addr) = super::depend::named_address_of(
+            interp,
+            &NamedObject::Rule {
+                relid,
+                name: stmt.rulename.clone(),
+            },
+        )
+    {
+        super::depend::record(
+            interp,
+            addr,
+            [ObjectAddress::relation(relid)],
+            DepType::Normal,
+        );
+    }
+    Ok(())
 }

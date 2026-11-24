@@ -77,9 +77,14 @@ pub fn create_extension(
 
     let target_version = extract_option(&stmt.options, "new_version")
         .unwrap_or_else(|| ext.default_version.to_owned());
+    let cascade = stmt.options.iter().any(|o| {
+        matches!(o.as_ref(), Some(typedpg_pg_query::ast::Node::DefElem(de))
+            if de.defname == "cascade")
+    });
     // CreateExtensionInternal: a SCHEMA given must exist, whatever the
     // control file says. A control file's fixed `schema` wins — giving
-    // another one is an error — else the SCHEMA given, or the creation
+    // another one is an error, unless CASCADE (which passes its SCHEMA to
+    // the extensions it installs) — else the SCHEMA given, or the creation
     // schema.
     if let Some(given) = extract_option(&stmt.options, "schema") {
         super::util::existing_namespace(interp, &given)?;
@@ -88,6 +93,7 @@ pub fn create_extension(
         Some(schema) => {
             if let Some(given) = extract_option(&stmt.options, "schema")
                 && given != schema
+                && !cascade
             {
                 return Err(DdlError::ExtensionError(format!(
                     "extension \"{name}\" must be installed in schema \"{schema}\""
@@ -113,10 +119,6 @@ pub fn create_extension(
 
     // get_required_extension: required extensions must be installed, or
     // are installed first with CASCADE.
-    let cascade = stmt.options.iter().any(|o| {
-        matches!(o.as_ref(), Some(typedpg_pg_query::ast::Node::DefElem(de))
-            if de.defname == "cascade")
-    });
     for required in requires(name) {
         if interp.extension_by_name.contains_key(*required) {
             continue;
@@ -396,22 +398,40 @@ const THIRD_PARTY: &[&str] = &[
     "pg_jsonschema",
     "pgmq",
     "postgis",
+    "postgis-3",
     "postgis_raster",
+    "postgis_raster-3",
     "postgis_sfcgal",
+    "postgis_sfcgal-3",
     "postgis_topology",
+    "postgis_topology-3",
     "vector",
 ];
 
-/// Whether `name` is a bundled extension the `postgres` image doesn't ship
-/// (`scripts/extensions-image` builds one that ships the third-party ones):
-/// a third-party one, or one requiring a procedural language the registry
-/// doesn't bundle (plperl, plperlu, plpython3u are built separately, and
-/// the image has none of them). The `pg_sanity` mirror stops comparing
-/// after the server rejects one of these as not available.
+/// The procedural languages built apart from the server: the official
+/// image has none of them (the extension oracle's `typedpg-pg-pl` image,
+/// `scripts/pg-pl`, adds them).
+#[cfg(any(test, feature = "pg_sanity"))]
+const SEPARATE_LANGUAGES: &[&str] = &["plperl", "plperlu", "plpython3u"];
+
+/// Whether `name` is one of [`SEPARATE_LANGUAGES`] or requires one.
+#[cfg(any(test, feature = "pg_sanity"))]
+fn needs_separate_language(name: &str) -> bool {
+    SEPARATE_LANGUAGES.contains(&name)
+        || requires(name)
+            .iter()
+            .any(|r| SEPARATE_LANGUAGES.contains(r))
+}
+
+/// Whether `name` is a bundled extension the `postgres` image doesn't ship:
+/// a third-party one (`scripts/extensions-image` builds an image that
+/// ships them), a procedural language built separately (plperl, plperlu,
+/// plpython3u), or one requiring such a language. The `pg_sanity` mirror
+/// stops comparing after the server rejects one of these as not available.
 #[cfg(any(test, feature = "pg_sanity"))]
 pub(crate) fn outside_postgres_image(name: &str) -> bool {
     let bundled = |n: &str| REGISTRY.iter().any(|e| e.name == n);
-    bundled(name) && (THIRD_PARTY.contains(&name) || requires(name).iter().any(|r| !bundled(r)))
+    bundled(name) && (THIRD_PARTY.contains(&name) || needs_separate_language(name))
 }
 
 /// The control files' `relocatable`: whether ALTER EXTENSION SET SCHEMA may
@@ -420,22 +440,63 @@ pub(crate) fn outside_postgres_image(name: &str) -> bool {
 fn relocatable(name: &str) -> bool {
     !matches!(
         name,
-        "plpgsql"
+        "plperl"
+            | "plperlu"
+            | "plpgsql"
+            | "plpython3u"
             | "xml2"
             | "pg_cron"
             | "pg_jsonschema"
             | "pgmq"
             | "postgis"
+            | "postgis-3"
             | "postgis_raster"
+            | "postgis_raster-3"
+            | "postgis_sfcgal-3"
             | "postgis_topology"
+            | "postgis_topology-3"
+    )
+}
+
+/// The control files' `trusted`: a non-superuser with CREATE on the
+/// database may install these (every bundled extension needs a superuser
+/// otherwise: `superuser = true`).
+#[cfg(feature = "pg_sanity")]
+fn trusted(name: &str) -> bool {
+    matches!(
+        name,
+        "btree_gin"
+            | "btree_gist"
+            | "citext"
+            | "cube"
+            | "dict_int"
+            | "fuzzystrmatch"
+            | "hstore"
+            | "intarray"
+            | "isn"
+            | "lo"
+            | "ltree"
+            | "pg_trgm"
+            | "pgcrypto"
+            | "bool_plperl"
+            | "jsonb_plperl"
+            | "plperl"
+            | "plpgsql"
+            | "seg"
+            | "tablefunc"
+            | "tcn"
+            | "tsm_system_rows"
+            | "tsm_system_time"
+            | "unaccent"
+            | "uuid-ossp"
     )
 }
 
 /// The control files' `schema`: extensions that must be installed in one
-/// schema (plpgsql.control: `schema = pg_catalog`).
+/// schema (the languages' control files: `schema = pg_catalog`).
 fn fixed_schema(name: &str) -> Option<&'static str> {
     match name {
-        "plpgsql" | "pg_cron" => Some("pg_catalog"),
+        "plperl" | "plperlu" | "plpgsql" | "plpython3u" | "pg_cron" => Some("pg_catalog"),
         "pgmq" => Some("pgmq"),
         "postgis_topology" => Some("topology"),
         _ => None,
@@ -976,25 +1037,53 @@ pub(crate) fn set_extension_schema(
         .filter(|d| d.refobjid == ext_generic && d.deptype == DepType::Extension)
         .map(|d| (d.classid, d.objid))
         .collect();
+    // The stored expressions naming a member (bound to it by OID in PG)
+    // follow it, as they follow the member's own SET SCHEMA.
+    use super::stored_exprs::{Renamed, follow_rename};
+    let schema = Some(new_schema);
     for (classid, objid) in members {
         if classid == PG_TYPE_RELID {
             let typ = PgTypeOid::from_nonzero(objid.into_nonzero());
             let array = interp.array_type_of(typ);
             for t in std::iter::once(typ).chain(array) {
                 if let Some(name) = interp.pg_type.get(&t).map(|r| r.typname.clone()) {
+                    follow_rename(
+                        interp,
+                        Renamed::Type {
+                            oid: t,
+                            schema,
+                            name: &name,
+                        },
+                    );
+                    super::policies::rewrite_type_refs(interp, t, schema, &name);
                     interp.rename_pg_type(t, name, new_nsoid);
                 }
             }
         } else if classid == PG_PROC_RELID {
             let proc = PgProcOid::from_nonzero(objid.into_nonzero());
             if let Some(name) = interp.pg_proc.get(&proc).map(|p| p.proname.clone()) {
+                super::policies::rewrite_function_refs(interp, proc, schema, &name);
+                follow_rename(
+                    interp,
+                    Renamed::Function {
+                        oid: proc,
+                        schema,
+                        name: &name,
+                    },
+                );
                 interp.rename_pg_proc(proc, name, new_nsoid);
             }
         } else if classid == crate::pg_catalog::PG_OPERATOR_RELID {
-            interp.move_pg_operator(
-                crate::oid::PgOperatorOid::from_nonzero(objid.into_nonzero()),
-                new_nsoid,
+            let oid = crate::oid::PgOperatorOid::from_nonzero(objid.into_nonzero());
+            follow_rename(
+                interp,
+                Renamed::Operator {
+                    oid,
+                    schema: new_schema,
+                },
             );
+            super::policies::rewrite_operator_refs(interp, oid, new_schema);
+            interp.move_pg_operator(oid, new_nsoid);
         } else if classid == super::depend::PG_OPCLASS_RELID
             || classid == super::depend::PG_OPFAMILY_RELID
         {
@@ -1006,6 +1095,17 @@ pub(crate) fn set_extension_schema(
             );
         } else if classid == crate::pg_catalog::PG_COLLATION_RELID {
             let coll = crate::oid::PgCollationOid::from_nonzero(objid.into_nonzero());
+            if let Some(name) = interp.pg_collation.get(&coll).map(|c| c.collname.clone()) {
+                follow_rename(
+                    interp,
+                    Renamed::Collation {
+                        oid: coll,
+                        schema,
+                        name: &name,
+                    },
+                );
+                super::policies::rewrite_collation_refs(interp, coll, schema, &name);
+            }
             if let Some(mut row) = interp.remove_pg_collation(coll) {
                 row.collnamespace = new_nsoid;
                 interp.insert_pg_collation(row);
@@ -1014,11 +1114,23 @@ pub(crate) fn set_extension_schema(
             // A relation moves with its row type (and that type's array).
             let rel = PgClassOid::from_nonzero(objid.into_nonzero());
             if let Some(class) = interp.pg_class.get(&rel).cloned() {
+                // Only a `regclass` constant names it.
+                follow_rename(interp, Renamed::Other);
+                super::policies::rewrite_relation_refs(interp, rel, schema, &class.relname);
                 interp.rename_pg_class(rel, class.relname, new_nsoid);
                 if let Some(rowtype) = class.reltype {
                     let array = interp.array_type_of(rowtype);
                     for t in std::iter::once(rowtype).chain(array) {
                         if let Some(name) = interp.pg_type.get(&t).map(|r| r.typname.clone()) {
+                            follow_rename(
+                                interp,
+                                Renamed::Type {
+                                    oid: t,
+                                    schema,
+                                    name: &name,
+                                },
+                            );
+                            super::policies::rewrite_type_refs(interp, t, schema, &name);
                             interp.rename_pg_type(t, name, new_nsoid);
                         }
                     }
@@ -1183,6 +1295,68 @@ pub(crate) fn check_opclass_options(
     Ok(())
 }
 
+// ─── The registry, for the extension oracle ────────────────────────────────
+
+/// What the analyzer knows of a bundled extension: its control file's
+/// facts and its version graph (for the extension oracle,
+/// `tests/catalog_oracle`).
+#[cfg(feature = "pg_sanity")]
+#[derive(Clone, Debug)]
+pub struct ExtensionInfo {
+    pub name: &'static str,
+    pub default_version: &'static str,
+    /// Every script: `(version, from)` — `from` `None` for an install
+    /// script.
+    pub versions: Vec<(&'static str, Option<&'static str>)>,
+    pub requires: &'static [&'static str],
+    pub relocatable: bool,
+    /// The control file's fixed `schema`.
+    pub schema: Option<&'static str>,
+    /// The control file's `superuser` and `trusted`.
+    pub superuser: bool,
+    pub trusted: bool,
+    /// The Docker image whose server ships it.
+    pub image: &'static str,
+}
+
+/// The Docker image whose PostgreSQL server ships extension `name`: the
+/// official `postgres` image the release names for PostgreSQL's own, that
+/// image with PL/Perl and PL/Python (`scripts/pg-pl`, which
+/// `scripts/run-pg-sanity.sh` builds) for the separately built languages
+/// and what requires them, the one `scripts/build-extensions-image.sh`
+/// builds for the third-party ones.
+#[cfg(feature = "pg_sanity")]
+fn image(name: &str) -> &'static str {
+    if THIRD_PARTY.contains(&name) {
+        "typedpg-extensions:pg19"
+    } else if needs_separate_language(name) {
+        "typedpg-pg-pl:19.0"
+    } else {
+        "postgres:19.0"
+    }
+}
+
+/// Every bundled extension, in registry order.
+#[cfg(feature = "pg_sanity")]
+pub fn extension_registry() -> Vec<ExtensionInfo> {
+    REGISTRY
+        .iter()
+        .map(|e| ExtensionInfo {
+            name: e.name,
+            default_version: e.default_version,
+            versions: e.versions.iter().map(|v| (v.version, v.from)).collect(),
+            requires: requires(e.name),
+            relocatable: relocatable(e.name),
+            schema: fixed_schema(e.name),
+            // The control files' `superuser`: every one says `true` but
+            // pgmq's.
+            superuser: e.name != "pgmq",
+            trusted: trusted(e.name),
+            image: image(e.name),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,13 +1380,20 @@ mod tests {
                 "jsonb_plperlu",
                 "jsonb_plpython3u",
                 "ltree_plpython3u",
+                "plperl",
+                "plperlu",
+                "plpython3u",
                 "pg_cron",
                 "pg_jsonschema",
                 "pgmq",
                 "postgis",
+                "postgis-3",
                 "postgis_raster",
+                "postgis_raster-3",
                 "postgis_sfcgal",
+                "postgis_sfcgal-3",
                 "postgis_topology",
+                "postgis_topology-3",
                 "vector",
             ]
         );

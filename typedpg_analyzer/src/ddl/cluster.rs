@@ -21,6 +21,17 @@ pub(crate) struct ClusterObjects {
     large_objects: Vec<u32>,
 }
 
+impl ClusterObjects {
+    /// Each subscription's name and foreign server (for the catalog
+    /// oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn subscription_servers(&self) -> impl Iterator<Item = (&str, Option<&str>)> + '_ {
+        self.subscriptions
+            .iter()
+            .map(|s| (s.name.as_str(), s.server.as_deref()))
+    }
+}
+
 /// What the analyzer keeps of a `pg_subscription` row.
 #[derive(Clone, Debug)]
 struct Subscription {

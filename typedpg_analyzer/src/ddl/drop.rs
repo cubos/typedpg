@@ -216,7 +216,12 @@ fn drop_each(
                 super::rules::drop_rule(interp, obj_node.as_ref(), stmt.missing_ok)?;
             }
             ObjectType::ObjectTransform => {
-                super::languages::drop_transform(interp, obj_node.as_ref(), stmt.missing_ok)?;
+                super::languages::drop_transform(
+                    interp,
+                    obj_node.as_ref(),
+                    stmt.missing_ok,
+                    cascade,
+                )?;
             }
             _ => {}
         }

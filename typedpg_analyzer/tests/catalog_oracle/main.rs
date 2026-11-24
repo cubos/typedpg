@@ -13,6 +13,18 @@
 //! - `catalog_oracle_random_ddl`: `CATALOG_FUZZ_RUNS` (default 40) random
 //!   sequences of `CATALOG_FUZZ_STEPS` (default 40) DDL statements, from
 //!   `CATALOG_FUZZ_SEED` (default 0xCA7A).
+//! - `extension_oracle`: every bundled extension the server image under test
+//!   (`PG_IMAGE`; each registry entry names the image that ships it) has —
+//!   each installable version, each single-step `ALTER EXTENSION ... UPDATE`
+//!   (the default version reached by updates must be a fresh install of it,
+//!   on the server too), a `SCHEMA` / `CASCADE` install, `DROP EXTENSION`
+//!   back to nothing, and the control files' facts against
+//!   `pg_available_extension_versions`. `EXTENSION_ORACLE_ONLY=a,b` limits it.
+//!   The registry is covered by three images: `postgres:19.0`,
+//!   `typedpg-pg-pl:19.0` (PL/Perl and PL/Python, for plperl, plperlu,
+//!   plpython3u and their transforms: `scripts/pg-pl`, which
+//!   `scripts/run-pg-sanity.sh` builds) and `typedpg-extensions:pg19` (the
+//!   third-party ones: `scripts/build-extensions-image.sh`).
 //! - `catalog_oracle_minimize`: the smallest subsequence of the migrations
 //!   in `CATALOG_MINIMIZE` (separated by `;;` lines) that diverges the same
 //!   way, greedily (run with `PG_SANITY_CATALOG=1` and no log).
@@ -269,5 +281,318 @@ fn catalog_oracle_minimize() {
             .map(|s| format!("{s};"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// The versions of `ext` an install reaches (CREATE EXTENSION ... VERSION):
+/// an install script's, and each one an update path leads to from one.
+fn installable(ext: &typedpg_analyzer::ExtensionInfo) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = ext
+        .versions
+        .iter()
+        .filter(|(_, from)| from.is_none())
+        .map(|(v, _)| *v)
+        .collect();
+    let mut at = 0;
+    while at < out.len() {
+        let current = out[at];
+        for (v, from) in &ext.versions {
+            if *from == Some(current) && !out.contains(v) {
+                out.push(v);
+            }
+        }
+        at += 1;
+    }
+    out
+}
+
+/// The server catalog after `steps` on a fresh database, compared with the
+/// analyzer's after each of them by the catalog oracle (a divergence
+/// panics: `PG_SANITY_CATALOG=1`) — in `database` when given (see
+/// [`PgCatalog::pg_sanity_database`]).
+fn server_catalog_after(steps: &[String], database: Option<&str>) -> Option<Vec<String>> {
+    let mut catalog = PgCatalog::new().expect("catalog");
+    if let Some(database) = database {
+        catalog.pg_sanity_database(database);
+    }
+    for step in steps {
+        // Both sides reject it or neither (the mirror compares outcomes).
+        let _ = catalog.apply_sql(step);
+    }
+    catalog.pg_sanity_server_catalog()
+}
+
+/// A row of `pg_available_extension_versions`.
+struct AvailableVersion {
+    name: String,
+    version: String,
+    superuser: bool,
+    trusted: bool,
+    relocatable: bool,
+    schema: Option<String>,
+    requires: Vec<String>,
+}
+
+#[test]
+#[ignore = "extension oracle: needs run-pg-sanity.sh (PG_IMAGE names the image under test)"]
+fn extension_oracle() {
+    // Every bundled extension the server image under test ships: each
+    // installable version, each single-step update, a SCHEMA and a
+    // CASCADE install, DROP back to nothing, and the control files'
+    // facts against pg_available_extension_versions.
+    let image = std::env::var("PG_IMAGE").unwrap_or_else(|_| "postgres:19.0".into());
+    let only: Option<Vec<String>> = std::env::var("EXTENSION_ORACLE_ONLY")
+        .ok()
+        .map(|s| s.split(',').map(str::to_owned).collect());
+    let registry = typedpg_analyzer::extension_registry();
+    let bundled = |n: &str| registry.iter().any(|e| e.name == n);
+    let log_before = log_size();
+    let mut failed = 0;
+    let empty = server_catalog_after(&[], None).unwrap_or_default();
+
+    // (5) The control files, as the server reads them.
+    let url = std::env::var("POSTGRES_URL").expect("POSTGRES_URL");
+    let mut client = typedpg_analyzer::pg_sanity_support::postgres::Client::connect(
+        &url,
+        typedpg_analyzer::pg_sanity_support::postgres::NoTls,
+    )
+    .expect("connect");
+    let available: Vec<AvailableVersion> = client
+        .query(
+            "SELECT name::text, version, superuser, trusted, relocatable, schema::text, \
+                    coalesce(requires::text[], '{}') \
+             FROM pg_catalog.pg_available_extension_versions",
+            &[],
+        )
+        .expect("pg_available_extension_versions")
+        .iter()
+        .map(|r| AvailableVersion {
+            name: r.get(0),
+            version: r.get(1),
+            superuser: r.get(2),
+            trusted: r.get(3),
+            relocatable: r.get(4),
+            schema: r.get(5),
+            requires: r.get(6),
+        })
+        .collect();
+    let defaults: Vec<(String, String)> = client
+        .query(
+            "SELECT name::text, default_version FROM pg_catalog.pg_available_extensions",
+            &[],
+        )
+        .expect("pg_available_extensions")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    for (name, _) in &defaults {
+        if !bundled(name) && only.is_none() {
+            log(&format!(
+                "=== extension {name}: the server ({image}) ships it, the registry doesn't\n"
+            ));
+        }
+    }
+
+    for ext in &registry {
+        if ext.image != image
+            || only
+                .as_ref()
+                .is_some_and(|o| !o.iter().any(|n| n == ext.name))
+        {
+            continue;
+        }
+        let name = ext.name;
+        let missing: Vec<&str> = ext
+            .requires
+            .iter()
+            .copied()
+            .filter(|r| !bundled(r))
+            .collect();
+        // The registry must bundle what its extensions require: no
+        // extension is left out.
+        if !missing.is_empty() {
+            failed += 1;
+            log(&format!(
+                "=== extension {name}: requires {}, which the registry doesn't bundle\n",
+                missing.join(", ")
+            ));
+            continue;
+        }
+        // (5)
+        let server_default = defaults
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone());
+        let mut facts = Vec::new();
+        if server_default.as_deref() != Some(ext.default_version) {
+            facts.push(format!(
+                "default_version: {} in the registry, {server_default:?} in PostgreSQL",
+                ext.default_version
+            ));
+        }
+        let mut server_versions: Vec<&str> = available
+            .iter()
+            .filter(|a| a.name == name)
+            .map(|a| a.version.as_str())
+            .collect();
+        server_versions.sort_unstable();
+        let mut ours = installable(ext);
+        ours.sort_unstable();
+        if server_versions != ours {
+            facts.push(format!(
+                "versions: {ours:?} in the registry, {server_versions:?} in PostgreSQL"
+            ));
+        }
+        for a in available.iter().filter(|a| a.name == name) {
+            let mut requires: Vec<&str> = a.requires.iter().map(String::as_str).collect();
+            requires.sort_unstable();
+            let mut our_requires = ext.requires.to_vec();
+            our_requires.sort_unstable();
+            if a.relocatable != ext.relocatable
+                || a.schema.as_deref() != ext.schema
+                || requires != our_requires
+                || a.superuser != ext.superuser
+                || a.trusted != ext.trusted
+            {
+                facts.push(format!(
+                    "version {}: relocatable / schema / requires / superuser / trusted are \
+                     {} / {:?} / {:?} / {} / {} in the registry, {} / {:?} / {:?} / {} / {} in \
+                     PostgreSQL",
+                    a.version,
+                    ext.relocatable,
+                    ext.schema,
+                    our_requires,
+                    ext.superuser,
+                    ext.trusted,
+                    a.relocatable,
+                    a.schema,
+                    requires,
+                    a.superuser,
+                    a.trusted
+                ));
+            }
+        }
+        if !facts.is_empty() {
+            failed += 1;
+            log(&format!(
+                "=== extension {name}: control file\n{}\n",
+                facts.join("\n")
+            ));
+        }
+
+        // pg_cron installs in `cron.database_name` only: the extensions
+        // image's (scripts/extensions-image) is `pg_sanity_cron`.
+        let database =
+            (name == "pg_cron" || ext.requires.contains(&"pg_cron")).then_some("pg_sanity_cron");
+        let cascade = if ext.requires.is_empty() {
+            ""
+        } else {
+            " CASCADE"
+        };
+        let create = |version: &str, extra: &str| {
+            format!("CREATE EXTENSION \"{name}\" VERSION '{version}'{extra}{cascade}")
+        };
+        // (1) Each installable version.
+        let mut fresh_default = None;
+        for version in installable(ext) {
+            let steps = vec![create(version, "")];
+            let mut dump = None;
+            let ok = run_sequence(&format!("extension {name} {version}"), |_, at| {
+                at.clone_from(&steps[0]);
+                dump = server_catalog_after(&steps, database);
+            });
+            failed += usize::from(!ok);
+            if version == ext.default_version {
+                fresh_default = dump;
+            }
+        }
+        // (2) Each single-step update, and the default version reached by
+        // updates against a fresh install of it — on the server too.
+        for (to, from) in &ext.versions {
+            let Some(from) = from else { continue };
+            let steps = vec![
+                create(from, ""),
+                format!("ALTER EXTENSION \"{name}\" UPDATE TO '{to}'"),
+            ];
+            let mut dump = None;
+            let ok = run_sequence(&format!("extension {name} {from} -> {to}"), |_, at| {
+                at.clone_from(&steps.join(";\n"));
+                dump = server_catalog_after(&steps, database);
+            });
+            failed += usize::from(!ok);
+            if *to == ext.default_version
+                && let (Some(updated), Some(fresh)) = (&dump, &fresh_default)
+                && updated != fresh
+            {
+                failed += 1;
+                let only_updated: Vec<&String> = updated
+                    .iter()
+                    .filter(|l| !fresh.contains(l))
+                    .take(20)
+                    .collect();
+                let only_fresh: Vec<&String> = fresh
+                    .iter()
+                    .filter(|l| !updated.contains(l))
+                    .take(20)
+                    .collect();
+                log(&format!(
+                    "=== extension {name}: {from} -> {to} isn't a fresh {to} on the server\n\
+                     only updated: {only_updated:#?}\nonly fresh: {only_fresh:#?}\n"
+                ));
+            }
+        }
+        // (3) Into another schema, and with CASCADE (its requirements).
+        let steps = vec![
+            "CREATE SCHEMA other_schema".to_owned(),
+            create(ext.default_version, " SCHEMA other_schema"),
+        ];
+        let ok = run_sequence(&format!("extension {name} SCHEMA"), |_, at| {
+            at.clone_from(&steps.join(";\n"));
+            server_catalog_after(&steps, database);
+        });
+        failed += usize::from(!ok);
+        // (4) DROP EXTENSION returns to nothing.
+        let steps = vec![
+            create(ext.default_version, ""),
+            format!("DROP EXTENSION \"{name}\" CASCADE"),
+        ];
+        let mut dump = None;
+        let ok = run_sequence(&format!("extension {name} DROP"), |_, at| {
+            at.clone_from(&steps.join(";\n"));
+            dump = server_catalog_after(&steps, database);
+        });
+        failed += usize::from(!ok);
+        // What CASCADE installed stays; so does the control file's fixed
+        // schema, which CREATE EXTENSION created outside the extension
+        // (CreateExtensionInternal: not a member, DROP leaves it).
+        let required_left = |l: &String| {
+            ext.requires
+                .iter()
+                .any(|r| l.contains(&format!("pg_extension {r} ")))
+                || ext
+                    .schema
+                    .is_some_and(|schema| l.starts_with(&format!("pg_namespace {schema} ")))
+        };
+        if let Some(dump) = dump {
+            let left: Vec<&String> = dump
+                .iter()
+                .filter(|l| !empty.contains(l) && !required_left(l))
+                .collect();
+            if !left.is_empty() && ext.requires.is_empty() {
+                failed += 1;
+                log(&format!(
+                    "=== extension {name}: DROP EXTENSION left rows on the server\n{left:#?}\n"
+                ));
+            }
+        }
+    }
+    assert_eq!(
+        failed, 0,
+        "{failed} extension check(s) diverged (see the log)"
+    );
+    assert_eq!(
+        log_size(),
+        log_before,
+        "the catalogs diverged (see the log)"
     );
 }

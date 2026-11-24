@@ -2785,6 +2785,41 @@ fn do_block_role_existence_branch_runs_other_statements() {
 }
 
 #[test]
+fn do_block_if_a_role_exists_runs_the_branch_its_existence_selects() {
+    // The converse idiom: a grant to a role that may not exist yet.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_do5_here;
+         CREATE TABLE acl2_do5_t (id int);
+         DO $$ BEGIN
+             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'acl2_do5_here') THEN
+                 GRANT SELECT ON acl2_do5_t TO acl2_do5_here;
+             END IF;
+             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'acl2_do5_missing') THEN
+                 GRANT SELECT ON acl2_do5_t TO acl2_do5_missing;
+             ELSE
+                 GRANT INSERT ON acl2_do5_t TO acl2_do5_here;
+             END IF;
+         END $$;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl2_do5_here",
+        "public",
+        "acl2_do5_t",
+        Privilege::Select
+    ));
+    assert!(table_has(
+        &db,
+        "acl2_do5_here",
+        "public",
+        "acl2_do5_t",
+        Privilege::Insert
+    ));
+    assert!(!db.role_exists("acl2_do5_missing"));
+}
+
+#[test]
 fn do_block_role_existence_branch_can_create_a_role_in_role() {
     let db = build_db(&[(
         "0001.sql",
