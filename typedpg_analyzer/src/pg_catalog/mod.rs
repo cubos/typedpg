@@ -219,7 +219,7 @@ pub struct PgCatalog {
     pub(crate) pg_constraint: Shared<HashMap<PgConstraintOid, PgConstraint>>,
     /// Keyed by `indexrelid` (the index's `pg_class.oid`).
     pub(crate) pg_index: Shared<HashMap<PgClassOid, PgIndex>>,
-    pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
+    pg_rewrite: Shared<HashMap<PgRewriteOid, PgRewrite>>,
     pub(crate) pg_collation: Shared<HashMap<PgCollationOid, PgCollation>>,
     pub(crate) pg_am: Shared<Vec<PgAm>>,
     pub(crate) pg_opfamily: Shared<Vec<PgOpfamily>>,
@@ -293,7 +293,7 @@ pub struct PgCatalog {
     /// what MergeAttributes compares when several parents give a column a
     /// default (PG compares the cooked `pg_attrdef` trees).
     pub(crate) attr_default_exprs:
-        HashMap<(PgClassOid, i16), crate::ddl::tables::check_inherit::StoredExpr>,
+        Shared<HashMap<(PgClassOid, i16), crate::ddl::tables::check_inherit::StoredExpr>>,
     /// The columns each generation expression reads, by the generated
     /// column (PG records them as `pg_depend` rows of the column's
     /// `pg_attrdef` entry): DROP COLUMN of such a column needs CASCADE and
@@ -388,7 +388,7 @@ pub struct PgCatalog {
         Shared<HashMap<crate::ddl::depend::ObjectAddress, crate::ddl::depend::ExprTypeUse>>,
     /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
     /// kept so `to_seed` round-trips them.
-    sql_function_defs: HashMap<PgProcOid, String>,
+    sql_function_defs: Shared<HashMap<PgProcOid, String>>,
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
     pub(crate) partition_keys: Shared<HashMap<PgClassOid, Vec<i16>>>,
@@ -581,14 +581,26 @@ pub struct PgCatalog {
     /// CHECK constraints' expressions and `connoinherit`.
     pub(crate) check_defs:
         Shared<HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>>,
-    /// The stored expressions (by a hash of their tree) already bound to
-    /// the objects their names found (see
+    /// The stored expressions (by a hash of their tree) whose names are
+    /// bound to the objects they found (see
     /// [`crate::ddl::stored_exprs::bind_stored_expressions`]): a later
     /// statement's search path doesn't rebind them.
     pub(crate) bound_stored_exprs: Shared<std::collections::HashSet<u64>>,
     /// The stored expressions (by tree hash) whose datetime literals hold
     /// their canonical text ([`crate::ddl::stored_exprs`]).
     pub(crate) settled_stored_exprs: Shared<std::collections::HashSet<u64>>,
+    /// For each stored expression (by slot), the tree hash whose
+    /// `regrole` / `regdatabase` constants were refused or found harmless
+    /// ([`crate::ddl::stored_exprs::bind_stored_expressions`]). Cleared
+    /// when a statement changes a column's type, which changes what a
+    /// literal coerces to.
+    pub(crate) refused_stored_exprs: Shared<HashMap<crate::ddl::stored_exprs::Slot, u64>>,
+    /// The write counts of the catalog tables stored expressions live in
+    /// ([`Shared::version`]) as of the last pass over them
+    /// ([`crate::ddl::stored_exprs::bind_stored_expressions`]): when they
+    /// are unchanged, no stored expression was added, changed or removed
+    /// since, and there is nothing to do. `None` before the first pass.
+    pub(crate) stored_expr_versions: Option<[u64; crate::ddl::stored_exprs::STORED_EXPR_SOURCES]>,
     /// The datetime literals of stored expressions whose value wasn't known
     /// when they were written (a zone-less timestamptz in the server's
     /// unknown zone, `today`): read again later, under other settings, they
@@ -635,7 +647,7 @@ pub struct PgCatalog {
     pub(crate) uncertain_collations: Shared<std::collections::HashSet<(PgClassOid, i16)>>,
     /// The column / relation dependencies of policies, triggers, rules and
     /// SQL-standard function bodies.
-    pub(crate) column_deps: crate::ddl::coldeps::ColumnDeps,
+    pub(crate) column_deps: Shared<crate::ddl::coldeps::ColumnDeps>,
     /// The migration session's prepared statements (PREPARE), by name.
     pub(crate) prepared_statements:
         Shared<HashMap<String, crate::ddl::prepared::PreparedStatement>>,
@@ -649,7 +661,7 @@ pub struct PgCatalog {
     /// The seed's `pg_acl` rows, kept verbatim so `to_seed` round-trips the
     /// seed exporter's output (the internal ACL state also holds ACLs
     /// migrations created, which the exporter never writes).
-    pub(crate) seed_acls: Vec<SeedAcl>,
+    pub(crate) seed_acls: Shared<Vec<SeedAcl>>,
     /// One past the largest OID the seed holds: anything below it is a
     /// built-in object, owned by the bootstrap superuser.
     pub(crate) seed_oid_end: u32,
@@ -928,7 +940,7 @@ impl PgCatalog {
         for acl in &seed.pg_acl {
             cat.load_seed_acl(acl);
         }
-        cat.seed_acls = seed.pg_acl;
+        cat.seed_acls = Shared::new(seed.pg_acl);
         // initdb makes `pg_database_owner` the owner of the `public` schema;
         // every other built-in object belongs to the bootstrap superuser.
         if let (Some(public), Some(database_owner)) = (
@@ -962,7 +974,7 @@ impl PgCatalog {
             pg_inherits: Shared::default(),
             pg_constraint: Shared::default(),
             pg_index: Shared::default(),
-            pg_rewrite: HashMap::new(),
+            pg_rewrite: Shared::default(),
             pg_collation: Shared::default(),
             pg_am: Shared::default(),
             pg_opfamily: Shared::default(),
@@ -993,7 +1005,7 @@ impl PgCatalog {
             domain_default_exprs: Shared::default(),
             domain_default_sequence_perms: Shared::default(),
             attr_default_types: Shared::default(),
-            attr_default_exprs: HashMap::new(),
+            attr_default_exprs: Shared::default(),
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
             allow_system_table_mods: crate::ddl::session::BoolGuc::new(false),
@@ -1018,7 +1030,7 @@ impl PgCatalog {
             routine_defaults: Shared::default(),
             types_with_typmodin: Shared::default(),
             expr_type_uses: Shared::default(),
-            sql_function_defs: HashMap::new(),
+            sql_function_defs: Shared::default(),
             partition_keys: Shared::default(),
             partition_key_exprs: Shared::default(),
             triggers: Shared::default(),
@@ -1078,6 +1090,8 @@ impl PgCatalog {
             check_defs: Shared::default(),
             bound_stored_exprs: Shared::default(),
             settled_stored_exprs: Shared::default(),
+            refused_stored_exprs: Shared::default(),
+            stored_expr_versions: None,
             unsettled_datetime_literals: Shared::default(),
             toast_tables: Shared::default(),
             toast_rewrites: Shared::default(),
@@ -1088,10 +1102,10 @@ impl PgCatalog {
             attnum_high_water: Shared::default(),
             attr_compression: Shared::default(),
             uncertain_collations: Shared::default(),
-            column_deps: Default::default(),
+            column_deps: Shared::default(),
             roles: Shared::new(crate::ddl::roles::Roles::new()),
             acls: Shared::default(),
-            seed_acls: Vec::new(),
+            seed_acls: Shared::default(),
             seed_oid_end: 0,
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -1220,7 +1234,7 @@ impl PgCatalog {
             pg_ts_objects: Vec::clone(&self.pg_ts_objects),
             pg_ts_config_map: Vec::clone(&self.pg_ts_config_map),
             pg_conversion: Vec::clone(&self.conversions),
-            pg_acl: self.seed_acls.clone(),
+            pg_acl: self.seed_acls.to_vec(),
             pg_language: {
                 let mut rows: Vec<_> = self.pg_language.values().cloned().collect();
                 rows.sort_by_key(|l| l.oid);
@@ -2222,7 +2236,17 @@ impl PgCatalog {
     /// Errors with [`DdlError::Internal`] only when the OID space (`u32`) is
     /// exhausted — practically unreachable in a single analyzer run since
     /// allocation starts at [`USER_OID_START`] (100_000) and steps by one.
-    /// The OID the next object will get.
+    /// The OID the next object will get. Every object a statement creates
+    /// gets one at or above the value before it ran, and OIDs are never
+    /// reused: comparing an object's OID with that value tells whether the
+    /// statement created it.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn next_oid_value(&self) -> u32 {
+        self.next_oid.get()
+    }
+
+    /// [`Self::next_oid_value`], for the crate itself.
+    #[cfg(not(any(test, feature = "internal")))]
     pub(crate) fn next_oid_value(&self) -> u32 {
         self.next_oid.get()
     }

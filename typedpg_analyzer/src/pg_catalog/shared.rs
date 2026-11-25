@@ -7,17 +7,32 @@
 //! quadratic in the schema's size. [`Shared`] keeps a table behind an `Arc`:
 //! cloning the catalog shares every table, and a table is copied only on its
 //! first write after a clone ([`Arc::make_mut`]).
+//!
+//! Each table also counts its writes ([`Shared::version`]), so a reader that
+//! caches what it derived from a table — the stored expressions already
+//! processed, say — can tell whether the table changed since. The counter is
+//! shared by every copy of the catalog (a snapshot bumps it too, which only
+//! makes the reader look again).
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A catalog table shared between catalog copies until one writes to it.
-#[derive(Debug, Default)]
-pub struct Shared<T>(Arc<T>);
+#[derive(Debug)]
+pub struct Shared<T> {
+    data: Arc<T>,
+    /// How many times the table was opened for writing (see the module
+    /// docs).
+    version: Arc<AtomicU64>,
+}
 
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
-        Shared(Arc::new(value))
+        Shared {
+            data: Arc::new(value),
+            version: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// The table, owned: moved out if this copy is its only owner, cloned
@@ -26,13 +41,28 @@ impl<T> Shared<T> {
     where
         T: Clone,
     {
-        Arc::unwrap_or_clone(self.0)
+        Arc::unwrap_or_clone(self.data)
+    }
+
+    /// How many times the table was opened for writing. Equal versions mean
+    /// the table was not written in between; a version only ever grows.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+}
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Shared::new(T::default())
     }
 }
 
 impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
-        Shared(Arc::clone(&self.0))
+        Shared {
+            data: Arc::clone(&self.data),
+            version: Arc::clone(&self.version),
+        }
     }
 }
 
@@ -40,13 +70,14 @@ impl<T> Deref for Shared<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &self.0
+        &self.data
     }
 }
 
 impl<T: Clone> DerefMut for Shared<T> {
     fn deref_mut(&mut self) -> &mut T {
-        Arc::make_mut(&mut self.0)
+        self.version.fetch_add(1, Ordering::Relaxed);
+        Arc::make_mut(&mut self.data)
     }
 }
 
@@ -64,7 +95,7 @@ where
     type IntoIter = <&'a T as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        (&*self.0).into_iter()
+        (&*self.data).into_iter()
     }
 }
 
@@ -76,6 +107,7 @@ where
     type IntoIter = <&'a mut T as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        Arc::make_mut(&mut self.0).into_iter()
+        self.version.fetch_add(1, Ordering::Relaxed);
+        Arc::make_mut(&mut self.data).into_iter()
     }
 }

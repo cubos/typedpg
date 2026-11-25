@@ -94,9 +94,8 @@ pub fn lint_migrations(
         created_indexes: HashMap::new(),
         created_constraints: HashMap::new(),
         column_creators: HashMap::new(),
-        before_classes: HashSet::new(),
-        before_indexes: HashSet::new(),
-        before_constraints: HashSet::new(),
+        before_oid: 0,
+        before_routines: HashSet::new(),
         before_relation: None,
         before_columns: HashSet::new(),
         orderings: HashMap::new(),
@@ -117,7 +116,6 @@ pub fn lint_migrations(
         created_policies: HashMap::new(),
         rls_enablers: HashMap::new(),
         created_routines: HashMap::new(),
-        before_routines: HashSet::new(),
         not_valid_in_transaction: HashSet::new(),
         drop_parts: None,
     };
@@ -204,12 +202,15 @@ struct MigrationLinter<'a> {
     /// For each column of a table, the last statement that gave it its
     /// current type: `CREATE TABLE`, `ADD COLUMN` or `ALTER COLUMN TYPE`.
     column_creators: HashMap<(PgClassOid, i16), Creator>,
-    /// The relations that existed before the current statement: a
-    /// `CREATE TABLE IF NOT EXISTS` that found its table already there
-    /// created nothing, so it defines no column's type.
-    before_classes: HashSet<PgClassOid>,
-    before_indexes: HashSet<PgClassOid>,
-    before_constraints: HashSet<PgConstraintOid>,
+    /// The OID the statement that is running will hand out next: every
+    /// relation, index or constraint it creates gets one at or above it
+    /// (OIDs are never reused), so its OID tells whether the statement
+    /// created it. A `CREATE TABLE IF NOT EXISTS` that found its table
+    /// already there created nothing, so it defines no column's type.
+    before_oid: u32,
+    /// The migrations' routines before a `CREATE FUNCTION`, to find the one
+    /// it creates.
+    before_routines: HashSet<PgProcOid>,
     /// The columns of the relation an `ALTER TABLE` targets, before that
     /// statement: an `ADD COLUMN IF NOT EXISTS` that skipped an existing one
     /// defines no new type.
@@ -261,9 +262,6 @@ struct MigrationLinter<'a> {
     rls_enablers: HashMap<PgClassOid, Creator>,
     /// The last `CREATE [OR REPLACE] FUNCTION / PROCEDURE` of each routine.
     created_routines: HashMap<PgProcOid, Creator>,
-    /// The migrations' routines before a `CREATE FUNCTION`, to find the one
-    /// it creates.
-    before_routines: HashSet<PgProcOid>,
     /// The constraints the open transaction added `NOT VALID` to a table
     /// that existed before the file: their `ADD CONSTRAINT` still holds its
     /// lock until the transaction ends.
@@ -2021,7 +2019,7 @@ impl MigrationLinter<'_> {
         let built = catalog.iter_indexes().any(|index| {
             leaves.contains(&index.indrelid)
                 && self.pre_existing.contains(&index.indrelid)
-                && !self.before_indexes.contains(&index.indexrelid)
+                && index.indexrelid.get() >= self.before_oid
                 && catalog
                     .class_row(index.indexrelid)
                     .is_some_and(|index| index.relkind == RelKind::Index)
@@ -2077,7 +2075,7 @@ impl MigrationLinter<'_> {
                 .iter_indexes()
                 .filter(|index| {
                     tables.contains(&index.indrelid)
-                        && !self.before_indexes.contains(&index.indexrelid)
+                        && index.indexrelid.get() >= self.before_oid
                         && catalog
                             .class_row(index.indexrelid)
                             .is_some_and(|index| index.relkind == RelKind::Index)
@@ -2420,7 +2418,7 @@ impl MigrationLinter<'_> {
                     // `CREATE TABLE IF NOT EXISTS` on an existing table is
                     // a no-op: its columns keep the statements that gave
                     // them their types.
-                    if !self.before_classes.contains(&class.oid) {
+                    if class.oid.get() >= self.before_oid {
                         self.record_columns(catalog, class.oid);
                     }
                 }
@@ -2436,7 +2434,7 @@ impl MigrationLinter<'_> {
                 {
                     // `CREATE TABLE AS … IF NOT EXISTS` on an existing
                     // relation is a no-op too.
-                    if !self.before_classes.contains(&class.oid) {
+                    if class.oid.get() >= self.before_oid {
                         self.record_columns(catalog, class.oid);
                     }
                 }
@@ -3268,15 +3266,17 @@ impl MigrationLinter<'_> {
 
 impl MigrationObserver for MigrationLinter<'_> {
     fn before(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
-        // The relations before the statement: a `CREATE TABLE IF NOT
-        // EXISTS` that finds its table already there creates nothing.
-        self.before_classes = catalog.iter_classes().map(|class| class.oid).collect();
-        // Every file's indexes are tracked, for their order: an extra
-        // migration's index can make one of ours redundant.
-        self.before_indexes = catalog
-            .iter_indexes()
-            .map(|index| index.indexrelid)
-            .collect();
+        // The OID the statement will hand out next: what it creates has an
+        // OID at or above it (a `CREATE TABLE IF NOT EXISTS` that finds its
+        // table already there creates nothing).
+        self.before_oid = catalog.next_oid_value();
+        if let N::CreateFunctionStmt(_) = statement.node {
+            self.before_routines = catalog
+                .lint_routine_security()
+                .into_iter()
+                .map(|(oid, _, _)| oid)
+                .collect();
+        }
         if self.files[self.current].lint == MigrationLint::None {
             return;
         }
@@ -3300,17 +3300,6 @@ impl MigrationObserver for MigrationLinter<'_> {
                 .map(|attribute| attribute.attnum)
                 .collect();
         }
-        self.before_constraints = catalog
-            .iter_constraints()
-            .map(|constraint| constraint.oid)
-            .collect();
-        if let N::CreateFunctionStmt(_) = statement.node {
-            self.before_routines = catalog
-                .lint_routine_security()
-                .into_iter()
-                .map(|(oid, _, _)| oid)
-                .collect();
-        }
         self.drop_parts = (self.files[self.current].lint == MigrationLint::All
             && matches!(statement.node, N::DropStmt(_)))
         .then(|| self.table_parts(catalog));
@@ -3321,15 +3310,16 @@ impl MigrationObserver for MigrationLinter<'_> {
     }
 
     fn after(&mut self, catalog: &PgCatalog, statement: &MigrationStatement<'_>) {
-        let indexes: HashSet<PgClassOid> = catalog
+        let indexes: Vec<PgClassOid> = catalog
             .iter_indexes()
+            .filter(|index| index.indexrelid.get() >= self.before_oid)
             .map(|index| index.indexrelid)
             .collect();
         // A `CREATE INDEX` on a partitioned table also makes its partitions'
         // indexes: all of them in the statement's order.
         if let N::IndexStmt(stmt) = statement.node {
             let order = key_order(stmt);
-            for oid in indexes.difference(&self.before_indexes) {
+            for oid in &indexes {
                 self.orderings.insert(*oid, order.clone());
             }
         }
@@ -3337,11 +3327,7 @@ impl MigrationObserver for MigrationLinter<'_> {
             return;
         }
         self.track_column_creators(catalog, statement);
-        let constraints: HashSet<PgConstraintOid> = catalog
-            .iter_constraints()
-            .map(|constraint| constraint.oid)
-            .collect();
-        for oid in indexes.difference(&self.before_indexes) {
+        for oid in &indexes {
             self.created_indexes.insert(
                 *oid,
                 Creator {
@@ -3351,9 +3337,12 @@ impl MigrationObserver for MigrationLinter<'_> {
                 },
             );
         }
-        for oid in constraints.difference(&self.before_constraints) {
+        for constraint in catalog
+            .iter_constraints()
+            .filter(|constraint| constraint.oid.get() >= self.before_oid)
+        {
             self.created_constraints.insert(
-                *oid,
+                constraint.oid,
                 Creator {
                     file: self.current,
                     span: self.current_span.clone(),
@@ -3374,7 +3363,7 @@ impl MigrationObserver for MigrationLinter<'_> {
         {
             for constraint in catalog.iter_constraints() {
                 if !constraint.convalidated
-                    && !self.before_constraints.contains(&constraint.oid)
+                    && constraint.oid.get() >= self.before_oid
                     && self.pre_existing.contains(&constraint.conrelid)
                 {
                     self.not_valid_in_transaction.insert(constraint.oid);
@@ -3389,7 +3378,7 @@ impl MigrationObserver for MigrationLinter<'_> {
             .iter_classes()
             .filter(|class| {
                 matches!(class.relkind, RelKind::Table | RelKind::Partitioned)
-                    && !self.before_classes.contains(&class.oid)
+                    && class.oid.get() >= self.before_oid
             })
             .map(|class| class.oid)
             .collect();
@@ -3429,7 +3418,7 @@ impl MigrationLinter<'_> {
                     .relation
                     .as_ref()
                     .and_then(|relation| resolve_relation(catalog, relation))
-                    && !self.before_classes.contains(&class.oid)
+                    && class.oid.get() >= self.before_oid
                 {
                     self.created_relations.insert(class.oid, self.creator());
                 }
@@ -3440,7 +3429,7 @@ impl MigrationLinter<'_> {
                     .as_ref()
                     .and_then(|into| into.rel.as_ref())
                     .and_then(|relation| resolve_relation(catalog, relation))
-                    && !self.before_classes.contains(&class.oid)
+                    && class.oid.get() >= self.before_oid
                 {
                     self.created_relations.insert(class.oid, self.creator());
                 }

@@ -543,9 +543,27 @@ fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError>
     {
         stored_exprs::note_all_bound(db);
     }
+    // A column or domain that changes type changes what a literal cast to
+    // it coerces to: the expressions whose `regrole` / `regdatabase`
+    // constants were refused or found harmless are checked again.
+    if changes_column_types(stmt) {
+        db.refused_stored_exprs.clear();
+    }
     // The stored expressions it wrote are bound to the objects their names
     // find under the search path it ran with.
     stored_exprs::bind_stored_expressions(db)
+}
+
+/// Whether `stmt` changes the type of a column (or of a domain, whose
+/// `ALTER DOMAIN … SET DATA TYPE` arrives as one).
+fn changes_column_types(stmt: &ast::Node) -> bool {
+    let ast::Node::AlterTableStmt(alter) = stmt else {
+        return false;
+    };
+    alter.cmds.iter().any(|command| {
+        matches!(command.as_ref(), Some(ast::Node::AlterTableCmd(command))
+            if command.subtype == ast::AlterTableType::AtAlterColumnType)
+    })
 }
 
 /// Apply a single parsed statement, by kind.
