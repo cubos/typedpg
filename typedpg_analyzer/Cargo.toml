@@ -30,8 +30,8 @@ catalog_export = ["dep:postgres"]
 record_corpus = []
 
 [dependencies]
-typedpg_core = { path = "../typedpg_core", version = "0.9.0" }
-typedpg_pg_query = { path = "../typedpg_pg_query", version = "0.9.0" }
+typedpg_core = { path = "../typedpg_core", version = "0.9.1" }
+typedpg_pg_query = { path = "../typedpg_pg_query", version = "0.9.1" }
 stacker = "0.1"
 base64 = "0.23"
 postcard = { version = "1", default-features = false, features = ["alloc"] }

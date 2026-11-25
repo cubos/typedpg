@@ -3616,7 +3616,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typedpg"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "bb8",
  "bb8-postgres",
@@ -3640,7 +3640,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_analyzer"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -3661,7 +3661,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "chrono",
  "clap",
@@ -3689,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "md5",
  "serde",
@@ -3735,7 +3735,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_lint"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "globset",
  "postgres",
@@ -3749,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_macros"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_pg_query"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cc",
  "serde",
@@ -3775,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_pg_query_codegen"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "heck",
  "regex",
@@ -3804,7 +3804,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_ts"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "clap",
  "globset",
@@ -3832,7 +3832,7 @@ dependencies = [
 
 [[package]]
 name = "typedpg_wasm"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "typedpg_core",
 ]
