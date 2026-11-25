@@ -24,7 +24,12 @@
 //! level) leads a non-partial btree index, and the table has no expression
 //! index at all (one may match the expression). The other side must be a
 //! value an index scan could use: no column of the same table, no subquery,
-//! no volatile call. Only the top-level `AND` parts of a condition are read.
+//! no volatile call. A plain indexed column of another relation is not
+//! reported: the planner computes the wrapped side's value and looks that
+//! relation up with an index scan on its own index (a nested loop with
+//! `b."level" = a."level" + 1` as the index condition), so the comparison is
+//! sargable through that side. Only the top-level `AND` parts of a condition
+//! are read.
 //! The help names the sargable rewrite when it is a range (`::date`,
 //! `date_trunc`): one no other rule reports (a `timestamptz` column's
 //! bounds convert the day explicitly, as the cast reads it in the session's
@@ -271,6 +276,16 @@ fn comparison(ctx: &Ctx<'_>, level: &Level, expr: &AExpr) -> Option<RawFinding> 
         if !others
             .iter()
             .all(|other| index_usable_value(ctx, other, &wrapped.source))
+        {
+            continue;
+        }
+        // A nested loop looks the other relation up by the value this side
+        // computes (`b."level" = a."level" + 1`, an index scan on `b`): the
+        // comparison is sargable through that side, so this column's index
+        // is not what the planner reaches for.
+        if compared.is_some()
+            && matches!(others.as_slice(), [other]
+                if indexed_other_column(ctx, level, other, &wrapped.source))
         {
             continue;
         }
@@ -679,6 +694,59 @@ fn wrapped_column<'a>(ctx: &Ctx<'_>, level: &Level, side: &'a Node) -> Option<Wr
     })
 }
 
+/// Whether `node` is a plain column of another FROM entry, with the index
+/// that serves the comparison the other way round: a nested loop looks
+/// that relation up by the value this side computes, so the wrapped
+/// column's own index is irrelevant to the comparison.
+fn indexed_other_column(ctx: &Ctx<'_>, level: &Level, node: &Node, wrapped_source: &str) -> bool {
+    let Node::ColumnRef(column) = node else {
+        return false;
+    };
+    let Some(binding) = ctx.view.column_ref_binding(column.location) else {
+        return false;
+    };
+    if binding.outer {
+        return false;
+    }
+    let Some(source) = binding
+        .source
+        .as_deref()
+        .filter(|source| *source != wrapped_source)
+    else {
+        return false;
+    };
+    let Some(table) = level.table(source) else {
+        return false;
+    };
+    let name = match column.fields.last() {
+        Some(Some(Node::String(s))) => s.sval.as_str(),
+        _ => return false,
+    };
+    let Some(attnum) = ctx
+        .catalog
+        .attributes_of(table)
+        .iter()
+        .find(|attribute| attribute.attnum > 0 && attribute.attname == name)
+        .map(|attribute| attribute.attnum)
+    else {
+        return false;
+    };
+    let Some((_, opclass)) = leading_btree_index(ctx, table, attnum) else {
+        return false;
+    };
+    // As for the wrapped column: the comparison reads this one as stored,
+    // or relabeled to a type its index's operator family compares. A
+    // conversion that changes the value leaves the index unable to serve.
+    match ctx.view.value_conversion(NodeRef::ColumnRef(column)) {
+        None => true,
+        Some(conversion) => {
+            !conversion.explicit
+                && binary_coercible(ctx, conversion.from, conversion.to)
+                && family_compares(ctx, opclass, conversion.to)
+        }
+    }
+}
+
 /// The name of the first non-partial btree index of `table` led by column
 /// `attnum`, and its leading column's operator class, when the table has no
 /// expression index (which might match the wrapped expression).
@@ -789,7 +857,10 @@ mod tests {
                  CREATE INDEX posts_posted_on ON posts (posted_on);
                  CREATE TABLE slugs (id int PRIMARY KEY, slug text NOT NULL);
                  CREATE INDEX slugs_slug ON slugs (slug);
-                 CREATE INDEX slugs_lower ON slugs (lower(slug));",
+                 CREATE INDEX slugs_lower ON slugs (lower(slug));
+                 CREATE TABLE leagues (id bigint PRIMARY KEY, level int NOT NULL, name text);
+                 CREATE INDEX leagues_level ON leagues (level);
+                 CREATE TABLE rungs (id int PRIMARY KEY, level int NOT NULL, label text);",
             )
             .unwrap();
         catalog
@@ -853,10 +924,6 @@ mod tests {
             (
                 "SELECT name FROM users WHERE id IN (1, 2.5)",
                 "cast the other side to int4",
-            ),
-            (
-                "SELECT u.name FROM users u JOIN posts p ON u.id::bigint = p.id",
-                "converting the other side",
             ),
             (
                 "UPDATE users SET name = 'x' WHERE lower(email) = $1",
@@ -1032,6 +1099,83 @@ mod tests {
             let help = findings[0].help.as_deref().unwrap();
             assert!(!help.contains('`'), "{sql}: {help}");
         }
+    }
+
+    /// The other side of a join comparison is a plain indexed column of
+    /// another relation: the planner looks that relation up by the value
+    /// this side computes (a nested loop with an index scan on it), so the
+    /// comparison is sargable through that side and the wrapped column's
+    /// own index is irrelevant.
+    #[test]
+    fn a_join_lookup_through_the_other_sides_index_is_not_reported() {
+        let db = catalog();
+        for sql in [
+            // EXPLAIN: Nested Loop, `Index Cond: (level = (c.level + 1))` on
+            // leagues_level.
+            "SELECT c.id FROM leagues c JOIN leagues n ON n.level = c.level + 1",
+            // The same comparison the other way round.
+            "SELECT c.id FROM leagues c JOIN leagues n ON c.level + 1 = n.level",
+            "SELECT c.id FROM leagues c, rungs r WHERE r.id = c.level + 1",
+            // The other side's primary key serves the lookup.
+            "SELECT c.id FROM leagues c JOIN rungs r ON r.id = c.level + 1",
+            // A cast on this side: posts_pkey serves the lookup
+            // (`Index Cond: (id = (u.id)::bigint)`).
+            "SELECT u.name FROM users u JOIN posts p ON u.id::bigint = p.id",
+            "SELECT u.name FROM users u JOIN posts p ON p.id = u.id::bigint",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // Not a single plain column on the other side: an unindexed column
+        // or an expression.
+        for (sql, index) in [
+            (
+                "SELECT c.id FROM leagues c JOIN rungs r ON r.level = c.level + 1",
+                "leagues_level",
+            ),
+            (
+                "SELECT c.id FROM leagues c JOIN rungs r ON r.level + 0 = c.level + 1",
+                "leagues_level",
+            ),
+            (
+                r#"SELECT c.id FROM leagues c JOIN rungs r ON r.level = c.level + 1 AND r.id = $1"#,
+                "leagues_level",
+            ),
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                findings[0].message.contains(index),
+                "{sql}: {:?}",
+                findings[0].message
+            );
+        }
+        for sql in [
+            "SELECT id FROM users WHERE lower(email) = $1",
+            "SELECT id FROM users WHERE lower(email) = 'a'",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        }
+    }
+
+    /// The reported shape: a self-join on the next level, whose lookup the
+    /// index on the other alias's column serves (`League_level_key` is the
+    /// index condition; the wrapped expression's own index is not used).
+    #[test]
+    fn the_league_self_join_is_not_reported() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            r#"CREATE SCHEMA "olitef";
+               CREATE TABLE "olitef"."League" ("id" bigint PRIMARY KEY, "level" int NOT NULL);
+               CREATE INDEX "League_level_key" ON "olitef"."League" ("level");"#,
+        )
+        .unwrap();
+        let sql = r#"SELECT current_league."id" FROM "olitef"."League" current_league
+                     JOIN "olitef"."League" next_league
+                       ON next_league."level" = current_league."level" + 1"#;
+        let findings = lint_rule(&db, sql, RULE);
+        assert!(findings.is_empty(), "{findings:?}");
     }
 
     #[test]
