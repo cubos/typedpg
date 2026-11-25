@@ -27,10 +27,19 @@
 //! When the name a fix would write is ambiguous among the output columns, or
 //! the query has a `DISTINCT ON` the rewritten key must keep matching, no fix
 //! is offered.
+//!
+//! A `GROUP BY` position whose target is an aliased expression is reported
+//! only when the alias provably names no input column of the same `SELECT`:
+//! PostgreSQL resolves a bare name in `GROUP BY` to a `FROM` column before an
+//! output column, so the alias would group by something else. When it is
+//! safe, the help names the alias; an item whose columns can't be enumerated
+//! (a CTE, a function without a covering column alias list) leaves the
+//! position unreported, as a collision can't be ruled out.
 
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{
-    AConstValue, MinMaxOp, Node, Node as N, ResTarget, SetOperation, SubLinkType,
+    AConstValue, Alias, MinMaxOp, Node, Node as N, RangeFunction, RangeSubselect, ResTarget,
+    SelectStmt, SetOperation, SubLinkType,
 };
 
 use super::node_span;
@@ -61,6 +70,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         }
         let names = target_names(&targets);
         let has_distinct_on = select.distinct_clause.iter().flatten().next().is_some();
+        let input_columns = input_columns(ctx, select);
         for sort in select.sort_clause.iter().flatten() {
             let N::SortBy(sort) = sort else {
                 continue;
@@ -70,6 +80,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 &targets,
                 &names,
                 has_distinct_on,
+                &input_columns,
                 sort.node.as_ref(),
                 Clause::OrderBy,
             );
@@ -81,6 +92,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 &targets,
                 &names,
                 has_distinct_on,
+                &input_columns,
                 Some(key),
                 Clause::GroupBy,
             ));
@@ -91,6 +103,7 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
                 &targets,
                 &names,
                 has_distinct_on,
+                &input_columns,
                 Some(key),
                 Clause::DistinctOn,
             ));
@@ -133,6 +146,7 @@ fn ordinal(
     targets: &[&ResTarget],
     names: &[Option<String>],
     has_distinct_on: bool,
+    input_columns: &Option<Vec<String>>,
     node: Option<&Node>,
     clause: Clause,
 ) -> Option<RawFinding> {
@@ -154,6 +168,7 @@ fn ordinal(
         "{} {position} refers to {description} by its position: name it instead",
         clause.name()
     );
+    let help = help(clause, target, index, names, input_columns)?;
     let fix = fix(
         ctx,
         target,
@@ -166,9 +181,42 @@ fn ordinal(
     Some(RawFinding {
         span,
         message,
-        help: Some(clause.help().to_owned()),
+        help: Some(help),
         fix: fix.into_iter().collect(),
     })
+}
+
+/// The help for a position: `None` when the position must be left alone, as
+/// naming the target could resolve to something else.
+fn help(
+    clause: Clause,
+    target: &ResTarget,
+    index: usize,
+    names: &[Option<String>],
+    input_columns: &Option<Vec<String>>,
+) -> Option<String> {
+    if clause != Clause::GroupBy || target.name.is_empty() || column_ref(target).is_some() {
+        return Some(clause.help().to_owned());
+    }
+    // `GROUP BY <alias>` resolves to an input column of that name first.
+    // Without every item's input columns, a collision can't be ruled out.
+    let input_columns = input_columns.as_ref()?;
+    if input_columns.iter().any(|name| name == &target.name) {
+        return None;
+    }
+    // Another output column may carry the same name (or a name this can't
+    // tell), which would make the alias ambiguous.
+    let contested = names.iter().enumerate().any(|(other, other_name)| {
+        other != index
+            && (other_name.as_deref() == Some(target.name.as_str()) || other_name.is_none())
+    });
+    if contested {
+        return Some(clause.help().to_owned());
+    }
+    Some(format!(
+        "write the alias `{}` instead of its position",
+        typedpg_core::quote_identifier(&target.name)
+    ))
 }
 
 /// How the message names the target: its alias, its plain column reference,
@@ -273,6 +321,250 @@ fn name_string(node: &Node) -> Option<&str> {
         N::String(name) => Some(name.sval.as_str()),
         _ => None,
     }
+}
+
+/// The names the `FROM` items of `select` give its own level — what a bare
+/// name in `GROUP BY` resolves to before the select list. `None` when an
+/// item's columns can't be enumerated with certainty.
+fn input_columns(ctx: &Ctx<'_>, select: &SelectStmt) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    for item in &select.from_clause {
+        names.extend(from_item_columns(ctx, item.as_ref())?);
+    }
+    Some(names)
+}
+
+/// The input column names one `FROM` item contributes, in column order.
+fn from_item_columns(ctx: &Ctx<'_>, node: Option<&Node>) -> Option<Vec<String>> {
+    match node? {
+        N::RangeVar(range) => range_var_columns(ctx, range),
+        N::JoinExpr(join) => {
+            // A join's column alias list renames its merged columns.
+            if join
+                .alias
+                .as_ref()
+                .is_some_and(|alias| !alias.colnames.is_empty())
+            {
+                return None;
+            }
+            let mut names = from_item_columns(ctx, join.larg.as_ref())?;
+            names.extend(from_item_columns(ctx, join.rarg.as_ref())?);
+            Some(names)
+        }
+        N::RangeSubselect(subselect) => subselect_columns(subselect),
+        N::RangeFunction(function) => range_function_columns(function),
+        // A CTE, a table function, a sampled relation, …: what it
+        // contributes isn't certain here.
+        _ => None,
+    }
+}
+
+/// A plain table's columns: its `pg_attribute` rows, the system columns, and
+/// an alias column list renaming the leading ones.
+fn range_var_columns(
+    ctx: &Ctx<'_>,
+    range: &typedpg_pg_query::ast::RangeVar,
+) -> Option<Vec<String>> {
+    let Some(typedpg_analyzer::RelationRef::Relation(relation)) = ctx.view.relation_of(range)
+    else {
+        return None;
+    };
+    let mut names: Vec<String> = ctx
+        .catalog
+        .attributes_of(relation)
+        .iter()
+        .filter(|attribute| attribute.attnum > 0)
+        .map(|attribute| attribute.attname.clone())
+        .collect();
+    // An empty list may as well mean the catalog knows nothing: leave it
+    // unknown instead of claiming there is no column to collide with.
+    if names.is_empty() {
+        return None;
+    }
+    rename_columns(&mut names, range.alias.as_deref())?;
+    names.extend(
+        ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"]
+            .into_iter()
+            .map(str::to_owned),
+    );
+    Some(names)
+}
+
+/// A subquery's output columns, its alias column list renaming the leading
+/// ones.
+fn subselect_columns(subselect: &RangeSubselect) -> Option<Vec<String>> {
+    let N::SelectStmt(select) = subselect.subquery.as_ref()? else {
+        return None;
+    };
+    let arity = select_arity(select)?;
+    if let Some(alias) = subselect.alias.as_deref()
+        && !alias.colnames.is_empty()
+    {
+        if alias.colnames.len() == arity {
+            // The list names every column; what the subquery would call them
+            // doesn't matter.
+            return colname_list(alias);
+        }
+        if alias.colnames.len() > arity {
+            return None;
+        }
+    }
+    let mut names = select_output_names(select)?;
+    rename_columns(&mut names, subselect.alias.as_deref())?;
+    Some(names)
+}
+
+/// A function item's columns, when its column definition list or its alias
+/// column list names them all.
+fn range_function_columns(function: &RangeFunction) -> Option<Vec<String>> {
+    if !function.coldeflist.is_empty() {
+        return function
+            .coldeflist
+            .iter()
+            .map(|column| match column.as_ref()? {
+                N::ColumnDef(column) => Some(column.colname.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+    let arity = range_function_arity(function)?;
+    let alias = function.alias.as_deref()?;
+    if alias.colnames.len() != arity {
+        return None;
+    }
+    colname_list(alias)
+}
+
+/// The number of columns a `FROM` function yields, when the parse tree tells
+/// it. Only `unnest`'s count is known here: one per array argument.
+fn range_function_arity(function: &RangeFunction) -> Option<usize> {
+    if function.ordinality {
+        // `WITH ORDINALITY` appends a column, and the function's own columns
+        // may be anything.
+        return None;
+    }
+    let [Some(N::List(pair))] = function.functions.as_slice() else {
+        return None;
+    };
+    if pair.items.get(1).is_some_and(|item| item.is_some()) {
+        // A per-function column definition list defines the columns itself.
+        return None;
+    }
+    let Some(Some(N::FuncCall(call))) = pair.items.first() else {
+        return None;
+    };
+    if name_string(call.funcname.last()?.as_ref()?)? != "unnest" {
+        return None;
+    }
+    if call.funcname.len() == 1 {
+        // The SQL-standard `unnest(a, b, …)` is rewritten into one
+        // single-argument call per array, each yielding one column.
+        (!call.args.is_empty()).then_some(call.args.len())
+    } else {
+        // A qualified `unnest` takes exactly one array or range.
+        (call.args.len() == 1).then_some(1)
+    }
+}
+
+/// The number of output columns of `select`, when the parse tree tells.
+fn select_arity(select: &SelectStmt) -> Option<usize> {
+    if select.op != SetOperation::SetopNone {
+        // A set operation's branches all have the leftmost one's arity.
+        return select_arity(select.larg.as_deref()?);
+    }
+    if let Some(first) = select.values_lists.first() {
+        let N::List(row) = first.as_ref()? else {
+            return None;
+        };
+        return (!row.items.is_empty()).then_some(row.items.len());
+    }
+    if select.target_list.is_empty() {
+        return None;
+    }
+    let mut count = 0;
+    for target in select.target_list.iter().flatten() {
+        let N::ResTarget(target) = target else {
+            return None;
+        };
+        if is_star(target) {
+            return None;
+        }
+        count += 1;
+    }
+    (count > 0).then_some(count)
+}
+
+/// The names a subquery's output columns take, when every one is certain.
+fn select_output_names(select: &SelectStmt) -> Option<Vec<String>> {
+    if select.op != SetOperation::SetopNone {
+        // A set operation names its columns after the leftmost branch.
+        return select_output_names(select.larg.as_deref()?);
+    }
+    if !select.values_lists.is_empty() {
+        let arity = select_arity(select)?;
+        return Some(
+            (1..=arity)
+                .map(|number| format!("column{number}"))
+                .collect(),
+        );
+    }
+    select
+        .target_list
+        .iter()
+        .map(|node| {
+            let N::ResTarget(target) = node.as_ref()? else {
+                return None;
+            };
+            if is_star(target) {
+                return None;
+            }
+            subquery_output_name(target)
+        })
+        .collect()
+}
+
+/// The name a subquery output column takes with certainty: its alias, or the
+/// last field of a plain column reference. Other expressions' derived names
+/// are left to the analyzer.
+fn subquery_output_name(target: &ResTarget) -> Option<String> {
+    if !target.name.is_empty() {
+        return Some(target.name.clone());
+    }
+    if !target.indirection.is_empty() {
+        return None;
+    }
+    let last = column_ref(target)?.fields.last()?.as_ref()?;
+    Some(name_string(last)?.to_owned())
+}
+
+/// Renames the leading columns after an alias column list (`users AS u(a,
+/// b)`); the rest keep their names.
+fn rename_columns(names: &mut [String], alias: Option<&Alias>) -> Option<()> {
+    let Some(alias) = alias else {
+        return Some(());
+    };
+    if alias.colnames.len() > names.len() {
+        return None;
+    }
+    for (column, name) in names.iter_mut().zip(&alias.colnames) {
+        let N::String(name) = name.as_ref()? else {
+            return None;
+        };
+        *column = name.sval.clone();
+    }
+    Some(())
+}
+
+/// The names of an alias column list, when every entry is a plain name.
+fn colname_list(alias: &Alias) -> Option<Vec<String>> {
+    alias
+        .colnames
+        .iter()
+        .map(|name| match name.as_ref()? {
+            N::String(name) => Some(name.sval.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The edit naming the target, when the replacement is provably the same
@@ -469,6 +761,81 @@ mod tests {
             assert_eq!(findings[0].message, message, "{sql}");
             assert!(findings[0].fix.is_empty(), "{sql}");
         }
+    }
+
+    #[test]
+    fn group_by_positions_naming_an_input_column_are_not_reported() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE cost_rollup (
+                bucket timestamptz,
+                tenant_id bigint,
+                user_role_ids bigint[],
+                cost_usd numeric
+             );",
+        )
+        .unwrap();
+        // Every alias also names an input column, and repeating the
+        // expression is the only alternative to the position.
+        let sql = "SELECT CASE WHEN $by_time THEN date_trunc($unit, r.bucket, $tz) END AS bucket,
+                          CASE WHEN $g_tenant THEN r.tenant_id END AS tenant_id,
+                          SUM(r.cost_usd) AS cost_usd
+                   FROM cost_rollup r
+                   LEFT JOIN LATERAL unnest(CASE WHEN $g_role THEN r.user_role_ids END) AS gr(user_role_id) ON true
+                   GROUP BY 1, 2";
+        let findings = lint_rule(&db, sql, RULE);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_group_by_alias_is_named_when_no_input_column_has_it() {
+        let db = catalog();
+        // `users.email` is an input column: `GROUP BY email` would group by
+        // it rather than by the lowercased output column.
+        let sql = "SELECT lower(email) AS email, count(*) FROM users GROUP BY 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert!(findings.is_empty(), "{findings:?}");
+        // No input column `e`: the alias names the target.
+        let sql = "SELECT lower(email) AS e, count(*) FROM users GROUP BY 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some("write the alias `e` instead of its position")
+        );
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_group_by_alias_with_unknown_input_columns_is_not_reported() {
+        let db = catalog();
+        // `generate_series` names its only column `g` here, but the parse
+        // tree doesn't say how many columns it yields: a collision can't be
+        // ruled out.
+        let sql =
+            "SELECT lower(email) AS e, count(*) FROM users, generate_series(1, 3) g GROUP BY 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert!(findings.is_empty(), "{findings:?}");
+        // A covering column alias list makes the item's columns certain.
+        let sql = "SELECT lower(email) AS e, count(*) \
+                   FROM users, unnest(ARRAY['x']) AS u(tag) GROUP BY 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+    }
+
+    #[test]
+    fn a_group_by_alias_sees_columns_a_subquery_alias_list_names() {
+        let db = catalog();
+        let sql = "SELECT lower(v.tag) AS tag, count(*) FROM (VALUES ('a')) AS v(tag) GROUP BY 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert!(findings.is_empty(), "{findings:?}");
+        let sql = "SELECT lower(v.tag) AS t, count(*) FROM (VALUES ('a')) AS v(tag) GROUP BY 1";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some("write the alias `t` instead of its position")
+        );
     }
 
     #[test]
