@@ -32,6 +32,10 @@ mod json_stringify;
 #[cfg(feature = "pg_sanity")]
 mod migration_oracle;
 mod migrations;
+/// The map the CLIs run their independent analyses with, across the
+/// machine's cores: not part of the lint's API.
+#[doc(hidden)]
+pub mod parallel;
 pub mod report;
 mod rules;
 

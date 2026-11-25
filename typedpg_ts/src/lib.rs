@@ -8,8 +8,6 @@ pub mod cache;
 pub mod config;
 pub mod emit;
 pub mod generate;
-#[doc(hidden)]
-pub mod parallel;
 pub mod project;
 pub mod scan;
 pub mod serve;

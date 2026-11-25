@@ -176,6 +176,59 @@ ignore = ["migrations/0002_hazards.sql"]
 }
 
 #[test]
+fn lint_reports_a_migration_that_does_not_build_and_skips_its_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "broken_migration_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY;\n",
+    )
+    .unwrap();
+    // A query that does not analyze against any schema: it must not be
+    // analyzed against a catalog that could not be built.
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool) -> Result<(), typedpg::Error> {
+    sql!(pool, "SELECT * FROM missing").execute().await?;
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = lint_crate(root, &[]);
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
+    // The migration that does not build is the one failure reported.
+    assert!(
+        stdout.contains("error: syntax error at or near \";\"\n  --> migrations"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("relation \"missing\" does not exist"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("✖ failed: 1 analysis error"), "{stderr}");
+}
+
+#[test]
 fn lint_fix_rewrites_the_binding_rules() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fixture = crate_dir.join("tests/lint_fixture");

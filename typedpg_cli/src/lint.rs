@@ -22,6 +22,7 @@ use typedpg_analyzer::PgCatalog;
 use typedpg_core::QualifiedName;
 use typedpg_core::config::{Config, FINITE_PARAMETER_TYPES};
 use typedpg_core::migrations::compare_migration_names;
+use typedpg_lint::parallel;
 use typedpg_lint::report::{
     Entry, Failure, Format, Position, Report, position, stderr_colors, stdout_colors,
 };
@@ -82,6 +83,16 @@ struct Sources {
     sites: Vec<Site>,
     copies: Vec<CopySite>,
     failures: Vec<Failure>,
+}
+
+/// One source file as read and scanned, or why it could not be.
+struct ScannedFile {
+    path: PathBuf,
+    /// Its text, empty when it could not be read.
+    file: String,
+    /// Its `sql!` and `copy_in!` sites, or the position (none for a read
+    /// error) and message of the error that kept it from being scanned.
+    scan: Result<scan::Scan, (Option<Position>, String)>,
 }
 
 /// A statement's analysis error: its message and byte offset.
@@ -175,14 +186,7 @@ fn build(
             );
         }
     };
-    let Sources {
-        sites,
-        copies,
-        failures,
-    } = scan_sources(&base);
     let mut report = Report {
-        queries: sites.len() + copies.len(),
-        failures,
         previous_deployment: previous_deployment.map(str::to_owned),
         ..Report::default()
     };
@@ -194,42 +198,86 @@ fn build(
     let mut catalogs: HashMap<Option<String>, Result<PgCatalog, String>> = HashMap::new();
     let mut new_migrations: HashMap<Option<String>, NewMigrations> = HashMap::new();
     let mut migration_paths = HashSet::new();
+    // Each database's migrations are collected here, then linted on a thread
+    // of their own below: the lint builds the catalog the queries are analyzed
+    // against, and runs while the sources are scanned.
+    let mut prepared = Vec::new();
     for db in &databases {
-        let catalog = match config.resolve(db.as_deref()) {
-            Ok(_) => catalog_for(
-                &config,
-                db.as_deref(),
-                &base,
-                &MigrationSettings {
-                    options: &options,
-                    ignore: &ignore,
-                    previous_deployment,
-                },
-                &mut migration_paths,
-                &mut report,
-            )
-            .map(|(catalog, migrations)| {
-                new_migrations.insert(db.clone(), migrations);
-                catalog
-            }),
-            Err(error) => {
-                let message = error.to_string();
-                report.failures.push(Failure {
-                    path: relative(manifest, &base),
-                    start: None,
-                    message: message.clone(),
-                });
-                Err(message)
-            }
-        };
-        if let Ok(catalog) = &catalog {
-            report.schemas.push((
-                db.clone().unwrap_or_else(|| "default".to_owned()),
-                catalog.user_object_counts(),
-            ));
+        if let Err(error) = config.resolve(db.as_deref()) {
+            let message = error.to_string();
+            report.failures.push(Failure {
+                path: relative(manifest, &base),
+                start: None,
+                message: message.clone(),
+            });
+            catalogs.insert(db.clone(), Err(message));
+            continue;
         }
-        catalogs.insert(db.clone(), catalog);
+        match prepare_migrations(
+            &config,
+            db.as_deref(),
+            &base,
+            &MigrationSettings {
+                options: &options,
+                ignore: &ignore,
+                previous_deployment,
+            },
+            &mut migration_paths,
+            &mut report,
+        ) {
+            Ok(migrations) => prepared.push((db.clone(), migrations)),
+            Err(message) => {
+                catalogs.insert(db.clone(), Err(message));
+            }
+        }
     }
+    let (sources, linted) = std::thread::scope(|scope| {
+        let running: Vec<_> = prepared
+            .into_iter()
+            .map(|(db, migrations)| {
+                let linting = std::thread::Builder::new()
+                    .stack_size(parallel::STACK)
+                    .spawn_scoped(scope, || lint_database(&base, migrations, &options))
+                    .expect("failed to spawn a thread");
+                (db, linting)
+            })
+            .collect();
+        let sources = scan_sources(&base);
+        let linted: Vec<_> = running
+            .into_iter()
+            .map(|(db, linting)| {
+                let linted = linting
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (db, linted)
+            })
+            .collect();
+        (sources, linted)
+    });
+    for (db, linted) in linted {
+        report.entries.extend(linted.entries);
+        report.failures.extend(linted.failures);
+        match linted.catalog {
+            Ok((catalog, migrations)) => {
+                report.schemas.push((
+                    db.clone().unwrap_or_else(|| "default".to_owned()),
+                    catalog.user_object_counts(),
+                ));
+                new_migrations.insert(db.clone(), migrations);
+                catalogs.insert(db, Ok(catalog));
+            }
+            Err(message) => {
+                catalogs.insert(db, Err(message));
+            }
+        }
+    }
+    let Sources {
+        sites,
+        copies,
+        failures,
+    } = sources;
+    report.queries = sites.len() + copies.len();
+    report.failures.extend(failures);
 
     if let Some(reference) = previous_deployment
         && options.level(Rule::DeployedQueryBreakage).is_some()
@@ -293,9 +341,15 @@ fn build(
     }
 
     let mut pending = Vec::new();
-    type CacheKey = (Option<String>, Vec<String>, String, Vec<LintCall>, bool);
-    let mut cache: HashMap<CacheKey, LintResult> = HashMap::new();
-    for site in &sites {
+    // Every site's statement is linted once per distinct statement, across the
+    // machine's cores, before the report places the findings: the same query is
+    // often written at several call sites.
+    let statements: Vec<SiteStatement<'_>> = sites
+        .iter()
+        .map(|site| site_statement(site, &config))
+        .collect();
+    let cache = lint_statements(&statements, &catalogs, &options);
+    for (site, statement) in sites.iter().zip(&statements) {
         let path = relative(&site.path, &base);
         report.sources.insert(path.clone(), site.file.clone());
         // The binding rules read the Rust source alone: report them even
@@ -318,54 +372,20 @@ fn build(
                 edits: binding.edits,
             });
         }
-        let Ok(catalog) = catalogs.get(&site.db).expect("every database was built") else {
+        let built = catalogs.get(&site.db).expect("every database was built");
+        // A database whose catalog could not be built has no statement
+        // result: the failure its build reported is in the report.
+        if built.is_err() {
             continue;
-        };
-        let mut calls = Vec::new();
-        let mut call_sites = Vec::new();
-        let mut escapes = site.escapes;
-        for call in &site.calls {
-            match call_method(&call.method) {
-                Some(method) => {
-                    calls.push(LintCall {
-                        method,
-                        name: call.method.clone(),
-                        language: Language::Rust,
-                        stringified: Vec::new(),
-                    });
-                    call_sites.push(call);
-                }
-                // A method the rules do not know still uses the query, so
-                // `unused_returning` cannot be sure every use is an
-                // `execute()`.
-                None => escapes = true,
-            }
         }
-        let mut site_options = options.clone();
-        if escapes {
-            site_options = site_options.with_rule_off(Rule::UnusedReturning);
-        }
-        // Analyzed as the roles it runs as, as the macro analyzes it.
-        let roles = roles_of(&config, site.db.as_deref(), site.role.as_deref());
-        let result = cache
-            .entry((
-                site.db.clone(),
-                roles.clone(),
-                site.sql.clone(),
-                calls.clone(),
-                escapes,
-            ))
-            .or_insert_with(|| {
-                lint_query_called_as(catalog, &site.sql, &calls, &roles, &site_options)
-                    .map_err(|error| (error.error.to_string(), error.offset))
-            });
+        let result = &cache[&statement.key];
         match result {
             Ok(findings) => {
                 for placed in findings {
                     let finding = &placed.finding;
                     let entry = match placed.call {
                         Some(index) => {
-                            let call = call_sites[index];
+                            let call = statement.call_sites[index];
                             Entry {
                                 path: path.clone(),
                                 start: position(&site.file, call.span.start),
@@ -458,6 +478,99 @@ fn roles_of(config: &Config, db: Option<&str>, role: Option<&str>) -> Vec<String
             .map(|resolved| resolved.roles().to_vec())
             .unwrap_or_default(),
     }
+}
+
+/// A statement's analysis, keyed by everything that decides its findings: the
+/// database, the roles it runs as, the SQL, the methods called on it and
+/// whether a use escapes. The same statement is often written at several
+/// sites.
+type CacheKey = (Option<String>, Vec<String>, String, Vec<LintCall>, bool);
+
+/// One `sql!` site's statement as the rules see it, linted once per distinct
+/// [`CacheKey`] and reported at every site that has it.
+struct SiteStatement<'a> {
+    /// The scanned calls a call-site finding is placed at, by
+    /// [`CallFinding::call`].
+    call_sites: Vec<&'a scan::Call>,
+    key: CacheKey,
+}
+
+/// `site`'s statement, as the rules see it and as the cache keys it.
+fn site_statement<'a>(site: &'a Site, config: &Config) -> SiteStatement<'a> {
+    let mut calls = Vec::new();
+    let mut call_sites = Vec::new();
+    let mut escapes = site.escapes;
+    for call in &site.calls {
+        match call_method(&call.method) {
+            Some(method) => {
+                calls.push(LintCall {
+                    method,
+                    name: call.method.clone(),
+                    language: Language::Rust,
+                    stringified: Vec::new(),
+                });
+                call_sites.push(call);
+            }
+            // A method the rules do not know still uses the query, so
+            // `unused_returning` cannot be sure every use is an
+            // `execute()`.
+            None => escapes = true,
+        }
+    }
+    // Analyzed as the roles it runs as, as the macro analyzes it.
+    let roles = roles_of(config, site.db.as_deref(), site.role.as_deref());
+    let key = (site.db.clone(), roles, site.sql.clone(), calls, escapes);
+    SiteStatement { call_sites, key }
+}
+
+/// Lint every distinct statement of `statements` across the machine's cores,
+/// keyed by what it was linted from: the report reads them in site order.
+fn lint_statements(
+    statements: &[SiteStatement<'_>],
+    catalogs: &HashMap<Option<String>, Result<PgCatalog, String>>,
+    options: &LintOptions,
+) -> HashMap<CacheKey, LintResult> {
+    let mut seen = HashSet::new();
+    let mut distinct = Vec::new();
+    for statement in statements {
+        if !seen.insert(&statement.key) {
+            continue;
+        }
+        // A database whose catalog could not be built has nothing to lint:
+        // its sites report the failure the catalog's build already gave.
+        let db = &statement.key.0;
+        if let Some(Ok(catalog)) = catalogs.get(db) {
+            distinct.push((&statement.key, catalog));
+        }
+    }
+    let results = parallel::map(&distinct, |&(key, catalog)| {
+        let (_, roles, sql, calls, escapes) = key;
+        lint_query(catalog, sql, calls, *escapes, roles, options)
+    });
+    distinct
+        .into_iter()
+        .map(|(key, _)| key.clone())
+        .zip(results)
+        .collect()
+}
+
+/// Lint one statement as the macro checks it: as each of `roles`, the rules
+/// reading the first one's analysis. An `escapes` statement's calls can't tell
+/// that its value is unused.
+fn lint_query(
+    catalog: &PgCatalog,
+    sql: &str,
+    calls: &[LintCall],
+    escapes: bool,
+    roles: &[String],
+    options: &LintOptions,
+) -> LintResult {
+    let mut options = options.clone();
+    if escapes {
+        options = options.with_rule_off(Rule::UnusedReturning);
+    }
+    lint_query_called_as(catalog, sql, calls, roles, &options)
+        .map_err(|error| (error.error.to_string(), error.offset))
 }
 
 /// A `copy_in!` target analyzed as the macro analyzes it: as each of
@@ -698,6 +811,11 @@ fn call_method(name: &str) -> Option<CallMethod> {
     }
 }
 
+/// Scan the crate's Rust sources for `sql!` and `copy_in!` sites.
+///
+/// Every file is read and scanned on its own, across the machine's cores: a
+/// scan reads nothing another writes. The sites are assembled in path order,
+/// as a serial scan would find them.
 fn scan_sources(base: &Path) -> Sources {
     let mut paths = Vec::new();
     for dir in SOURCE_DIRS {
@@ -705,31 +823,43 @@ fn scan_sources(base: &Path) -> Sources {
     }
     paths.sort();
 
-    let mut sources = Sources::default();
-    for path in paths {
-        let shown = relative(&path, base);
-        let file = match std::fs::read_to_string(&path) {
+    let scanned = parallel::map(&paths, |path| {
+        let file = match std::fs::read_to_string(path) {
             Ok(file) => file,
             Err(error) => {
-                sources.failures.push(Failure {
-                    path: shown,
-                    start: None,
-                    message: error.to_string(),
-                });
-                continue;
+                return ScannedFile {
+                    path: path.clone(),
+                    file: String::new(),
+                    scan: Err((None, error.to_string())),
+                };
             }
         };
-        let scanned = match scan::scan(&file) {
+        let scan = scan::scan(&file).map_err(|error| {
+            let start = error.span().start();
+            (
+                Some(Position {
+                    line: start.line as u32,
+                    column: start.column as u32 + 1,
+                }),
+                error.to_string(),
+            )
+        });
+        ScannedFile {
+            path: path.clone(),
+            file,
+            scan,
+        }
+    });
+    let mut sources = Sources::default();
+    for ScannedFile { path, file, scan } in scanned {
+        let shown = relative(&path, base);
+        let scanned = match scan {
             Ok(scanned) => scanned,
-            Err(error) => {
-                let start = error.span().start();
+            Err((start, message)) => {
                 sources.failures.push(Failure {
                     path: shown,
-                    start: Some(Position {
-                        line: start.line as u32,
-                        column: start.column as u32 + 1,
-                    }),
-                    message: error.to_string(),
+                    start,
+                    message,
                 });
                 continue;
             }
@@ -907,20 +1037,46 @@ struct MigrationSettings<'a> {
     previous_deployment: Option<&'a str>,
 }
 
-/// Build the catalog of database `db` from its migrations, reporting the
-/// failures that keep it from being built; with the migrations as linted.
-fn catalog_for(
+/// A database's migration files, collected and prepared for linting.
+struct PreparedMigrations {
+    /// Every file, with its path on disk: the findings are placed in them.
+    files: Vec<(PathBuf, MigrationFile)>,
+    /// The files as linted: statement rules skipped where configured.
+    lint_files: Vec<MigrationFile>,
+    /// The first reported file `--previous-deployment` doesn't have as is.
+    first_new: Option<usize>,
+    use_transaction: bool,
+    /// The parameter types the catalog assumes finite.
+    finite: Vec<QualifiedName>,
+    /// The directory holding the reported files: a failure shows it.
+    migrations_dir: PathBuf,
+}
+
+/// A database's migrations after linting.
+struct LintedDatabase {
+    /// The entries of its migration findings.
+    entries: Vec<Entry>,
+    /// The failures that kept its catalog from being built.
+    failures: Vec<Failure>,
+    /// Its catalog, with the migrations as linted; or why it could not be
+    /// built.
+    catalog: Result<(PgCatalog, NewMigrations), String>,
+}
+
+/// Collect database `db`'s migration files and prepare them for linting,
+/// reporting the failures that keep them from being linted.
+fn prepare_migrations(
     config: &Config,
     db: Option<&str>,
     base: &Path,
     settings: &MigrationSettings<'_>,
     migration_paths: &mut HashSet<String>,
     report: &mut Report,
-) -> Result<(PgCatalog, NewMigrations), String> {
+) -> Result<PreparedMigrations, String> {
     let MigrationSettings {
-        options,
         ignore,
         previous_deployment,
+        ..
     } = *settings;
     let resolved = config.resolve(db).map_err(|error| error.to_string())?;
     let migrations_dir = resolved.migrations_dir(base);
@@ -984,49 +1140,107 @@ fn catalog_for(
             file.lint = MigrationLint::SchemaOnly;
         }
     }
-    let linted = match lint_migrations(&lint_files, resolved.migrations_use_transaction(), options)
-    {
-        Ok(linted) => linted,
-        Err(error) => {
-            let message = error.to_string();
-            report.failures.push(Failure {
-                path: relative(&migrations_dir, base),
-                start: None,
-                message: message.clone(),
-            });
-            return Err(message);
-        }
-    };
-    for migration in &linted.findings {
-        let file = &files[migration.file].1;
-        report.entries.push(Entry {
-            path: file.path.clone(),
-            start: position(&file.sql, migration.finding.span.start),
-            end: position(&file.sql, migration.finding.span.end),
-            finding: migration.finding.clone(),
-        });
-    }
-    let mut catalog = linted.catalog;
     let finite: Vec<QualifiedName> = FINITE_PARAMETER_TYPES
         .iter()
         .map(|name| QualifiedName::new("pg_catalog", *name))
         .filter(|name| !resolved.types.contains_key(name))
         .collect();
+    Ok(PreparedMigrations {
+        files,
+        lint_files,
+        first_new,
+        use_transaction: resolved.migrations_use_transaction(),
+        finite,
+        migrations_dir,
+    })
+}
+
+/// Lint the migrations of `prepared` and build its catalog: the part of a
+/// database's lint that reports nothing (it can run on a thread of its own).
+fn lint_database(
+    base: &Path,
+    prepared: PreparedMigrations,
+    options: &LintOptions,
+) -> LintedDatabase {
+    let PreparedMigrations {
+        files,
+        lint_files,
+        first_new,
+        use_transaction,
+        finite,
+        migrations_dir,
+    } = prepared;
+    let mut failures = Vec::new();
+    let linted = match lint_migrations(&lint_files, use_transaction, options) {
+        Ok(linted) => linted,
+        Err(error) => {
+            let message = error.to_string();
+            failures.push(Failure {
+                path: relative(&migrations_dir, base),
+                start: None,
+                message: message.clone(),
+            });
+            return LintedDatabase {
+                entries: Vec::new(),
+                failures,
+                catalog: Err(message),
+            };
+        }
+    };
+    let entries = linted
+        .findings
+        .iter()
+        .map(|migration| {
+            let file = &files[migration.file].1;
+            Entry {
+                path: file.path.clone(),
+                start: position(&file.sql, migration.finding.span.start),
+                end: position(&file.sql, migration.finding.span.end),
+                finding: migration.finding.clone(),
+            }
+        })
+        .collect();
+    let mut catalog = linted.catalog;
     if let Err(error) = catalog.assume_finite_parameters(&finite) {
-        report.failures.push(Failure {
+        failures.push(Failure {
             path: relative(&migrations_dir, base),
             start: None,
             message: error.clone(),
         });
-        return Err(error);
+        return LintedDatabase {
+            entries,
+            failures,
+            catalog: Err(error),
+        };
     }
     let migrations = NewMigrations {
         files: lint_files,
         first_new,
-        use_transaction: resolved.migrations_use_transaction(),
+        use_transaction,
         finite,
     };
-    Ok((catalog, migrations))
+    LintedDatabase {
+        entries,
+        failures,
+        catalog: Ok((catalog, migrations)),
+    }
+}
+
+/// Build the catalog of database `db` from its migrations, reporting the
+/// failures that keep it from being built; with the migrations as linted.
+fn catalog_for(
+    config: &Config,
+    db: Option<&str>,
+    base: &Path,
+    settings: &MigrationSettings<'_>,
+    migration_paths: &mut HashSet<String>,
+    report: &mut Report,
+) -> Result<(PgCatalog, NewMigrations), String> {
+    let prepared = prepare_migrations(config, db, base, settings, migration_paths, report)?;
+    let linted = lint_database(base, prepared, settings.options);
+    report.entries.extend(linted.entries);
+    report.failures.extend(linted.failures);
+    linted.catalog
 }
 
 /// The database's migration files, with their paths on disk, in the order the

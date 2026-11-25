@@ -499,7 +499,7 @@ impl Project {
                 .map(|(config, overrides)| {
                     let root = &root;
                     std::thread::Builder::new()
-                        .stack_size(crate::parallel::STACK)
+                        .stack_size(typedpg_lint::parallel::STACK)
                         .spawn_scoped(scope, move || load_migrations(config, overrides, root))
                         .expect("failed to spawn a thread")
                 })
@@ -712,7 +712,7 @@ impl Project {
         // another writes.
         let scanned: Vec<(PathBuf, Option<FileScan>)> = {
             let project = &*self;
-            crate::parallel::map(&sources, |path| {
+            typedpg_lint::parallel::map(&sources, |path| {
                 let source = std::fs::read_to_string(path).ok()?;
                 let result = scan(path, &source, &mut |spec, name| {
                     project.resolve_export(path, spec, name, 0)
@@ -1005,7 +1005,7 @@ impl Project {
         }
         let overrides = &db.overrides;
         let roles = &db.config.roles;
-        let generated = crate::parallel::map(&fresh, |&(kind, text)| {
+        let generated = typedpg_lint::parallel::map(&fresh, |&(kind, text)| {
             let mapper = TypeMapper {
                 overrides,
                 used: Default::default(),

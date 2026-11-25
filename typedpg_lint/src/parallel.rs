@@ -1,4 +1,7 @@
 //! Independent analyses run across the machine's cores.
+//!
+//! Both CLIs lint a project by running each statement's and each database's
+//! analysis on its own: this is the map they share.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

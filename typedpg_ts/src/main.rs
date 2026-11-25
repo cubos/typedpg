@@ -335,7 +335,7 @@ fn build_lint(
             options.clone(),
         );
         let linting = std::thread::Builder::new()
-            .stack_size(typedpg_ts::parallel::STACK)
+            .stack_size(typedpg_lint::parallel::STACK)
             .spawn(move || {
                 typedpg_lint::lint_migrations(&linted_files, use_transaction, &linted_options)
                     .map(|linted| linted.findings)
@@ -640,7 +640,7 @@ fn lint_distinct_queries(
         }
     }
     let results =
-        typedpg_ts::parallel::map(&distinct, |((_, text, calls, escapes), catalog, roles)| {
+        typedpg_lint::parallel::map(&distinct, |((_, text, calls, escapes), catalog, roles)| {
             lint_query(catalog, text, calls, *escapes, roles, options)
         });
     cache.extend(distinct.into_iter().map(|(key, ..)| key).zip(results));
