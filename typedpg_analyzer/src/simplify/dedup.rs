@@ -1657,7 +1657,9 @@ impl<'a> Scope<'a> {
     /// With `scalar_sublinks` (the cardinality
     /// proof's wider form), also a scalar sublink uncorrelated with this
     /// level, a cast and a call to a non-volatile, non-set-returning
-    /// function or operator every argument of which is one of these, and a
+    /// function or operator every argument of which is one of these, a
+    /// subscript of an array (`arr[1]`, or the `arr[lo:hi]` slice) whose
+    /// bounds are (see [`Self::subscript_operand`]), and a
     /// `CASE`, `COALESCE`, `IS [NOT] NULL`, boolean test or `AND` / `OR` /
     /// `NOT` of them — each one value per evaluation of the row (see
     /// [`Self::call_operand`]).
@@ -1784,6 +1786,12 @@ impl<'a> Scope<'a> {
                     },
                 )
             }
+            // A subscript of a determined array is one value per evaluation
+            // like the array itself: `arr[1]` reads one element of a value
+            // fixed for the row, a slice (`arr[lo:hi]`) one sub-array of it.
+            Node::AIndirection(indirection) if scalar_sublinks => {
+                self.subscript_operand(ctx, indirection, outer, env)
+            }
             Node::FuncCall(call) if scalar_sublinks => {
                 self.call_operand(ctx, call, outer, scalar_sublinks, env)
             }
@@ -1838,6 +1846,67 @@ impl<'a> Scope<'a> {
             Node::CaseExpr(case) if scalar_sublinks => self.case_operand(ctx, case, outer, env),
             _ => None,
         }
+    }
+
+    /// The one value a subscripted array yields per evaluation of the row:
+    /// an element of it (`arr[1]`), or a sub-array of it for a slice
+    /// (`arr[lo:hi]`), when [`Self::operand`] reads the array and every
+    /// subscript expression, and PostgreSQL's own array handler does the
+    /// subscripting (see [`array_subscript_handler`]). `rels` adds the
+    /// subscripts' to the array's.
+    fn subscript_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        indirection: &ast::AIndirection,
+        outer: Option<&FromScope<'_>>,
+        env: Option<&CteEnv>,
+    ) -> Option<Operand> {
+        let base = self.operand(ctx, indirection.arg.as_ref(), outer, true, env)?;
+        // `transformContainerSubscripts` (parse_node.c) decides slicing for
+        // the whole run: one `lo:hi` makes every subscript of the reference
+        // a slice (`arr[1:2][3]` is `arr[1:2][1:3]`, still an array), and a
+        // run without one fetches one element however many dimensions it
+        // spells.
+        let mut is_slice = false;
+        let mut rels = base.rels;
+        for step in &indirection.indirection {
+            // A composite field (`(row).field`) is an indirection too, but
+            // no element of a fixed value.
+            let Some(Node::AIndices(indices)) = step else {
+                return None;
+            };
+            is_slice |= indices.is_slice;
+            for bound in [indices.lidx.as_ref(), indices.uidx.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                rels |= self.operand(ctx, Some(bound), outer, true, env)?.rels;
+            }
+        }
+        // A domain subscripts as its base type, and `int2vector` /
+        // `oidvector` as `int2[]` / `oid[]`.
+        let base_type = match ctx.catalog.unwrap_domain(base.typ) {
+            oid::INT2VECTOR => oid::INT2ARRAY,
+            oid::OIDVECTOR => oid::OIDARRAY,
+            base_type => base_type,
+        };
+        if !array_subscript_handler(ctx, base_type) {
+            return None;
+        }
+        let typ = if is_slice {
+            base_type
+        } else {
+            crate::coerce::element_type(base_type, ctx.catalog)?
+        };
+        // A subscripted reference derives its collation from its container,
+        // which [`Self::operand`] already read as deterministic.
+        Some(Operand {
+            typ,
+            column: None,
+            rels,
+            call: None,
+            cast_column: None,
+        })
     }
 
     /// A `CASE` / `COALESCE` branch's value: an [`Self::operand`], or a
@@ -4065,6 +4134,27 @@ pub(super) fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
             .and_then(|base| base.typcollation)
     });
     deterministic(ctx.catalog, collation)
+}
+
+/// Whether `typ` — a base type, no domain — is subscripted by one of
+/// PostgreSQL's own array handlers: `array_subscript_handler` (a true array)
+/// or `raw_array_subscript_handler` (`int2vector`, `oidvector`, a base type
+/// declared with `ELEMENT`). Those fetch an element of the container and
+/// keep an array for a slice. A user type's `SUBSCRIPT` function may return
+/// anything, even another value on each evaluation, and `jsonb` and `hstore`
+/// have handlers of their own that subscript no array.
+fn array_subscript_handler(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
+    ctx.catalog
+        .pg_type
+        .get(&typ)
+        .and_then(|ty| ty.typsubscript)
+        .and_then(|handler| ctx.catalog.pg_proc.get(&handler))
+        .is_some_and(|proc| {
+            matches!(
+                proc.proname.as_str(),
+                "array_subscript_handler" | "raw_array_subscript_handler"
+            ) && ctx.catalog.namespace_name(proc.pronamespace) == Some("pg_catalog")
+        })
 }
 
 /// The number of output columns a non-set-returning function expands to in

@@ -4203,6 +4203,72 @@ mod tests {
     }
 
     #[test]
+    fn an_outer_subscript_pins_a_key() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE batches (
+                id bigint PRIMARY KEY,
+                item_ids bigint[],
+                grid bigint[][],
+                tag_names text[]
+             );
+             CREATE TABLE items (id bigint PRIMARY KEY, label text);
+             CREATE TABLE id_sets (ids bigint[] NOT NULL UNIQUE);",
+        )
+        .unwrap();
+        // A subscript of an outer column is one value per evaluation like
+        // the column itself: one element of a fixed array, one sub-array of
+        // it for a slice. An expression over it is one value too.
+        for sql in [
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = b.item_ids[1]) FROM batches b",
+            // `(x)[1]` is the same node as `x[1]`.
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = (b.item_ids)[1]) FROM batches b",
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = b.item_ids[1] + 0) FROM batches b",
+            // A non-volatile call as the subscript is one value too.
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = b.item_ids[abs(-1)]) FROM batches b",
+            // Two dimensions, a subscript of a slice, and a slice of the
+            // array type itself.
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = b.grid[1][2]) FROM batches b",
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = (b.grid[1:2])[1][1]) FROM batches b",
+            "SELECT (SELECT s.ids FROM id_sets s \
+             WHERE s.ids = b.item_ids[1:2]) FROM batches b",
+        ] {
+            assert!(sublink_one(&db, sql), "{sql}");
+        }
+        // A subscript the proof doesn't read as one value, and a column that
+        // is no key, still prove nothing.
+        for sql in [
+            // A volatile subscript: a different index on each evaluation.
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = b.item_ids[random()::int]) FROM batches b",
+            // A subscript that reads the relation the key belongs to.
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.id = b.item_ids[i.id::int]) FROM batches b",
+            "SELECT (SELECT i.label FROM items i \
+             WHERE i.label = b.tag_names[1]) FROM batches b",
+        ] {
+            assert!(!sublink_one(&db, sql), "{sql}");
+        }
+        // The system catalogs' own keys: `pg_attribute`'s (attrelid, attnum)
+        // is pinned by a row of `pg_constraint`, whose key columns an outer
+        // row fixes.
+        for sql in [
+            "SELECT (SELECT a.attname FROM pg_attribute a \
+             WHERE a.attrelid = fk.conrelid AND a.attnum = fk.conkey[1]) FROM pg_constraint fk",
+            "SELECT (SELECT a.attname FROM pg_attribute a \
+             WHERE a.attrelid = fk.conrelid AND a.attnum = fk.confkey[1] + 0) FROM pg_constraint fk",
+        ] {
+            assert!(sublink_one(&db, sql), "{sql}");
+        }
+    }
+
+    #[test]
     fn a_join_onto_a_single_row_side_is_one_row() {
         let mut db = PgCatalog::new().unwrap();
         db.apply_sql(
