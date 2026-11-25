@@ -77,6 +77,13 @@ A query proven to return at most one row:
   tells its values apart: an integer, `numeric`, `uuid`, `boolean`, enum or
   string column (`WHERE n.id::text = $id`), not a float, date or time one,
   whose text depends on session settings;
+- a `LEFT` / `RIGHT` join whose preserved side is one row onto a join whose
+  relations are each pinned by a key: by the outer join's `ON` from the
+  preserved side's values, by an inner join's `ON` inside that side, or by a
+  nested outer join's nullable side. `FROM (SELECT $p AS who) q LEFT JOIN
+  (users u JOIN profiles pr ON pr.user_id = u.principal) ON u.principal =
+  q.p` is one row with `users.principal` and `profiles.user_id` unique; a
+  `FULL JOIN` in that side never does;
 - a partial unique index whose predicate the `WHERE` implies
   (`… WHERE state IN ('queued', 'done')` by `state = 'done'`), and a unique
   index on a function of columns matched by the same call

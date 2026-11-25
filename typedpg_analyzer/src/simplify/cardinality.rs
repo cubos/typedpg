@@ -290,6 +290,14 @@ pub fn redundant_group_keys(
 /// (a LEFT join's left, a RIGHT join's right; a FULL join's `COALESCE`
 /// gives up).
 ///
+/// An outer join's nullable side may itself be a join tree, and it is at
+/// most one row once every relation of it is determined: by the outer join's
+/// `ON` (equating keys to the preserved side's values), by an inner join
+/// nested in the side — its `ON` holds on every row the side emits — or by a
+/// nested outer join's nullable side, once that join's preserved side is
+/// determined. The preserved side itself must be determined first: before
+/// that some of its rows match and others null-extend the side.
+///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
 /// referenced more than once, and its columns are values a key equality may
@@ -327,8 +335,8 @@ pub fn redundant_group_keys(
 /// that returns a set, an inheritance parent read with its children — a
 /// plain reference, not `ONLY` — a foreign table), a set-returning call, a
 /// `FULL JOIN` (two one-row sides still produce an unmatched row from each
-/// when their keys differ), or an outer join whose nullable side isn't
-/// determined.
+/// when their keys differ), or an outer join whose nullable side has a
+/// relation the proof doesn't determine.
 ///
 /// The same "equalities to a key" fixed point backs the DML proofs: an
 /// `UPDATE` / `DELETE` needs only its target determined — a `FROM` /
@@ -2933,6 +2941,16 @@ type JoinFacts<'j, 'a, 'q> = (
 /// treatment too. A key may be equated partly by the `WHERE`, partly by
 /// one join's `ON` and partly by another's: all of them hold on every row
 /// the joins contribute.
+///
+/// An outer join's nullable side may itself be a join tree, and every
+/// relation of it is a target of that join's `ON` facts: the side is one row
+/// once each of its relations is (each relation is then at most one row, and
+/// a join of at-most-one-row inputs is at most one row). An inner join
+/// nested in the side matched on every row the side emits, so its own `ON`
+/// determines its relations too; a nested outer join determines only its own
+/// nullable side, and only once its preserved side is — what the outer
+/// join's `ON` said about that preserved side never pins it, an unmatched
+/// row has it too.
 fn determined_relations(
     ctx: &Ctx<'_>,
     where_clause: Option<&ast::Node>,
@@ -3034,11 +3052,20 @@ fn determined_relations(
                 // match it and others null-extend it, and an expression of
                 // its columns that maps NULL to a value (`quote_nullable`)
                 // then differs from row to row.
+                //
+                // Its `ON` may determine that whole side, every relation of
+                // it: a side that is itself a join tree is one row when each
+                // of its relations is (two one-row relations joined, however,
+                // are still one row). A nested inner join then contributes
+                // its own `ON` as facts for its relations (it matched on
+                // every row of the side), and a nested outer join only its
+                // nullable side once its preserved side is fixed — its own
+                // arm below, with `targets` its nullable side.
                 typedpg_pg_query::ast::JoinType::JoinLeft if join.left & !known == 0 => {
-                    (join.right_rel.map_or(0, |b| 1 << b), join.left)
+                    (join.right, join.left)
                 }
                 typedpg_pg_query::ast::JoinType::JoinRight if join.right & !known == 0 => {
-                    (join.left_rel.map_or(0, |b| 1 << b), join.right)
+                    (join.left, join.right)
                 }
                 typedpg_pg_query::ast::JoinType::JoinLeft
                 | typedpg_pg_query::ast::JoinType::JoinRight => (0, 0),
@@ -3320,6 +3347,14 @@ mod tests {
                 id bigint PRIMARY KEY,
                 customer_id bigint NOT NULL REFERENCES customers
              );
+             CREATE TABLE principals (id bigint PRIMARY KEY, label text);
+             CREATE TABLE profiles (
+                id bigint PRIMARY KEY,
+                principal_id bigint NOT NULL UNIQUE,
+                bio text
+             );
+             CREATE TABLE profile_settings (profile_id bigint PRIMARY KEY, theme text);
+             CREATE TABLE loose_profiles (principal_id bigint NOT NULL, bio text);
              CREATE TABLE defaults (
                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 v int DEFAULT 1 NOT NULL
@@ -3899,6 +3934,100 @@ mod tests {
         assert!(!select_one(
             &db,
             "SELECT o.id FROM users u LEFT JOIN orders o ON o.customer_id = u.id WHERE u.id = $1"
+        ));
+    }
+
+    #[test]
+    fn an_outer_join_onto_a_determined_join_tree_is_one_row() {
+        let db = catalog();
+        // The one-row side pins `u`'s key, and `u`'s key the profile's
+        // unique column: every relation of the nullable side is one row, so
+        // the join is.
+        for sql in [
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            // Two levels of inner joins inside the nullable side.
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p",
+            // A `LEFT` inside a `LEFT`: the nested join's nullable side is
+            // fixed by its own `ON`, its preserved side by the outer one.
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        LEFT JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p",
+            // A nested `RIGHT` join: its preserved side is the one the outer
+            // `ON` pins.
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (profiles pr RIGHT JOIN principals u ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            // The mirror: a `RIGHT` join onto the tree.
+            "SELECT pr.bio FROM (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             RIGHT JOIN (SELECT $1::bigint AS p) q ON u.id = q.p",
+            // Pinning the nested relation's key instead fixes the join's
+            // other relation through its `ON`.
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON pr.id = q.p",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        // The `WHERE` may still pin every relation of the side, as it may
+        // pin one.
+        assert!(select_one(
+            &db,
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON true \
+             WHERE u.id = $2 AND pr.principal_id = $3",
+        ));
+        // A non-unique nested join column pins nothing.
+        assert!(!select_one(
+            &db,
+            "SELECT lp.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN loose_profiles lp ON lp.principal_id = u.id) \
+             ON u.id = q.p",
+        ));
+        // A `FULL JOIN` in the nullable side emits an unmatched row from each
+        // side when their keys differ.
+        assert!(!select_one(
+            &db,
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u FULL JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+        ));
+        // The preserved side may hold many rows: a table is never fixed.
+        assert!(!select_one(
+            &db,
+            "SELECT pr.bio FROM principals q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.id",
+        ));
+        // The outer `ON` pins one relation of the nested join only: the other
+        // may match many rows.
+        assert!(!select_one(
+            &db,
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON u.id = q.p",
+        ));
+        // A nested outer join's `ON` never pins its preserved side: every `u`
+        // row is kept there, matched or not.
+        assert!(!select_one(
+            &db,
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id \
+                       AND u.id = $2) ON true",
+        ));
+        // Two unique columns equated to each other are still many pairs.
+        assert!(!select_one(
+            &db,
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON true \
+             WHERE u.id = pr.principal_id",
         ));
     }
 

@@ -385,6 +385,67 @@ mod tests {
     }
 
     #[test]
+    fn an_outer_join_onto_a_join_of_determined_rows_is_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE principals (id bigint PRIMARY KEY, label text);
+             CREATE TABLE profiles (
+                id bigint PRIMARY KEY,
+                principal_id bigint NOT NULL UNIQUE,
+                bio text
+             );
+             CREATE TABLE profile_settings (profile_id bigint PRIMARY KEY, theme text);
+             CREATE TABLE loose_profiles (principal_id bigint NOT NULL, bio text);",
+        )
+        .unwrap();
+        // A one-row side pins `u`'s key, `u`'s key the profile's unique
+        // column: every relation of the nullable join tree is one row.
+        for sql in [
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             RIGHT JOIN (SELECT $1::bigint AS p) q ON u.id = q.p LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(
+                findings[0].message, "LIMIT 1 has no effect: the query returns at most one row",
+                "{sql}"
+            );
+        }
+        // A non-unique nested join column, a FULL join inside, a preserved
+        // side with many rows and an `ON` pinning one relation only keep the
+        // LIMIT.
+        for sql in [
+            "SELECT lp.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN loose_profiles lp ON lp.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u FULL JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM principals q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.id LIMIT 1",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON u.id = q.p LIMIT 1",
+        ] {
+            assert!(
+                limit_findings(&db, sql).is_empty(),
+                "{sql}: {:?}",
+                limit_findings(&db, sql)
+            );
+        }
+    }
+
+    #[test]
     fn aggregates_and_from_less_selects_are_one_row() {
         let db = catalog();
         let sql = "SELECT count(*) FROM users LIMIT 10";

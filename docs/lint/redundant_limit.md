@@ -42,7 +42,9 @@ The query is known to return at most one row through:
 - a primary or unique key fully equated to constants, parameters or columns
   of other such rows (also across joins), or through a cast to `text` that
   tells the key's values apart (`WHERE id::text = $id`, see
-  [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported));
+  [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported)); an
+  outer join onto a side whose every relation is pinned that way is one row
+  too ([`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported));
 - an aggregate without `GROUP BY`, or `GROUP BY` columns pinned by `WHERE`;
 - no `FROM`, or a one-row `VALUES`.
 

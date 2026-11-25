@@ -1015,6 +1015,89 @@ mod tests {
     }
 
     #[test]
+    fn fetch_all_on_an_outer_join_onto_a_join_of_determined_rows_is_single_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE principals (id bigint PRIMARY KEY, label text);
+             CREATE TABLE profiles (
+                id bigint PRIMARY KEY,
+                principal_id bigint NOT NULL UNIQUE,
+                bio text
+             );
+             CREATE TABLE profile_settings (profile_id bigint PRIMARY KEY, theme text);
+             CREATE TABLE loose_profiles (principal_id bigint NOT NULL, bio text);",
+        )
+        .unwrap();
+        // A one-row side pins `u`'s key, `u`'s key the profile's unique
+        // column: every relation of the nullable join tree is one row.
+        for sql in [
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            "SELECT pr.bio FROM (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             RIGHT JOIN (SELECT $1::bigint AS p) q ON u.id = q.p",
+        ] {
+            for call in [
+                rust(CallMethod::FetchOne, "fetch_one"),
+                rust(CallMethod::FetchOptional, "fetch_optional"),
+            ] {
+                assert!(
+                    only(lint(&db, sql, &[call]), Rule::FetchOneMultipleRows).is_empty(),
+                    "{sql}"
+                );
+            }
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchAll, "fetch_all")]),
+                    Rule::FetchAllSingleRow
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
+        // What may still multiply the nullable side keeps the finding.
+        for sql in [
+            "SELECT lp.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN loose_profiles lp ON lp.principal_id = u.id) \
+             ON u.id = q.p",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u FULL JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            "SELECT pr.bio FROM principals q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.id",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON u.id = q.p",
+        ] {
+            assert!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchAll, "fetch_all")]),
+                    Rule::FetchAllSingleRow
+                )
+                .is_empty(),
+                "{sql}"
+            );
+            assert_eq!(
+                only(
+                    lint(&db, sql, &[rust(CallMethod::FetchOne, "fetch_one")]),
+                    Rule::FetchOneMultipleRows
+                )
+                .len(),
+                1,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn fetch_all_on_a_non_unique_query_is_fine() {
         let db = catalog();
         let sql = "SELECT id, name FROM users WHERE org_id = $1";
