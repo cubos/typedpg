@@ -682,11 +682,13 @@ a finding reaches `failOn` or a query or migration fails analysis.
 `--previous-deployment <ref>` names the git ref of what is deployed now (for
 example `origin/main`; `--ignore-migrations-from` is its old name). It skips
 the statement rules of migration files identical to their version at that git
-ref: they build the schema, but their locks, scans and rewrites are not
-reported. The schema rules still report the current schema's problems, placed
-on the statement that created the object, with a help line that puts the fix
-in a new migration; their allow comments are honored and validated. A file
-absent from the ref, or changed by the branch, is linted as usual.
+ref — a file differing only in comments and whitespace counts as identical,
+as the migration runner's drift check sees it: they build the schema, but
+their locks, scans and rewrites are not reported. The schema rules still
+report the current schema's problems, placed on the statement that created
+the object, with a help line that puts the fix in a new migration; their
+allow comments are honored and validated. A file absent from the ref, or
+changed by the branch, is linted as usual.
 It also runs `deployed_query_breakage`: the code at the ref keeps running
 while the new migrations are applied and during the rollout, so its queries
 (read from the ref, even those the branch changed or removed) are analyzed

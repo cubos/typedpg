@@ -226,10 +226,12 @@ deployed now (for example `origin/main`): its code and its migrations.
 Migrations already applied in production cannot be changed, so it skips the
 statement rules of every migration file identical to its version at that ref:
 it is applied for the schema, but its locks, scans and rewrites are not
-reported. The schema rules (`fk_without_index`, `redundant_index`) still
-report problems of the current schema, placed on the statement that created
-the object, with a help line that puts the fix in a new migration; its allow
-comments are honored and validated. A file absent from the ref, or changed by
+reported. A file differing only in comments and whitespace counts as
+identical, as the migration runner's drift check sees it. The schema rules
+(`fk_without_index`, `redundant_index`) still report problems of the
+current schema, placed on the statement that created the object, with a help
+line that puts the fix in a new migration; its allow comments are honored and
+validated. A file absent from the ref, or changed by
 the branch, is linted as usual. The summary states how many files skipped the
 statement rules, e.g.
 `300 unchanged from origin/main: statement rules skipped`.

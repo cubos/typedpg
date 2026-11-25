@@ -601,6 +601,57 @@ fn deployed_query_breakage_checks_the_previous_deployments_queries() {
 }
 
 #[test]
+fn lint_ignores_a_migration_edited_only_by_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts"
+        }"#,
+    );
+    let init = root.join("migrations/0001_init.sql");
+    write(
+        &init,
+        "CREATE TABLE cost_rollup (day date, total numeric);\n",
+    );
+    write(
+        &root.join("migrations/0002_more.sql"),
+        "ALTER TABLE cost_rollup ADD COLUMN note text;\n",
+    );
+    write(&root.join("src/app.ts"), "export {};\n");
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A", "."]);
+    git(root, &["commit", "-q", "-m", "deployed"]);
+
+    // Both are findings of their files as last deployed.
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("table_without_primary_key"), "{stdout}");
+    assert!(stdout.contains("lock_without_timeout"), "{stdout}");
+
+    // A comment-only edit is no drift: the file is still the deployed one,
+    // and its allow comment is honored.
+    write(
+        &init,
+        "-- No primary key: dimensions are nullable, the key is UNIQUE NULLS NOT DISTINCT.\n\
+         -- typedpg-lint: allow(table_without_primary_key)\n\
+         CREATE TABLE cost_rollup (day date, total numeric);\n",
+    );
+    let output = run(root, &["lint", "--previous-deployment", "HEAD"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("table_without_primary_key"), "{stdout}");
+    assert!(!stdout.contains("lock_without_timeout"), "{stdout}");
+    assert!(
+        stderr.contains("(2 unchanged from HEAD: statement rules skipped)"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn queries_are_linted_as_the_databases_roles() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
