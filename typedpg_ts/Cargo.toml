@@ -39,7 +39,7 @@ oxc_ast = "0.159"
 oxc_ast_visit = "0.159"
 oxc_semantic = "0.159"
 oxc_allocator = "0.159"
-oxc_span = "0.159"
+oxc_span = "0.160"
 oxc_syntax = "0.159"
 oxc_resolver = "11.24"
 
