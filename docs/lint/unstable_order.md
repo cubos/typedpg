@@ -40,6 +40,10 @@ or skip rows, `ORDER BY created_at DESC LIMIT 1` returns a different row
 each call, and `DISTINCT ON` keeps an arbitrary row per group. It depends on
 the data, so tests rarely catch it. End the `ORDER BY` with a unique column.
 
+The tiebreaker doesn't cost an index scan: `ORDER BY embedding <=> $q, id
+LIMIT 10` still uses pgvector's HNSW index scan, with PostgreSQL adding an
+incremental sort on top.
+
 ## Reported when
 
 The `ORDER BY` keys, together with the columns `WHERE` (or an inner join's
@@ -56,8 +60,9 @@ table the keys determine, don't cover a unique key of every table in `FROM`:
   nondeterministic one, distinct values can compare equal.
 
 A `DISTINCT ON` whose keys `WHERE` fixes returns one row, still picked
-among ties. The help names each undetermined table's primary key columns
-that nothing above fixes.
+among ties. The help names the fewest tables' primary key columns that,
+added to the `ORDER BY`, make the order unique (and that nothing above
+already fixes).
 
 ## Not reported
 
@@ -75,6 +80,19 @@ that nothing above fixes.
 - An `EXISTS` subquery, or a batching `IN (SELECT … LIMIT n)` in an `UPDATE`
   or `DELETE`.
 - A select list that is the same for every row (`SELECT 1 … LIMIT 1`).
+- A volatile `ORDER BY` key: `ORDER BY random() LIMIT 5` samples on
+  purpose, and ties between rows mean nothing.
+- A `DISTINCT ON` whose select list the `DISTINCT ON` expressions
+  determine:
+
+  ```sql
+  SELECT DISTINCT ON (u.id) u.id, u.name, u.email
+  FROM users u JOIN posts p ON p.user_id = u.id
+  WHERE … ORDER BY u.id LIMIT 20;
+  ```
+
+  Every group is the rows of one `u`, so whichever of its posts is joined,
+  the output row is the same one.
 - `FROM` with a subquery, CTE, function, partitioned or inheritance table, or
   a table with a partial, expression or deferrable unique index.
 - No `ORDER BY` at all: see [`limit_without_order`](limit_without_order.md).

@@ -185,6 +185,64 @@ fn order_ties_in(ctx: &Ctx<'_>, select: &SelectStmt) -> dedup::OrderTies {
     }
 }
 
+/// Whether the `DISTINCT ON` of `select` — a node borrowed from
+/// `view.tree` at any nesting depth — keeps rows whose select list is the
+/// same whichever of each group's rows it picks: every target-list
+/// expression reads only columns of the relations the `DISTINCT ON`
+/// expressions determine (the [`order_ties`] closure, with the `DISTINCT ON`
+/// expressions in place of the `ORDER BY` keys), the `DISTINCT ON` columns,
+/// constants, parameters or columns of an enclosing query level.
+///
+/// False for a query with spreads, and whenever the proof can't tell: a
+/// FROM clause it can't see through (see [`order_ties`]), a `DISTINCT ON`
+/// expression that isn't a plain column, or a target that reads a column of
+/// an undetermined relation, a whole row, a subquery, an aggregate, a
+/// window or a volatile call.
+pub fn distinct_on_output_determined(
+    catalog: &PgCatalog,
+    view: &QueryView,
+    select: &SelectStmt,
+) -> bool {
+    if !view.analyzed.spreads.is_empty() {
+        return false;
+    }
+    let ctx = Ctx {
+        sql: &view.sql,
+        tree: &view.tree,
+        catalog,
+        analyzed: &view.analyzed,
+    };
+    distinct_on_output_determined_in(&ctx, select)
+}
+
+/// [`distinct_on_output_determined`] of `select`, a node of `ctx`'s tree.
+fn distinct_on_output_determined_in(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    if dedup::distinct_on_output_determined(ctx, &dedup::cte_names(ctx.tree), select, None) {
+        return true;
+    }
+    // Again with the levels around `select`, which only the walk from the
+    // statement's root knows.
+    let mut found = None;
+    let env = CteEnv::default();
+    for raw in &ctx.tree.stmts {
+        if let Some(root) = raw.stmt.as_ref() {
+            find_select(
+                ctx,
+                root.to_ref(),
+                None,
+                &env,
+                select,
+                SelectCheck::DistinctOnOutput,
+                &mut found,
+            );
+            if found.is_some() {
+                break;
+            }
+        }
+    }
+    found == Some(true)
+}
+
 /// What each `ORDER BY` item of `select` — a node borrowed from `view.tree`
 /// at any nesting depth — sorts by (see [`dedup::OrderKey`]). `None` for a
 /// query with spreads, or a FROM clause the proof can't see through.
@@ -1380,6 +1438,9 @@ enum SelectCheck {
     /// [`dedup::order_ties`] is `Unique`, with the enclosing levels' columns
     /// as values.
     OrderUnique,
+    /// [`dedup::distinct_on_output_determined`], with the enclosing levels'
+    /// columns as values.
+    DistinctOnOutput,
 }
 
 /// Search `node`'s subtree for `target`, giving each nested query level the
@@ -1417,6 +1478,12 @@ fn find_select(
                         dedup::order_ties(ctx, &dedup::cte_names(ctx.tree), select, Some(&scope))
                             == dedup::OrderTies::Unique
                     }
+                    SelectCheck::DistinctOnOutput => dedup::distinct_on_output_determined(
+                        ctx,
+                        &dedup::cte_names(ctx.tree),
+                        select,
+                        Some(&scope),
+                    ),
                 });
                 return;
             }

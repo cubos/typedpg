@@ -17,16 +17,24 @@
 //! not reported (with `DISTINCT ON`, one with at most one row before it: a
 //! single group still picks among its rows), nor `FETCH … WITH TIES` (it returns every tie), a
 //! `SKIP LOCKED` queue, an `EXISTS` subquery or a batching `IN` in an
-//! `UPDATE` / `DELETE` (which don't care which rows), nor a select whose
-//! output is the same for every row. Nothing is reported when the proof
-//! can't see the whole FROM clause (a subquery, a CTE, a function, a
-//! partitioned or inheritance table, a partial or expression unique index):
-//! the keys may be unique there.
+//! `UPDATE` / `DELETE` (which don't care which rows), a select whose
+//! output is the same for every row, a key that calls a VOLATILE function
+//! (`ORDER BY random() LIMIT 5` samples on purpose), or a `DISTINCT ON`
+//! whose select list the `DISTINCT ON` expressions determine (which tied
+//! row of a group is kept then doesn't show; see
+//! [`typedpg_analyzer::distinct_on_output_determined`]). Nothing is
+//! reported when the proof can't see the whole FROM clause (a subquery, a
+//! CTE, a function, a partitioned or inheritance table, a partial or
+//! expression unique index): the keys may be unique there.
 //!
 //! No `ORDER BY` at all is `limit_without_order`'s finding. No fix is
-//! offered: which tiebreaker to add is the author's choice.
+//! offered: which tiebreaker to add is the author's choice. The help names
+//! the fewest undetermined tables' primary keys that, added to the keys,
+//! make the order unique.
 
-use typedpg_analyzer::{OrderTies, order_ties, select_at_most_one_row};
+use typedpg_analyzer::{
+    OrderTies, ProVolatile, distinct_on_output_determined, order_ties, select_at_most_one_row,
+};
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{AConstValue, LimitOption, Node, SelectStmt};
 
@@ -74,15 +82,21 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         {
             continue;
         }
-        let OrderTies::Ties(undetermined) = order_ties(ctx.catalog, ctx.view, select) else {
+        if picks == "DISTINCT ON" && distinct_on_output_determined(ctx.catalog, ctx.view, select) {
+            continue;
+        }
+        if volatile_order_key(ctx, select) {
+            continue;
+        }
+        let OrderTies::Ties(ties) = order_ties(ctx.catalog, ctx.view, select) else {
             continue;
         };
         let Some(span) = order_by_span(ctx, select) else {
             continue;
         };
-        let names: Vec<String> = undetermined
+        let names: Vec<String> = ties
             .iter()
-            .map(|(name, _)| typedpg_core::quote_identifier(name))
+            .map(|tie| typedpg_core::quote_identifier(&tie.name))
             .collect();
         let what = if picks == "DISTINCT ON" {
             "DISTINCT ON keeps an arbitrary row of the tied ones in each group"
@@ -96,13 +110,14 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
              {what}",
             names.join(", ")
         );
-        let tiebreakers: Vec<String> = undetermined
+        let tiebreakers: Vec<String> = ties
             .iter()
-            .filter(|(_, pk)| !pk.is_empty())
-            .map(|(name, pk)| {
-                let table = typedpg_core::quote_identifier(name);
-                pk.iter()
-                    .map(|c| format!("{table}.{}", typedpg_core::quote_identifier(c)))
+            .filter(|tie| tie.tiebreak && !tie.primary_key.is_empty())
+            .map(|tie| {
+                let table = typedpg_core::quote_identifier(&tie.name);
+                tie.primary_key
+                    .iter()
+                    .map(|column| format!("{table}.{}", typedpg_core::quote_identifier(column)))
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -123,6 +138,117 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         });
     }
     out
+}
+
+/// Whether any of `select`'s `ORDER BY` keys calls a function or operator
+/// that is VOLATILE: the keys then sort by a fresh value, and ties aren't
+/// the author's concern (`ORDER BY random() LIMIT 5` samples on purpose).
+fn volatile_order_key(ctx: &Ctx<'_>, select: &SelectStmt) -> bool {
+    select.sort_clause.iter().any(|item| {
+        let Some(Node::SortBy(sort)) = item else {
+            return false;
+        };
+        key_expression(select, sort.node.as_ref())
+            .is_some_and(|key| volatile_call(ctx, key.to_ref()))
+    })
+}
+
+/// The expression an `ORDER BY` item sorts by: an output column's
+/// expression for a bare name the select list outputs (SQL92's rule, which
+/// PG tries first) or for an ordinal, else the item itself.
+fn key_expression<'a>(select: &'a SelectStmt, node: Option<&'a Node>) -> Option<&'a Node> {
+    let targets = || {
+        select.target_list.iter().filter_map(|target| match target {
+            Some(Node::ResTarget(target)) => Some(target),
+            _ => None,
+        })
+    };
+    match node? {
+        Node::AConst(value) => {
+            let Some(AConstValue::Integer(index)) = &value.val else {
+                return None;
+            };
+            let index = usize::try_from(index.ival).ok()?.checked_sub(1)?;
+            targets().nth(index)?.val.as_ref()
+        }
+        key @ Node::ColumnRef(column) => {
+            let names: Vec<&str> = column
+                .fields
+                .iter()
+                .filter_map(|field| match field {
+                    Some(Node::String(name)) => Some(name.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let [name] = names.as_slice() else {
+                return Some(key);
+            };
+            let mut named = targets().filter(|target| {
+                target.name == *name
+                    || (target.name.is_empty()
+                        && matches!(target.val.as_ref(), Some(Node::ColumnRef(reference))
+                            if matches!(reference.fields.as_slice(), [Some(Node::String(column))]
+                                if column.sval == *name)))
+            });
+            match named.next() {
+                Some(target) => Some(target.val.as_ref()?),
+                None => Some(key),
+            }
+        }
+        key => Some(key),
+    }
+}
+
+/// Whether `root` calls a function or operator any overload of which may be
+/// VOLATILE (`random()`, `gen_random_uuid()`, `clock_timestamp()`, …), an
+/// unknown one included.
+fn volatile_call(ctx: &Ctx<'_>, root: NodeRef<'_>) -> bool {
+    let volatile_proc = |oid| {
+        ctx.catalog
+            .pg_proc()
+            .get(&oid)
+            .is_none_or(|proc| proc.provolatile == ProVolatile::Volatile)
+    };
+    let volatile_operator = |name: Option<&str>| {
+        name.is_some_and(|name| {
+            ctx.catalog.pg_operator().values().any(|operator| {
+                operator.oprname == name && operator.oprcode.is_none_or(volatile_proc)
+            })
+        })
+    };
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeRef::FuncCall(call) => {
+                let names: Vec<&str> = call
+                    .funcname
+                    .iter()
+                    .filter_map(|node| match node {
+                        Some(Node::String(name)) => Some(name.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let procs = match names.as_slice() {
+                    [name] => ctx.catalog.find_functions(None, name),
+                    [schema, name] => ctx.catalog.find_functions(Some(schema), name),
+                    _ => return true,
+                };
+                if procs.is_empty()
+                    || procs
+                        .iter()
+                        .any(|proc| proc.provolatile == ProVolatile::Volatile)
+                {
+                    return true;
+                }
+            }
+            NodeRef::AExpr(expr) if volatile_operator(super::operator_name(expr)) => {
+                return true;
+            }
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    false
 }
 
 /// Whether the row count is the literal 1 (`LIMIT 1`, `FETCH FIRST 1 ROW
@@ -189,6 +315,28 @@ mod tests {
                     PRIMARY KEY (source_id, version)
                  );
                  CREATE TABLE mig (name text PRIMARY KEY);
+                 CREATE TABLE membership (
+                    id bigint PRIMARY KEY,
+                    user_id bigint NOT NULL REFERENCES users
+                 );
+                 CREATE TABLE prize (
+                    id bigint PRIMARY KEY,
+                    membership_id bigint NOT NULL REFERENCES membership
+                 );
+                 CREATE TABLE source (id int PRIMARY KEY);
+                 CREATE TABLE chunk (
+                    id int PRIMARY KEY,
+                    source_id int NOT NULL REFERENCES source,
+                    score real NOT NULL
+                 );
+                 CREATE TABLE a (id int PRIMARY KEY, b_id int NOT NULL, x int NOT NULL);
+                 CREATE TABLE b (id int PRIMARY KEY, c_id int NOT NULL);
+                 CREATE TABLE c (id int PRIMARY KEY);
+                 CREATE TABLE orders (id int PRIMARY KEY, ref int NOT NULL, total int NOT NULL);
+                 CREATE TABLE shipments (id int PRIMARY KEY, ref int NOT NULL);
+                 CREATE FUNCTION jitter(int, int) RETURNS int VOLATILE LANGUAGE sql
+                    AS 'SELECT $1 + $2 + (random() * 10)::int';
+                 CREATE OPERATOR <+> (LEFTARG = int, RIGHTARG = int, FUNCTION = jitter);
                  CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', \
                     deterministic = false);",
             )
@@ -409,6 +557,122 @@ mod tests {
             Some(
                 "add a unique tiebreaker as the last ORDER BY key, such as the primary key: \
                   ver.version"
+            )
+        );
+    }
+
+    #[test]
+    fn a_volatile_order_key_is_not_reported() {
+        let db = catalog();
+        // A fresh value per row: the query samples on purpose, so ties
+        // between rows mean nothing.
+        for sql in [
+            "SELECT id FROM users ORDER BY random() LIMIT 5",
+            "SELECT id FROM users ORDER BY created_at, random() LIMIT 5",
+            "SELECT id FROM users ORDER BY random() OFFSET $1",
+            "SELECT DISTINCT ON (user_id) id FROM posts ORDER BY user_id, random()",
+            // An output column names the volatile expression it stands for.
+            "SELECT random() AS r FROM users ORDER BY r LIMIT 5",
+            "SELECT random() FROM users ORDER BY 1 LIMIT 5",
+            // A volatile operator is a fresh value too.
+            "SELECT id FROM users ORDER BY tenant <+> 1 LIMIT 5",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+        // A non-volatile call sorts by its arguments' values: ties remain.
+        for sql in [
+            "SELECT id FROM users ORDER BY lower(name) LIMIT 5",
+            "SELECT id FROM users ORDER BY tenant + 1 LIMIT 5",
+        ] {
+            let findings = lint_rule(&db, sql, RULE);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert!(
+                findings[0].help.as_deref().unwrap().contains("users.id"),
+                "{findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_on_output_the_keys_determine_is_not_reported() {
+        let db = catalog();
+        // Every output column is `u`'s, and the DISTINCT ON key is `u`'s
+        // primary key: whichever prize/membership row of a group is kept,
+        // the output is the same.
+        let sql = "SELECT DISTINCT ON (u.id) u.id, u.name, u.email \
+                   FROM prize p JOIN membership m ON m.id = p.membership_id \
+                   JOIN users u ON u.id = m.user_id \
+                   WHERE p.id > $1 ORDER BY u.id LIMIT $2";
+        assert!(lint_rule(&db, sql, RULE).is_empty(), "{sql}");
+        // The DISTINCT ON key itself is one value per group.
+        let sql = "SELECT DISTINCT ON (user_id) user_id FROM posts \
+                   ORDER BY user_id, created_at";
+        assert!(lint_rule(&db, sql, RULE).is_empty(), "{sql}");
+        // Reading an undetermined relation keeps the report: `p.id` differs
+        // between the group's rows.
+        let sql = "SELECT DISTINCT ON (u.id) u.id, p.id \
+                   FROM prize p JOIN membership m ON m.id = p.membership_id \
+                   JOIN users u ON u.id = m.user_id \
+                   WHERE p.id > $1 ORDER BY u.id LIMIT $2";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        // A DISTINCT ON key that isn't a unique key of `u` determines no
+        // row of it.
+        let sql = "SELECT DISTINCT ON (u.tenant) u.name FROM users u ORDER BY u.tenant";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        // An outer column fixes the rest of `ver`'s key, so the group's
+        // row is one.
+        let sql = "SELECT (SELECT DISTINCT ON (v.version) v.digest FROM ver v \
+                   WHERE v.source_id = s.id ORDER BY v.version) FROM src s";
+        assert!(lint_rule(&db, sql, RULE).is_empty(), "{sql}");
+    }
+
+    #[test]
+    fn the_help_names_the_fewest_tables_primary_keys() {
+        let db = catalog();
+        // `ch.id` determines `ch`, and `s` through the join on its key.
+        let sql = "SELECT ch.id FROM chunk ch JOIN source s ON s.id = ch.source_id \
+                   ORDER BY ch.score LIMIT 10";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        assert!(
+            findings[0]
+                .message
+                .contains("don't determine a unique row of ch, s"),
+            "{findings:?}"
+        );
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some(
+                "add a unique tiebreaker as the last ORDER BY key, such as the primary key: \
+                  ch.id"
+            )
+        );
+        // A chain: `a`'s key determines `b`, and `b`'s `c`.
+        let sql = "SELECT a.id FROM a JOIN b ON b.id = a.b_id JOIN c ON c.id = b.c_id \
+                   ORDER BY a.x LIMIT 10";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some(
+                "add a unique tiebreaker as the last ORDER BY key, such as the primary key: \
+                  a.id"
+            )
+        );
+        // Nothing determines the other: both keys are needed.
+        let sql = "SELECT orders.id FROM orders \
+                   JOIN shipments ON shipments.ref = orders.ref \
+                   ORDER BY orders.total LIMIT 10";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        assert_eq!(
+            findings[0].help.as_deref(),
+            Some(
+                "add a unique tiebreaker as the last ORDER BY key, such as the primary key: \
+                  orders.id, shipments.id"
             )
         );
     }
