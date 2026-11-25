@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use typedpg::migrate::{self, MigrationSource, MigrationsConfig};
+use typedpg_core::migrations::normalize;
 
 #[derive(clap::Subcommand)]
 pub enum MigrateAction {
@@ -147,8 +148,11 @@ fn write_new(path: &Path) -> std::io::Result<()> {
 ///
 /// `reference` is resolved to a commit; a file absent from it, or different
 /// from it, is not returned. Files are compared by blob id, so the same
-/// filters a commit applies are applied to the working copies too. Not being
-/// in a git repository, or an unknown ref, is an error.
+/// filters a commit applies are applied to the working copies too; a
+/// different blob whose text normalizes the same as the ref's — comments and
+/// whitespace only — is unchanged, as the migration runner's drift check
+/// sees it, and text that is not valid UTF-8 on either side is changed. Not
+/// being in a git repository, or an unknown ref, is an error.
 pub fn unchanged_from_ref(reference: &str, files: &[PathBuf]) -> Result<HashSet<PathBuf>, String> {
     let base = files
         .first()
@@ -244,12 +248,97 @@ pub fn unchanged_from_ref(reference: &str, files: &[PathBuf]) -> Result<HashSet<
     }
     let working = String::from_utf8_lossy(&output.stdout);
     let mut unchanged = HashSet::new();
+    // Paths whose blob differs from the ref's, with the ref's blob id.
+    let mut differing: Vec<(&str, &str)> = Vec::new();
     for ((path, reference_blob), working_blob) in reference_blobs.iter().zip(working.lines()) {
         if *reference_blob == working_blob {
+            unchanged.insert(relative[*path].clone());
+        } else {
+            differing.push((*path, *reference_blob));
+        }
+    }
+    if differing.is_empty() {
+        return Ok(unchanged);
+    }
+
+    // A different blob is not necessarily an edit: comments and whitespace
+    // are no drift for the migration runner, so a file edited that way is
+    // still unchanged here. Both sides must be text to normalize; anything
+    // else counts as changed.
+    let reference_oids: Vec<&str> = differing.iter().map(|(_, blob)| *blob).collect();
+    let reference_texts = blob_texts(&top, &reference_oids)?;
+    for ((path, _), reference_text) in differing.iter().zip(reference_texts) {
+        let (Some(reference_text), Ok(working_text)) = (reference_text, fs::read(&relative[*path]))
+        else {
+            continue;
+        };
+        let Ok(working_text) = String::from_utf8(working_text) else {
+            continue;
+        };
+        if normalize(&reference_text) == normalize(&working_text) {
             unchanged.insert(relative[*path].clone());
         }
     }
     Ok(unchanged)
+}
+
+/// The contents of the blobs `oids` name, read with one
+/// `git cat-file --batch` process: `None` for one that is missing, is not a
+/// blob, or is not valid UTF-8.
+fn blob_texts(top: &Path, oids: &[&str]) -> Result<Vec<Option<String>>, String> {
+    let mut child = Command::new("git")
+        .args(["cat-file", "--batch"])
+        .current_dir(top)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    let mut stdin = child.stdin.take().expect("git's stdin is piped");
+    let mut input = String::new();
+    for oid in oids {
+        input.push_str(oid);
+        input.push('\n');
+    }
+    stdin
+        .write_all(input.as_bytes())
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    if !output.status.success() {
+        return Err(git_error("cat-file --batch", &output.stderr));
+    }
+
+    // Each answer is `<oid> <type> <size>` on a line, the content, then a
+    // line break; an object it could not read is `<name> missing`. Blob
+    // content is not necessarily UTF-8, so the answers are split by size.
+    let mut texts = Vec::with_capacity(oids.len());
+    let mut rest = &output.stdout[..];
+    for _ in oids {
+        let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+            return Err("git cat-file printed a truncated answer".to_owned());
+        };
+        let mut fields = rest[..newline].split(|byte| *byte == b' ');
+        let (_oid, kind, size) = (fields.next(), fields.next(), fields.next());
+        rest = &rest[newline + 1..];
+        let is_blob = kind == Some(&b"blob"[..]);
+        let size = size
+            .and_then(|size| std::str::from_utf8(size).ok())
+            .and_then(|size| size.parse::<usize>().ok());
+        let (true, Some(size)) = (is_blob, size) else {
+            texts.push(None);
+            continue;
+        };
+        if rest.len() < size {
+            return Err("git cat-file printed a truncated blob".to_owned());
+        }
+        let (content, tail) = rest.split_at(size);
+        rest = tail.strip_prefix(b"\n").unwrap_or(tail);
+        texts.push(String::from_utf8(content.to_vec()).ok());
+    }
+    Ok(texts)
 }
 
 /// The root of the git work tree `dir` is in, canonical.
@@ -674,6 +763,71 @@ mod tests {
         let unchanged =
             unchanged_from_ref("HEAD", &[first.clone(), second.clone(), third.clone()]).unwrap();
         assert_eq!(unchanged, HashSet::from([first]));
+    }
+
+    #[test]
+    fn unchanged_from_ref_ignores_comments_and_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        let commented = root.join("0001_commented.sql");
+        let statement = root.join("0002_statement.sql");
+        let marker = root.join("0003_marker.sql");
+        fs::write(
+            &commented,
+            "CREATE TABLE a (\n    id integer,\n    at timestamptz\n);\n",
+        )
+        .unwrap();
+        fs::write(&statement, "CREATE TABLE b (id integer);\n").unwrap();
+        fs::write(&marker, "CREATE TABLE c (id integer);\n").unwrap();
+        let identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+        git(root, &[&identity[..], &["add", "."]].concat());
+        git(
+            root,
+            &[&identity[..], &["commit", "-q", "-m", "three migrations"]].concat(),
+        );
+
+        // Comments and indentation are no drift, as the migration runner
+        // sees it...
+        fs::write(
+            &commented,
+            "-- No primary key: dimensions are nullable.\n\
+             -- typedpg-lint: allow(table_without_primary_key)\n\
+             CREATE TABLE a (id integer, at timestamptz); -- one line\n",
+        )
+        .unwrap();
+        // ...a statement change is one...
+        fs::write(&statement, "CREATE TABLE b (id bigint);\n").unwrap();
+        // ...and the `-- no-transaction` marker decides how the file runs, so
+        // adding it is one too.
+        fs::write(&marker, "-- no-transaction\nCREATE TABLE c (id integer);\n").unwrap();
+
+        let unchanged = unchanged_from_ref(
+            "HEAD",
+            &[commented.clone(), statement.clone(), marker.clone()],
+        )
+        .unwrap();
+        assert_eq!(unchanged, HashSet::from([commented]));
+    }
+
+    #[test]
+    fn unchanged_from_ref_counts_a_file_with_invalid_utf8_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        let file = root.join("0001_binary.sql");
+        fs::write(&file, b"CREATE TABLE a (id integer);\n").unwrap();
+        let identity = ["-c", "user.name=Test", "-c", "user.email=test@example.com"];
+        git(root, &[&identity[..], &["add", "."]].concat());
+        git(
+            root,
+            &[&identity[..], &["commit", "-q", "-m", "one migration"]].concat(),
+        );
+
+        // A comment-only edit whose text is no UTF-8 normalizes to nothing.
+        fs::write(&file, b"-- \xff\nCREATE TABLE a (id integer);\n").unwrap();
+        let unchanged = unchanged_from_ref("HEAD", &[file]).unwrap();
+        assert!(unchanged.is_empty(), "{unchanged:?}");
     }
 
     #[test]

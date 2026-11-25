@@ -42,14 +42,27 @@ position named.
 
 - `ORDER BY <n>`, `GROUP BY <n>` or `DISTINCT ON (<n>)` where `<n>` is a plain
   integer constant that names a target of the same `SELECT`.
+- A `GROUP BY <n>` whose target is an aliased expression, when no input column
+  of the same `SELECT` has the alias's name: the help names the alias, which
+  works there.
+
+## Not reported
+
 - A position outside the select list doesn't analyze, so it is never linted.
-- `ORDER BY 1 + 0` is an expression, not a position, and is not reported.
+- `ORDER BY 1 + 0` is an expression, not a position.
 - The `ORDER BY` of a `UNION`/`INTERSECT`/`EXCEPT`, or of a `VALUES` list,
-  names the output column of a list that isn't a `SELECT`'s target list here:
-  neither is reported.
+  names the output column of a list that isn't a `SELECT`'s target list here.
 - A `SELECT *` (or `t.*`): it expands to columns the parse tree doesn't list,
   so the positions after it map to no target, and one of its columns may take
   the name a target has. The select list's positions are not reported.
+- A `GROUP BY` position whose output column's alias is also an input column's
+  name: `GROUP BY` resolves a bare name to the input column first, so with
+  `r.bucket` in `FROM`, `GROUP BY bucket` would group by `r.bucket`, not by
+  `CASE … END AS bucket`. Repeating the whole expression is worse than the
+  position, which is then the only short form. The same holds when a `FROM`
+  item's columns can't be enumerated (a CTE, a function without a covering
+  column alias list): a collision can't be ruled out, so the position is left
+  alone.
 
 ## Fix
 

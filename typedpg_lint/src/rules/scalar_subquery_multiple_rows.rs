@@ -390,6 +390,48 @@ mod tests {
     }
 
     #[test]
+    fn an_outer_subscript_pins_a_key() {
+        // `pg_attribute`'s unique key is (attrelid, attnum): a row of
+        // `pg_constraint` fixes `attrelid` with a plain outer column, and
+        // `attnum` with an element of its `conkey` / `confkey` array.
+        for sql in [
+            "SELECT (SELECT a.attname FROM pg_attribute a \
+             WHERE a.attrelid = fk.conrelid AND a.attnum = fk.conkey[1]) AS n \
+             FROM pg_constraint fk",
+            "SELECT (SELECT a.attname FROM pg_attribute a \
+             WHERE a.attrelid = fk.conrelid AND a.attnum = fk.confkey[1] + 0) AS n \
+             FROM pg_constraint fk",
+        ] {
+            assert_clean(sql);
+        }
+        // One column of the system key alone pins nothing.
+        assert_reported(
+            "SELECT (SELECT a.attname FROM pg_attribute a WHERE a.attnum = fk.conkey[1]) AS n FROM pg_constraint fk",
+            "(SELECT a.attname FROM pg_attribute a WHERE a.attnum = fk.conkey[1])",
+        );
+        let mut db = db();
+        db.apply_sql(
+            "CREATE TABLE batches (id bigint PRIMARY KEY, item_ids bigint[]);
+             CREATE TABLE items (id bigint PRIMARY KEY, label bigint, note text);",
+        )
+        .unwrap();
+        let clean =
+            "SELECT (SELECT i.note FROM items i WHERE i.id = b.item_ids[1]) AS n FROM batches b";
+        assert!(lint_rule(&db, clean, RULE).is_empty(), "{clean}");
+        // A subscript at most one row per evaluation still proves no key: a
+        // column that isn't unique keeps the subquery many-row.
+        let many = "SELECT (SELECT i.note FROM items i \
+                    WHERE i.label = b.item_ids[1]) AS n FROM batches b";
+        let findings = lint_rule(&db, many, RULE);
+        assert_eq!(findings.len(), 1, "{many}: {findings:?}");
+        assert_eq!(
+            &many[findings[0].span.clone()],
+            "(SELECT i.note FROM items i WHERE i.label = b.item_ids[1])",
+            "{many}"
+        );
+    }
+
+    #[test]
     fn subqueries_taking_any_number_of_rows_are_fine() {
         for sql in [
             "SELECT id FROM users WHERE id IN (SELECT user_id FROM posts)",

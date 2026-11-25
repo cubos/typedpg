@@ -16,16 +16,27 @@
 //! An explicit cast (`x::timestamptz`) or `AT TIME ZONE` says what is meant
 //! and is not reported, nor is a parameter or an untyped literal: its type
 //! comes from its context, so it converts nothing.
+//!
+//! A `date` formatted by `to_char(<date>, <format>)` is not reported either
+//! when the format reads only the date's fields: there is no
+//! `to_char(date, text)`, so the date becomes midnight in the session's
+//! `TimeZone` — 01:00 of the same day when the midnight doesn't exist — and
+//! `to_char(timestamptz, text)` prints it back in the same `TimeZone`, so
+//! every date field is the date's own whatever the zone (see
+//! [`date_fields_only`]). A `timestamp` is left reported: a wall-clock
+//! reading that a zone change maps to another instant need not come back the
+//! same.
 
 use std::collections::HashSet;
 
 use typedpg_analyzer::PgTypeOid;
 use typedpg_pg_query::NodeRef;
-use typedpg_pg_query::ast::{AExprKind, Node as N};
+use typedpg_pg_query::ast::{AConstValue, AExprKind, FuncCall, Node as N};
 
 use super::{node_span, operator_name};
 use crate::{Ctx, RawFinding};
 
+const TEXT: PgTypeOid = PgTypeOid::from_raw(25);
 const DATE: PgTypeOid = PgTypeOid::from_raw(1082);
 const TIMESTAMP: PgTypeOid = PgTypeOid::from_raw(1114);
 const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
@@ -57,9 +68,220 @@ fn is_param(node: &N) -> bool {
     matches!(node, N::ParamRef(_))
 }
 
+/// The first arguments whose conversion to `timestamptz` only lets
+/// `to_char` format a `date` as the date it is: `to_char(<date>, <constant
+/// format reading only date fields>)` resolving to
+/// `pg_catalog.to_char(timestamptz, text)`.
+fn date_only_to_char_arguments(ctx: &Ctx<'_>) -> HashSet<std::ops::Range<usize>> {
+    let mut sites = HashSet::new();
+    for (node, _) in ctx.tree.nodes() {
+        let NodeRef::FuncCall(call) = node else {
+            continue;
+        };
+        // `to_char(timestamptz, text)` takes the two arguments.
+        if call.args.len() != 2 {
+            continue;
+        }
+        let (Some(Some(argument)), Some(Some(format))) = (call.args.first(), call.args.get(1))
+        else {
+            continue;
+        };
+        // A named-argument call needn't write the value first.
+        if matches!(argument, N::NamedArgExpr(_)) || matches!(format, N::NamedArgExpr(_)) {
+            continue;
+        }
+        let Some(format) = string_constant(format) else {
+            continue;
+        };
+        if !date_fields_only(format) {
+            continue;
+        }
+        let Some(conversion) = ctx.view.value_conversion(argument.to_ref()) else {
+            continue;
+        };
+        // A `timestamp` is a wall-clock reading a zone change may move to
+        // another date; only a `date` is printed back as itself.
+        if conversion.explicit || conversion.from != DATE || conversion.to != TIMESTAMPTZ {
+            continue;
+        }
+        if !is_builtin_to_char(ctx, call) {
+            continue;
+        }
+        if let Some(span) = node_span(ctx, argument.to_ref()) {
+            sites.insert(span);
+        }
+    }
+    sites
+}
+
+/// The value of a string literal argument.
+fn string_constant(node: &N) -> Option<&str> {
+    match node {
+        N::AConst(value) => match &value.val {
+            Some(AConstValue::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `call` is PostgreSQL's own `to_char(timestamptz, text)`: the
+/// first routine named `to_char` a call of a `timestamptz` resolves to
+/// along the search path is that one (a user routine of the name earlier on
+/// the path may read the value otherwise, whatever its kind).
+fn is_builtin_to_char(ctx: &Ctx<'_>, call: &FuncCall) -> bool {
+    let names: Vec<&str> = call
+        .funcname
+        .iter()
+        .filter_map(|name| match name {
+            Some(N::String(name)) => Some(name.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let schema = match names.as_slice() {
+        ["to_char"] => None,
+        ["pg_catalog", "to_char"] => Some("pg_catalog"),
+        _ => return false,
+    };
+    let found = ctx
+        .catalog
+        .find_functions(schema, "to_char")
+        .into_iter()
+        .find(|proc| proc.proargtypes.first() == Some(&TIMESTAMPTZ));
+    found.is_some_and(|proc| {
+        proc.proargtypes.as_slice() == [TIMESTAMPTZ, TEXT]
+            && ctx.catalog.namespace_name(proc.pronamespace) == Some("pg_catalog")
+    })
+}
+
+/// One template pattern of `to_char`'s format (`formatting.c`): whether it
+/// reads the time of day or the time zone, and its length.
+const PATTERNS: &[(bool, &str)] = &[
+    // The date fields: the year, the month, the day of the week or year,
+    // the week, the quarter, the century, the Julian day, the eras, and
+    // the ISO fields; the ordinal suffixes and `FM`/`FX` are not patterns
+    // of their own (see [`date_fields_only`]).
+    (false, "yyyy"),
+    (false, "y,yyy"),
+    (false, "iyyy"),
+    (false, "month"),
+    (false, "iddd"),
+    (false, "yyy"),
+    (false, "iyy"),
+    (false, "mon"),
+    (false, "ddd"),
+    (false, "day"),
+    (false, "dy"),
+    (false, "dd"),
+    (false, "ww"),
+    (false, "iw"),
+    (false, "id"),
+    (false, "yy"),
+    (false, "iy"),
+    (false, "rm"),
+    (false, "cc"),
+    (false, "bc"),
+    (false, "b.c."),
+    (false, "ad"),
+    (false, "a.d."),
+    (false, "mm"),
+    (false, "q"),
+    (false, "w"),
+    (false, "d"),
+    (false, "j"),
+    (false, "y"),
+    (false, "i"),
+    // The time of day and the time zone.
+    (true, "hh24"),
+    (true, "hh12"),
+    (true, "ssss"),
+    (true, "hh"),
+    (true, "mi"),
+    (true, "ss"),
+    (true, "ms"),
+    (true, "us"),
+    (true, "ff1"),
+    (true, "ff2"),
+    (true, "ff3"),
+    (true, "ff4"),
+    (true, "ff5"),
+    (true, "ff6"),
+    (true, "am"),
+    (true, "a.m."),
+    (true, "pm"),
+    (true, "p.m."),
+    (true, "tzm"),
+    (true, "tzh"),
+    (true, "tz"),
+    (true, "of"),
+];
+
+/// The pattern at the start of `text`, the longest one, as
+/// `formatting.c`'s `parse_format` scans its keyword table.
+fn pattern_at(text: &[u8]) -> Option<(bool, usize)> {
+    PATTERNS
+        .iter()
+        .filter(|(_, pattern)| starts_with_ignore_ascii_case(text, pattern))
+        .max_by_key(|(_, pattern)| pattern.len())
+        .map(|&(time, pattern)| (time, pattern.len()))
+}
+
+fn starts_with_ignore_ascii_case(text: &[u8], pattern: &str) -> bool {
+    text.len() >= pattern.len() && text[..pattern.len()].eq_ignore_ascii_case(pattern.as_bytes())
+}
+
+/// Whether `format` names only date fields: every template pattern in it is
+/// one of the year, month, day, week, quarter, century, Julian day or ISO
+/// fields — with the `FM`/`FX` prefixes and the `TH` suffix — and the rest
+/// is literal text or a quoted string. Any time-of-day or zone pattern
+/// (`HH`, `HH12`, `HH24`, `MI`, `SS`, `MS`, `US`, `FF1`–`FF6`, `SSSS`,
+/// `AM`, `PM`, `A.M.`, `P.M.`, `TZ`, `tz`, `TZH`, `TZM`, `OF`), in the case
+/// PostgreSQL reads it in, is not a date field, and neither are letters
+/// that are no pattern this knows: a format it can't prove is reported.
+fn date_fields_only(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            // A quoted string is literal text: its content is never a
+            // pattern.
+            b'"' => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += 1;
+                }
+                at += 1;
+            }
+            // The escaped character is literal.
+            b'\\' => at += 2,
+            // The fill-mode and fixed-format prefixes.
+            b'F' | b'f' if matches!(bytes.get(at + 1).copied(), Some(b'M' | b'X')) => at += 2,
+            _ => {
+                let Some((time, len)) = pattern_at(&bytes[at..]) else {
+                    if bytes[at].is_ascii_alphabetic() {
+                        return false;
+                    }
+                    at += 1;
+                    continue;
+                };
+                if time {
+                    return false;
+                }
+                at += len;
+                // The ordinal suffix a numeric pattern may take.
+                if starts_with_ignore_ascii_case(&bytes[at..], "th") {
+                    at += 2;
+                }
+            }
+        }
+    }
+    true
+}
+
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
     let mut out = Vec::new();
     let mut reported: HashSet<std::ops::Range<usize>> = HashSet::new();
+    let date_only_to_char = date_only_to_char_arguments(ctx);
     // The values converted on their way to the type their context takes.
     for (node, _) in ctx.tree.nodes() {
         if matches!(node, NodeRef::ParamRef(_)) {
@@ -74,6 +296,9 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         let Some(span) = node_span(ctx, node) else {
             continue;
         };
+        if date_only_to_char.contains(&span) {
+            continue;
+        }
         if !reported.insert(span.clone()) {
             continue;
         }
@@ -280,6 +505,85 @@ mod tests {
         ] {
             assert!(reported(sql).is_empty(), "{sql}: {:?}", reported(sql));
         }
+    }
+
+    #[test]
+    fn a_date_formatted_by_to_char_as_a_date_is_not_reported() {
+        for sql in [
+            "SELECT to_char(current_date, 'YYYY-MM-DD')",
+            "SELECT to_char($d::date, 'FMDD/MM/YYYY')",
+            "SELECT to_char(day, 'IYYY-IW') FROM events",
+            // Quoted text, the fill mode and the ordinal suffix.
+            "SELECT to_char(day, 'FMDDth \"of\" Month, YYYY') FROM events",
+            "SELECT to_char(day, 'Q CC J DDD D DD WW W ID IDDD DY Day MON Mon RM') FROM events",
+            "SELECT to_char(day, 'YYYY\"-\"MM\"-\"DD') FROM events",
+        ] {
+            assert!(reported(sql).is_empty(), "{sql}: {:?}", reported(sql));
+        }
+    }
+
+    #[test]
+    fn a_format_reading_the_time_or_the_zone_is_reported() {
+        for sql in [
+            "SELECT to_char(current_date, 'YYYY-MM-DD HH24:MI')",
+            "SELECT to_char(current_date, 'YYYY TZ')",
+            "SELECT to_char(current_date, 'yyyy-mm-dd hh24:mi')",
+            "SELECT to_char(current_date, 'HH')",
+            "SELECT to_char(current_date, 'SS')",
+            "SELECT to_char(current_date, 'MS')",
+            "SELECT to_char(current_date, 'US')",
+            "SELECT to_char(current_date, 'FF3')",
+            "SELECT to_char(current_date, 'SSSS')",
+            "SELECT to_char(current_date, 'AM')",
+            "SELECT to_char(current_date, 'P.M.')",
+            "SELECT to_char(current_date, 'TZH')",
+            "SELECT to_char(current_date, 'OF')",
+        ] {
+            assert_eq!(reported(sql), ["current_date"], "{sql}");
+        }
+        // A `timestamp` argument takes `to_char(timestamp, text)`, which
+        // converts nothing: nothing to report either way.
+        assert!(reported("SELECT to_char(at, 'YYYY-MM-DD') FROM events").is_empty());
+        // And a `timestamp` converted to `timestamptz` elsewhere stays
+        // reported, the date fields being no proof for a wall-clock value.
+        assert_eq!(reported("SELECT takes_tz(at) FROM events"), ["at"]);
+    }
+
+    #[test]
+    fn a_non_constant_format_is_reported() {
+        assert_eq!(
+            reported("SELECT to_char(current_date, $fmt)"),
+            ["current_date"]
+        );
+        assert_eq!(
+            reported("SELECT to_char(current_date, 'YYYY' || '-MM')"),
+            ["current_date"]
+        );
+    }
+
+    #[test]
+    fn a_user_to_char_of_the_name_is_reported() {
+        let mut db = db();
+        db.apply_sql(
+            "CREATE ROLE app;
+             CREATE SCHEMA app;
+             CREATE FUNCTION app.to_char(timestamptz, text) RETURNS text
+                 LANGUAGE sql AS 'SELECT $2';
+             GRANT USAGE ON SCHEMA app TO app;
+             ALTER ROLE app SET search_path = app, pg_catalog;",
+        )
+        .unwrap();
+        let scoped = db.with_role_search_path("app");
+        let sql = "SELECT to_char(current_date, 'YYYY-MM-DD')";
+        let findings = crate::lint_query(&scoped, sql, &crate::LintOptions::default())
+            .unwrap()
+            .into_iter()
+            .filter(|finding| finding.rule == RULE)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        // Qualified, it is `pg_catalog`'s again.
+        let sql = "SELECT pg_catalog.to_char(current_date, 'YYYY-MM-DD')";
+        assert!(lint_rule(&scoped, sql, RULE).is_empty());
     }
 
     #[test]

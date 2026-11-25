@@ -72,6 +72,20 @@ Domains count as their base type.
 - A parameter or an untyped literal, which take the column's type:
   `published_at > $since`, `published_at > '2026-01-01'`.
 - `date` with `timestamp`: `published_at > current_date`.
+- A `date` formatted as a date: `to_char(current_date, 'YYYY-MM-DD')`. The
+  date becomes midnight in the session's zone — 01:00 of the same day when
+  that midnight doesn't exist — and `to_char` prints it back in the same
+  zone, so a format naming only date fields prints the date itself whatever
+  the zone: `Y`, `YY`, `YYY`, `YYYY`, `IYYY`, `IYY`, `IY`, `I`, `MM`, `MON`,
+  `MONTH`, `RM`, `Q`, `CC`, `J`, `DD`, `DDD`, `D`, `DAY`, `DY`, `ID`,
+  `IDDD`, `WW`, `W`, `IW`, `BC`, `AD`, with `FM`/`FX` prefixes, a `TH`
+  suffix, literal text and quoted strings. `to_char(published_at, 'YYYY')`
+  on a `timestamp` column is not this case (`to_char(timestamp, text)`
+  converts nothing). A format naming a time-of-day or zone field (`HH`,
+  `HH12`, `HH24`, `MI`, `SS`, `MS`, `US`, `FF1`–`FF6`, `SSSS`, `AM`, `PM`,
+  `A.M.`, `P.M.`, `TZ`, `tz`, `TZH`, `TZM`, `OF`), a format that isn't a
+  constant string, and a user-defined `to_char(timestamptz, text)` earlier
+  on the search path are reported.
 - Conversions inside a column default or a called SQL function.
 
 No fix is offered: only the application knows which zone the wall-clock

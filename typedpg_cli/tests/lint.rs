@@ -102,6 +102,72 @@ fn lint_ignores_migrations_unchanged_from_a_ref() {
 }
 
 #[test]
+fn lint_ignores_a_migration_edited_only_by_comments() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "comment_edit_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    let init = root.join("migrations/0001_init.sql");
+    std::fs::write(
+        &init,
+        "CREATE TABLE cost_rollup (day date, total numeric);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0002_more.sql"),
+        "ALTER TABLE cost_rollup ADD COLUMN note text;\n",
+    )
+    .unwrap();
+    git(root, &["init", "-q"]);
+    commit_all(root, "deployed");
+
+    // Both are findings of their files as last deployed.
+    let (_, stdout, stderr) = lint_crate(root, &[]);
+    assert!(
+        stdout.contains("table_without_primary_key"),
+        "{stderr}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("lock_without_timeout"),
+        "{stderr}\n{stdout}"
+    );
+
+    // A comment-only edit is no drift: the file is still the deployed one,
+    // and its allow comment is honored.
+    std::fs::write(
+        &init,
+        "-- No primary key: dimensions are nullable, the key is UNIQUE NULLS NOT DISTINCT.\n\
+         -- typedpg-lint: allow(table_without_primary_key)\n\
+         CREATE TABLE cost_rollup (day date, total numeric);\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = lint_crate(root, &["--previous-deployment", "HEAD"]);
+    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert!(!stdout.contains("table_without_primary_key"), "{stdout}");
+    assert!(!stdout.contains("lock_without_timeout"), "{stdout}");
+    assert!(
+        stderr.contains("(2 unchanged from HEAD: statement rules skipped)"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn lint_ignore_keeps_a_migrations_schema_findings() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

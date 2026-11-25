@@ -143,9 +143,10 @@ pub use resolve::{
 };
 pub use simplify::{
     AppliedSimplification, OrderKey, OrderTies, RedundantJoin, RedundantJoinProof, Rule,
-    SimplifyOptions, order_keys, order_ties, redundant_distinct_spans, redundant_group_keys,
-    relation_holds_at_most_one_row, select_at_most_one_row, statement_at_most_one_row,
-    statement_node_at_most_one_row, unique_order_prefix,
+    SimplifyOptions, Tie, distinct_on_output_determined, order_keys, order_ties,
+    redundant_distinct_spans, redundant_group_keys, relation_holds_at_most_one_row,
+    select_at_most_one_row, statement_at_most_one_row, statement_node_at_most_one_row,
+    unique_order_prefix,
 };
 pub use sql_text::strip_trailing_junk;
 /// The "did you mean" matcher behind the analyzer's suggestions, for the

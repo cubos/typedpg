@@ -242,7 +242,9 @@ Accept a break (the code using the column is gone everywhere) with
 `-- typedpg-lint: allow(deployed_query_breakage)` before the statement in
 the migration file, or in the deployed query's SQL at the ref.
 `--previous-deployment` also makes migration files unchanged at the ref skip
-the statement rules. See [Configuring rules](README.md#configuring-rules)
+the statement rules; a file edited only in comments or whitespace is still
+unchanged, as the migration runner's drift check sees it. See
+[Configuring rules](README.md#configuring-rules)
 and [`--previous-deployment`](README.md#--previous-deployment-ref).
 
 ## Related

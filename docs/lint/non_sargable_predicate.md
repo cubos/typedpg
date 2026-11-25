@@ -102,7 +102,9 @@ And the index would otherwise apply:
 - the column is a table's of this query level;
 - a non-partial btree index has it as its first key;
 - the other side reads no column of the same table, runs no subquery and
-  calls nothing volatile.
+  calls nothing volatile — and is not itself a plain indexed column of
+  another table, which a nested loop looks up by the computed value
+  (see [Not reported](#not-reported)).
 
 ## Not reported
 
@@ -110,6 +112,17 @@ And the index would otherwise apply:
   operator family compares: `sku::text = $sku` on `varchar` (`text_ops`).
 - A column of a domain, compared as its base type: `c = 'a'::text` on a
   domain over `text`.
+- A join condition whose other side is a plain indexed column of another
+  table: `ON next_league."level" = current_league."level" + 1`,
+  `ON u.id::bigint = p.id`. The planner computes the value from one side
+  and looks the other table up with an index scan on its own index (a
+  nested loop), so the comparison is sargable through that side and the
+  wrapped column's index is irrelevant. The other side must be a plain
+  column of another `FROM` item, read as stored (a relabeling its index's
+  operator family compares aside), with a non-partial btree index leading
+  with it; an unindexed column (`ON r."level" = c."level" + 1`), an
+  expression (`ON r."level" + 0 = c."level" + 1`), a parameter or a list
+  keeps the report.
 - A polymorphic operator, which takes the column as it is: an enum's `=`
   (`anyenum`, served by `enum_ops`: `arch = 'x86_64'`, `arch IN (…)`,
   `arch = ANY($1)`), an array's (`anyarray`).

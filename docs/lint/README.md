@@ -265,9 +265,11 @@ The git ref of what runs in production now, e.g. `origin/main` or a release
 tag (formerly `--ignore-migrations-from`, still accepted).
 
 - Migration files identical at the ref have already run and can't change:
-  the migration rules skip them. They still build the schema, schema rules
-  still report on them (with the fix in a new migration), and their allow
-  comments still apply. The summary counts them, e.g.
+  the migration rules skip them. A file differing only in comments and
+  whitespace counts as identical — the migration runner's drift check
+  compares normalized text, and so does this. They still build the schema,
+  schema rules still report on them (with the fix in a new migration), and
+  their allow comments still apply. The summary counts them, e.g.
   `(300 unchanged from origin/main: statement rules skipped)`.
 - [`deployed_query_breakage`](deployed_query_breakage.md) runs: the queries
   of the code at the ref are checked against the new schema, since that code

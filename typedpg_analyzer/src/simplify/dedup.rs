@@ -81,6 +81,11 @@ use crate::pg_catalog::{ConType, PgCatalog, ProKind, ProVolatile, RelKind, oid};
 /// The most relations one proof follows (a bit each in a `u64`).
 const MAX_RELATIONS: usize = 64;
 
+/// The most undetermined relations whose primary keys the tiebreaker help
+/// tries in combination (`2^12` closures at worst): beyond it, the help
+/// names every one, as it always did.
+const MAX_TIEBREAK_CANDIDATES: usize = 12;
+
 /// [`Rule::Distinct`]: every plain `SELECT DISTINCT` — at the top level or
 /// nested anywhere — whose rows are provably distinct without it, when the
 /// select is error-free ([`super::cardinality::select_is_error_free_in`]).
@@ -1652,7 +1657,9 @@ impl<'a> Scope<'a> {
     /// With `scalar_sublinks` (the cardinality
     /// proof's wider form), also a scalar sublink uncorrelated with this
     /// level, a cast and a call to a non-volatile, non-set-returning
-    /// function or operator every argument of which is one of these, and a
+    /// function or operator every argument of which is one of these, a
+    /// subscript of an array (`arr[1]`, or the `arr[lo:hi]` slice) whose
+    /// bounds are (see [`Self::subscript_operand`]), and a
     /// `CASE`, `COALESCE`, `IS [NOT] NULL`, boolean test or `AND` / `OR` /
     /// `NOT` of them — each one value per evaluation of the row (see
     /// [`Self::call_operand`]).
@@ -1779,6 +1786,12 @@ impl<'a> Scope<'a> {
                     },
                 )
             }
+            // A subscript of a determined array is one value per evaluation
+            // like the array itself: `arr[1]` reads one element of a value
+            // fixed for the row, a slice (`arr[lo:hi]`) one sub-array of it.
+            Node::AIndirection(indirection) if scalar_sublinks => {
+                self.subscript_operand(ctx, indirection, outer, env)
+            }
             Node::FuncCall(call) if scalar_sublinks => {
                 self.call_operand(ctx, call, outer, scalar_sublinks, env)
             }
@@ -1833,6 +1846,67 @@ impl<'a> Scope<'a> {
             Node::CaseExpr(case) if scalar_sublinks => self.case_operand(ctx, case, outer, env),
             _ => None,
         }
+    }
+
+    /// The one value a subscripted array yields per evaluation of the row:
+    /// an element of it (`arr[1]`), or a sub-array of it for a slice
+    /// (`arr[lo:hi]`), when [`Self::operand`] reads the array and every
+    /// subscript expression, and PostgreSQL's own array handler does the
+    /// subscripting (see [`array_subscript_handler`]). `rels` adds the
+    /// subscripts' to the array's.
+    fn subscript_operand(
+        &self,
+        ctx: &Ctx<'_>,
+        indirection: &ast::AIndirection,
+        outer: Option<&FromScope<'_>>,
+        env: Option<&CteEnv>,
+    ) -> Option<Operand> {
+        let base = self.operand(ctx, indirection.arg.as_ref(), outer, true, env)?;
+        // `transformContainerSubscripts` (parse_node.c) decides slicing for
+        // the whole run: one `lo:hi` makes every subscript of the reference
+        // a slice (`arr[1:2][3]` is `arr[1:2][1:3]`, still an array), and a
+        // run without one fetches one element however many dimensions it
+        // spells.
+        let mut is_slice = false;
+        let mut rels = base.rels;
+        for step in &indirection.indirection {
+            // A composite field (`(row).field`) is an indirection too, but
+            // no element of a fixed value.
+            let Some(Node::AIndices(indices)) = step else {
+                return None;
+            };
+            is_slice |= indices.is_slice;
+            for bound in [indices.lidx.as_ref(), indices.uidx.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                rels |= self.operand(ctx, Some(bound), outer, true, env)?.rels;
+            }
+        }
+        // A domain subscripts as its base type, and `int2vector` /
+        // `oidvector` as `int2[]` / `oid[]`.
+        let base_type = match ctx.catalog.unwrap_domain(base.typ) {
+            oid::INT2VECTOR => oid::INT2ARRAY,
+            oid::OIDVECTOR => oid::OIDARRAY,
+            base_type => base_type,
+        };
+        if !array_subscript_handler(ctx, base_type) {
+            return None;
+        }
+        let typ = if is_slice {
+            base_type
+        } else {
+            crate::coerce::element_type(base_type, ctx.catalog)?
+        };
+        // A subscripted reference derives its collation from its container,
+        // which [`Self::operand`] already read as deterministic.
+        Some(Operand {
+            typ,
+            column: None,
+            rels,
+            call: None,
+            cast_column: None,
+        })
     }
 
     /// A `CASE` / `COALESCE` branch's value: an [`Self::operand`], or a
@@ -4062,6 +4136,27 @@ pub(super) fn deterministic_type(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
     deterministic(ctx.catalog, collation)
 }
 
+/// Whether `typ` — a base type, no domain — is subscripted by one of
+/// PostgreSQL's own array handlers: `array_subscript_handler` (a true array)
+/// or `raw_array_subscript_handler` (`int2vector`, `oidvector`, a base type
+/// declared with `ELEMENT`). Those fetch an element of the container and
+/// keep an array for a slice. A user type's `SUBSCRIPT` function may return
+/// anything, even another value on each evaluation, and `jsonb` and `hstore`
+/// have handlers of their own that subscript no array.
+fn array_subscript_handler(ctx: &Ctx<'_>, typ: PgTypeOid) -> bool {
+    ctx.catalog
+        .pg_type
+        .get(&typ)
+        .and_then(|ty| ty.typsubscript)
+        .and_then(|handler| ctx.catalog.pg_proc.get(&handler))
+        .is_some_and(|proc| {
+            matches!(
+                proc.proname.as_str(),
+                "array_subscript_handler" | "raw_array_subscript_handler"
+            ) && ctx.catalog.namespace_name(proc.pronamespace) == Some("pg_catalog")
+        })
+}
+
 /// The number of output columns a non-set-returning function expands to in
 /// `FROM`, when known: its `OUT` / `INOUT` / `TABLE` parameters, the
 /// attributes of a named composite return type (or a domain over one), else
@@ -4492,13 +4587,27 @@ pub enum OrderTies {
     /// The keys determine one row: no two rows tie.
     Unique,
     /// Two rows the schema allows may share every key: the FROM items
-    /// whose row the keys don't determine, each with its primary key's
-    /// columns that neither the keys nor an equality fix (empty when it has
-    /// none).
-    Ties(Vec<(String, Vec<String>)>),
+    /// whose row the keys don't determine (see [`Tie`]).
+    Ties(Vec<Tie>),
     /// The proof can't tell (a FROM item it can't see through, a key that
     /// is an expression index, a set-returning call, …).
     Unknown,
+}
+
+/// A FROM item whose row an `ORDER BY`'s keys don't determine: one of the
+/// ties [`OrderTies::Ties`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tie {
+    /// The item's name in the query: its alias, or the table's name.
+    pub name: String,
+    /// The primary key's columns that neither the keys nor an equality
+    /// fix, in key order: the tiebreaker to add for this table. Empty when
+    /// it has no primary key.
+    pub primary_key: Vec<String>,
+    /// Whether this table is one of the fewest whose primary keys — added
+    /// to the keys — make them determine every row: the tiebreaker the
+    /// help suggests. A table with no primary key is never one of them.
+    pub tiebreak: bool,
 }
 
 /// [`OrderTies`] of `s`'s `ORDER BY` over the rows its FROM, WHERE and
@@ -4517,6 +4626,11 @@ pub enum OrderTies {
 /// `Ties` is only claimed when the FROM clause is base tables and joins the
 /// proof models, none with a partial, expression or deferrable unique index
 /// (which may make the keys unique in a way not followed).
+///
+/// Each `Ties` item carries its table's primary key columns that nothing
+/// fixes; [`Tie::tiebreak`] marks the fewest of the items whose primary
+/// keys, added to the keys, make them determine a unique row — the keys to
+/// suggest.
 ///
 /// `outer` is the scope of `s`'s own level and the levels around it, when
 /// known: a column of an enclosing level (a correlated subquery's, a
@@ -4544,28 +4658,9 @@ pub(super) fn order_ties(
     {
         return OrderTies::Unknown;
     }
-    let Some(scope) = Scope::build(ctx, ctes, &s.from_clause) else {
+    let Some(scope) = ties_scope(ctx, ctes, s) else {
         return OrderTies::Unknown;
     };
-    let n = scope.rels.len();
-    if n == 0 || n > MAX_RELATIONS {
-        return OrderTies::Unknown;
-    }
-    for rel in &scope.rels {
-        let Some(oid) = rel.oid else {
-            return OrderTies::Unknown;
-        };
-        let unmodelled_key = ctx.catalog.pg_index.values().any(|i| {
-            i.indrelid == oid
-                && i.indisunique
-                && (i.indpred.is_some()
-                    || i.indkey.contains(&0)
-                    || ctx.catalog.nonimmediate_indexes.contains(&i.indexrelid))
-        });
-        if unmodelled_key {
-            return OrderTies::Unknown;
-        }
-    }
 
     // The ORDER BY keys that are plain columns.
     let mut cols: HashSet<(usize, i16)> = HashSet::new();
@@ -4642,177 +4737,543 @@ pub(super) fn order_ties(
         None
     };
 
-    let all: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
-    let where_facts = conjuncts(s.where_clause.as_ref())
-        .into_iter()
-        .flat_map(|c| scope.equality_facts(ctx, c, outer))
-        .collect::<Vec<_>>();
-    let mut deps: Vec<(u64, usize)> = Vec::new();
-    for b in 0..n {
-        if let Some(det) = scope.key_equated(ctx, b, &where_facts, all & !(1 << b)) {
-            deps.push((det, b));
-        }
-    }
-    for join in &scope.joins {
-        let mut facts: Vec<EqFact> = Vec::new();
-        for c in conjuncts(join.quals) {
-            facts.extend(scope.equality_facts(ctx, c, outer));
-        }
-        for name in &join.using {
-            facts.extend(scope.using_facts(ctx, name, join.left, join.right));
-        }
-        match join.kind {
-            JoinType::JoinInner => {
-                for b in (0..n).filter(|&b| join.rels() & (1 << b) != 0) {
-                    let others = join.rels() & !(1 << b);
-                    if let Some(det) = scope.key_equated(ctx, b, &facts, others) {
-                        deps.push((if join.nullable { others } else { det }, b));
-                    }
-                }
-            }
-            JoinType::JoinLeft => {
-                if let Some(b) = join.right_rel
-                    && scope.key_equated(ctx, b, &facts, join.left).is_some()
-                {
-                    deps.push((join.left, b));
-                }
-            }
-            JoinType::JoinRight => {
-                if let Some(a) = join.left_rel
-                    && scope.key_equated(ctx, a, &facts, join.right).is_some()
-                {
-                    deps.push((join.right, a));
-                }
-            }
-            _ => {}
-        }
-    }
-    // The equalities every row satisfies: the WHERE's, and those of the
-    // inner joins no outer join null-extends (their ON filters every row as
-    // a WHERE would).
-    let mut level_facts = where_facts.clone();
-    for join in &scope.joins {
-        if join.kind != JoinType::JoinInner || join.nullable {
-            continue;
-        }
-        for c in conjuncts(join.quals) {
-            level_facts.extend(scope.equality_facts(ctx, c, outer));
-        }
-        for name in &join.using {
-            level_facts.extend(scope.using_facts(ctx, name, join.left, join.right));
-        }
-    }
-    let covered = |r: usize, attnum: i16, known: u64| {
-        cols.contains(&(r, attnum))
-            || scope.column_fixed_by_facts(ctx, r, attnum, &level_facts, known)
-    };
-    // The columns WHERE and the joins' conditions read.
-    let mut read: HashSet<(usize, i16)> = HashSet::new();
-    let mut quals: Vec<&Node> = s.where_clause.iter().collect();
-    quals.extend(scope.joins.iter().filter_map(|j| j.quals));
-    let mut stack: Vec<NodeRef<'_>> = quals.iter().map(|q| q.to_ref()).collect();
-    while let Some(n) = stack.pop() {
-        if let NodeRef::ColumnRef(cr) = n
-            && let Fields::Names(names) = column_ref_fields(cr)
-            && let Col::Rel(r, attnum) = scope.resolve(&names)
-        {
-            read.insert((r, attnum));
-        }
-        stack.extend(n.children());
-    }
-    let conditions_read = |r: usize, attnum: i16| read.contains(&(r, attnum));
-    let mut uncertain = false;
-    let mut known: u64 = 0;
-    loop {
-        let before = known;
-        for (r, rel) in scope.rels.iter().enumerate() {
-            if known & (1 << r) != 0 {
-                continue;
-            }
-            let Some(oid) = rel.oid else {
-                continue;
-            };
-            let keys = unique_keys(ctx, oid);
-            let covering = |key: &&UniqueKey| {
-                key.predicate.is_none()
-                    && key
-                        .columns
-                        .iter()
-                        .all(|c| c.deterministic && c.default_family && covered(r, c.attnum, known))
-            };
-            let determined = singleton_table(ctx, oid)
-                || keys.iter().filter(covering).any(|key| {
-                    key.columns.iter().all(|c| c.notnull)
-                        || (key.nulls_not_distinct && !rel.nullable)
-                });
-            // A covered key whose NULLs may tie, but whose nullable column
-            // a condition reads (`WHERE nick IS NOT NULL`): it may be
-            // proven non-NULL there.
-            if !determined
-                && keys.iter().filter(covering).any(|key| {
-                    key.columns
-                        .iter()
-                        .any(|c| !c.notnull && conditions_read(r, c.attnum))
-                })
-            {
-                uncertain = true;
-            }
-            if determined {
-                known |= 1 << r;
-            }
-        }
-        for &(det, b) in &deps {
-            if det & !known == 0 {
-                known |= 1 << b;
-            }
-        }
-        if known == before {
-            break;
-        }
-    }
-    if known & all == all {
+    let proof = TiesProof::new(ctx, scope, s, outer, cols);
+    if proof.known & proof.all == proof.all {
         return OrderTies::Unique;
     }
     if let Some(groups) = &grouping
         && groups
             .iter()
-            .all(|&(r, attnum)| known & (1 << r) != 0 || covered(r, attnum, known))
+            .all(|&(r, attnum)| proof.known & (1 << r) != 0 || proof.fixed(ctx, r, attnum))
     {
         return OrderTies::Unique;
     }
-    if uncertain {
+    if proof.uncertain {
         return OrderTies::Unknown;
     }
-    let undetermined = (0..n)
-        .filter(|&r| known & (1 << r) == 0)
+    let undetermined: Vec<usize> = (0..proof.scope.rels.len())
+        .filter(|&r| proof.known & (1 << r) == 0)
         .filter(|&r| {
             // Grouped: only a relation with a grouping column left
             // uncovered makes groups tie.
             grouping.as_ref().is_none_or(|groups| {
                 groups
                     .iter()
-                    .any(|&(g, attnum)| g == r && !covered(g, attnum, known))
+                    .any(|&(g, attnum)| g == r && !proof.fixed(ctx, g, attnum))
             })
         })
-        .map(|r| {
-            let rel = &scope.rels[r];
-            (
-                rel.refname.clone(),
-                // The primary key's columns the keys and the equalities
-                // don't already fix: the tiebreaker to add.
-                rel.oid
+        .collect();
+    let fewest = proof.fewest_tiebreakers(ctx, &undetermined, grouping.as_deref());
+    OrderTies::Ties(
+        undetermined
+            .into_iter()
+            .map(|r| {
+                let rel = &proof.scope.rels[r];
+                let primary_key: Vec<String> = rel
+                    .oid
                     .map(|oid| {
                         primary_key_columns(ctx, oid)
                             .into_iter()
-                            .filter(|&(attnum, _)| !covered(r, attnum, known))
+                            .filter(|&(attnum, _)| !proof.fixed(ctx, r, attnum))
                             .map(|(_, name)| name)
                             .collect()
                     })
-                    .unwrap_or_default(),
-            )
+                    .unwrap_or_default();
+                Tie {
+                    name: rel.refname.clone(),
+                    // Without a set of keys that would make the rows
+                    // unique, the help names every table's key, as it
+                    // always did.
+                    tiebreak: fewest
+                        .as_ref()
+                        .map_or(!primary_key.is_empty(), |set| set.contains(&r)),
+                    primary_key,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Whether `DISTINCT ON` keeps rows whose select list is the same whichever
+/// of the group's rows it picks: every target-list expression reads only
+/// columns of the relations the `DISTINCT ON` expressions determine — the
+/// [`order_ties`] closure, with the `DISTINCT ON` expressions in place of
+/// the `ORDER BY` keys — the `DISTINCT ON` columns themselves, constants,
+/// parameters or columns of an enclosing query level, through calls that
+/// aren't volatile, aggregate, window or set-returning.
+///
+/// False whenever the proof can't tell: a FROM clause it can't see through
+/// (see [`order_ties`]), a `DISTINCT ON` expression that isn't a plain
+/// column of one of the FROM items (only those can determine a row), a
+/// grouping construct (a `GROUP BY`, an aggregate), or a target that reads
+/// anything else — a column of an undetermined relation, a whole row, a
+/// volatile call, a subquery.
+pub(super) fn distinct_on_output_determined(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    s: &ast::SelectStmt,
+    outer: Option<&FromScope<'_>>,
+) -> bool {
+    if s.op != SetOperation::SetopNone
+        || s.into_clause.is_some()
+        || s.from_clause.is_empty()
+        || !s.values_lists.is_empty()
+        || s.group_distinct
+        || !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.window_clause.is_empty()
+        || s.target_list.is_empty()
+    {
+        return false;
+    }
+    let Some(scope) = ties_scope(ctx, ctes, s) else {
+        return false;
+    };
+    // The DISTINCT ON expressions: a group is the rows sharing their
+    // values, so only a plain column of one FROM item can determine that
+    // item's row.
+    let mut keys: HashSet<(usize, i16)> = HashSet::new();
+    let mut any = false;
+    for item in &s.distinct_clause {
+        let Some(node) = item.as_ref() else {
+            return false;
+        };
+        any = true;
+        let Node::ColumnRef(cr) = node else {
+            return false;
+        };
+        let Fields::Names(names) = column_ref_fields(cr) else {
+            return false;
+        };
+        match scope.resolve(&names) {
+            Col::Rel(r, attnum) => {
+                keys.insert((r, attnum));
+            }
+            _ => return false,
+        }
+    }
+    if !any {
+        return false;
+    }
+    let proof = TiesProof::new(ctx, scope, s, outer, keys);
+    if proof.uncertain {
+        return false;
+    }
+    s.target_list.iter().all(|target| {
+        let Some(Node::ResTarget(target)) = target else {
+            return false;
+        };
+        target
+            .val
+            .as_ref()
+            .is_some_and(|value| output_fixed(ctx, &proof, value))
+    })
+}
+
+/// Whether every row of a `DISTINCT ON` group gives `value` the same
+/// result (see [`distinct_on_output_determined`]).
+fn output_fixed(ctx: &Ctx<'_>, proof: &TiesProof<'_>, value: &ast::Node) -> bool {
+    let mut stack = vec![value.to_ref()];
+    while let Some(node) = stack.pop() {
+        match node {
+            NodeRef::ColumnRef(cr) => {
+                let Fields::Names(names) = column_ref_fields(cr) else {
+                    return false;
+                };
+                match proof.scope.resolve(&names) {
+                    Col::Rel(r, attnum) => {
+                        if !proof.keys.contains(&(r, attnum)) && proof.known & (1 << r) == 0 {
+                            return false;
+                        }
+                    }
+                    Col::Opaque => return false,
+                    // An enclosing level's column is one value per
+                    // evaluation. Anything else `resolve` can't place — a
+                    // whole row, a `USING` column a coercion turns into
+                    // another value — isn't fixed.
+                    Col::Other if outer_value(&proof.scope, &names) => {}
+                    Col::Other => return false,
+                }
+            }
+            NodeRef::FuncCall(call) => {
+                if !plain_call(ctx, call) {
+                    return false;
+                }
+            }
+            NodeRef::AExpr(expr) => {
+                if operator_volatile(ctx, operator_name(expr)) {
+                    return false;
+                }
+            }
+            // A subquery reads rows of its own, whatever columns it binds.
+            NodeRef::SubLink(_) | NodeRef::RangeSubselect(_) | NodeRef::SelectStmt(_) => {
+                return false;
+            }
+            _ => {}
+        }
+        stack.extend(node.children());
+    }
+    true
+}
+
+/// Whether `names` — a column reference `Scope::resolve` couldn't place —
+/// may name a column of an enclosing query level rather than a whole row or
+/// a column of this level's FROM items.
+fn outer_value(scope: &Scope<'_>, names: &[&str]) -> bool {
+    match names {
+        // The name of a FROM item is a whole-row reference; a `USING`
+        // column of it is one of the join's inputs.
+        [name] => {
+            scope.rel_named(name).is_none()
+                && !scope.joins.iter().any(|join| join.using.contains(name))
+        }
+        [qualifier, _] => scope.rel_named(qualifier).is_none(),
+        _ => false,
+    }
+}
+
+/// Whether every overload of the function `call` calls is a plain
+/// non-volatile function: an aggregate, window or set-returning one gives
+/// different values to rows of one group, and so does a volatile one.
+fn plain_call(ctx: &Ctx<'_>, call: &ast::FuncCall) -> bool {
+    if call.agg_star || call.agg_filter.is_some() || call.agg_within_group || call.over.is_some() {
+        return false;
+    }
+    let (schema, name) = match string_list(&call.funcname).as_slice() {
+        [name] => (None, *name),
+        [schema, name] => (Some(*schema), *name),
+        _ => return false,
+    };
+    let procs = ctx.catalog.find_functions(schema, name);
+    !procs.is_empty()
+        && procs.iter().all(|p| {
+            p.prokind == ProKind::Function && !p.proretset && p.provolatile != ProVolatile::Volatile
         })
-        .collect();
-    OrderTies::Ties(undetermined)
+}
+
+/// The name of the operator an `A_Expr` calls: the last part of its
+/// (possibly schema-qualified) name.
+fn operator_name(expr: &ast::AExpr) -> Option<&str> {
+    expr.name.iter().rev().find_map(|node| match node {
+        Some(Node::String(name)) => Some(name.sval.as_str()),
+        _ => None,
+    })
+}
+
+/// Whether the operator `name` may call a VOLATILE routine (any same-named
+/// operator can, an unknown one included): its value then isn't a function
+/// of its operands.
+fn operator_volatile(ctx: &Ctx<'_>, name: Option<&str>) -> bool {
+    let Some(name) = name else {
+        return false;
+    };
+    ctx.catalog.pg_operator.values().any(|operator| {
+        operator.oprname == name
+            && operator
+                .oprcode
+                .and_then(|code| ctx.catalog.pg_proc.get(&code))
+                .is_none_or(|p| p.provolatile == ProVolatile::Volatile)
+    })
+}
+
+/// The FROM clause of `s` as the tie proofs read it, or `None` when the
+/// proof can't see through it: an item that isn't a base table or a plain
+/// join of them, no relation at all, or one with a partial, expression or
+/// deferrable unique index (which may make the keys unique in a way not
+/// followed).
+fn ties_scope<'a>(
+    ctx: &Ctx<'_>,
+    ctes: &HashSet<String>,
+    s: &'a ast::SelectStmt,
+) -> Option<Scope<'a>> {
+    let scope = Scope::build(ctx, ctes, &s.from_clause)?;
+    let n = scope.rels.len();
+    if n == 0 || n > MAX_RELATIONS {
+        return None;
+    }
+    for rel in &scope.rels {
+        let oid = rel.oid?;
+        let unmodelled_key = ctx.catalog.pg_index.values().any(|i| {
+            i.indrelid == oid
+                && i.indisunique
+                && (i.indpred.is_some()
+                    || i.indkey.contains(&0)
+                    || ctx.catalog.nonimmediate_indexes.contains(&i.indexrelid))
+        });
+        if unmodelled_key {
+            return None;
+        }
+    }
+    Some(scope)
+}
+
+/// What the tie proofs know about one query level: its FROM clause, the
+/// equalities that determine its relations, and the relations its keys
+/// determine (see [`order_ties`] and [`distinct_on_output_determined`]).
+struct TiesProof<'a> {
+    /// The FROM clause's relations.
+    scope: Scope<'a>,
+    /// For a relation `b`, the relations that must be determined for an
+    /// equality to determine `b`: the WHERE's facts, and each join's.
+    deps: Vec<(u64, usize)>,
+    /// The equalities every row satisfies: the WHERE's, and those of the
+    /// inner joins no outer join null-extends.
+    level_facts: Vec<EqFact>,
+    /// The columns the keys are.
+    keys: HashSet<(usize, i16)>,
+    /// The columns `WHERE` and the joins' conditions read.
+    read: HashSet<(usize, i16)>,
+    /// One bit per relation of the FROM clause.
+    all: u64,
+    /// The relations the keys determine.
+    known: u64,
+    /// A nullable key column a condition reads may be non-NULL: a relation
+    /// [`Self::known`] doesn't hold may still be determined.
+    uncertain: bool,
+}
+
+impl<'a> TiesProof<'a> {
+    /// The proof of `s`, whose FROM clause `ties_scope` resolved, with
+    /// `keys` as the columns its keys are.
+    fn new(
+        ctx: &Ctx<'_>,
+        scope: Scope<'a>,
+        s: &ast::SelectStmt,
+        outer: Option<&FromScope<'_>>,
+        keys: HashSet<(usize, i16)>,
+    ) -> TiesProof<'a> {
+        let n = scope.rels.len();
+        let all: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let where_facts = conjuncts(s.where_clause.as_ref())
+            .into_iter()
+            .flat_map(|c| scope.equality_facts(ctx, c, outer))
+            .collect::<Vec<_>>();
+        let mut deps: Vec<(u64, usize)> = Vec::new();
+        for b in 0..n {
+            if let Some(det) = scope.key_equated(ctx, b, &where_facts, all & !(1 << b)) {
+                deps.push((det, b));
+            }
+        }
+        for join in &scope.joins {
+            let mut facts: Vec<EqFact> = Vec::new();
+            for c in conjuncts(join.quals) {
+                facts.extend(scope.equality_facts(ctx, c, outer));
+            }
+            for name in &join.using {
+                facts.extend(scope.using_facts(ctx, name, join.left, join.right));
+            }
+            match join.kind {
+                JoinType::JoinInner => {
+                    for b in (0..n).filter(|&b| join.rels() & (1 << b) != 0) {
+                        let others = join.rels() & !(1 << b);
+                        if let Some(det) = scope.key_equated(ctx, b, &facts, others) {
+                            deps.push((if join.nullable { others } else { det }, b));
+                        }
+                    }
+                }
+                JoinType::JoinLeft => {
+                    if let Some(b) = join.right_rel
+                        && scope.key_equated(ctx, b, &facts, join.left).is_some()
+                    {
+                        deps.push((join.left, b));
+                    }
+                }
+                JoinType::JoinRight => {
+                    if let Some(a) = join.left_rel
+                        && scope.key_equated(ctx, a, &facts, join.right).is_some()
+                    {
+                        deps.push((join.right, a));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The equalities every row satisfies: the WHERE's, and those of the
+        // inner joins no outer join null-extends (their ON filters every row
+        // as a WHERE would).
+        let mut level_facts = where_facts;
+        for join in &scope.joins {
+            if join.kind != JoinType::JoinInner || join.nullable {
+                continue;
+            }
+            for c in conjuncts(join.quals) {
+                level_facts.extend(scope.equality_facts(ctx, c, outer));
+            }
+            for name in &join.using {
+                level_facts.extend(scope.using_facts(ctx, name, join.left, join.right));
+            }
+        }
+        // The columns WHERE and the joins' conditions read.
+        let mut read: HashSet<(usize, i16)> = HashSet::new();
+        let mut quals: Vec<&Node> = s.where_clause.iter().collect();
+        quals.extend(scope.joins.iter().filter_map(|j| j.quals));
+        let mut stack: Vec<NodeRef<'_>> = quals.iter().map(|q| q.to_ref()).collect();
+        while let Some(n) = stack.pop() {
+            if let NodeRef::ColumnRef(cr) = n
+                && let Fields::Names(names) = column_ref_fields(cr)
+                && let Col::Rel(r, attnum) = scope.resolve(&names)
+            {
+                read.insert((r, attnum));
+            }
+            stack.extend(n.children());
+        }
+        let mut proof = TiesProof {
+            scope,
+            deps,
+            level_facts,
+            keys,
+            read,
+            all,
+            known: 0,
+            uncertain: false,
+        };
+        let (known, uncertain) = proof.closure(ctx, &proof.keys);
+        proof.known = known;
+        proof.uncertain = uncertain;
+        proof
+    }
+
+    /// The relations `keys` determine, and whether a nullable key column a
+    /// condition reads leaves one undecided: the fixed point of a covered
+    /// unique key and [`Self::deps`].
+    fn closure(&self, ctx: &Ctx<'_>, keys: &HashSet<(usize, i16)>) -> (u64, bool) {
+        let mut uncertain = false;
+        let mut known: u64 = 0;
+        loop {
+            let before = known;
+            for (r, rel) in self.scope.rels.iter().enumerate() {
+                if known & (1 << r) != 0 {
+                    continue;
+                }
+                let Some(oid) = rel.oid else {
+                    continue;
+                };
+                let unique = unique_keys(ctx, oid);
+                let covering = |key: &&UniqueKey| {
+                    key.predicate.is_none()
+                        && key.columns.iter().all(|c| {
+                            c.deterministic
+                                && c.default_family
+                                && self.covered(ctx, keys, known, r, c.attnum)
+                        })
+                };
+                let determined = singleton_table(ctx, oid)
+                    || unique.iter().filter(covering).any(|key| {
+                        key.columns.iter().all(|c| c.notnull)
+                            || (key.nulls_not_distinct && !rel.nullable)
+                    });
+                // A covered key whose NULLs may tie, but whose nullable
+                // column a condition reads (`WHERE nick IS NOT NULL`): it
+                // may be proven non-NULL there.
+                if !determined
+                    && unique.iter().filter(covering).any(|key| {
+                        key.columns
+                            .iter()
+                            .any(|c| !c.notnull && self.read.contains(&(r, c.attnum)))
+                    })
+                {
+                    uncertain = true;
+                }
+                if determined {
+                    known |= 1 << r;
+                }
+            }
+            for &(det, b) in &self.deps {
+                if det & !known == 0 {
+                    known |= 1 << b;
+                }
+            }
+            if known == before {
+                break;
+            }
+        }
+        (known, uncertain)
+    }
+
+    /// Whether relation `r`'s column `attnum` is one the keys are, or one
+    /// the equalities fix to what the determined relations give it.
+    fn fixed(&self, ctx: &Ctx<'_>, r: usize, attnum: i16) -> bool {
+        self.covered(ctx, &self.keys, self.known, r, attnum)
+    }
+
+    /// Whether relation `r`'s column `attnum` is one `keys` are, or
+    /// `Scope::column_fixed_by_facts` fixes it under `known`.
+    fn covered(
+        &self,
+        ctx: &Ctx<'_>,
+        keys: &HashSet<(usize, i16)>,
+        known: u64,
+        r: usize,
+        attnum: i16,
+    ) -> bool {
+        keys.contains(&(r, attnum))
+            || self
+                .scope
+                .column_fixed_by_facts(ctx, r, attnum, &self.level_facts, known)
+    }
+
+    /// The fewest of the `undetermined` relations whose primary keys, added
+    /// to the keys, make the proof determine every relation — or every
+    /// grouping column, for a grouped query: the tiebreaker to suggest.
+    /// `None` when more than [`MAX_TIEBREAK_CANDIDATES`] of them have a
+    /// primary key, or when no such set determines every row (a relation
+    /// without one, joined on nothing).
+    fn fewest_tiebreakers(
+        &self,
+        ctx: &Ctx<'_>,
+        undetermined: &[usize],
+        grouping: Option<&[(usize, i16)]>,
+    ) -> Option<Vec<usize>> {
+        // Only a relation with a primary key can be named, and only its
+        // adding columns can determine it.
+        let candidates: Vec<(usize, Vec<(i16, String)>)> = undetermined
+            .iter()
+            .filter_map(|&r| {
+                let key = primary_key_columns(ctx, self.scope.rels[r].oid?);
+                (!key.is_empty()).then_some((r, key))
+            })
+            .collect();
+        if candidates.is_empty() || candidates.len() > MAX_TIEBREAK_CANDIDATES {
+            return None;
+        }
+        let determined = |positions: &[usize]| {
+            let mut keys = self.keys.clone();
+            for &position in positions {
+                let (r, key) = &candidates[position];
+                keys.extend(key.iter().map(|&(attnum, _)| (*r, attnum)));
+            }
+            let (known, _) = self.closure(ctx, &keys);
+            known & self.all == self.all
+                || grouping.is_some_and(|groups| {
+                    groups.iter().all(|&(r, attnum)| {
+                        known & (1 << r) != 0 || self.covered(ctx, &keys, known, r, attnum)
+                    })
+                })
+        };
+        // A relation without a primary key isn't helped by adding keys:
+        // when even every candidate's leaves one undetermined, there is no
+        // tiebreaker to suggest.
+        if !determined(&(0..candidates.len()).collect::<Vec<_>>()) {
+            return None;
+        }
+        let n = candidates.len();
+        for size in 1..=n {
+            let mut index: Vec<usize> = (0..size).collect();
+            loop {
+                if determined(&index) {
+                    return Some(index.iter().map(|&i| candidates[i].0).collect());
+                }
+                let Some(position) = (0..size).rfind(|&k| index[k] < n - size + k) else {
+                    break;
+                };
+                index[position] += 1;
+                for k in position + 1..size {
+                    index[k] = index[k - 1] + 1;
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Whether `COLLATE` names a collation the catalog records as deterministic
