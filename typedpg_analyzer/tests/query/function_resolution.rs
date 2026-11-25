@@ -81,8 +81,10 @@ fn varchar_char_name_with_unknown_literal() {
             c("e", bool_ty()),
             c("f", bool_ty()),
             c("g", bool_ty()),
-            c("h", text()),
-            c("i", text()),
+            // `name`'s "C" passes through its cast to text (PG 19:
+            // pg_collation_for('x'::name || 'y') is "C").
+            c("h", basic_with_collation("pg_catalog", "text", "C")),
+            c("i", basic_with_collation("pg_catalog", "text", "C")),
             c("j", text()),
         ],
     );

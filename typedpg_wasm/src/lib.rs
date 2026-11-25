@@ -105,7 +105,7 @@
 //!   DbError: optional string code, string message, optional string severity,
 //!            optional string detail, optional string hint,
 //!            optional u32 position, optional u32 internal_position,
-//!            optional string internal_query
+//!            optional string internal_query, optional string context
 //! ```
 //!
 //! Step (`migrator_step`'s output):

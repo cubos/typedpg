@@ -144,7 +144,7 @@ fn export_types(client: &mut postgres::Client, min: u32) -> Result<Vec<PgType>, 
     let rows = client.query(
         "SELECT oid, typname, typnamespace, typtype, typcategory, typispreferred, \
                 typrelid, typelem, typarray, typbasetype, typnotnull, typtypmod, typcollation, \
-                typstorage, typlen, typbyval, typalign, typsubscript::oid, typisdefined \
+                typstorage, typlen, typbyval, typalign, typsubscript::oid, typisdefined, typdelim \
          FROM pg_catalog.pg_type WHERE oid >= $1 ORDER BY oid",
         &[&min],
     )?;
@@ -191,6 +191,7 @@ fn export_types(client: &mut postgres::Client, min: u32) -> Result<Vec<PgType>, 
                 },
                 typsubscript: PgProcOid::new(r.get(17)),
                 typisdefined: r.get(18),
+                typdelim: r.get::<_, i8>(19) as u8 as char,
             }
         })
         .collect())

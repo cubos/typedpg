@@ -79,7 +79,7 @@ fn lint_ignores_migrations_unchanged_from_a_ref() {
     // Every migration is unchanged from HEAD, so none of their statement
     // findings is reported...
     assert!(!stdout.contains("create_index_blocking"), "{stdout}");
-    assert!(!stdout.contains("constraint_validating"), "{stdout}");
+    assert!(!stdout.contains("add_constraint_scan"), "{stdout}");
     // ...but the schema rules still report the current schema's problems,
     // with the fix in a new migration.
     assert!(stdout.contains("fk_without_index"), "{stdout}");
@@ -151,7 +151,10 @@ ignore = ["migrations/0002_hazards.sql"]
     // The statement rules of the ignored migration are skipped...
     assert!(!stdout.contains("create_index_blocking"), "{stdout}");
     // ...but the schema rules still report, with the fix in a new migration.
-    assert!(stdout.contains("warning[fk_without_index]"), "{stdout}");
+    assert!(
+        stdout.contains("warning[performance/fk_without_index]"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains(
             "CREATE INDEX CONCURRENTLY ON public.posts (author_id), in a new migration whose \
@@ -159,7 +162,10 @@ ignore = ["migrations/0002_hazards.sql"]
         ),
         "{stdout}"
     );
-    assert!(stdout.contains("info[redundant_index]"), "{stdout}");
+    assert!(
+        stdout.contains("warning[performance/redundant_index]"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains(
             "DROP INDEX CONCURRENTLY users_id_idx, in a new migration whose first line is \
@@ -167,6 +173,59 @@ ignore = ["migrations/0002_hazards.sql"]
         ),
         "{stdout}"
     );
+}
+
+#[test]
+fn lint_reports_a_migration_that_does_not_build_and_skips_its_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("migrations")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        r#"[package]
+name = "broken_migration_fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata.typedpg.database]
+migrations = "./migrations"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("migrations/0001_init.sql"),
+        "CREATE TABLE users (id integer PRIMARY KEY;\n",
+    )
+    .unwrap();
+    // A query that does not analyze against any schema: it must not be
+    // analyzed against a catalog that could not be built.
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"use typedpg::sql;
+
+pub async fn run(pool: &typedpg::Pool) -> Result<(), typedpg::Error> {
+    sql!(pool, "SELECT * FROM missing").execute().await?;
+    Ok(())
+}
+"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = lint_crate(root, &[]);
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
+    // The migration that does not build is the one failure reported.
+    assert!(
+        stdout.contains("error: syntax error at or near \";\"\n  --> migrations"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("relation \"missing\" does not exist"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("✖ failed: 1 analysis error"), "{stderr}");
 }
 
 #[test]
@@ -308,12 +367,15 @@ pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>>
     let output = run(false);
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}\n{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
-    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(
+        stdout.contains("info[redundant/unused_returning]"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains(
             "`.fetch_one()` fails with TooManyRows if this query returns a second row, and \
@@ -358,7 +420,7 @@ pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>>
     let output = run(false);
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
     assert!(!stdout.contains("unused_returning"), "{stdout}");
-    assert!(stdout.contains("fetch_may_return_many"), "{stdout}");
+    assert!(stdout.contains("fetch_one_multiple_rows"), "{stdout}");
 }
 
 #[test]
@@ -408,10 +470,10 @@ pub async fn run(pool: &typedpg::Pool) -> Result<(), Box<dyn std::error::Error>>
         .expect("run `cargo-typedpg`");
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(0), "{stderr}\n{stdout}");
+    assert_eq!(output.status.code(), Some(1), "{stderr}\n{stdout}");
     assert!(stdout.contains("src/main.rs:6:19]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
 }
@@ -709,7 +771,7 @@ fn lint_crate(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
 }
 
 #[test]
-fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
+fn deployed_query_breakage_reports_what_the_deployed_code_trips_on() {
     let queries = [
         "SELECT email FROM users WHERE id = $id",
         "SELECT name, status FROM users",
@@ -734,8 +796,10 @@ fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
         &[],
     );
     let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
-    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
-    let findings = stdout.matches("warning[breaks_deployed_queries]").count();
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
+    let findings = stdout
+        .matches("error[correctness/deployed_query_breakage]")
+        .count();
     // One per query and statement that breaks it.
     assert_eq!(findings, 8, "{stdout}");
     for expected in [
@@ -757,14 +821,16 @@ fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
 
     // Without the flag, the rule has nothing to compare with.
     let (_, stdout, _) = lint_crate(dir.path(), &[]);
-    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+    assert!(!stdout.contains("deployed_query_breakage"), "{stdout}");
 
     // Unmapped, `status` decodes into a `String`, which takes the new label:
     // the two queries reading it are not broken by the ALTER TYPE.
     let unmapped = deployed_crate(&queries, migration, &[]);
     let (_, stdout, _) = lint_crate(unmapped.path(), &["--previous-deployment", "HEAD"]);
     assert_eq!(
-        stdout.matches("warning[breaks_deployed_queries]").count(),
+        stdout
+            .matches("error[correctness/deployed_query_breakage]")
+            .count(),
         6,
         "{stdout}"
     );
@@ -773,10 +839,10 @@ fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
     // The flag's old name still works, and reports the same.
     let (code, alias_stdout, stderr) =
         lint_crate(dir.path(), &["--ignore-migrations-from", "HEAD"]);
-    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(code, Some(1), "{stderr}");
     assert_eq!(
         alias_stdout
-            .matches("warning[breaks_deployed_queries]")
+            .matches("error[correctness/deployed_query_breakage]")
             .count(),
         8,
         "{alias_stdout}"
@@ -788,7 +854,7 @@ fn breaks_deployed_queries_reports_what_the_deployed_code_trips_on() {
 }
 
 #[test]
-fn breaks_deployed_queries_reports_an_insert_and_honors_its_level() {
+fn deployed_query_breakage_reports_an_insert_and_honors_its_level() {
     let dir = deployed_crate(
         &["INSERT INTO users (id, email, name, status) VALUES ($id, $email, $name, 'active')"],
         "ALTER TABLE users ADD COLUMN tenant integer NOT NULL;\n",
@@ -805,18 +871,18 @@ fn breaks_deployed_queries_reports_an_insert_and_honors_its_level() {
     // `fail_on` and the level apply as to any rule.
     let manifest = dir.path().join("Cargo.toml");
     let mut config = std::fs::read_to_string(&manifest).unwrap();
-    config.push_str("\n[package.metadata.typedpg.lint]\nbreaks_deployed_queries = \"error\"\n");
+    config.push_str("\n[package.metadata.typedpg.lint]\ndeployed_query_breakage = \"error\"\n");
     std::fs::write(&manifest, config).unwrap();
     let (code, stdout, _) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
     assert_eq!(code, Some(1), "{stdout}");
     assert!(
-        stdout.contains("error[breaks_deployed_queries]"),
+        stdout.contains("error[correctness/deployed_query_breakage]"),
         "{stdout}"
     );
 }
 
 #[test]
-fn breaks_deployed_queries_accepts_a_compatible_migration() {
+fn deployed_query_breakage_accepts_a_compatible_migration() {
     let dir = deployed_crate(
         &[
             "SELECT id, email, name, status, age FROM users WHERE id = $id",
@@ -833,11 +899,11 @@ fn breaks_deployed_queries_accepts_a_compatible_migration() {
     );
     let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
     assert_eq!(code, Some(0), "{stderr}\n{stdout}");
-    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+    assert!(!stdout.contains("deployed_query_breakage"), "{stdout}");
 }
 
 #[test]
-fn breaks_deployed_queries_analyzes_a_query_as_its_roles() {
+fn deployed_query_breakage_analyzes_a_query_as_its_roles() {
     let dir = deployed_crate_with(
         "roles = [\"app\"]\n",
         "CREATE ROLE app;\n\
@@ -854,9 +920,11 @@ fn breaks_deployed_queries_analyzes_a_query_as_its_roles() {
         &[],
     );
     let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
-    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
     assert_eq!(
-        stdout.matches("warning[breaks_deployed_queries]").count(),
+        stdout
+            .matches("error[correctness/deployed_query_breakage]")
+            .count(),
         2,
         "{stdout}"
     );
@@ -919,9 +987,11 @@ pub async fn run(pool: &typedpg::Pool, org: i32) -> Result<(), Box<dyn std::erro
 "#,
     );
     let (code, stdout, stderr) = lint_crate(dir.path(), &[]);
-    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
     assert_eq!(
-        stdout.matches("warning[fetch_may_return_many]").count(),
+        stdout
+            .matches("error[correctness/fetch_one_multiple_rows]")
+            .count(),
         2,
         "{stdout}"
     );
@@ -962,7 +1032,7 @@ pub async fn run(pool: &typedpg::Pool, cond: bool) -> Result<(), Box<dyn std::er
     assert_eq!(code, Some(0), "{stderr}\n{stdout}");
     // Only the query whose every call is `execute()` reports its RETURNING.
     assert_eq!(
-        stdout.matches("info[unused_returning]").count(),
+        stdout.matches("info[redundant/unused_returning]").count(),
         1,
         "{stdout}"
     );
@@ -1000,7 +1070,7 @@ fn an_invalid_lint_key_fails_the_run() {
 }
 
 #[test]
-fn breaks_deployed_queries_checks_a_deployed_copy_in() {
+fn deployed_query_breakage_checks_a_deployed_copy_in() {
     let dir = deployed_crate_with(
         "",
         "",
@@ -1012,9 +1082,11 @@ fn breaks_deployed_queries_checks_a_deployed_copy_in() {
         &[],
     );
     let (code, stdout, stderr) = lint_crate(dir.path(), &["--previous-deployment", "HEAD"]);
-    assert_eq!(code, Some(0), "{stderr}\n{stdout}");
+    assert_eq!(code, Some(1), "{stderr}\n{stdout}");
     assert_eq!(
-        stdout.matches("warning[breaks_deployed_queries]").count(),
+        stdout
+            .matches("error[correctness/deployed_query_breakage]")
+            .count(),
         1,
         "{stdout}"
     );

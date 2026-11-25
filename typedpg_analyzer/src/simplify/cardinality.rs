@@ -61,13 +61,51 @@ impl QueryView {
         dedup::distinct_candidates_with_select(&ctx)
             .into_iter()
             .flat_map(|(select, candidate)| {
-                let error_free = select_is_error_free_in(&ctx, select);
+                // DISTINCT also resolves an untyped literal output to
+                // `text`, which a set operation's branch otherwise leaves
+                // to the set operation.
+                let error_free = select_is_error_free_in(&ctx, select)
+                    && !self.clauses_type_unknown_outputs(select);
                 candidate
                     .edits
                     .into_iter()
                     .map(move |edit| (edit.range, error_free))
             })
             .collect()
+    }
+}
+
+impl QueryView {
+    /// Whether `select` — a node of this view at any nesting depth — leaves
+    /// an untyped literal output (`'x'`, `NULL`) `unknown` for its context
+    /// to type, so that its `DISTINCT`, `ORDER BY` or `GROUP BY` resolving
+    /// it to `text` is what types it: a branch of a set operation, whose
+    /// column types the set operation resolves across its branches, or the
+    /// `SELECT` of an `INSERT`, whose values are coerced to the target
+    /// columns (PG's `p_resolve_unknowns`). Removing such a clause there can
+    /// change the type of the statement's column or value.
+    pub fn clauses_type_unknown_outputs(&self, select: &SelectStmt) -> bool {
+        let pointer: *const SelectStmt = select;
+        let is = |node: Option<&Node>| matches!(node, Some(Node::SelectStmt(s)) if std::ptr::eq(&**s, pointer));
+        let unresolved = self.tree.nodes().any(|(node, _)| match node {
+            NodeRef::SelectStmt(s) if s.op != SetOperation::SetopNone => {
+                s.larg.as_deref().is_some_and(|l| std::ptr::eq(l, pointer))
+                    || s.rarg.as_deref().is_some_and(|r| std::ptr::eq(r, pointer))
+            }
+            NodeRef::InsertStmt(insert) => is(insert.select_stmt.as_ref()),
+            _ => false,
+        });
+        unresolved
+            && select.target_list.iter().any(|target| {
+                matches!(
+                    target,
+                    Some(Node::ResTarget(rt)) if matches!(
+                        rt.val.as_ref(),
+                        Some(Node::AConst(c))
+                            if c.isnull || matches!(c.val, Some(AConstValue::String(_)))
+                    )
+                )
+            })
     }
 }
 
@@ -252,6 +290,14 @@ pub fn redundant_group_keys(
 /// (a LEFT join's left, a RIGHT join's right; a FULL join's `COALESCE`
 /// gives up).
 ///
+/// An outer join's nullable side may itself be a join tree, and it is at
+/// most one row once every relation of it is determined: by the outer join's
+/// `ON` (equating keys to the preserved side's values), by an inner join
+/// nested in the side — its `ON` holds on every row the side emits — or by a
+/// nested outer join's nullable side, once that join's preserved side is
+/// determined. The preserved side itself must be determined first: before
+/// that some of its rows match and others null-extend the side.
+///
 /// A CTE the statement's own `WITH` clause proves yields at most one row is
 /// a relation with no key needed: it is determined from the start, may be
 /// referenced more than once, and its columns are values a key equality may
@@ -289,8 +335,8 @@ pub fn redundant_group_keys(
 /// that returns a set, an inheritance parent read with its children — a
 /// plain reference, not `ONLY` — a foreign table), a set-returning call, a
 /// `FULL JOIN` (two one-row sides still produce an unmatched row from each
-/// when their keys differ), or an outer join whose nullable side isn't
-/// determined.
+/// when their keys differ), or an outer join whose nullable side has a
+/// relation the proof doesn't determine.
 ///
 /// The same "equalities to a key" fixed point backs the DML proofs: an
 /// `UPDATE` / `DELETE` needs only its target determined — a `FROM` /
@@ -841,8 +887,17 @@ pub(super) fn select_output_columns(
         let Some(Node::ResTarget(target)) = target else {
             return Vec::new();
         };
-        if target.val.is_none() || composite_star(target.val.as_ref()) {
+        if target.val.is_none() {
             return Vec::new();
+        }
+        if composite_star(target.val.as_ref()) {
+            match composite_star_columns(ctx, scope.as_ref(), parent, target.val.as_ref()) {
+                Some(columns) => {
+                    out.extend(columns);
+                    continue;
+                }
+                None => return Vec::new(),
+            }
         }
         let value = &target.val;
         if let Some(Node::ColumnRef(column)) = value
@@ -1017,9 +1072,10 @@ fn target_named(rel: &dedup::Rel, qualifier: &str) -> bool {
 }
 
 /// The type of a value an output column exposes, when it is a column, a
-/// parameter, a constant or a cast of one: a cast's target type is known
-/// even when it is collatable, but only a non-collatable one compares
-/// bytewise (`bigint`, `int`, `uuid` — not `text`).
+/// parameter, a constant, a cast or a call of them: a collatable one
+/// compares bytewise when its input's — a call's collatable arguments' —
+/// collation does, and a type without collation always does (`bigint`,
+/// `int`, `uuid`).
 fn value_type(
     ctx: &Ctx<'_>,
     scope: Option<&Scope<'_>>,
@@ -1051,6 +1107,13 @@ fn value_type(
                     };
                     if qualifier.is_some_and(|q| scope.rel_named(q).is_some()) {
                         return (None, false);
+                    }
+                    if let [name] = names.as_slice()
+                        && let Some(typ) = whole_row_type(ctx, scope, outer, name)
+                    {
+                        // A row's equality compares its fields under their
+                        // own collations: not known to be bytewise.
+                        return (Some(typ), false);
                     }
                     outer
                         .and_then(|outer| outer.resolve_value(ctx, column))
@@ -1103,14 +1166,73 @@ fn value_type(
             if typ == Some(oid::UNKNOWN) {
                 return (None, false);
             }
-            // A cast to a collatable type keeps its input's collation (a
+            // A cast to a collatable type keeps its input's collation (PG's
+            // `exprCollation` reads a `TypeCast`'s from its argument, a
             // nondeterministic one included, which then wins over a
-            // column's default), so only a type without collation is known
-            // to compare bytewise.
-            (
-                typ,
-                typ.is_some_and(|typ| !dedup::collatable_type(ctx, typ)),
-            )
+            // column's default), so it compares bytewise exactly when the
+            // input does. A type without collation compares bytewise
+            // whatever the input.
+            match typ {
+                Some(typ) if dedup::collatable_type(ctx, typ) => {
+                    let (_, deterministic) = value_type(ctx, scope, outer, cast.arg.as_ref());
+                    (Some(typ), deterministic)
+                }
+                Some(typ) => (Some(typ), true),
+                None => (None, false),
+            }
+        }
+        // A call's result: the routine its argument types resolve to. Its
+        // collation is its collatable arguments' (PG derives a call's from
+        // them), so it compares bytewise exactly when theirs do; a type
+        // without collation does so whatever they are. An aggregate, window
+        // or set-returning call is still one output column — of the
+        // aggregate's, the window function's or the element's type.
+        Some(Node::FuncCall(call)) => {
+            let Some((schema, name)) = function_name(&call.funcname) else {
+                return (None, false);
+            };
+            let Ok(notation) = crate::functions::CallNotation::of(call) else {
+                return (None, false);
+            };
+            let mut types = Vec::with_capacity(call.args.len());
+            let mut deterministic = true;
+            for arg in &call.args {
+                let arg_value = crate::functions::call_arg_value(arg.as_ref());
+                let (arg_type, arg_deterministic) = value_type(ctx, scope, outer, arg_value);
+                // An untyped literal argument is `unknown` to PG's function
+                // resolution, whatever type it takes in an output column.
+                let arg_type = match arg_value {
+                    Some(Node::AConst(constant))
+                        if matches!(constant.val, Some(AConstValue::String(_))) =>
+                    {
+                        oid::UNKNOWN
+                    }
+                    _ => match arg_type {
+                        Some(arg_type) => arg_type,
+                        None => return (None, false),
+                    },
+                };
+                deterministic &= arg_deterministic || !dedup::collatable_type(ctx, arg_type);
+                types.push(arg_type);
+            }
+            let Ok(resolved) = crate::functions::resolve_function(
+                ctx.catalog,
+                schema,
+                name,
+                &types,
+                &notation,
+                call.agg_star,
+                None,
+            ) else {
+                return (None, false);
+            };
+            let typ = resolved.return_type_oid;
+            // A polymorphic pseudo-type is no value's type.
+            if crate::polymorphic::is_polymorphic(typ) {
+                return (None, false);
+            }
+            let deterministic = deterministic || !dedup::collatable_type(ctx, typ);
+            (Some(typ), deterministic)
         }
         // A `CASE` is its results' common type: known when every result
         // that isn't a bare NULL has the same known type (all-literal
@@ -1159,6 +1281,74 @@ fn value_type(
 fn composite_star(value: Option<&ast::Node>) -> bool {
     matches!(value, Some(Node::AIndirection(indirection))
         if matches!(indirection.indirection.last(), Some(Some(Node::AStar(_)))))
+}
+
+/// The row type of a bare `name` that PG reads as a whole-row reference to
+/// a base table of `scope`: no column of this level or of a level around it
+/// may be called `name` (PG's `transformColumnRef` tries a column first, at
+/// every level), and the level's relation named `name` is a table.
+fn whole_row_type(
+    ctx: &Ctx<'_>,
+    scope: &Scope<'_>,
+    outer: Option<&FromScope<'_>>,
+    name: &str,
+) -> Option<crate::oid::PgTypeOid> {
+    let column_here = scope
+        .rels
+        .iter()
+        .any(|rel| !rel.columns_known || rel.columns.iter().any(|(column, _)| column == name));
+    if column_here || outer.is_some_and(|outer| outer.may_bind_column(name)) {
+        return None;
+    }
+    let relid = scope.rels[scope.rel_named(name)?].oid?;
+    let class = ctx.catalog.pg_class.get(&relid)?;
+    if !matches!(class.relkind, RelKind::Table | RelKind::Partitioned) {
+        return None;
+    }
+    class.reltype
+}
+
+/// The fields `(value).*` expands to, by name, type and whether their
+/// collation compares bytewise, when `value` is a column reference whose
+/// type ([`value_type`]) is a composite type: its live attributes in order.
+pub(super) fn composite_star_columns(
+    ctx: &Ctx<'_>,
+    scope: Option<&Scope<'_>>,
+    outer: Option<&FromScope<'_>>,
+    value: Option<&ast::Node>,
+) -> Option<Vec<CteColumn>> {
+    let Some(Node::AIndirection(indirection)) = value else {
+        return None;
+    };
+    if !matches!(indirection.indirection.as_slice(), [Some(Node::AStar(_))]) {
+        return None;
+    }
+    let arg = indirection.arg.as_ref()?;
+    if !matches!(arg, Node::ColumnRef(_)) {
+        return None;
+    }
+    let typ = value_type(ctx, scope, outer, Some(arg)).0?;
+    let ty = ctx.catalog.pg_type.get(&typ)?;
+    if ty.typtype != crate::pg_catalog::TypType::Composite {
+        return None;
+    }
+    let relid = ty.typrelid?;
+    let mut attributes: Vec<_> = ctx
+        .catalog
+        .attributes_of(relid)
+        .iter()
+        .filter(|attribute| attribute.attnum > 0)
+        .collect();
+    attributes.sort_by_key(|attribute| attribute.attnum);
+    let columns: Vec<CteColumn> = attributes
+        .into_iter()
+        .map(|attribute| CteColumn {
+            name: Some(attribute.attname.clone()),
+            typ: Some(attribute.atttypid),
+            deterministic: dedup::deterministic(ctx.catalog, attribute.attcollation),
+        })
+        .collect();
+    (!columns.is_empty()).then_some(columns)
 }
 
 /// The column name PG gives a target that has none written, when it is
@@ -1256,7 +1446,17 @@ fn find_select(
                 }
                 return;
             }
-            let scope = FromScope::of_select(ctx, select, parent);
+            let mut scope = FromScope::of_select(ctx, select, parent);
+            // A nested level's proof reads this level's columns as fixed
+            // values: a FROM subquery's or CTE's typed output columns too,
+            // as the cardinality scope lists them.
+            if matches!(check, SelectCheck::OneRow)
+                && let Some(items) =
+                    Scope::build_env(ctx, &visible.after, &select.from_clause, &scope)
+                        .map(|level| level.items(ctx))
+            {
+                scope = scope.with_items(items);
+            }
             for child in select_children(select) {
                 find_select(ctx, child, Some(&scope), &visible.after, target, check, out);
             }
@@ -1682,8 +1882,11 @@ pub(super) fn select_at_most_one_row_in(
     outer: &FromScope<'_>,
     env: &CteEnv,
 ) -> bool {
-    if select.op != SetOperation::SetopNone || select.into_clause.is_some() {
+    if select.into_clause.is_some() {
         return false;
+    }
+    if select.op != SetOperation::SetopNone {
+        return exclusive_union_all(ctx, select, outer, env);
     }
     // `GROUP BY ()` is a single empty grouping set: one group, like an
     // aggregate without `GROUP BY`. Any other grouping construct —
@@ -1776,6 +1979,387 @@ pub(super) fn select_at_most_one_row_in(
         }
     }
     all_relations_determined(ctx, select, &scope, outer, env)
+}
+
+// ── Mutually exclusive UNION ALL branches ──────────────────────────────────
+
+/// What a statement yielding a row implies about one CTE of the `WITH`
+/// clause around it, by position: that the CTE yields a row (`true`), or
+/// that it yields none (`false`).
+type Guard = (usize, bool);
+
+/// Whether `select` is a `UNION ALL` of two branches of at most one row each
+/// that never both yield one: a row of one implies that a CTE of the
+/// statement's own `WITH` yields a row, and a row of the other that the same
+/// CTE yields none.
+///
+/// The CTE must be read once for the whole statement, so every reference
+/// sees the same rows: it is not `NOT MATERIALIZED` (two references, one per
+/// branch, make PG materialize it otherwise) and its name names no other CTE
+/// of the statement. Data-modifying CTEs all run once, on the same
+/// snapshot, so a branch reading one inherits what its rows imply.
+fn exclusive_union_all(
+    ctx: &Ctx<'_>,
+    select: &SelectStmt,
+    outer: &FromScope<'_>,
+    env: &CteEnv,
+) -> bool {
+    if select.op != SetOperation::SetopUnion || !select.all {
+        return false;
+    }
+    let (Some(left), Some(right)) = (select.larg.as_deref(), select.rarg.as_deref()) else {
+        return false;
+    };
+    let Some(with) = select.with_clause.as_deref() else {
+        return false;
+    };
+    if with.recursive {
+        return false;
+    }
+    // A branch's own `WITH` isn't in `env`: it would shadow names.
+    let one_row = |branch: &SelectStmt| {
+        branch.with_clause.is_none() && {
+            let scope = FromScope::of_select(ctx, branch, Some(outer));
+            select_at_most_one_row_in(ctx, branch, &scope, env) || limit_bounds_one(branch)
+        }
+    };
+    if !one_row(left) || !one_row(right) {
+        return false;
+    }
+    let Some(guards) = Guards::of(ctx, with, env) else {
+        return false;
+    };
+    let visible = guards.ctes.len();
+    let right = guards.select(ctx, right, visible, env);
+    guards
+        .select(ctx, left, visible, env)
+        .iter()
+        .any(|&(cte, rows)| guards.read_once(cte) && right.contains(&(cte, !rows)))
+}
+
+/// A `WITH` clause's CTEs, with what a row of each body implies.
+struct Guards<'q> {
+    ctes: Vec<&'q CommonTableExpr>,
+    /// The CTE's name is defined once in the whole statement: a reference
+    /// spelling it can't be to a nested `WITH`'s CTE.
+    unique: Vec<bool>,
+    implied: Vec<Vec<Guard>>,
+}
+
+impl<'q> Guards<'q> {
+    /// `env` is the environment after the clause: each body is judged with
+    /// the CTEs from its own on given up on (a reference to a later one is to
+    /// a table of that name).
+    fn of(ctx: &Ctx<'_>, with: &'q WithClause, env: &CteEnv) -> Option<Guards<'q>> {
+        let mut ctes = Vec::with_capacity(with.ctes.len());
+        for node in &with.ctes {
+            let Some(Node::CommonTableExpr(cte)) = node else {
+                return None;
+            };
+            ctes.push(&**cte);
+        }
+        let unique = ctes
+            .iter()
+            .map(|cte| {
+                ctx.tree
+                    .nodes()
+                    .filter(|(node, _)| {
+                        matches!(node, NodeRef::CommonTableExpr(other) if other.ctename == cte.ctename)
+                    })
+                    .count()
+                    == 1
+            })
+            .collect();
+        let mut guards = Guards {
+            ctes,
+            unique,
+            implied: Vec::new(),
+        };
+        for i in 0..guards.ctes.len() {
+            let mut body_env = env.clone();
+            for later in &guards.ctes[i..] {
+                body_env.insert(later.ctename.clone(), None);
+            }
+            let implied = match guards.ctes[i].ctequery.as_ref() {
+                Some(body) => guards.statement(ctx, body.to_ref(), i, &body_env),
+                None => Vec::new(),
+            };
+            guards.implied.push(implied);
+        }
+        Some(guards)
+    }
+
+    /// Whether every reference to CTE `cte` reads the same rows: PG
+    /// evaluates it once (see [`exclusive_union_all`]).
+    fn read_once(&self, cte: usize) -> bool {
+        let expr = self.ctes[cte];
+        self.unique[cte] && !expr.cterecursive && expr.ctematerialized != ast::CteMaterialize::Never
+    }
+
+    /// The CTE among the first `visible` that an unqualified `name` reads.
+    fn cte_named(&self, name: &str, visible: usize) -> Option<usize> {
+        (0..visible).find(|&i| self.unique[i] && self.ctes[i].ctename == name)
+    }
+
+    /// What `statement` yielding a row implies, the first `visible` CTEs
+    /// being in scope.
+    fn statement(
+        &self,
+        ctx: &Ctx<'_>,
+        statement: NodeRef<'_>,
+        visible: usize,
+        env: &CteEnv,
+    ) -> Vec<Guard> {
+        match statement {
+            NodeRef::SelectStmt(select) => self.select(ctx, select, visible, env),
+            // A returned row is a row of the source query, inserted or (`ON
+            // CONFLICT DO UPDATE`) updated.
+            NodeRef::InsertStmt(insert) => {
+                let writable = insert
+                    .relation
+                    .as_deref()
+                    .is_some_and(|relation| dml_target_without_rules(ctx, relation));
+                match insert.select_stmt.as_ref() {
+                    Some(Node::SelectStmt(select)) if writable && insert.with_clause.is_none() => {
+                        self.select(ctx, select, visible, env)
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            NodeRef::UpdateStmt(update) if update.with_clause.is_none() => self.dml(
+                ctx,
+                update.relation.as_deref(),
+                &update.from_clause,
+                update.where_clause.as_ref(),
+                visible,
+                env,
+            ),
+            NodeRef::DeleteStmt(delete) if delete.with_clause.is_none() => self.dml(
+                ctx,
+                delete.relation.as_deref(),
+                &delete.using_clause,
+                delete.where_clause.as_ref(),
+                visible,
+                env,
+            ),
+            _ => Vec::new(),
+        }
+    }
+
+    /// What a plain `SELECT` yielding a row implies: a row of each CTE its
+    /// `FROM` reads where no outer join null-extends it, and what each
+    /// `WHERE` conjunct (see [`Self::conjunct`]) implies. An aggregate,
+    /// `GROUP BY` or `HAVING` query is refused: an aggregate yields its row
+    /// from no input row at all.
+    fn select(
+        &self,
+        ctx: &Ctx<'_>,
+        select: &SelectStmt,
+        visible: usize,
+        env: &CteEnv,
+    ) -> Vec<Guard> {
+        if select.op != SetOperation::SetopNone
+            || !select.values_lists.is_empty()
+            || select.with_clause.is_some()
+            || !select.group_clause.is_empty()
+            || select.having_clause.is_some()
+            || [
+                &select.target_list,
+                &select.sort_clause,
+                &select.distinct_clause,
+                &select.window_clause,
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|node| may_aggregate(ctx, node))
+        {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for item in &select.from_clause {
+            self.item_guards(item.as_ref(), visible, &mut out);
+        }
+        let root = FromScope::opaque(None);
+        let scope = Scope::build_env(ctx, env, &select.from_clause, &root);
+        for conjunct in dedup::conjuncts(select.where_clause.as_ref()) {
+            self.conjunct(ctx, conjunct, scope.as_ref(), visible, env, &mut out);
+        }
+        out
+    }
+
+    /// What an `UPDATE` / `DELETE` returning a row implies: a target row
+    /// matched its `WHERE` and its `FROM` / `USING` items (every one an
+    /// inner join with the target).
+    fn dml(
+        &self,
+        ctx: &Ctx<'_>,
+        relation: Option<&ast::RangeVar>,
+        from: &[Option<Node>],
+        where_clause: Option<&Node>,
+        visible: usize,
+        env: &CteEnv,
+    ) -> Vec<Guard> {
+        let Some(relation) = relation else {
+            return Vec::new();
+        };
+        if !dml_target_without_rules(ctx, relation) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for item in from {
+            self.item_guards(item.as_ref(), visible, &mut out);
+        }
+        let scope = Scope::dml(ctx, env, relation, from);
+        for conjunct in dedup::conjuncts(where_clause) {
+            self.conjunct(ctx, conjunct, scope.as_ref(), visible, env, &mut out);
+        }
+        out
+    }
+
+    /// The CTEs a `FROM` item reads on every row it yields: a CTE reference,
+    /// and the sides of a join no outer join null-extends.
+    fn item_guards(&self, item: Option<&Node>, visible: usize, out: &mut Vec<Guard>) {
+        match item {
+            Some(Node::RangeVar(range))
+                if range.schemaname.is_empty() && range.catalogname.is_empty() =>
+            {
+                if let Some(cte) = self.cte_named(&range.relname, visible) {
+                    out.push((cte, true));
+                    out.extend(self.implied[cte].iter().copied());
+                }
+            }
+            Some(Node::JoinExpr(join)) => match join.jointype {
+                JoinType::JoinInner => {
+                    self.item_guards(join.larg.as_ref(), visible, out);
+                    self.item_guards(join.rarg.as_ref(), visible, out);
+                }
+                JoinType::JoinLeft => self.item_guards(join.larg.as_ref(), visible, out),
+                JoinType::JoinRight => self.item_guards(join.rarg.as_ref(), visible, out),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// What a `WHERE` conjunct holding implies: `EXISTS (q)` that `q`
+    /// yields a row; `NOT EXISTS (SELECT … FROM c)` reading all of CTE `c`
+    /// that `c` yields none; and a comparison through a strict operator
+    /// (one the cardinality proof reads as an equality fact) with a scalar
+    /// subquery operand that the subquery yields a row, since an empty one
+    /// is NULL.
+    fn conjunct(
+        &self,
+        ctx: &Ctx<'_>,
+        conjunct: Option<&Node>,
+        scope: Option<&Scope<'_>>,
+        visible: usize,
+        env: &CteEnv,
+        out: &mut Vec<Guard>,
+    ) {
+        match conjunct {
+            Some(Node::SubLink(sub)) if sub.sub_link_type == ast::SubLinkType::ExistsSublink => {
+                if let Some(Node::SelectStmt(select)) = sub.subselect.as_ref() {
+                    out.extend(self.select(ctx, select, visible, env));
+                }
+            }
+            Some(Node::BoolExpr(not))
+                if not.boolop == ast::BoolExprType::NotExpr && not.args.len() == 1 =>
+            {
+                if let Some(Node::SubLink(sub)) = not.args[0].as_ref()
+                    && sub.sub_link_type == ast::SubLinkType::ExistsSublink
+                    && let Some(Node::SelectStmt(select)) = sub.subselect.as_ref()
+                    && let Some(cte) = self.reads_whole_cte(select, visible)
+                {
+                    out.push((cte, false));
+                }
+            }
+            Some(Node::AExpr(expr)) if expr.kind == ast::AExprKind::AexprOp => {
+                let Some(scope) = scope else {
+                    return;
+                };
+                for side in [expr.lexpr.as_ref(), expr.rexpr.as_ref()] {
+                    let Some(Node::SubLink(sub)) = side else {
+                        continue;
+                    };
+                    let Some(Node::SelectStmt(select)) = sub.subselect.as_ref() else {
+                        continue;
+                    };
+                    let root = FromScope::opaque(None);
+                    if sub.sub_link_type == ast::SubLinkType::ExprSublink
+                        && !scope
+                            .cardinality_facts(ctx, conjunct, Some(&root), env)
+                            .is_empty()
+                    {
+                        out.extend(self.select(ctx, select, visible, env));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The CTE `select` yields a row of whenever the CTE has one: `SELECT
+    /// <constants or columns> FROM c` with no `WHERE`, grouping, ordering,
+    /// window, `LIMIT`, `OFFSET` or locking.
+    fn reads_whole_cte(&self, select: &SelectStmt, visible: usize) -> Option<usize> {
+        if select.op != SetOperation::SetopNone
+            || !select.values_lists.is_empty()
+            || select.with_clause.is_some()
+            || select.where_clause.is_some()
+            || !select.group_clause.is_empty()
+            || select.having_clause.is_some()
+            || !select.sort_clause.is_empty()
+            || select.limit_count.is_some()
+            || select.limit_offset.is_some()
+            || !select.locking_clause.is_empty()
+            || !select.window_clause.is_empty()
+        {
+            return None;
+        }
+        let plain_targets = select.target_list.iter().all(|target| {
+            matches!(
+                target,
+                Some(Node::ResTarget(target))
+                    if matches!(target.val.as_ref(), Some(Node::AConst(_) | Node::ColumnRef(_)))
+            )
+        });
+        if !plain_targets {
+            return None;
+        }
+        match select.from_clause.as_slice() {
+            [Some(Node::RangeVar(range))]
+                if range.schemaname.is_empty() && range.catalogname.is_empty() =>
+            {
+                self.cte_named(&range.relname, visible)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Whether `node` may contain a call that makes its query level an
+/// aggregate one: an aggregate syntax, a `GROUPING` call, or a call to a
+/// name some routine of which is not a plain function. Nested subqueries
+/// count too (an aggregate there can belong to this level).
+fn may_aggregate(ctx: &Ctx<'_>, node: &Node) -> bool {
+    node.nodes().any(|(node, _)| match node {
+        NodeRef::GroupingFunc(_) => true,
+        NodeRef::FuncCall(call) => {
+            call.agg_star
+                || call.agg_distinct
+                || call.agg_within_group
+                || call.agg_filter.is_some()
+                || !call.agg_order.is_empty()
+                || function_name(&call.funcname).is_none_or(|(schema, name)| {
+                    ctx.catalog
+                        .find_functions(schema, name)
+                        .iter()
+                        .any(|proc| proc.prokind != ProKind::Function)
+                })
+        }
+        _ => false,
+    })
 }
 
 /// Whether a plain `GROUP BY` / `DISTINCT ON` item is one value per
@@ -2357,6 +2941,16 @@ type JoinFacts<'j, 'a, 'q> = (
 /// treatment too. A key may be equated partly by the `WHERE`, partly by
 /// one join's `ON` and partly by another's: all of them hold on every row
 /// the joins contribute.
+///
+/// An outer join's nullable side may itself be a join tree, and every
+/// relation of it is a target of that join's `ON` facts: the side is one row
+/// once each of its relations is (each relation is then at most one row, and
+/// a join of at-most-one-row inputs is at most one row). An inner join
+/// nested in the side matched on every row the side emits, so its own `ON`
+/// determines its relations too; a nested outer join determines only its own
+/// nullable side, and only once its preserved side is — what the outer
+/// join's `ON` said about that preserved side never pins it, an unmatched
+/// row has it too.
 fn determined_relations(
     ctx: &Ctx<'_>,
     where_clause: Option<&ast::Node>,
@@ -2458,11 +3052,20 @@ fn determined_relations(
                 // match it and others null-extend it, and an expression of
                 // its columns that maps NULL to a value (`quote_nullable`)
                 // then differs from row to row.
+                //
+                // Its `ON` may determine that whole side, every relation of
+                // it: a side that is itself a join tree is one row when each
+                // of its relations is (two one-row relations joined, however,
+                // are still one row). A nested inner join then contributes
+                // its own `ON` as facts for its relations (it matched on
+                // every row of the side), and a nested outer join only its
+                // nullable side once its preserved side is fixed — its own
+                // arm below, with `targets` its nullable side.
                 typedpg_pg_query::ast::JoinType::JoinLeft if join.left & !known == 0 => {
-                    (join.right_rel.map_or(0, |b| 1 << b), join.left)
+                    (join.right, join.left)
                 }
                 typedpg_pg_query::ast::JoinType::JoinRight if join.right & !known == 0 => {
-                    (join.left_rel.map_or(0, |b| 1 << b), join.right)
+                    (join.left, join.right)
                 }
                 typedpg_pg_query::ast::JoinType::JoinLeft
                 | typedpg_pg_query::ast::JoinType::JoinRight => (0, 0),
@@ -2744,6 +3347,14 @@ mod tests {
                 id bigint PRIMARY KEY,
                 customer_id bigint NOT NULL REFERENCES customers
              );
+             CREATE TABLE principals (id bigint PRIMARY KEY, label text);
+             CREATE TABLE profiles (
+                id bigint PRIMARY KEY,
+                principal_id bigint NOT NULL UNIQUE,
+                bio text
+             );
+             CREATE TABLE profile_settings (profile_id bigint PRIMARY KEY, theme text);
+             CREATE TABLE loose_profiles (principal_id bigint NOT NULL, bio text);
              CREATE TABLE defaults (
                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 v int DEFAULT 1 NOT NULL
@@ -2947,11 +3558,15 @@ mod tests {
         ));
         // Only part of the key: not one row.
         assert!(!select_one(&db, "SELECT id FROM paints WHERE shop = $1"));
-        // Comparing the enum as text is not the key's own operator family:
-        // the key equality isn't there.
-        assert!(!select_one(
+        // Comparing the enum as text pins it too: a label names one value.
+        assert!(select_one(
             &db,
             "SELECT id FROM paints WHERE shop = $1 AND color::text = 'red'"
+        ));
+        // A text comparison that isn't the text type's equality does not.
+        assert!(!select_one(
+            &db,
+            "SELECT id FROM paints WHERE shop = $1 AND color::text LIKE 'red'"
         ));
     }
 
@@ -3323,6 +3938,100 @@ mod tests {
     }
 
     #[test]
+    fn an_outer_join_onto_a_determined_join_tree_is_one_row() {
+        let db = catalog();
+        // The one-row side pins `u`'s key, and `u`'s key the profile's
+        // unique column: every relation of the nullable side is one row, so
+        // the join is.
+        for sql in [
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            // Two levels of inner joins inside the nullable side.
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p",
+            // A `LEFT` inside a `LEFT`: the nested join's nullable side is
+            // fixed by its own `ON`, its preserved side by the outer one.
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        LEFT JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p",
+            // A nested `RIGHT` join: its preserved side is the one the outer
+            // `ON` pins.
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (profiles pr RIGHT JOIN principals u ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+            // The mirror: a `RIGHT` join onto the tree.
+            "SELECT pr.bio FROM (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             RIGHT JOIN (SELECT $1::bigint AS p) q ON u.id = q.p",
+            // Pinning the nested relation's key instead fixes the join's
+            // other relation through its `ON`.
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON pr.id = q.p",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        // The `WHERE` may still pin every relation of the side, as it may
+        // pin one.
+        assert!(select_one(
+            &db,
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON true \
+             WHERE u.id = $2 AND pr.principal_id = $3",
+        ));
+        // A non-unique nested join column pins nothing.
+        assert!(!select_one(
+            &db,
+            "SELECT lp.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN loose_profiles lp ON lp.principal_id = u.id) \
+             ON u.id = q.p",
+        ));
+        // A `FULL JOIN` in the nullable side emits an unmatched row from each
+        // side when their keys differ.
+        assert!(!select_one(
+            &db,
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u FULL JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p",
+        ));
+        // The preserved side may hold many rows: a table is never fixed.
+        assert!(!select_one(
+            &db,
+            "SELECT pr.bio FROM principals q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.id",
+        ));
+        // The outer `ON` pins one relation of the nested join only: the other
+        // may match many rows.
+        assert!(!select_one(
+            &db,
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON u.id = q.p",
+        ));
+        // A nested outer join's `ON` never pins its preserved side: every `u`
+        // row is kept there, matched or not.
+        assert!(!select_one(
+            &db,
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id \
+                       AND u.id = $2) ON true",
+        ));
+        // Two unique columns equated to each other are still many pairs.
+        assert!(!select_one(
+            &db,
+            "SELECT u.label FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON true \
+             WHERE u.id = pr.principal_id",
+        ));
+    }
+
+    #[test]
     fn a_correlated_outer_column_is_fixed() {
         let db = catalog();
         let outer = view(
@@ -3353,6 +4062,134 @@ mod tests {
             })
             .collect();
         assert!(!select_at_most_one_row(&db, &inner, selects[1]));
+    }
+
+    /// Whether the first scalar sublink's select of `sql` is one row.
+    #[track_caller]
+    fn sublink_one(db: &PgCatalog, sql: &str) -> bool {
+        let view = view(db, sql);
+        let select = view
+            .tree
+            .nodes()
+            .find_map(|(node, _)| match node {
+                NodeRef::SubLink(sub) if sub.sub_link_type == ast::SubLinkType::ExprSublink => {
+                    match sub.subselect.as_ref() {
+                        Some(Node::SelectStmt(select)) => Some(&**select),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("a scalar sublink");
+        select_at_most_one_row(db, &view, select)
+    }
+
+    #[test]
+    fn an_outer_expression_column_pins_a_key() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE accounts (id uuid PRIMARY KEY, gid text);
+             CREATE TABLE grant_renewals (
+                grant_id text PRIMARY KEY,
+                acquired_at timestamptz,
+                note text
+             );
+             CREATE FUNCTION grant_of(a uuid) RETURNS text STABLE LANGUAGE sql
+                AS $$ SELECT a::text $$;",
+        )
+        .unwrap();
+        // A CTE's or a FROM subquery's column holding an expression is one
+        // value per evaluation like a plain column: the subquery's key
+        // equality to it pins the key.
+        for sql in [
+            "WITH standing AS (SELECT id, grant_of(id) AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) FROM standing s",
+            "SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) \
+             FROM (SELECT id, grant_of(id) AS grant_id FROM accounts WHERE id = $1) s",
+            // A cast to `text` keeps its input's (the default) collation.
+            "WITH standing AS (SELECT id, gid::text AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) FROM standing s",
+        ] {
+            assert!(sublink_one(&db, sql), "{sql}");
+        }
+        // An expression whose type the proof doesn't resolve still gives up.
+        assert!(!sublink_one(
+            &db,
+            "WITH standing AS (SELECT id, (grant_of(id) || '-x') AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.grant_id = s.grant_id) FROM standing s",
+        ));
+        // So does an equality on a column that is no key.
+        assert!(!sublink_one(
+            &db,
+            "WITH standing AS (SELECT id, grant_of(id) AS grant_id \
+                               FROM accounts WHERE id = $1) \
+             SELECT (SELECT g.acquired_at FROM grant_renewals g \
+                     WHERE g.note = s.grant_id) FROM standing s",
+        ));
+    }
+
+    #[test]
+    fn a_join_onto_a_single_row_side_is_one_row() {
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE users (principal text PRIMARY KEY, disabled_at timestamptz);
+             CREATE TABLE memberships (
+                org_id uuid NOT NULL,
+                principal text NOT NULL,
+                PRIMARY KEY (org_id, principal)
+             );
+             CREATE FUNCTION principal_of(p text) RETURNS text STABLE LANGUAGE sql
+                AS $$ SELECT p $$;",
+        )
+        .unwrap();
+        // A one-row side and a table whose key its columns pin: the join
+        // matches at most one row of the table per row of that side.
+        for sql in [
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             JOIN users u ON u.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             LEFT JOIN users u ON u.principal = q.p",
+            // The fact written in WHERE, over a comma join.
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q, users u \
+             WHERE u.principal = q.p",
+            // A call of the one-row side's column.
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             JOIN users u ON u.principal = principal_of(q.p)",
+            // A RIGHT join whose preserved side is the one-row subquery: the
+            // pinned table is the nullable side.
+            "SELECT q.p FROM users u RIGHT JOIN (SELECT $1::text AS p) q \
+             ON u.principal = q.p",
+        ] {
+            assert!(select_one(&db, sql), "{sql}");
+        }
+        // One column of a composite key, a side that may have many rows, a
+        // non-unique column, a FULL join and a set-returning function on the
+        // one-row side all keep the proof away.
+        for sql in [
+            "SELECT m.principal FROM (SELECT $1::text AS p) q \
+             JOIN memberships m ON m.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT principal AS p FROM users) q \
+             JOIN users u ON u.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT $1::timestamptz AS p) q \
+             JOIN users u ON u.disabled_at = q.p",
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             FULL JOIN users u ON u.principal = q.p",
+            "SELECT u.disabled_at FROM (SELECT unnest(ARRAY[$1::text]) AS p) q \
+             JOIN users u ON u.principal = q.p",
+            // The preserved (right) side is the many-row table: each of its
+            // rows is emitted.
+            "SELECT u.disabled_at FROM (SELECT $1::text AS p) q \
+             RIGHT JOIN users u ON u.principal = q.p",
+        ] {
+            assert!(!select_one(&db, sql), "{sql}");
+        }
     }
 
     #[test]
@@ -5836,7 +6673,9 @@ mod tests {
              CREATE FUNCTION other.norm(v text) RETURNS text IMMUTABLE LANGUAGE sql
                 AS $$ SELECT v $$;
              CREATE TABLE handles (id bigint PRIMARY KEY, handle text NOT NULL);
-             CREATE UNIQUE INDEX ON handles (norm(handle));
+             SET search_path = other, public;
+             CREATE UNIQUE INDEX ON public.handles (norm(handle));
+             RESET search_path;
              CREATE TABLE builds (
                 id bigint PRIMARY KEY,
                 project_id bigint NOT NULL,
@@ -6085,14 +6924,33 @@ mod tests {
             &db,
             "SELECT id FROM ci_users WHERE lower(email) = $1",
         ));
-        // An index made under `search_path = other, public` stores
-        // `other.norm`, while the query's `norm` is `public.norm`: the stored
-        // name can't tell which one it was (on PG, `norm(handle) = 'a'`
-        // matches both 'a' and 'A' there).
+        // An index made under `search_path = other, public` keys
+        // `other.norm`, while the query's `norm` is `public.norm` (on PG,
+        // `norm(handle) = 'a'` matches both 'a' and 'A' there).
         assert!(!select_one(
             &db,
             "SELECT id FROM handles WHERE norm(handle) = $1",
         ));
+        assert!(select_one(
+            &db,
+            "SELECT id FROM handles WHERE other.norm(handle) = $1",
+        ));
+    }
+
+    #[test]
+    fn a_rebuilt_unique_expression_index_keys_its_call() {
+        // ALTER COLUMN TYPE rebuilds the index as pg_get_indexdef prints
+        // it, `lower((v)::text)`: the cast to the parameter's type is the
+        // coercion the query's `lower(v)` makes too.
+        let mut db = PgCatalog::new().unwrap();
+        db.apply_sql(
+            "CREATE TABLE vv (id bigint PRIMARY KEY, v varchar NOT NULL);
+             CREATE UNIQUE INDEX ON vv (lower(v));
+             ALTER TABLE vv ALTER v TYPE varchar(40);",
+        )
+        .unwrap();
+        assert!(select_one(&db, "SELECT id FROM vv WHERE lower(v) = $1"));
+        assert!(!select_one(&db, "SELECT id FROM vv WHERE upper(v) = $1"));
     }
 
     #[test]

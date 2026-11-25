@@ -11,7 +11,7 @@
 # target/lint-oracle-findings), typedpg_lint/tests/migration_oracle.rs
 # (the docs/lint migrations, the analyzer suite's migrations, and generated
 # ALTER TABLE & co.; findings in target/migration-oracle-findings) and
-# typedpg_lint/tests/deployed_oracle.rs (breaks_deployed_queries: generated
+# typedpg_lint/tests/deployed_oracle.rs (deployed_query_breakage: generated
 # migration changes x deployed query shapes; findings in
 # target/deployed-oracle-findings).
 # scripts/run-migration-oracle.sh runs the migration corpus alone.
@@ -23,7 +23,7 @@
 # Usage:
 #   scripts/run-lint-oracle.sh                     # everything
 #   scripts/run-lint-oracle.sh lint_oracle_corpus  # the query corpus run only
-#   scripts/run-lint-oracle.sh deployed_oracle_corpus  # breaks_deployed_queries
+#   scripts/run-lint-oracle.sh deployed_oracle_corpus  # deployed_query_breakage
 #   LINT_ORACLE_ITERS=20000 LINT_ORACLE_SEED=7 scripts/run-lint-oracle.sh lint_oracle_corpus
 #   LINT_ORACLE_ONLY=catalogs LINT_ORACLE_GEN_CASES=2000 LINT_ORACLE_SEED=7 \
 #       scripts/run-lint-oracle.sh lint_oracle_corpus   # random catalogs alone

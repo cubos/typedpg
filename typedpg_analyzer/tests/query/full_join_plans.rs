@@ -120,6 +120,15 @@ fn a_reduced_or_empty_full_join_is_never_built() {
         // inner) join, which a nested loop implements.
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x = 1",
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x = 1 AND b.y = 2",
+        // `x op ALL` over a non-empty array (`is_strict_saop`), below a NOT
+        // too, of the column or a strict cast of it, the array's elements
+        // constants cast or not.
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x >= ALL(ARRAY[1])",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.x::numeric <> ALL(ARRAY[0.5]::numeric[])",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y \
+         WHERE NOT ((a.x)::numeric <> ALL(ARRAY[0.5]::numeric[]))",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.s >= ALL(ARRAY['m'::text])",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.s = ALL(ARRAY[b.s, a.s, NULL])",
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y JOIN a a2 ON a2.id = a.id",
         // A qual of the query a FROM subquery is pulled up into, the ON of
         // the join a MERGE's source is on the nullable side of.
@@ -128,6 +137,11 @@ fn a_reduced_or_empty_full_join_is_never_built() {
          ON a.id = s.id WHEN NOT MATCHED BY SOURCE THEN DELETE",
         // PostgreSQL 19 folds `a.id IS NULL` over the primary key to FALSE.
         "SELECT 1 FROM a FULL JOIN b ON CASE WHEN a.id IS NULL THEN false ELSE a.x = b.y END",
+        // ... and `a.id IS NOT NULL` to TRUE: no clause is left.
+        "SELECT 1 FROM a FULL JOIN b ON a.id IS NOT NULL",
+        "SELECT 1 FROM a FULL JOIN b ON (a.id > 0) IS UNKNOWN",
+        "MERGE INTO a USING b ON a.id IS NOT NULL \
+         WHEN NOT MATCHED BY SOURCE THEN DELETE WHEN NOT MATCHED THEN INSERT (id) VALUES (1)",
         // A constant FALSE qual over the join (`restriction_is_constant_false`),
         // both sides proven empty (`is_dummy_rel`).
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE false",
@@ -140,6 +154,84 @@ fn a_reduced_or_empty_full_join_is_never_built() {
         "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE a.id = $1",
     ] {
         db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// `reduce_outer_joins` reads only the strictness of the quals above the
+/// join (`find_nonnullable_rels`): what else proves a side non-NULL — a
+/// whole-row test, a COALESCE or CASE evaluated for a NULL column, a CHECK
+/// constraint, a LATERAL subquery's WHERE — reduces nothing, and the join
+/// stays a FULL one the planner can't build.
+#[test]
+fn only_strict_quals_reduce_a_full_join() {
+    let mut db = setup();
+    db.apply_sql(
+        "CREATE TABLE c (id int PRIMARY KEY, y int, z int CHECK (y IS NOT NULL OR z IS NOT NULL));",
+    )
+    .unwrap();
+    for sql in [
+        // A whole-row IS NOT NULL tests a row (`argisrow`).
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE b IS NOT NULL",
+        // A DistinctExpr, a COALESCE, a CASE: not strict.
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE b.y IS DISTINCT FROM 1",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE coalesce(b.y, a.x) = 1",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y \
+         WHERE CASE WHEN b.y IS NULL THEN false ELSE true END",
+        // A CHECK constraint makes one of the two non-NULL: no qual says so.
+        "SELECT 1 FROM a FULL JOIN c ON a.x < c.y WHERE c.y IS NULL AND c.z IS NULL",
+        // A LATERAL subquery's WHERE stays in its own FROM item.
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y CROSS JOIN LATERAL \
+         (SELECT 1 FROM a a2 WHERE a2.id = b.y) s",
+        // A qual of the level around that isn't strict in the subquery's
+        // column.
+        "SELECT * FROM (SELECT a.id, b.y FROM a FULL JOIN b ON a.x < b.y) s WHERE s.y IS NULL",
+        "SELECT * FROM (SELECT a.id, b.y FROM a FULL JOIN b ON a.x < b.y) s \
+         WHERE coalesce(s.y, 0) = 0",
+    ] {
+        assert_unplannable(&db, sql);
+    }
+    for sql in [
+        // Strict once folded, through a NOT, an IN list, a row equality.
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE coalesce(NULL, b.y) = 1 AND a.x = 1",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE NOT (b.y IS NULL OR a.x IS NULL)",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE (a.x, b.y) = (1, 2)",
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y WHERE b.y IN (1, 2) AND a.x IN (1, 2)",
+        // An EXISTS pulled up into a semi-join above the join.
+        "SELECT 1 FROM a FULL JOIN b ON a.x < b.y \
+         WHERE EXISTS (SELECT 1 FROM a a2 WHERE a2.x = a.x AND a2.id = b.y)",
+        // A HAVING conjunct without aggregates moves into WHERE.
+        "SELECT a.x FROM a FULL JOIN b ON a.x < b.y GROUP BY a.x, b.y HAVING b.y > 0 AND a.x > 0",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+/// The planner builds the join's paths after parse analysis, the rewriter
+/// and constant folding (`preprocess_expression`), and before the
+/// statement runs: an UPDATE's or DELETE's errors from those come first, a
+/// NULL written into a NOT NULL column (its execution's error) after.
+#[test]
+fn the_full_join_error_comes_after_folding_before_execution() {
+    let mut db = setup();
+    db.apply_sql("CREATE TABLE t (id int PRIMARY KEY, a int NOT NULL);")
+        .unwrap();
+    for (sql, msg) in [
+        (
+            "UPDATE t SET a = 1 / 0 FROM a FULL JOIN b ON a.x < b.y",
+            "division by zero",
+        ),
+        (
+            "UPDATE t SET nosuch = 1 FROM a FULL JOIN b ON a.x < b.y",
+            "column \"nosuch\" of relation \"t\" does not exist",
+        ),
+        (
+            "DELETE FROM t USING a FULL JOIN b ON a.x < b.y RETURNING 1 / 0",
+            "division by zero",
+        ),
+        ("UPDATE t SET a = NULL FROM a FULL JOIN b ON a.x < b.y", MSG),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
     }
 }
 

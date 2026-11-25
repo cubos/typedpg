@@ -12,14 +12,16 @@ pub(crate) mod cmdtag;
 pub(crate) mod coldeps;
 pub mod collations;
 mod comment;
+pub(crate) mod const_output;
 mod conversion_procs;
 pub(crate) mod conversions;
 pub(crate) mod cooked;
 pub(crate) mod cursors;
+pub(crate) mod datetime_output;
 pub(crate) mod defaults;
 pub(crate) mod depend;
 mod dml;
-mod do_block;
+pub(crate) mod do_block;
 pub mod drop;
 pub(crate) mod event_triggers;
 mod expr_kind;
@@ -35,6 +37,7 @@ pub(crate) mod maintenance;
 pub(crate) mod opclass;
 pub mod operators;
 pub(crate) mod opfamily_members;
+pub(crate) mod permissions;
 pub(crate) mod policies;
 pub(crate) mod prepared;
 pub(crate) mod publications;
@@ -47,11 +50,13 @@ pub mod sequences;
 pub(crate) mod session;
 pub(crate) mod statistics;
 pub(crate) mod stored_exprs;
+pub(crate) mod symbolic;
 pub mod tables;
 pub(crate) mod text_search;
 pub(crate) mod triggers;
 mod txblock;
 pub mod types;
+pub(crate) mod uncertain;
 pub mod util;
 pub mod views;
 pub(crate) mod volatile;
@@ -220,12 +225,29 @@ fn apply_migration_here(
                 span: start + span_offset..end + span_offset,
             };
             observer.before(db, &statement);
+            // Once code the analyzer couldn't follow may have changed
+            // anything (see `uncertain`), a statement's failure is no longer
+            // certain: its effect becomes uncertain too.
+            let uncertain_start = (db.roles.uncertain.may_fail_on(stmt)
+                && !matches!(stmt, ast::Node::TransactionStmt(_)))
+            .then(|| db.snapshot());
             let result = {
                 db.in_transaction_block = tx.in_block();
                 with_statement_sql(db, sql, raw_stmt, |db| match stmt {
                     ast::Node::TransactionStmt(t) => tx.control(db, t),
                     _ => apply_statement(db, stmt),
                 })
+            };
+            let result = match (result, uncertain_start) {
+                (Err(_), Some(start)) => {
+                    // What it would have done, had it run, is uncertain.
+                    db.roll_back_to(&start);
+                    let mut found = uncertain::Uncertain::default();
+                    symbolic::classify_statement(stmt, &mut found);
+                    do_block::record(db, &found);
+                    Ok(())
+                }
+                (result, _) => result,
             };
             if let Err(e) = result {
                 located = Some(locate_in_statement(sql, raw_stmt, &e));
@@ -492,8 +514,56 @@ pub(super) fn note_user_code(db: &mut PgCatalog) {
 /// Apply a single parsed statement, noting what it does to foreign-key
 /// checks (`fk_bypass`).
 fn apply_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlError> {
+    schema_stmt::materialize_user_schema(db, stmt);
+    // Under a role the privilege checks apply to, the search path holds
+    // only the schemas it may use, which the previous statement may have
+    // changed.
+    if permissions::restricted_role(db).is_some() {
+        db.refresh_search_path();
+    }
+    permissions::check_statement(db, stmt)?;
     fk_bypass::note(db, stmt);
-    dispatch_statement(db, stmt)
+    // The migration's session reads datetime literals under its DateOrder
+    // and IntervalStyle.
+    let order = db.datestyle.get().1;
+    let sql_standard = db.intervalstyle.get() == session::IntervalStyle::SqlStandard;
+    let dispatched = crate::datetime_input::with_input_settings(order, sql_standard, || {
+        dispatch_statement(db, stmt)
+    });
+    if let Err(e) = dispatched {
+        stored_exprs::discard_pending_reg_constants();
+        return Err(e);
+    }
+    // A rename or a move writes no stored expression of its own: what it
+    // rewrote (a policy's, a CHECK's names) is still bound.
+    if matches!(
+        stmt,
+        ast::Node::RenameStmt(_) | ast::Node::AlterObjectSchemaStmt(_)
+    ) || matches!(stmt, ast::Node::AlterEnumStmt(e) if !e.old_val.is_empty())
+    {
+        stored_exprs::note_all_bound(db);
+    }
+    // A column or domain that changes type changes what a literal cast to
+    // it coerces to: the expressions whose `regrole` / `regdatabase`
+    // constants were refused or found harmless are checked again.
+    if changes_column_types(stmt) {
+        db.refused_stored_exprs.clear();
+    }
+    // The stored expressions it wrote are bound to the objects their names
+    // find under the search path it ran with.
+    stored_exprs::bind_stored_expressions(db)
+}
+
+/// Whether `stmt` changes the type of a column (or of a domain, whose
+/// `ALTER DOMAIN … SET DATA TYPE` arrives as one).
+fn changes_column_types(stmt: &ast::Node) -> bool {
+    let ast::Node::AlterTableStmt(alter) = stmt else {
+        return false;
+    };
+    alter.cmds.iter().any(|command| {
+        matches!(command.as_ref(), Some(ast::Node::AlterTableCmd(command))
+            if command.subtype == ast::AlterTableType::AtAlterColumnType)
+    })
 }
 
 /// Apply a single parsed statement, by kind.
@@ -526,14 +596,24 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         // ── Functions ───────────────────────────────────────────────
         ast::Node::CreateFunctionStmt(s) => {
             functions::create_function(db, s)?;
+            // A SQL-standard body is stored analyzed.
+            stored_exprs::refuse_unstorable_constant_casts(db, [s.sql_body.as_ref()])?;
             note_user_code(db);
             Ok(())
         }
         ast::Node::AlterFunctionStmt(s) => functions::alter_function(db, s),
 
         // ── Views ───────────────────────────────────────────────────
-        ast::Node::ViewStmt(s) => views::create_view(db, s),
-        ast::Node::CreateTableAsStmt(s) => views::create_table_as(db, s),
+        ast::Node::ViewStmt(s) => views::create_view(db, s)
+            .and_then(|()| stored_exprs::refuse_unstorable_constant_casts(db, [s.query.as_ref()])),
+        ast::Node::CreateTableAsStmt(s) => {
+            views::create_table_as(db, s)?;
+            // A materialized view keeps its query.
+            if s.objtype == ast::ObjectType::ObjectMatview {
+                stored_exprs::refuse_unstorable_constant_casts(db, [s.query.as_ref()])?;
+            }
+            Ok(())
+        }
 
         // ── Extensions ──────────────────────────────────────────────
         ast::Node::CreateExtensionStmt(s) => extensions::create_extension(db, s),
@@ -608,7 +688,14 @@ fn dispatch_statement(db: &mut PgCatalog, stmt: &ast::Node) -> Result<(), DdlErr
         ast::Node::AlterPolicyStmt(s) => {
             policies::alter_policy(db, s).and_then(|()| coldeps::record_policy_alter(db, s))
         }
-        ast::Node::RuleStmt(s) => rules::create_rule(db, s).and_then(|refs| coldeps::record_rule(db, s, &refs)),
+        ast::Node::RuleStmt(s) => rules::create_rule(db, s)
+            .and_then(|(qual, actions)| coldeps::record_rule(db, s, &qual, &actions))
+            .and_then(|()| {
+                stored_exprs::refuse_unstorable_constant_casts(
+                    db,
+                    std::iter::once(s.where_clause.as_ref()).chain(s.actions.iter().map(Option::as_ref)),
+                )
+            }),
         ast::Node::CreateAmStmt(s) => opclass::create_am(db, s),
         ast::Node::CreateConversionStmt(s) => conversions::create_conversion(db, s),
         ast::Node::CreatePLangStmt(s) => languages::create_language(db, s),

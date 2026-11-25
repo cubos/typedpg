@@ -747,6 +747,69 @@ pub(crate) struct RelationChecks {
     /// The subject a `jsonb_typeof(x)` subject is of, by name: non-NULL
     /// as `x` is.
     typeof_of: HashMap<String, String>,
+    /// What [`Self::derive`] returned before (see [`DeriveMemo`]).
+    derived: DeriveMemo,
+}
+
+/// What [`RelationChecks::derive`] returned for a FROM entry, with every
+/// answer of the [`Knowledge`] it read on the way. `derive` is a function
+/// of the constraints, the alias and those answers alone, so a call whose
+/// knowledge gives the same answers to the same questions returns the
+/// same facts. A query recomputes what its constraints prove each time it
+/// learns something (a WHERE, each WHEN, each join), mostly about other
+/// columns: the solver need not run again then. Shared by the clones of
+/// one relation's checks (the catalog keeps them, so every query of the
+/// catalog reads them).
+#[derive(Clone, Default)]
+struct DeriveMemo(DeriveMemoMap);
+
+/// The results [`DeriveMemo`] keeps: per alias, with the questions each
+/// answered.
+type DeriveMemoMap =
+    std::sync::Arc<std::sync::Mutex<HashMap<String, Vec<(KnowledgeTrace, super::Facts)>>>>;
+
+impl std::fmt::Debug for DeriveMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeriveMemo")
+    }
+}
+
+/// The most results [`DeriveMemo`] keeps per alias: past it, the oldest
+/// is forgotten (a lookup compares the knowledge of each one kept).
+const MAX_DERIVED: usize = 64;
+
+/// Every question a [`Knowledge`] was asked, by column, with its answer.
+#[derive(Default)]
+struct KnowledgeTrace {
+    non_null: Vec<(String, bool)>,
+    null: Vec<(String, bool)>,
+    equals: Vec<(String, Option<Literal>)>,
+    preds: Vec<(String, Vec<ValPred>)>,
+}
+
+impl KnowledgeTrace {
+    /// Whether `k` answers every question as recorded.
+    fn holds(&self, k: &Knowledge<'_>) -> bool {
+        self.non_null.iter().all(|(c, v)| (k.non_null)(c) == *v)
+            && self.null.iter().all(|(c, v)| (k.null)(c) == *v)
+            && self.equals.iter().all(|(c, v)| (k.equals)(c) == *v)
+            && self.preds.iter().all(|(c, v)| (k.preds)(c) == *v)
+    }
+}
+
+/// `f`, answering each question once and recording it in `trace`.
+fn recorded<T: Clone>(
+    f: &dyn Fn(&str) -> T,
+    trace: &std::cell::RefCell<Vec<(String, T)>>,
+) -> impl Fn(&str) -> T {
+    move |c: &str| {
+        if let Some((_, v)) = trace.borrow().iter().find(|(d, _)| d == c) {
+            return v.clone();
+        }
+        let v = f(c);
+        trace.borrow_mut().push((c.to_owned(), v.clone()));
+        v
+    }
 }
 
 /// What a query knows of one row of the relation (keyed by column name).
@@ -1129,6 +1192,7 @@ impl RelationChecks {
             spaces,
             subjects,
             typeof_of,
+            derived: DeriveMemo::default(),
         }
     }
 
@@ -1278,6 +1342,7 @@ impl RelationChecks {
         // rejected before any constraint is evaluated.
         let nothing = RelationChecks {
             clauses: Vec::new(),
+            derived: DeriveMemo::default(),
             ..checks.clone()
         };
         !nothing.contradicts(k) && checks.contradicts(k)
@@ -1331,6 +1396,7 @@ impl RelationChecks {
                 .into_values()
                 .map(|s| (s.name(), s))
                 .collect(),
+            derived: DeriveMemo::default(),
         }
     }
 
@@ -1643,6 +1709,53 @@ impl RelationChecks {
     /// columns non-NULL or NULL, and sets of columns one of which is
     /// non-NULL — over the columns of FROM entry `alias`.
     pub(crate) fn derive(&self, alias: &str, k: &Knowledge<'_>) -> Facts {
+        if let Ok(memo) = self.derived.0.lock()
+            && let Some((_, facts)) = memo
+                .get(alias)
+                .and_then(|kept| kept.iter().rev().find(|(trace, _)| trace.holds(k)))
+        {
+            return facts.clone();
+        }
+        let trace = (
+            std::cell::RefCell::new(Vec::new()),
+            std::cell::RefCell::new(Vec::new()),
+            std::cell::RefCell::new(Vec::new()),
+            std::cell::RefCell::new(Vec::new()),
+        );
+        let facts = {
+            let (non_null, null, equals, preds) = (
+                recorded(k.non_null, &trace.0),
+                recorded(k.null, &trace.1),
+                recorded(k.equals, &trace.2),
+                recorded(k.preds, &trace.3),
+            );
+            self.derive_uncached(
+                alias,
+                &Knowledge {
+                    non_null: &non_null,
+                    null: &null,
+                    equals: &equals,
+                    preds: &preds,
+                },
+            )
+        };
+        let trace = KnowledgeTrace {
+            non_null: trace.0.into_inner(),
+            null: trace.1.into_inner(),
+            equals: trace.2.into_inner(),
+            preds: trace.3.into_inner(),
+        };
+        if let Ok(mut memo) = self.derived.0.lock() {
+            let kept = memo.entry(alias.to_owned()).or_default();
+            if kept.len() == MAX_DERIVED {
+                kept.remove(0);
+            }
+            kept.push((trace, facts.clone()));
+        }
+        facts
+    }
+
+    fn derive_uncached(&self, alias: &str, k: &Knowledge<'_>) -> Facts {
         let col = |c: &str| -> Col { (alias.to_owned(), c.to_owned()) };
         let s = self.solve(k, None);
         let mut out = Facts::default();

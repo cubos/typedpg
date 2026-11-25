@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use typedpg_pg_query::NodeRef;
 use typedpg_pg_query::ast::{Node as N, TypeCast};
 
-use super::{leftmost_start, location};
+use super::{leftmost_start, location, node_span};
 use crate::{Ctx, RawFinding, SqlEdit};
 
 /// The words that continue a multi-word type name: `double precision`,
@@ -26,17 +26,14 @@ use crate::{Ctx, RawFinding, SqlEdit};
 const CONTINUATIONS: &[&str] = &["precision", "varying", "with", "without", "time", "zone"];
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
-    // The casts that are an output column's whole expression with no
-    // alias: they name the column.
-    let mut naming = HashSet::new();
-    for (node, _) in ctx.tree.nodes() {
-        if let NodeRef::ResTarget(target) = node
-            && target.name.is_empty()
-            && let Some(N::TypeCast(cast)) = target.val.as_ref()
-        {
-            naming.insert(cast.location);
-        }
-    }
+    // The casts that name an output column (see `naming_expressions`).
+    let naming: HashSet<i32> = super::naming_expressions(ctx)
+        .into_iter()
+        .filter_map(|node| match node {
+            N::TypeCast(cast) => Some(cast.location),
+            _ => None,
+        })
+        .collect();
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         if let NodeRef::TypeCast(cast) = node
@@ -57,10 +54,15 @@ fn redundant(ctx: &Ctx<'_>, cast: &TypeCast, names_column: bool, out: &mut Vec<R
     };
     let postfix = ctx.sql.get(at..).is_some_and(|rest| rest.starts_with("::"));
     let type_end = type_name_end(ctx, type_start);
+    // From the operand's first token, a parenthesis opening it included
+    // (`(a)::int`).
     let start = cast
         .arg
         .as_ref()
         .and_then(leftmost_start)
+        .into_iter()
+        .chain(node_span(ctx, NodeRef::TypeCast(cast)).map(|span| span.start))
+        .min()
         .filter(|start| *start <= at)
         .unwrap_or(at);
     let written = &ctx.sql[type_start..type_end.max(type_start)];
@@ -222,11 +224,23 @@ mod tests {
     }
 
     #[test]
+    fn the_span_starts_at_a_parenthesis_opening_the_operand() {
+        let db = catalog();
+        let sql = "SELECT (id)::bigint AS i FROM users";
+        let findings = lint_rule(&db, sql, RULE);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(&sql[findings[0].span.clone()], "(id)::bigint");
+        assert_eq!(fixed(sql, &findings), "SELECT (id) AS i FROM users");
+    }
+
+    #[test]
     fn what_has_no_fix() {
         let db = catalog();
         for sql in [
             // The cast names the column `int4`.
             "SELECT 1::int",
+            // The CASE is named after its ELSE's cast, `int4`.
+            "SELECT CASE WHEN id > 1 THEN 2 ELSE 1::int END FROM users",
             "SELECT CAST(id AS bigint) FROM users",
         ] {
             let findings = lint_rule(&db, sql, RULE);
@@ -255,6 +269,12 @@ mod tests {
             // without it.
             "SELECT ARRAY[ROW(id, name, email, code)::users] FROM users",
             "SELECT ARRAY[id::int]::bigint[] FROM users",
+            // A whole-row reference to a subquery is a `record`: the cast
+            // rebuilds it as the composite.
+            "SELECT s::users AS u FROM (SELECT id, name, email, code FROM users) s",
+            "SELECT (s.*)::users AS u FROM (SELECT id, name, email, code FROM users) s",
+            // A cast to `record` forgets the row's fields.
+            "SELECT s::record AS r FROM (SELECT 1 AS a, 'x' AS b) s",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert!(findings.is_empty(), "{sql}: {findings:?}");

@@ -431,13 +431,29 @@ await sql("UPDATE users SET name = $name? WHERE id = $id").execute(pool, { name,
 
 ### Enums and domains
 
-An enum reads as the union of its labels, NULL included when the column is.
-`CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral')` gives:
+An enum is a type the generated module exports, the union of its labels as
+declared, NULL added when the column is nullable. `CREATE TYPE mood AS ENUM
+('happy', 'sad', 'neutral')` gives `export type Mood = "happy" | "sad" |
+"neutral";` in the module, for your own code to use too:
 
 ```ts
+import { sql, type Mood } from "./db.ts";
+
 const rows = await sql("SELECT mood FROM users").fetchAll(pool);
-// rows: { mood: "happy" | "sad" | "neutral" | null }[]
+// rows: { mood: Mood | null }[]
+
+const cheerful = (mood: Mood) => sql("SELECT name FROM users WHERE mood = $mood").fetchAll(pool, { mood });
 ```
+
+The name is the type's in PascalCase, the schema's before it outside
+`public` (`billing.status` is `BillingStatus`). A name the module already
+has (`Queries`, a type `types` maps to, a `.sql` file's query types) adds the
+schema's (`PublicQueries`), then a number (`BillingStatus_2`). The database's
+module exports every enum of the schema, and an extension's only when a
+query uses it; a `.sql` file's module exports the enums its queries' types
+use. An enum `types` maps is not exported: the mapping wins. A value
+narrowed to some labels (`WHERE mood <> 'neutral'`) stays their union,
+`"happy" | "sad"`.
 
 A domain reads as its base type, unless `types` maps it; a CHECK on the
 domain can still narrow it (the `band` domain above).
@@ -522,7 +538,8 @@ const rows = await sql("SELECT name FROM users WHERE id IN $..ids").fetchAll(poo
 // $ids: readonly number[]
 ```
 
-An empty spread or list still runs as SQL would; above 1000 items a list is
+An empty spread or list still runs as SQL would; above 1000 items (or fewer,
+when their placeholders would pass 65535 parameters) a list is
 bound as one array and a rows spread as one array per field. The
 [Queries](#queries) section has both.
 
@@ -563,69 +580,73 @@ the rules — and the database's migrations. Each rule has a page in
 [`docs/lint`](https://github.com/cubos/typedpg/blob/main/docs/lint/README.md)
 with its motivation, what it proves, examples and configuration:
 
-| Rule | Default | What it reports |
-|---|---|---|
-| [`null_comparison`](https://github.com/cubos/typedpg/blob/main/docs/lint/null_comparison.md) | error | A comparison with a `NULL` literal, which is never true. |
-| [`unbounded_write`](https://github.com/cubos/typedpg/blob/main/docs/lint/unbounded_write.md) | error | An `UPDATE` or `DELETE` with no `WHERE`. |
-| [`not_in_nullable`](https://github.com/cubos/typedpg/blob/main/docs/lint/not_in_nullable.md) | warning | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
-| [`create_index_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/create_index_blocking.md) | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
-| [`constraint_validating`](https://github.com/cubos/typedpg/blob/main/docs/lint/constraint_validating.md) | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
-| [`set_not_null_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/set_not_null_scan.md) | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
-| [`table_rewrite`](https://github.com/cubos/typedpg/blob/main/docs/lint/table_rewrite.md) | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
-| [`fk_without_index`](https://github.com/cubos/typedpg/blob/main/docs/lint/fk_without_index.md) | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
-| [`redundant_index`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_index.md) | info | An index another index on the table already covers. |
-| [`redundant_null_check`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_null_check.md) | warning | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
-| [`limit_without_order`](https://github.com/cubos/typedpg/blob/main/docs/lint/limit_without_order.md) | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
-| [`redundant_limit`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_limit.md) | info | A `LIMIT` on a query that returns at most one row. |
-| [`redundant_distinct`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_distinct.md) | info | A `DISTINCT` on rows that are already distinct. |
-| [`constant_condition`](https://github.com/cubos/typedpg/blob/main/docs/lint/constant_condition.md) | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
-| [`unreachable_case_branch`](https://github.com/cubos/typedpg/blob/main/docs/lint/unreachable_case_branch.md) | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
-| [`case_without_else`](https://github.com/cubos/typedpg/blob/main/docs/lint/case_without_else.md) | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
-| [`redundant_cast`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_cast.md) | info | A cast to the type (and type modifier) its operand already has. |
-| [`redundant_alias`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_alias.md) | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
-| [`outer_reference_in_subquery`](https://github.com/cubos/typedpg/blob/main/docs/lint/outer_reference_in_subquery.md) | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
-| [`cartesian_join`](https://github.com/cubos/typedpg/blob/main/docs/lint/cartesian_join.md) | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
-| [`insert_without_columns`](https://github.com/cubos/typedpg/blob/main/docs/lint/insert_without_columns.md) | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
-| [`self_assignment`](https://github.com/cubos/typedpg/blob/main/docs/lint/self_assignment.md) | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
-| [`unused_cte`](https://github.com/cubos/typedpg/blob/main/docs/lint/unused_cte.md) | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
-| [`simplifiable_case`](https://github.com/cubos/typedpg/blob/main/docs/lint/simplifiable_case.md) | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
-| [`like_unescaped_param`](https://github.com/cubos/typedpg/blob/main/docs/lint/like_unescaped_param.md) | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
-| [`redundant_join`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_join.md) | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
-| [`scalar_subquery_may_return_many`](https://github.com/cubos/typedpg/blob/main/docs/lint/scalar_subquery_may_return_many.md) | warning | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
-| [`timestamp_timezone_mix`](https://github.com/cubos/typedpg/blob/main/docs/lint/timestamp_timezone_mix.md) | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
-| [`integer_division`](https://github.com/cubos/typedpg/blob/main/docs/lint/integer_division.md) | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
-| [`left_join_nullified`](https://github.com/cubos/typedpg/blob/main/docs/lint/left_join_nullified.md) | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
-| [`check_violation`](https://github.com/cubos/typedpg/blob/main/docs/lint/check_violation.md) | warning | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
-| [`unstable_order`](https://github.com/cubos/typedpg/blob/main/docs/lint/unstable_order.md) | warning | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
-| [`redundant_order_by`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_order_by.md) | info | `ORDER BY` keys that can't change the order: a key after keys that already determine a unique row (the proof `unstable_order` uses), a column `WHERE` pins to a constant or parameter (`WHERE status = 'a' ORDER BY status, id`), a column an earlier key already sorts by, and the whole `ORDER BY` of a query returning at most one row or of an `EXISTS` / `IN` / `ANY` / `ALL` subquery (without `LIMIT`, `OFFSET`, `DISTINCT ON` or a locking clause), whose order nothing observes. `FROM` subqueries, CTEs and `ARRAY(…)` are not judged, nor a `DISTINCT ON`'s leading keys, nor a last key under `LIMIT` / `OFFSET` (that is `unstable_order`'s). The fix removes plain-column, output-name and ordinal keys (the whole clause when all go). |
-| [`redundant_group_by`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_group_by.md) | info | `GROUP BY` keys that can't split a group: a column of a table whose other grouped columns cover a unique NOT NULL key of it, or one `WHERE` pins to a constant or parameter. A key the select list, `HAVING`, `ORDER BY` or a window reads is only reported when the table's primary key stays grouped (PostgreSQL accepts nothing else for an ungrouped column), one key always stays, and `GROUPING SETS` / `ROLLUP` / `CUBE` are never touched. The fix removes the keys. |
-| [`count_not_null`](https://github.com/cubos/typedpg/blob/main/docs/lint/count_not_null.md) | info | `count(expr)` over a value never NULL — a NOT NULL column no outer join null-extends, a literal (`count(1)`), a column the call's `FILTER` proves non-NULL — which counts every row like `count(*)`. `DISTINCT`, row values and parameters are not reported, nor an aggregate of outer columns (evaluated in the outer query). The fix writes `count(*)` when the argument is a plain column or constant. |
-| [`non_sargable_predicate`](https://github.com/cubos/typedpg/blob/main/docs/lint/non_sargable_predicate.md) | info | A `WHERE` / `JOIN … ON` comparison (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `= ANY`) that wraps an indexed column so no index can serve it: a converting cast (`created_at::date = $1`, `id::text = $1`), a function (`lower(email) = $1`, `date_trunc('day', ts) = $1`), arithmetic (`id + 1 = $1`) or an implicit conversion the other side's type forces (an `int4` column compared with a `numeric` value). Reported only when the column leads a non-partial btree index and its table has no expression index; the help names the range rewrite for `::date` and `date_trunc`. |
-| [`float_equality`](https://github.com/cubos/typedpg/blob/main/docs/lint/float_equality.md) | warning | An `=`, `<>`, `IN` or `NOT IN` comparison made between `real` / `double precision` values (after implicit conversions), which rarely holds for computed values (`0.1 + 0.2 = 0.3` is false). A comparison with a value exact in binary floating point — an integer or decimal literal the type holds exactly (`0`, `0.5`, `1e3`; up to 2^24 for `real`), `'NaN'`, `'Infinity'` — is not reported; columns, parameters and joins (`a.f = b.f`) are. |
-| [`fk_type_mismatch`](https://github.com/cubos/typedpg/blob/main/docs/lint/fk_type_mismatch.md) | warning | A foreign key whose column types differ from the referenced columns. |
-| [`missing_lock_timeout`](https://github.com/cubos/typedpg/blob/main/docs/lint/missing_lock_timeout.md) | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
-| [`drop_index_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/drop_index_blocking.md) | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
-| [`blocking_rebuild`](https://github.com/cubos/typedpg/blob/main/docs/lint/blocking_rebuild.md) | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
-| [`detach_partition_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/detach_partition_blocking.md) | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
-| [`validate_in_same_transaction`](https://github.com/cubos/typedpg/blob/main/docs/lint/validate_in_same_transaction.md) | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
-| [`attach_partition_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table whose validated `CHECK` and `NOT NULL` constraints don't imply the partition bound (proven as PostgreSQL proves it; a `CHECK` alone doesn't make the key `NOT NULL`), so PostgreSQL scans it under lock to check the bound; also the scan of an existing default partition. |
-| [`missing_primary_key`](https://github.com/cubos/typedpg/blob/main/docs/lint/missing_primary_key.md) | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
-| [`rls_policy_not_enforced`](https://github.com/cubos/typedpg/blob/main/docs/lint/rls_policy_not_enforced.md) | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
-| [`rls_no_policy`](https://github.com/cubos/typedpg/blob/main/docs/lint/rls_no_policy.md) | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
-| [`security_definer_search_path`](https://github.com/cubos/typedpg/blob/main/docs/lint/security_definer_search_path.md) | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
-| [`prefer_timestamptz`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_timestamptz.md) | off | A `timestamp without time zone` column. |
-| [`prefer_identity`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_identity.md) | off | A `serial` column instead of an identity column. |
-| [`prefer_text`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_text.md) | off | A `varchar(n)` or `char(n)` column instead of `text`. |
-| [`prefer_bigint_pk`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_bigint_pk.md) | off | An `int2` or `int4` primary key. |
-| [`prefer_jsonb`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_jsonb.md) | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
-| [`fetch_may_return_many`](https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_may_return_many.md) | warning | `fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` on a query not proven to return at most one row. |
-| [`fetch_all_single_row`](https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_all_single_row.md) | info | `fetchAll` on a query that returns at most one row. |
-| [`unused_returning`](https://github.com/cubos/typedpg/blob/main/docs/lint/unused_returning.md) | info | `execute` on a statement whose `RETURNING` rows are discarded. |
-| [`breaks_deployed_queries`](https://github.com/cubos/typedpg/blob/main/docs/lint/breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
+| Rule | Category | Default | What it reports |
+|---|---|---|---|
+| [`null_comparison`](https://github.com/cubos/typedpg/blob/main/docs/lint/null_comparison.md) | correctness | error | A comparison with a `NULL` literal, which is never true. |
+| [`unbounded_write`](https://github.com/cubos/typedpg/blob/main/docs/lint/unbounded_write.md) | suspicious | warning | An `UPDATE` or `DELETE` with no `WHERE`. |
+| [`not_in_nullable`](https://github.com/cubos/typedpg/blob/main/docs/lint/not_in_nullable.md) | correctness | error | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
+| [`create_index_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/create_index_blocking.md) | locking | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
+| [`add_constraint_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/add_constraint_scan.md) | locking | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
+| [`set_not_null_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/set_not_null_scan.md) | locking | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
+| [`alter_table_rewrite`](https://github.com/cubos/typedpg/blob/main/docs/lint/alter_table_rewrite.md) | locking | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
+| [`fk_without_index`](https://github.com/cubos/typedpg/blob/main/docs/lint/fk_without_index.md) | performance | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
+| [`redundant_index`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_index.md) | performance | warning | An index another index on the table already covers. |
+| [`redundant_null_check`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_null_check.md) | redundant | info | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
+| [`limit_without_order`](https://github.com/cubos/typedpg/blob/main/docs/lint/limit_without_order.md) | correctness | error | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
+| [`redundant_limit`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_limit.md) | redundant | info | A `LIMIT` on a query that returns at most one row. |
+| [`redundant_distinct`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_distinct.md) | redundant | info | A `DISTINCT` on rows that are already distinct. |
+| [`constant_condition`](https://github.com/cubos/typedpg/blob/main/docs/lint/constant_condition.md) | suspicious | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
+| [`unreachable_case_branch`](https://github.com/cubos/typedpg/blob/main/docs/lint/unreachable_case_branch.md) | redundant | info | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
+| [`case_without_else`](https://github.com/cubos/typedpg/blob/main/docs/lint/case_without_else.md) | style | info | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
+| [`redundant_cast`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_cast.md) | redundant | info | A cast to the type (and type modifier) its operand already has. |
+| [`redundant_alias`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_alias.md) | redundant | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
+| [`outer_reference_in_subquery`](https://github.com/cubos/typedpg/blob/main/docs/lint/outer_reference_in_subquery.md) | suspicious | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
+| [`cartesian_join`](https://github.com/cubos/typedpg/blob/main/docs/lint/cartesian_join.md) | suspicious | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
+| [`insert_without_columns`](https://github.com/cubos/typedpg/blob/main/docs/lint/insert_without_columns.md) | suspicious | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
+| [`self_assignment`](https://github.com/cubos/typedpg/blob/main/docs/lint/self_assignment.md) | suspicious | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
+| [`unused_cte`](https://github.com/cubos/typedpg/blob/main/docs/lint/unused_cte.md) | redundant | info | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
+| [`simplifiable_case`](https://github.com/cubos/typedpg/blob/main/docs/lint/simplifiable_case.md) | redundant | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
+| [`like_unescaped_param`](https://github.com/cubos/typedpg/blob/main/docs/lint/like_unescaped_param.md) | correctness | error | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| [`redundant_join`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_join.md) | redundant | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
+| [`scalar_subquery_multiple_rows`](https://github.com/cubos/typedpg/blob/main/docs/lint/scalar_subquery_multiple_rows.md) | correctness | error | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
+| [`timestamp_timezone_mix`](https://github.com/cubos/typedpg/blob/main/docs/lint/timestamp_timezone_mix.md) | suspicious | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
+| [`integer_division`](https://github.com/cubos/typedpg/blob/main/docs/lint/integer_division.md) | suspicious | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
+| [`left_join_nullified`](https://github.com/cubos/typedpg/blob/main/docs/lint/left_join_nullified.md) | suspicious | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
+| [`check_violation`](https://github.com/cubos/typedpg/blob/main/docs/lint/check_violation.md) | correctness | error | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
+| [`unstable_order`](https://github.com/cubos/typedpg/blob/main/docs/lint/unstable_order.md) | correctness | error | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
+| [`redundant_order_by`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_order_by.md) | redundant | info | `ORDER BY` keys that can't change the order: a key after keys that already determine a unique row (the proof `unstable_order` uses), a column `WHERE` pins to a constant or parameter (`WHERE status = 'a' ORDER BY status, id`), a column an earlier key already sorts by, and the whole `ORDER BY` of a query returning at most one row or of an `EXISTS` / `IN` / `ANY` / `ALL` subquery (without `LIMIT`, `OFFSET`, `DISTINCT ON` or a locking clause), whose order nothing observes. `FROM` subqueries, CTEs and `ARRAY(…)` are not judged, nor a `DISTINCT ON`'s leading keys, nor a last key under `LIMIT` / `OFFSET` (that is `unstable_order`'s). The fix removes plain-column, output-name and ordinal keys (the whole clause when all go). |
+| [`redundant_group_by`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_group_by.md) | redundant | info | `GROUP BY` keys that can't split a group: a column of a table whose other grouped columns cover a unique NOT NULL key of it, or one `WHERE` pins to a constant or parameter. A key the select list, `HAVING`, `ORDER BY` or a window reads is only reported when the table's primary key stays grouped (PostgreSQL accepts nothing else for an ungrouped column), one key always stays, and `GROUPING SETS` / `ROLLUP` / `CUBE` are never touched. The fix removes the keys. |
+| [`redundant_count_argument`](https://github.com/cubos/typedpg/blob/main/docs/lint/redundant_count_argument.md) | redundant | info | `count(expr)` over a value never NULL — a NOT NULL column no outer join null-extends, a literal (`count(1)`), a column the call's `FILTER` proves non-NULL — which counts every row like `count(*)`. `DISTINCT`, row values and parameters are not reported, nor an aggregate of outer columns (evaluated in the outer query). The fix writes `count(*)` when the argument is a plain column or constant. |
+| [`non_sargable_predicate`](https://github.com/cubos/typedpg/blob/main/docs/lint/non_sargable_predicate.md) | performance | warning | A `WHERE` / `JOIN … ON` comparison (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `= ANY`) that wraps an indexed column so no index can serve it: a converting cast (`created_at::date = $1`, `id::text = $1`), a function (`lower(email) = $1`, `date_trunc('day', ts) = $1`), arithmetic (`id + 1 = $1`) or an implicit conversion the other side's type forces (an `int4` column compared with a `numeric` value). Reported only when the column leads a non-partial btree index and its table has no expression index; the help names the range rewrite for `::date` and `date_trunc`. |
+| [`float_equality`](https://github.com/cubos/typedpg/blob/main/docs/lint/float_equality.md) | suspicious | warning | An `=`, `<>`, `IN` or `NOT IN` comparison made between `real` / `double precision` values (after implicit conversions), which rarely holds for computed values (`0.1 + 0.2 = 0.3` is false). A comparison with a value exact in binary floating point — an integer or decimal literal the type holds exactly (`0`, `0.5`, `1e3`; up to 2^24 for `real`), `'NaN'`, `'Infinity'` — is not reported; columns, parameters and joins (`a.f = b.f`) are. |
+| [`fk_type_mismatch`](https://github.com/cubos/typedpg/blob/main/docs/lint/fk_type_mismatch.md) | performance | warning | A foreign key whose column types differ from the referenced columns. |
+| [`lock_without_timeout`](https://github.com/cubos/typedpg/blob/main/docs/lint/lock_without_timeout.md) | locking | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| [`drop_index_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/drop_index_blocking.md) | locking | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
+| [`rebuild_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/rebuild_blocking.md) | locking | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
+| [`detach_partition_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/detach_partition_blocking.md) | locking | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
+| [`validate_constraint_blocking`](https://github.com/cubos/typedpg/blob/main/docs/lint/validate_constraint_blocking.md) | locking | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
+| [`attach_partition_scan`](https://github.com/cubos/typedpg/blob/main/docs/lint/attach_partition_scan.md) | locking | warning | `ATTACH PARTITION` of an existing table whose validated `CHECK` and `NOT NULL` constraints don't imply the partition bound (proven as PostgreSQL proves it; a `CHECK` alone doesn't make the key `NOT NULL`), so PostgreSQL scans it under lock to check the bound; also the scan of an existing default partition. |
+| [`table_without_primary_key`](https://github.com/cubos/typedpg/blob/main/docs/lint/table_without_primary_key.md) | suspicious | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
+| [`policy_without_rls`](https://github.com/cubos/typedpg/blob/main/docs/lint/policy_without_rls.md) | security | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
+| [`rls_without_policy`](https://github.com/cubos/typedpg/blob/main/docs/lint/rls_without_policy.md) | security | error | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
+| [`security_definer_without_search_path`](https://github.com/cubos/typedpg/blob/main/docs/lint/security_definer_without_search_path.md) | security | error | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
+| [`prefer_timestamptz`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_timestamptz.md) | pedantic | off | A `timestamp without time zone` column. |
+| [`prefer_identity`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_identity.md) | pedantic | off | A `serial` column instead of an identity column. |
+| [`prefer_text`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_text.md) | pedantic | off | A `varchar(n)` or `char(n)` column instead of `text`. |
+| [`prefer_bigint_pk`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_bigint_pk.md) | pedantic | off | An `int2` or `int4` primary key. |
+| [`prefer_jsonb`](https://github.com/cubos/typedpg/blob/main/docs/lint/prefer_jsonb.md) | performance | warning | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
+| [`fetch_one_multiple_rows`](https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_one_multiple_rows.md) | correctness | error | `fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` on a query not proven to return at most one row. |
+| [`fetch_all_single_row`](https://github.com/cubos/typedpg/blob/main/docs/lint/fetch_all_single_row.md) | redundant | info | `fetchAll` on a query that returns at most one row. |
+| [`unused_returning`](https://github.com/cubos/typedpg/blob/main/docs/lint/unused_returning.md) | redundant | info | `execute` on a statement whose `RETURNING` rows are discarded. |
+| [`json_stringify_param`](https://github.com/cubos/typedpg/blob/main/docs/lint/json_stringify_param.md) | correctness | error | `JSON.stringify(…)` passed as a `json` / `jsonb` parameter's value (in the parameters object, a `jsonb[]` array, a rows spread's item or a `copyIn` row), which stores a JSON string instead of the value: pass the value itself. |
+| [`deployed_query_breakage`](https://github.com/cubos/typedpg/blob/main/docs/lint/deployed_query_breakage.md) | correctness | error | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
+| [`comma_join`](https://github.com/cubos/typedpg/blob/main/docs/lint/comma_join.md) | style | info | A `FROM` list joining relations with commas instead of `JOIN … ON`; a function's or a `LATERAL` subquery's comma is not reported. |
+| [`ordinal_reference`](https://github.com/cubos/typedpg/blob/main/docs/lint/ordinal_reference.md) | style | info | `ORDER BY`, `GROUP BY` or `DISTINCT ON` by an output column's position; the fix names the column or expression when that is provably the same. |
+| [`boolean_comparison`](https://github.com/cubos/typedpg/blob/main/docs/lint/boolean_comparison.md) | style | info | A comparison of a boolean with the literal `true` or `false`; the fix writes the expression, or `NOT` it, without changing a select list's column name. |
 
 A call-site finding is placed at the method identifier in the calling file,
 which may be a different file from the `.sql` query. The fetch checks
-(`fetch_may_return_many`, `fetch_all_single_row`) see calls directly on
+(`fetch_one_multiple_rows`, `fetch_all_single_row`) see calls directly on
 `sql(…)`, through a local `const`/`let` binding, and through an exported `.sql`
 query or an exported TypeScript `sql(…)` binding imported by name, alias or
 namespace, and judge each call on its own. `unused_returning` needs every use
@@ -637,11 +658,14 @@ that inline SQL.
 
 The `lint` object sets each rule's level — `"error"`, `"warning"`, `"info"`
 or `"off"` — and `failOn`, the severity the run fails on (default `"error"`).
-`ignore` lists glob patterns relative to the config file's directory, with
-forward slashes:
+Every rule belongs to a category, and its default level is the category's; a
+category key sets every rule of the category, and a rule's own key wins over
+its category's. `ignore` lists glob patterns relative to the config file's
+directory, with forward slashes:
 
 ```json
-"lint": { "failOn": "warning", "ignore": ["tests/**"] }
+"lint": { "failOn": "warning", "style": "off", "correctness": "error",
+          "nullComparison": "off", "ignore": ["tests/**"] }
 ```
 
 Findings in a matching query file are not reported. A matching migration file
@@ -663,7 +687,7 @@ reported. The schema rules still report the current schema's problems, placed
 on the statement that created the object, with a help line that puts the fix
 in a new migration; their allow comments are honored and validated. A file
 absent from the ref, or changed by the branch, is linted as usual.
-It also runs `breaks_deployed_queries`: the code at the ref keeps running
+It also runs `deployed_query_breakage`: the code at the ref keeps running
 while the new migrations are applied and during the rollout, so its queries
 (read from the ref, even those the branch changed or removed) are analyzed
 against the new schema, and each one that breaks is reported on the statement
@@ -754,7 +778,8 @@ The SQL can be anything PostgreSQL accepts: CTEs, window functions,
   generic plan — a `Driver` of your own reusing a prepared statement —
   where PostgreSQL prunes partitions only for it and estimates its rows
   from its length instead of assuming 10 elements.
-- **Large spreads**: above 1000 items, a list is bound as one array —
+- **Large spreads**: above 1000 items (or fewer, when their placeholders
+  would pass 65535 parameters), a list is bound as one array —
   `(id = ANY($1::type[]))` — and a `VALUES` of one rows spread as `SELECT *
   FROM unnest($1::type1[], …)`, a parameter per field: faster, and past
   PostgreSQL's 65535-parameter limit. Only where the analyzer proves it the
@@ -934,15 +959,17 @@ as it describes a statement before binding it.
 | `time` | `Temporal.PlainTime` |
 | `timetz` | `string`: Temporal has no time of day with an offset |
 | `interval` | `Temporal.Duration`: years and months from its months, days, then hours down to microseconds from its time, as PostgreSQL prints it. A parameter's weeks are 7 days |
-| `json`, `jsonb` | `JsonValue`; parameters take `unknown` (stringified) |
-| `bytea` | `Uint8Array` |
-| enum | the union of its labels: `"draft" \| "published"` |
+| `json`, `jsonb` | `JsonValue`; parameters take any value but `null` (stringified), and `null` where SQL NULL is allowed |
+| `bytea` | `Buffer`; parameters take any `Uint8Array` |
+| enum | a type the generated module exports, the union of its labels: `export type PostStatus = "draft" \| "published"` (see [Enums and domains](#enums-and-domains)) |
 | domain | its base type, or the type `types` maps it to |
-| composite, `ROW(...)` | an object with a property per field, each with its nullability |
+| composite, `ROW(...)` | an object with a property per field, each with its nullability — also inside an array (`array_agg(ROW(a, b))`, `ARRAY(SELECT ROW(…))`), a subquery or a `CASE` / `COALESCE` whose rows share one shape; a record whose fields nobody knows (a `RETURNS record` function's, rows of different shapes) reads as its text form |
 | array | `T[]`, or `(T \| null)[]` unless the elements are known not null |
+| `int2vector`, `oidvector` | `number[]` |
 | range, multirange | `Range<T>`, `Range<T>[]` (`range(1, 10)`, `emptyRange` build them) |
 | `vector`, `halfvec` (pgvector) | `number[]` |
 | `hstore` | `Record<string, string \| null>` |
+| `geometry`, `geography` (PostGIS) | `string`, its text form: hex EWKB (`0101000020E6…`), which parameters take too, as WKT or EWKT (`SRID=4326;POINT(1 2)`) do |
 | anything else | `string`, its text form |
 
 A value the query proves holds one of a few values reads as their literal
@@ -960,7 +987,11 @@ one whose fields disagree in sign (`1 mon -1 days`, which a Duration can't
 hold) is a `DecodeError` — `justify_interval()` makes an interval's signs
 agree.
 
-In a `json`/`jsonb` parameter, `null` is SQL NULL, not the JSON `null`.
+In a `json`/`jsonb` parameter, `null` is SQL NULL, and the parameter's type
+admits it only where the column or expression takes NULL. The JSON `null` is
+`jsonNull` (`import { jsonNull } from "@cubos/typedpg"`); inside a value
+(`{ a: null }`, `[1, null]`) a plain `null` is already the JSON one. Reading,
+both come back as `null`.
 
 ### Mapping types
 
@@ -995,9 +1026,10 @@ npx typedpg migrate up --db warehouse  # with several databases
 Editing an applied migration's statements is drift: with `failOnDrift` (the
 default) the run aborts before applying anything new and prints a unified diff
 of the applied text against the file; with `failOnDrift: false` it only warns.
-Comments, whitespace and the case of unquoted words do not count. An
-intentional edit that does not need to run again is recorded with
-`acceptMigration` (or `typedpg migrate accept <name>`) without running it.
+Comments, whitespace, line endings (a CRLF checkout) and the case of unquoted
+words do not count. An intentional edit that does not need to run again is
+recorded with `acceptMigration` (or `typedpg migrate accept <name>`) without
+running it.
 
 At startup, from the generated module (`"migrations": { "embed": true }`)
 or from a directory:
@@ -1036,7 +1068,7 @@ Pass a pool or a client, not a transaction: each migration runs in its own.
 | `runtime` | The module the generated code imports the runtime from (default `@cubos/typedpg`). |
 | `databases` | Several databases: `{ "main": { "out": …, "migrations": … }, "warehouse": { … } }`, each with the keys above. A query belongs to the database whose module its `sql` comes from. |
 | `simplify` | The query simplifications, on by default: `false` turns them all off, or an object sets one rule to `false` — `notIn`, `countExists`, `distinct`, `unionAll`, `fkJoin`. Where the analysis proves an equivalent query returns the same rows (from validated `NOT NULL`s and keys only), the one PostgreSQL plans better is sent: `x NOT IN (SELECT y …)` as an anti-join `NOT EXISTS` when neither side can be NULL, `count(…) > 0` as `EXISTS`, a `DISTINCT` that can't remove a row, a `UNION` whose branches can't share a row as `UNION ALL`, or a join a foreign key proves matches exactly one row none of whose columns are read. The generated module's doc comments show the SQL sent. For every database. |
-| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `constraintValidating`, `setNotNullScan`, `tableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`, `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`, `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`, `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMayReturnMany`, `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`, `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `countNotNull`, `nonSargablePredicate`, `floatEquality`, `fkTypeMismatch`, `missingLockTimeout`, `dropIndexBlocking`, `blockingRebuild`, `detachPartitionBlocking`, `validateInSameTransaction`, `attachPartitionScan`, `missingPrimaryKey`, `rlsPolicyNotEnforced`, `rlsNoPolicy`, `securityDefinerSearchPath`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `preferJsonb`, `fetchMayReturnMany`, `fetchAllSingleRow`, `unusedReturning`, `breaksDeployedQueries` — as `"error"`, `"warning"`, `"info"` or `"off"`, and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
+| `lint` | `typedpg lint`'s settings: `failOn` (`"error"`, the default, `"warning"` or `"info"`), each rule's level — `nullComparison`, `unboundedWrite`, `notInNullable`, `createIndexBlocking`, `addConstraintScan`, `setNotNullScan`, `alterTableRewrite`, `fkWithoutIndex`, `redundantIndex`, `redundantNullCheck`, `limitWithoutOrder`, `redundantLimit`, `redundantDistinct`, `constantCondition`, `unreachableCaseBranch`, `caseWithoutElse`, `redundantCast`, `redundantAlias`, `outerReferenceInSubquery`, `cartesianJoin`, `insertWithoutColumns`, `selfAssignment`, `unusedCte`, `simplifiableCase`, `likeUnescapedParam`, `redundantJoin`, `scalarSubqueryMultipleRows`, `timestampTimezoneMix`, `integerDivision`, `leftJoinNullified`, `checkViolation`, `unstableOrder`, `redundantOrderBy`, `redundantGroupBy`, `redundantCountArgument`, `nonSargablePredicate`, `floatEquality`, `fkTypeMismatch`, `lockWithoutTimeout`, `dropIndexBlocking`, `rebuildBlocking`, `detachPartitionBlocking`, `validateConstraintBlocking`, `attachPartitionScan`, `tableWithoutPrimaryKey`, `policyWithoutRls`, `rlsWithoutPolicy`, `securityDefinerWithoutSearchPath`, `preferTimestamptz`, `preferIdentity`, `preferText`, `preferBigintPk`, `preferJsonb`, `fetchOneMultipleRows`, `fetchAllSingleRow`, `unusedReturning`, `deployedQueryBreakage`, `commaJoin`, `ordinalReference`, `booleanComparison`, `jsonStringifyParam` — as `"error"`, `"warning"`, `"info"` or `"off"` — or by its category (`correctness`, `security`, `suspicious`, `locking`, `performance`, `redundant`, `style`, `pedantic`), whose level sets every rule of it, a rule's own key winning — and `ignore`, glob patterns relative to the config's directory whose query findings are dropped and whose matching migration files skip the statement rules but keep their schema findings. For every database. |
 
 Unknown keys are errors.
 

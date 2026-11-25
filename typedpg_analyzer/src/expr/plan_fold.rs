@@ -1870,7 +1870,7 @@ fn equal_literals(a: &Literal, b: &Literal) -> bool {
     }
 }
 
-fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
+pub(crate) fn certain_a_expr(e: &ast::AExpr, snapshot: &PgCatalog) -> Certain {
     let kind = e.kind;
     let operands: Vec<Option<&ast::Node>> = [e.lexpr.as_ref(), e.rexpr.as_ref()]
         .into_iter()
@@ -4067,7 +4067,7 @@ impl Reads<'_> {
 /// down into it): the level is a FROM subquery, a view or a CTE there, and
 /// a qual there (WHERE, a JOIN's ON) may read it — any qual, when its name
 /// there isn't known; when the level around is no SELECT, to be sure.
-pub(crate) fn outer_quals_may_reduce() -> bool {
+pub(crate) fn outer_quals_may_reduce(snapshot: &PgCatalog) -> bool {
     LEVELS.with(|l| {
         let l = l.borrow();
         let Some((current, rest)) = l.split_last() else {
@@ -4105,17 +4105,18 @@ pub(crate) fn outer_quals_may_reduce() -> bool {
         for f in &psel.from_clause {
             join_quals(f.as_ref(), &mut quals, &mut using);
         }
-        let may_read = |q: &ast::Node, alias: &str| {
-            q.nodes().any(|(n, _)| match n {
-                typedpg_pg_query::NodeRef::ColumnRef(c) => {
-                    let fields = extract_names(&c.fields);
-                    fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
-                }
-                _ => false,
-            })
+        // A qual the planner's strictness test may find forcing it (see
+        // `nonnull::plan_strict`), judged by names alone.
+        let vars = crate::nonnull::plan_strict::NamedVars::of_from(&psel.from_clause, snapshot);
+        let strict = crate::nonnull::plan_strict::Strictness {
+            log: None,
+            snapshot,
+        };
+        let may_force = |q: &ast::Node, alias: &str| {
+            crate::nonnull::plan_strict::qual_rels(Some(q), &vars, &strict).contains(alias)
         };
         match current.item.as_deref() {
-            Some(alias) if !alias.is_empty() => using || quals.iter().any(|q| may_read(q, alias)),
+            Some(alias) if !alias.is_empty() => using || quals.iter().any(|q| may_force(q, alias)),
             _ => using || !quals.is_empty(),
         }
     })

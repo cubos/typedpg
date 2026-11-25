@@ -388,6 +388,7 @@ impl NarrowParam {
             Type::Array {
                 element,
                 element_nullable,
+                ..
             } if *element_nullable != Some(true) => Self::of(element, config),
             Type::Domain { .. } => match innermost_type(ty) {
                 Type::Array { element, .. } => Self::of(element, config),
@@ -462,6 +463,7 @@ fn resolve_type_mapping(
     if let Type::Array {
         element,
         element_nullable,
+        ..
     } = ty
     {
         return resolve_array_mapping(element, *element_nullable == Some(true), config, registry);
@@ -480,7 +482,7 @@ fn resolve_type_mapping(
         Type::Enum { .. } => {
             let target: syn::Type = match &ovr {
                 Some(path) => parse_str(path)?,
-                None => parse_str("String")?,
+                None => parse_str("::std::string::String")?,
             };
             Ok(RustMapping {
                 rust_type: target.clone(),
@@ -613,9 +615,12 @@ fn resolve_array_mapping(
     let inner = resolve_type_mapping(element, config, registry)?;
     let rt = &inner.rust_type;
     let vec_type: syn::Type = if nullable_elems {
-        parse_str(&format!("Vec<Option<{}>>", quote! { #rt }))?
+        parse_str(&format!(
+            "::std::vec::Vec<::std::option::Option<{}>>",
+            quote! { #rt }
+        ))?
     } else {
-        parse_str(&format!("Vec<{}>", quote! { #rt }))?
+        parse_str(&format!("::std::vec::Vec<{}>", quote! { #rt }))?
     };
     match inner.strategy {
         DeserStrategy::Plain { .. } => Ok(RustMapping {
@@ -670,9 +675,12 @@ fn has_nullable_elems(ty: &Type) -> bool {
 /// elements.
 fn vec_of(inner: &syn::Type, ty: &Type) -> Result<syn::Type, syn::Error> {
     Ok(if has_nullable_elems(ty) {
-        parse_str(&format!("Vec<Option<{}>>", quote! { #inner }))?
+        parse_str(&format!(
+            "::std::vec::Vec<::std::option::Option<{}>>",
+            quote! { #inner }
+        ))?
     } else {
-        parse_str(&format!("Vec<{}>", quote! { #inner }))?
+        parse_str(&format!("::std::vec::Vec<{}>", quote! { #inner }))?
     })
 }
 
@@ -827,12 +835,95 @@ fn reject_record_param(strategy: &DeserStrategy) -> Result<(), syn::Error> {
 fn emit_records(
     registry: &RecordRegistry,
     config: &ResolvedConfig,
+    catalog: &PgCatalog,
 ) -> Result<TokenStream, syn::Error> {
     let mut out = TokenStream::new();
     for record in &registry.types {
-        out.extend(emit_one_record(record, config, registry)?);
+        out.extend(emit_one_record(record, config, registry, catalog)?);
     }
     Ok(out)
+}
+
+/// The type a record field of type `ty` is decoded as, where the type
+/// `RecordReader` rebuilds from the field's inline OID would not do: a
+/// domain (decoded as its base type: a `jsonb` one strips jsonb's version
+/// byte), an array or a range, whose `FromSql` reads its element type or
+/// subtype from the `Type`. The inline OID only resolves for a built-in
+/// type — a domain, an array of an enum, a composite or a domain, or a user
+/// range carries one of the database's own, which would decode as `record`
+/// (`Vec`'s `FromSql` panics on it). Other values decode alike whatever the
+/// type passed.
+fn record_field_hint(catalog: &PgCatalog, ty: &Type) -> Option<TokenStream> {
+    match ty {
+        Type::Domain { .. } | Type::Array { .. } | Type::Range { .. } => {
+            let ty = value_type_expr(catalog, ty);
+            Some(quote! { &#ty })
+        }
+        _ => None,
+    }
+}
+
+/// A `tokio_postgres` `Type` to decode values of `ty` with, as an array's
+/// element or a range's subtype: a built-in type by its OID, a domain as
+/// its base, an array, range or multirange with its element type or
+/// subtype, and any other type of the database's own (an enum, a
+/// composite, an extension's scalar) by name, which its `FromSql` does not
+/// look at.
+fn value_type_expr(catalog: &PgCatalog, ty: &Type) -> TokenStream {
+    let pg = quote! { ::typedpg::__private::tokio_postgres::types };
+    let new = |kind: TokenStream| {
+        quote! {
+            #pg::Type::new(
+                ::std::string::String::new(),
+                0,
+                #kind,
+                ::std::string::String::new(),
+            )
+        }
+    };
+    match ty {
+        Type::Domain { base, .. } => value_type_expr(catalog, base),
+        // `int4[][]` has `int4` elements.
+        Type::Array { element, .. } => match &**element {
+            Type::Array { .. } => value_type_expr(catalog, element),
+            _ => {
+                let member = value_type_expr(catalog, element);
+                new(quote! { #pg::Kind::Array(#member) })
+            }
+        },
+        Type::Range {
+            subtype,
+            multirange,
+            ..
+        } => {
+            let subtype = value_type_expr(catalog, subtype);
+            if *multirange {
+                new(quote! { #pg::Kind::Multirange(#subtype) })
+            } else {
+                new(quote! { #pg::Kind::Range(#subtype) })
+            }
+        }
+        Type::Composite { .. } | Type::AnonymousRecord { .. } => quote! { #pg::Type::RECORD },
+        Type::Basic { schema, name, .. } | Type::Enum { schema, name, .. } => {
+            let kind = if matches!(ty, Type::Enum { .. }) {
+                quote! { #pg::Kind::Enum(::std::vec::Vec::new()) }
+            } else {
+                quote! { #pg::Kind::Simple }
+            };
+            let by_name = quote! {
+                #pg::Type::new(
+                    ::std::string::String::from(#name),
+                    0,
+                    #kind,
+                    ::std::string::String::from(#schema),
+                )
+            };
+            match wire_oid(catalog, ty) {
+                Some(oid) => quote! { #pg::Type::from_oid(#oid).unwrap_or_else(|| #by_name) },
+                None => by_name,
+            }
+        }
+    }
 }
 
 /// Emit the struct definition and the hand-written `FromSql` impl for a single
@@ -847,6 +938,7 @@ fn emit_one_record(
     record: &RecordType,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
+    catalog: &PgCatalog,
 ) -> Result<TokenStream, syn::Error> {
     let ident = &record.ident;
     let count_lit = proc_macro2::Literal::usize_unsuffixed(record.fields.len());
@@ -857,6 +949,12 @@ fn emit_one_record(
 
     for (i, field) in record.fields.iter().enumerate() {
         let fname = make_field_ident(&field.name);
+        if is_unknown_record(&field.ty) {
+            return Err(unknown_record_error(&format!(
+                "record field `{}`",
+                field.name
+            )));
+        }
         let mapping = resolve_type_mapping(&field.ty, config, registry)?;
         let site = &mapping.rust_type;
         let field_ty: syn::Type = if field.nullable {
@@ -867,13 +965,14 @@ fn emit_one_record(
         let doc = crate::refinement_doc::record_field_doc(field);
         struct_fields.extend(quote! { #doc pub #fname: #field_ty, });
 
+        let field_hint = record_field_hint(catalog, &field.ty);
         let decode = decode_value(
             &mapping,
             &field.ty,
             field.nullable,
             config,
             registry,
-            &|raw, hint| match hint {
+            &|raw, hint| match hint.or_else(|| field_hint.clone()) {
                 Some(ty) => quote! { __reader.read_field_with::<#raw>(#ty)? },
                 None => quote! { __reader.read_field::<#raw>()? },
             },
@@ -936,6 +1035,7 @@ pub fn generate(
             config,
             executor_expr,
             assignments,
+            catalog,
         )
     } else {
         generate_spread(
@@ -945,6 +1045,7 @@ pub fn generate(
             config,
             executor_expr,
             assignments,
+            catalog,
         )
     }
 }
@@ -1128,6 +1229,9 @@ fn wire_type(catalog: &PgCatalog, ty: &Type) -> Option<PgTypeOid> {
             .resolve_type_by_name(Some(schema), name)
             .map(|t| t.oid),
         Type::Domain { base, .. } => wire_type(catalog, base),
+        Type::Array {
+            name: Some(name), ..
+        } => named_array(catalog, name),
         Type::Array { element, .. } => {
             let mut element = &**element;
             while let Type::Domain { base, .. } = element {
@@ -1136,12 +1240,20 @@ fn wire_type(catalog: &PgCatalog, ty: &Type) -> Option<PgTypeOid> {
             match element {
                 // `int4[][]` is `int4[]`: an array's dimensions are not
                 // part of its type.
-                Type::Array { .. } => wire_type(catalog, element),
+                Type::Array { name: None, .. } => wire_type(catalog, element),
                 _ => catalog.get_type(wire_type(catalog, element)?)?.typarray,
             }
         }
         Type::AnonymousRecord { .. } => None,
     }
+}
+
+/// The OID of an array type of its own ([`Type::Array`]'s `name`:
+/// `int2vector`, `oidvector`).
+fn named_array(catalog: &PgCatalog, name: &QualifiedName) -> Option<PgTypeOid> {
+    catalog
+        .resolve_type_by_name(Some(&name.schema), &name.name)
+        .map(|t| t.oid)
 }
 
 /// The OID of each result column as the server describes it, when every
@@ -1172,9 +1284,12 @@ fn described_type(catalog: &PgCatalog, ty: &Type) -> Option<PgTypeOid> {
         | Type::Range { schema, name, .. }
         | Type::Composite { schema, name, .. } => named(schema, name).map(|t| t.oid),
         Type::Domain { base, .. } => described_type(catalog, base),
+        Type::Array {
+            name: Some(name), ..
+        } => named_array(catalog, name),
         Type::Array { element, .. } => match &**element {
-            // `int4[][]` is `int4[]`.
-            Type::Array { .. } => described_type(catalog, element),
+            // `int4[][]` is `int4[]` (but `int2vector[]` is its own type).
+            Type::Array { name: None, .. } => described_type(catalog, element),
             Type::Domain { schema, name, .. } => named(schema, name)?.typarray,
             _ => {
                 catalog
@@ -1286,14 +1401,14 @@ pub fn generate_copy_in(
             // The rows are converted one at a time, as the COPY consumes
             // them: the source is never collected.
             let __rows = ::std::iter::IntoIterator::into_iter(__source).map(
-                |__item| -> ::std::result::Result<typedpg::__private::CopyRow, typedpg::Error> {
-                    let mut __params: typedpg::__private::CopyRow =
+                |__item| -> ::std::result::Result<::typedpg::__private::CopyRow, ::typedpg::Error> {
+                    let mut __params: ::typedpg::__private::CopyRow =
                         ::std::vec::Vec::with_capacity(#width);
                     #pushes
                     ::std::result::Result::Ok(__params)
                 },
             );
-            typedpg::Executor::copy_in(&__executor, #describe_sql, #copy_sql, __rows).await
+            ::typedpg::Executor::copy_in(&__executor, #describe_sql, #copy_sql, __rows).await
         }
     }})
 }
@@ -1306,7 +1421,7 @@ fn query_context(analyzed: &AnalyzedQuery) -> TokenStream {
     let sql = &analyzed.sql;
     quote! {
         #[allow(dead_code)]
-        const __TYPEDPG_QUERY: typedpg::error::QueryContext = typedpg::error::QueryContext::new(
+        const __TYPEDPG_QUERY: ::typedpg::error::QueryContext = ::typedpg::error::QueryContext::new(
             #sql,
             ::core::file!(),
             ::core::line!(),
@@ -1344,9 +1459,10 @@ fn generate_regular(
     config: &ResolvedConfig,
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
+    catalog: &PgCatalog,
 ) -> Result<TokenStream, syn::Error> {
     let registry = RecordRegistry::build(analyzed, config);
-    let record_defs = emit_records(&registry, config)?;
+    let record_defs = emit_records(&registry, config, catalog)?;
     let output_struct = build_output_struct(&analyzed.columns, config, &registry)?;
     let column_impls = build_column_impls(&analyzed.columns, config, &registry)?;
     let (param_field_defs, param_field_inits) =
@@ -1395,16 +1511,16 @@ fn generate_regular(
             // ----- query builder struct -----
             #simplified_doc
             #[allow(non_camel_case_types)]
-            struct __typedpg_query<__E: typedpg::Executor> {
+            struct __typedpg_query<__E: ::typedpg::Executor> {
                 __executor: __E,
                 #param_field_defs
             }
 
             // ----- method implementations -----
-            impl<__E: typedpg::Executor> __typedpg_query<__E> {
+            impl<__E: ::typedpg::Executor> __typedpg_query<__E> {
                 /// Execute the query and return all resulting rows.
-                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query(
+                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
@@ -1419,8 +1535,8 @@ fn generate_regular(
                 }
 
                 /// Execute the query and return exactly one row.
-                async fn fetch_one(self) -> ::std::result::Result<__sql_output, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query(
+                async fn fetch_one(self) -> ::std::result::Result<__sql_output, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query(
                         &self.__executor,
                         #sql_limited,
                         &[#params_slice],
@@ -1429,9 +1545,9 @@ fn generate_regular(
                     ).await?;
                     let mut __iter = __rows.into_iter();
                     let __row = __iter.next()
-                        .ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
+                        .ok_or_else(|| ::typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                        return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
                     ::std::result::Result::Ok(__sql_output {
                         #row_mapping
@@ -1439,8 +1555,8 @@ fn generate_regular(
                 }
 
                 /// Execute the query and return at most one row.
-                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query(
+                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query(
                         &self.__executor,
                         #sql_limited,
                         &[#params_slice],
@@ -1449,29 +1565,29 @@ fn generate_regular(
                     ).await?;
                     let mut __iter = __rows.into_iter();
                     match __iter.next() {
-                        Some(__row) => {
+                        ::std::option::Option::Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                                return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
-                            ::std::result::Result::Ok(Some(__sql_output {
+                            ::std::result::Result::Ok(::std::option::Option::Some(__sql_output {
                                 #row_mapping
                             }))
                         },
-                        None => ::std::result::Result::Ok(None),
+                        ::std::option::Option::None => ::std::result::Result::Ok(::std::option::Option::None),
                     }
                 }
 
                 /// Execute the query and stream its rows as the server sends
                 /// them.
-                async fn fetch_stream(self) -> ::std::result::Result<typedpg::QueryStream<__sql_output>, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query_stream(
+                async fn fetch_stream(self) -> ::std::result::Result<::typedpg::QueryStream<__sql_output>, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query_stream(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
                         __TYPEDPG_PARAM_TYPES,
                         __TYPEDPG_COLUMN_TYPES,
                     ).await?;
-                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, |__row| {
+                    ::std::result::Result::Ok(::typedpg::QueryStream::new(__rows, |__row| {
                         ::std::result::Result::Ok(__sql_output {
                             #row_mapping
                         })
@@ -1479,20 +1595,20 @@ fn generate_regular(
                 }
 
                 /// Execute the query and stream its rows, mapped to `T`.
-                async fn fetch_stream_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query_stream(
+                async fn fetch_stream_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::typedpg::QueryStream<__T>, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query_stream(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
                         __TYPEDPG_PARAM_TYPES,
                         __TYPEDPG_COLUMN_TYPES,
                     ).await?;
-                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
+                    ::std::result::Result::Ok(::typedpg::QueryStream::new(__rows, <__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
                 }
 
                 /// Execute the statement and return the number of affected rows.
-                async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
-                    typedpg::__private::run_execute(
+                async fn execute(self) -> ::std::result::Result<u64, ::typedpg::Error> {
+                    ::typedpg::__private::run_execute(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
@@ -1503,8 +1619,8 @@ fn generate_regular(
                 #fetch_value_method
 
                 /// Execute the query and return all resulting rows mapped to `T`.
-                async fn fetch_all_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query(
+                async fn fetch_all_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query(
                         &self.__executor,
                         #sql_str,
                         &[#params_slice],
@@ -1512,13 +1628,13 @@ fn generate_regular(
                         __TYPEDPG_COLUMN_TYPES,
                     ).await?;
                     __rows.into_iter().map(|__row| {
-                        <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
+                        <__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                     }).collect()
                 }
 
                 /// Execute the query and return exactly one row mapped to `T`.
-                async fn fetch_one_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query(
+                async fn fetch_one_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query(
                         &self.__executor,
                         #sql_limited,
                         &[#params_slice],
@@ -1527,16 +1643,16 @@ fn generate_regular(
                     ).await?;
                     let mut __iter = __rows.into_iter();
                     let __row = __iter.next()
-                        .ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
+                        .ok_or_else(|| ::typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                        return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
-                    <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
+                    <__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                 }
 
                 /// Execute the query and return at most one row mapped to `T`.
-                async fn fetch_optional_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
-                    let __rows = typedpg::__private::run_query(
+                async fn fetch_optional_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, ::typedpg::Error> {
+                    let __rows = ::typedpg::__private::run_query(
                         &self.__executor,
                         #sql_limited,
                         &[#params_slice],
@@ -1545,13 +1661,13 @@ fn generate_regular(
                     ).await?;
                     let mut __iter = __rows.into_iter();
                     match __iter.next() {
-                        Some(__row) => {
+                        ::std::option::Option::Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                                return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
-                            ::std::result::Result::Ok(Some(<__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)?))
+                            ::std::result::Result::Ok(::std::option::Option::Some(<__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)?))
                         },
-                        None => ::std::result::Result::Ok(None),
+                        ::std::option::Option::None => ::std::result::Result::Ok(::std::option::Option::None),
                     }
                 }
             }
@@ -1578,13 +1694,21 @@ fn generate_spread(
     config: &ResolvedConfig,
     executor_expr: &syn::Expr,
     assignments: &[ParamAssignment],
+    catalog: &PgCatalog,
 ) -> Result<TokenStream, syn::Error> {
     let registry = RecordRegistry::build(analyzed, config);
-    let record_defs = emit_records(&registry, config)?;
+    let record_defs = emit_records(&registry, config, catalog)?;
     let output_struct = build_output_struct(&analyzed.columns, config, &registry)?;
     let column_impls = build_column_impls(&analyzed.columns, config, &registry)?;
     let row_mapping = build_row_mapping(&analyzed.columns, config, &registry)?;
     let num_regular_params = analyzed.params.len();
+    // Each spread's share of the parameters a query can bind: past it, a
+    // spread with an array form is bound as arrays (`uses_arrays`).
+    let budget = {
+        let regular = proc_macro2::Literal::usize_unsuffixed(num_regular_params);
+        let spreads = proc_macro2::Literal::usize_unsuffixed(analyzed.spreads.len());
+        quote! { ::typedpg::__private::spread_budget(#regular, #spreads) }
+    };
 
     // ── Regular param fields ────────────────────────────────────────────
     let mut regular_param_fields = TokenStream::new();
@@ -1628,7 +1752,8 @@ fn generate_spread(
     for (si, spread) in analyzed.spreads.iter().enumerate() {
         let col_count = spread.fields.len();
         let field_ident = format_ident!("__spread_{}", si);
-        fields_per_row_lits.push(proc_macro2::Literal::usize_unsuffixed(col_count));
+        let col_count_lit = proc_macro2::Literal::usize_unsuffixed(col_count);
+        fields_per_row_lits.push(col_count_lit.clone());
 
         // The spread's rows and parameters, extracted where `sql!` is
         // invoked — the one place the element type is concrete, so the
@@ -1637,7 +1762,7 @@ fn generate_spread(
         spread_struct_fields.extend(quote! {
             #field_ident: ::std::result::Result<
                 (usize, ::std::vec::Vec<__SpreadParam>),
-                typedpg::Error,
+                ::typedpg::Error,
             >,
         });
 
@@ -1713,7 +1838,7 @@ fn generate_spread(
                 )?);
             }
             quote! {
-                if ::typedpg::__private::uses_arrays(__items.len(), true) {
+                if ::typedpg::__private::uses_arrays(__items.len(), #col_count_lit, #budget, true) {
                     #decls
                     for __item in __items.iter() {
                         #collects
@@ -1763,7 +1888,7 @@ fn generate_spread(
     }
 
     // ── The parameters' types, in the order they are pushed ─────────────
-    let param_types = spread_param_types(wire, &capable);
+    let param_types = spread_param_types(wire, &capable, &budget);
 
     let query_preamble = quote! {
         #spread_empty_checks
@@ -1771,14 +1896,15 @@ fn generate_spread(
             __TYPEDPG_PIECES,
             &[#spread_size_args],
             #num_regular_lit + 1,
+            #budget,
         );
-        let mut __params: Vec<__SpreadParam> = Vec::with_capacity(#capacity_expr);
+        let mut __params: ::std::vec::Vec<__SpreadParam> = ::std::vec::Vec::with_capacity(#capacity_expr);
         #regular_param_pushes
         #spread_param_pushes
-        let __params_ref: Vec<&(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync)>
+        let __params_ref: ::std::vec::Vec<&(dyn ::typedpg::__private::tokio_postgres::types::ToSql + ::std::marker::Sync)>
             = __params
                 .iter()
-                .map(|p| p.as_ref() as &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync))
+                .map(|p| p.as_ref() as &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + ::std::marker::Sync))
                 .collect();
         let __param_types: ::std::option::Option<::std::vec::Vec<::typedpg::__private::ParamType>> = #param_types;
     };
@@ -1806,10 +1932,10 @@ fn generate_spread(
             // A parameter value, owned: `Send` so the query's future is.
             #[allow(non_camel_case_types)]
             type __SpreadParam =
-                ::std::boxed::Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync + Send>;
+                ::std::boxed::Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + ::std::marker::Sync + ::std::marker::Send>;
 
             #[allow(non_camel_case_types)]
-            struct __typedpg_query<__E: typedpg::Executor> {
+            struct __typedpg_query<__E: ::typedpg::Executor> {
                 __executor: __E,
                 #spread_struct_fields
                 #regular_param_fields
@@ -1818,93 +1944,93 @@ fn generate_spread(
             const __TYPEDPG_PIECES: &[::typedpg::__private::SqlPiece] = &[#(#pieces),*];
             #column_types
 
-            impl<__E: typedpg::Executor> __typedpg_query<__E> {
-                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, typedpg::Error> {
+            impl<__E: ::typedpg::Executor> __typedpg_query<__E> {
+                async fn fetch_all(self) -> ::std::result::Result<::std::vec::Vec<__sql_output>, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    let __rows = ::typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
                     __rows.into_iter().map(|__row| {
                         ::std::result::Result::Ok(__sql_output { #row_mapping })
                     }).collect()
                 }
 
-                async fn fetch_one(self) -> ::std::result::Result<__sql_output, typedpg::Error> {
+                async fn fetch_one(self) -> ::std::result::Result<__sql_output, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    let __rows = ::typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
                     let mut __iter = __rows.into_iter();
-                    let __row = __iter.next().ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
+                    let __row = __iter.next().ok_or_else(|| ::typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                        return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
                     ::std::result::Result::Ok(__sql_output { #row_mapping })
                 }
 
-                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, typedpg::Error> {
+                async fn fetch_optional(self) -> ::std::result::Result<::std::option::Option<__sql_output>, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    let __rows = ::typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
                     let mut __iter = __rows.into_iter();
                     match __iter.next() {
-                        Some(__row) => {
+                        ::std::option::Option::Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                                return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
-                            ::std::result::Result::Ok(Some(__sql_output { #row_mapping }))
+                            ::std::result::Result::Ok(::std::option::Option::Some(__sql_output { #row_mapping }))
                         },
-                        None => ::std::result::Result::Ok(None),
+                        ::std::option::Option::None => ::std::result::Result::Ok(::std::option::Option::None),
                     }
                 }
 
-                async fn fetch_stream(self) -> ::std::result::Result<typedpg::QueryStream<__sql_output>, typedpg::Error> {
+                async fn fetch_stream(self) -> ::std::result::Result<::typedpg::QueryStream<__sql_output>, ::typedpg::Error> {
                     #query_preamble
-                    let __decode: fn(&typedpg::__private::tokio_postgres::Row) -> ::std::result::Result<__sql_output, typedpg::Error> =
+                    let __decode: fn(&::typedpg::__private::tokio_postgres::Row) -> ::std::result::Result<__sql_output, ::typedpg::Error> =
                         |__row| ::std::result::Result::Ok(__sql_output { #row_mapping });
-                    let __rows = typedpg::__private::run_query_stream(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
-                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, __decode))
+                    let __rows = ::typedpg::__private::run_query_stream(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    ::std::result::Result::Ok(::typedpg::QueryStream::new(__rows, __decode))
                 }
 
-                async fn fetch_stream_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<typedpg::QueryStream<__T>, typedpg::Error> {
+                async fn fetch_stream_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::typedpg::QueryStream<__T>, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query_stream(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
-                    ::std::result::Result::Ok(typedpg::QueryStream::new(__rows, <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
+                    let __rows = ::typedpg::__private::run_query_stream(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    ::std::result::Result::Ok(::typedpg::QueryStream::new(__rows, <__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row))
                 }
 
-                async fn execute(self) -> ::std::result::Result<u64, typedpg::Error> {
+                async fn execute(self) -> ::std::result::Result<u64, ::typedpg::Error> {
                     #query_preamble
-                    typedpg::__private::run_execute(&self.__executor, &__sql, &__params_ref, __param_types.as_deref()).await
+                    ::typedpg::__private::run_execute(&self.__executor, &__sql, &__params_ref, __param_types.as_deref()).await
                 }
 
                 #fetch_value_method
 
-                async fn fetch_all_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, typedpg::Error> {
+                async fn fetch_all_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::vec::Vec<__T>, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    let __rows = ::typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
                     __rows.into_iter().map(|__row| {
-                        <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
+                        <__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                     }).collect()
                 }
 
-                async fn fetch_one_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, typedpg::Error> {
+                async fn fetch_one_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<__T, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    let __rows = ::typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
                     let mut __iter = __rows.into_iter();
-                    let __row = __iter.next().ok_or_else(|| typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
+                    let __row = __iter.next().ok_or_else(|| ::typedpg::Error::no_rows(__TYPEDPG_QUERY))?;
                     if __iter.next().is_some() {
-                        return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                        return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                     }
-                    <__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
+                    <__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)
                 }
 
-                async fn fetch_optional_as<__T: typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, typedpg::Error> {
+                async fn fetch_optional_as<__T: ::typedpg::from_row::FromQueryRow<__sql_columns>>(self) -> ::std::result::Result<::std::option::Option<__T>, ::typedpg::Error> {
                     #query_preamble
-                    let __rows = typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
+                    let __rows = ::typedpg::__private::run_query(&self.__executor, &__sql, &__params_ref, __param_types.as_deref(), __TYPEDPG_COLUMN_TYPES).await?;
                     let mut __iter = __rows.into_iter();
                     match __iter.next() {
-                        Some(__row) => {
+                        ::std::option::Option::Some(__row) => {
                             if __iter.next().is_some() {
-                                return ::std::result::Result::Err(typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
+                                return ::std::result::Result::Err(::typedpg::Error::too_many_rows(__TYPEDPG_QUERY));
                             }
-                            ::std::result::Result::Ok(Some(<__T as typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)?))
+                            ::std::result::Result::Ok(::std::option::Option::Some(<__T as ::typedpg::from_row::FromQueryRow<__sql_columns>>::from_query_row(&__row)?))
                         },
-                        None => ::std::result::Result::Ok(None),
+                        ::std::option::Option::None => ::std::result::Result::Ok(::std::option::Option::None),
                     }
                 }
             }
@@ -1926,7 +2052,11 @@ fn generate_spread(
 /// (`capable`), an array per field; otherwise a placeholder per field of
 /// each item. `None` (sent untyped) when `wire` is, or when a spread is
 /// bound as arrays (above the threshold) that have no stable array type.
-fn spread_param_types(wire: Option<&WireTypes>, capable: &[bool]) -> TokenStream {
+fn spread_param_types(
+    wire: Option<&WireTypes>,
+    capable: &[bool],
+    budget: &TokenStream,
+) -> TokenStream {
     let none = quote! { ::std::option::Option::None };
     let Some(wire) = wire else {
         return none;
@@ -1942,6 +2072,7 @@ fn spread_param_types(wire: Option<&WireTypes>, capable: &[bool]) -> TokenStream
     for (si, spread) in wire.spreads.iter().enumerate() {
         let len = format_ident!("__len_{}", si);
         let fields = tokens(&spread.fields);
+        let width = proc_macro2::Literal::usize_unsuffixed(spread.fields.len());
         let per_item = quote! {
             for _ in 0..#len {
                 __types.extend_from_slice(&[#(#fields),*]);
@@ -1959,7 +2090,7 @@ fn spread_param_types(wire: Option<&WireTypes>, capable: &[bool]) -> TokenStream
                 }
             };
             quote! {
-                if ::typedpg::__private::uses_arrays(#len, true) {
+                if ::typedpg::__private::uses_arrays(#len, #width, #budget, true) {
                     #as_arrays
                 } else {
                     #per_item
@@ -2001,15 +2132,15 @@ fn build_fetch_value_method(
     let optional_body = if col.nullable {
         quote! {
             match self.fetch_optional().await? {
-                Some(__v) => ::std::result::Result::Ok(__v.#field_name),
-                None => ::std::result::Result::Ok(None),
+                ::std::option::Option::Some(__v) => ::std::result::Result::Ok(__v.#field_name),
+                ::std::option::Option::None => ::std::result::Result::Ok(::std::option::Option::None),
             }
         }
     } else {
         quote! {
             match self.fetch_optional().await? {
-                Some(__v) => ::std::result::Result::Ok(Some(__v.#field_name)),
-                None => ::std::result::Result::Ok(None),
+                ::std::option::Option::Some(__v) => ::std::result::Result::Ok(::std::option::Option::Some(__v.#field_name)),
+                ::std::option::Option::None => ::std::result::Result::Ok(::std::option::Option::None),
             }
         }
     };
@@ -2021,12 +2152,12 @@ fn build_fetch_value_method(
     };
 
     Ok(quote! {
-        async fn fetch_value(self) -> ::std::result::Result<#return_type, typedpg::Error> {
+        async fn fetch_value(self) -> ::std::result::Result<#return_type, ::typedpg::Error> {
             let __v = self.fetch_one().await?;
             ::std::result::Result::Ok(__v.#field_name)
         }
 
-        async fn fetch_value_optional(self) -> ::std::result::Result<#optional_return_type, typedpg::Error> {
+        async fn fetch_value_optional(self) -> ::std::result::Result<#optional_return_type, ::typedpg::Error> {
             #optional_body
         }
     })
@@ -2075,12 +2206,12 @@ fn build_column_impls(
         let ty = column_rust_type(col, config, registry)?;
         let get_expr = column_get_expr(col, config, registry, idx)?;
         impls.extend(quote! {
-            impl typedpg::from_row::Column<#key> for __sql_columns {
+            impl ::typedpg::from_row::Column<#key> for __sql_columns {
                 type Type = #ty;
                 #[allow(clippy::needless_question_mark)]
                 fn decode(
                     __row: &::typedpg::__private::tokio_postgres::Row,
-                ) -> ::std::result::Result<#ty, typedpg::Error> {
+                ) -> ::std::result::Result<#ty, ::typedpg::Error> {
                     ::std::result::Result::Ok(#get_expr)
                 }
             }
@@ -2371,6 +2502,7 @@ fn sql_type_name(ty: &Type) -> String {
             };
             sql.to_string()
         }
+        Type::Array { name: Some(_), .. } => pg_type_label(ty),
         Type::Array { element, .. } => format!("{}[]", sql_type_name(element)),
         other => pg_type_label(other),
     }
@@ -2472,7 +2604,7 @@ fn spread_pieces(
                             let casts: Vec<String> = analyzed.spreads[si].fields.iter().map(cast).collect();
                             null_rows.push(format!(
                                 "({})",
-                                casts.iter().map(|c| format!("NULL{c}")).collect::<Vec<_>>().join(", ")
+                                casts.iter().map(|c| format!("NULL{c}")).collect::<::std::vec::Vec<_>>().join(", ")
                             ));
                             quote! {
                                 ::typedpg::__private::ValuesItem::Rows { spread: #si, casts: &[#(#casts),*] }
@@ -2529,6 +2661,7 @@ fn array_of(field: &AnalyzedSpreadField) -> Type {
     Type::Array {
         element: Box::new(field.pg_type.clone()),
         element_nullable: Some(field.nullable),
+        name: None,
     }
 }
 
@@ -2582,25 +2715,25 @@ fn push_param<P: TypedParam>(
     reject_record_param(&mapping.strategy)?;
     let is_nullable = param.nullable();
     let to_sql_ty = quote! {
-        Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync + Send>
+        ::std::boxed::Box<dyn ::typedpg::__private::tokio_postgres::types::ToSql + ::std::marker::Sync + ::std::marker::Send>
     };
 
     let ts = match mapping.strategy {
         DeserStrategy::JsonbDomain { .. } => {
             if is_nullable {
                 quote! {
-                    __params.push(Box::new(match &#accessor {
-                        Some(__v) => Some(::serde_json::to_value(__v)
-                            .map_err(|e| typedpg::Error::Serialize(
-                                format!("failed to serialize domain type to JSON: {e}")))?),
-                        None => None,
+                    __params.push(::std::boxed::Box::new(match &#accessor {
+                        ::std::option::Option::Some(__v) => ::std::option::Option::Some(::serde_json::to_value(__v)
+                            .map_err(|e| ::typedpg::Error::Serialize(
+                                ::std::format!("failed to serialize domain type to JSON: {e}")))?),
+                        ::std::option::Option::None => ::std::option::Option::None,
                     }) as #to_sql_ty);
                 }
             } else {
                 quote! {
-                    __params.push(Box::new(::serde_json::to_value(&#accessor)
-                        .map_err(|e| typedpg::Error::Serialize(
-                            format!("failed to serialize domain type to JSON: {e}")))?)
+                    __params.push(::std::boxed::Box::new(::serde_json::to_value(&#accessor)
+                        .map_err(|e| ::typedpg::Error::Serialize(
+                            ::std::format!("failed to serialize domain type to JSON: {e}")))?)
                         as #to_sql_ty);
                 }
             }
@@ -2608,34 +2741,34 @@ fn push_param<P: TypedParam>(
         DeserStrategy::EnumAsString { .. } => {
             if is_nullable {
                 quote! {
-                    __params.push(Box::new(#accessor.as_ref().map(|__v| ::typedpg::__private::EnumString(__v.to_string())))
+                    __params.push(::std::boxed::Box::new(#accessor.as_ref().map(|__v| ::typedpg::__private::EnumString(__v.to_string())))
                         as #to_sql_ty);
                 }
             } else {
                 quote! {
-                    __params.push(Box::new(::typedpg::__private::EnumString(#accessor.to_string())) as #to_sql_ty);
+                    __params.push(::std::boxed::Box::new(::typedpg::__private::EnumString(#accessor.to_string())) as #to_sql_ty);
                 }
             }
         }
         DeserStrategy::VecOfJsonbDomain { .. } => {
             if is_nullable {
                 quote! {
-                    __params.push(Box::new(match &#accessor {
-                        Some(__vec) => Some(__vec.iter()
+                    __params.push(::std::boxed::Box::new(match &#accessor {
+                        ::std::option::Option::Some(__vec) => ::std::option::Option::Some(__vec.iter()
                             .map(|__v| ::serde_json::to_value(__v)
-                                .map_err(|e| typedpg::Error::Serialize(
-                                    format!("failed to serialize domain type to JSON: {e}"))))
-                            .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?),
-                        None => None,
+                                .map_err(|e| ::typedpg::Error::Serialize(
+                                    ::std::format!("failed to serialize domain type to JSON: {e}"))))
+                            .collect::<::std::result::Result<::std::vec::Vec<::serde_json::Value>, _>>()?),
+                        ::std::option::Option::None => ::std::option::Option::None,
                     }) as #to_sql_ty);
                 }
             } else {
                 quote! {
-                    __params.push(Box::new(#accessor.iter()
+                    __params.push(::std::boxed::Box::new(#accessor.iter()
                         .map(|__v| ::serde_json::to_value(__v)
-                            .map_err(|e| typedpg::Error::Serialize(
-                                format!("failed to serialize domain type to JSON: {e}"))))
-                        .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?)
+                            .map_err(|e| ::typedpg::Error::Serialize(
+                                ::std::format!("failed to serialize domain type to JSON: {e}"))))
+                        .collect::<::std::result::Result<::std::vec::Vec<::serde_json::Value>, _>>()?)
                         as #to_sql_ty);
                 }
             }
@@ -2643,21 +2776,21 @@ fn push_param<P: TypedParam>(
         DeserStrategy::VecOfEnumAsString { .. } => {
             if is_nullable {
                 quote! {
-                    __params.push(Box::new(#accessor.as_ref().map(|__vec|
-                        __vec.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>()))
+                    __params.push(::std::boxed::Box::new(#accessor.as_ref().map(|__vec|
+                        __vec.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<::std::vec::Vec<_>>()))
                         as #to_sql_ty);
                 }
             } else {
                 quote! {
-                    __params.push(Box::new(
-                        #accessor.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>())
+                    __params.push(::std::boxed::Box::new(
+                        #accessor.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<::std::vec::Vec<_>>())
                         as #to_sql_ty);
                 }
             }
         }
         DeserStrategy::Plain { .. } => {
             quote! {
-                __params.push(Box::new(::typedpg::__private::BaseTyped(#accessor.clone())) as #to_sql_ty);
+                __params.push(::std::boxed::Box::new(::typedpg::__private::BaseTyped(#accessor.clone())) as #to_sql_ty);
             }
         }
         // `reject_record_param` above already bailed out for these.
@@ -2732,7 +2865,7 @@ fn cast_range(analyzed: &AnalyzedQuery, start: usize, end: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: `&[&(dyn ToSql + Sync)]` slice
+// Helper: `&[&(dyn ToSql + ::std::marker::Sync)]` slice
 // ---------------------------------------------------------------------------
 
 fn build_params_slice(
@@ -2742,7 +2875,7 @@ fn build_params_slice(
 ) -> Result<TokenStream, syn::Error> {
     let mut elems = TokenStream::new();
     let to_sql = quote! {
-        &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + Sync)
+        &(dyn ::typedpg::__private::tokio_postgres::types::ToSql + ::std::marker::Sync)
     };
 
     for (idx, pi) in analyzed.params.iter().enumerate() {
@@ -2757,17 +2890,17 @@ fn build_params_slice(
                 if nullable {
                     quote! {
                         &match &self.#field_name {
-                            Some(__v) => Some(::serde_json::to_value(__v)
-                                .map_err(|e| typedpg::Error::Serialize(
-                                    format!("failed to serialize domain type to JSON: {e}")))?),
-                            None => None,
+                            ::std::option::Option::Some(__v) => ::std::option::Option::Some(::serde_json::to_value(__v)
+                                .map_err(|e| ::typedpg::Error::Serialize(
+                                    ::std::format!("failed to serialize domain type to JSON: {e}")))?),
+                            ::std::option::Option::None => ::std::option::Option::None,
                         } as #to_sql,
                     }
                 } else {
                     quote! {
                         &::serde_json::to_value(&self.#field_name)
-                            .map_err(|e| typedpg::Error::Serialize(
-                                format!("failed to serialize domain type to JSON: {e}")))?
+                            .map_err(|e| ::typedpg::Error::Serialize(
+                                ::std::format!("failed to serialize domain type to JSON: {e}")))?
                             as #to_sql,
                     }
                 }
@@ -2790,21 +2923,21 @@ fn build_params_slice(
                 if nullable {
                     quote! {
                         &match &self.#field_name {
-                            Some(__vec) => Some(__vec.iter()
+                            ::std::option::Option::Some(__vec) => ::std::option::Option::Some(__vec.iter()
                                 .map(|__v| ::serde_json::to_value(__v)
-                                    .map_err(|e| typedpg::Error::Serialize(
-                                        format!("failed to serialize domain type to JSON: {e}"))))
-                                .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?),
-                            None => None,
+                                    .map_err(|e| ::typedpg::Error::Serialize(
+                                        ::std::format!("failed to serialize domain type to JSON: {e}"))))
+                                .collect::<::std::result::Result<::std::vec::Vec<::serde_json::Value>, _>>()?),
+                            ::std::option::Option::None => ::std::option::Option::None,
                         } as #to_sql,
                     }
                 } else {
                     quote! {
                         &self.#field_name.iter()
                             .map(|__v| ::serde_json::to_value(__v)
-                                .map_err(|e| typedpg::Error::Serialize(
-                                    format!("failed to serialize domain type to JSON: {e}"))))
-                            .collect::<::std::result::Result<Vec<::serde_json::Value>, _>>()?
+                                .map_err(|e| ::typedpg::Error::Serialize(
+                                    ::std::format!("failed to serialize domain type to JSON: {e}"))))
+                            .collect::<::std::result::Result<::std::vec::Vec<::serde_json::Value>, _>>()?
                             as #to_sql,
                     }
                 }
@@ -2813,13 +2946,13 @@ fn build_params_slice(
                 if nullable {
                     quote! {
                         &self.#field_name.as_ref().map(|__vec|
-                            __vec.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>())
+                            __vec.iter().map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<::std::vec::Vec<_>>())
                             as #to_sql,
                     }
                 } else {
                     quote! {
                         &self.#field_name.iter()
-                            .map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<Vec<_>>()
+                            .map(|__v| ::typedpg::__private::EnumString(__v.to_string())).collect::<::std::vec::Vec<_>>()
                             as #to_sql,
                     }
                 }
@@ -2875,11 +3008,45 @@ fn naming_subject(error: syn::Error, subject: &str) -> syn::Error {
     syn::Error::new(error.span(), message)
 }
 
+/// True for the pseudo-type `record` (behind any arrays or domains): a
+/// record whose fields the analysis doesn't know.
+fn is_unknown_record(ty: &Type) -> bool {
+    match ty {
+        Type::Domain { base, .. } => is_unknown_record(base),
+        Type::Array { element, .. } => is_unknown_record(element),
+        Type::Basic { schema, name, .. } => schema == "pg_catalog" && name == "record",
+        _ => false,
+    }
+}
+
+/// The error for a value (output column or record field) that is a record
+/// whose fields are unknown ([`is_unknown_record`]): there is nothing to
+/// build a struct from, and PostgreSQL doesn't know them either.
+fn unknown_record_error(subject: &str) -> syn::Error {
+    syn::Error::new(
+        proc_macro2::Span::call_site(),
+        format!(
+            "no Rust mapping for a record whose fields are unknown ({subject}) — PostgreSQL \
+             knows a record's fields only where it is built from known ones (`ROW(…)`, a \
+             table's row, a function with OUT parameters): a function declared `RETURNS \
+             record` has none unless called in FROM with a column definition list (`FROM \
+             f() AS t(a int, b text)`), and records of different shapes mixed in one \
+             array, CASE or COALESCE have no single field list"
+        ),
+    )
+}
+
 fn column_rust_type(
     col: &AnalyzedColumn,
     config: &ResolvedConfig,
     registry: &RecordRegistry,
 ) -> Result<syn::Type, syn::Error> {
+    if is_unknown_record(&col.pg_type) {
+        return Err(unknown_record_error(&format!(
+            "output column `{}`",
+            col.name
+        )));
+    }
     let mapping = resolve_type_mapping(&col.pg_type, config, registry)
         .map_err(|e| naming_subject(e, &format!("output column `{}`", col.name)))?;
     let inner = mapping.rust_type;
@@ -2912,9 +3079,9 @@ impl DecodeCtx<'_> {
     fn wrap_err(self, what: &str, target: &syn::Type) -> TokenStream {
         let (DecodeCtx::Column(label) | DecodeCtx::RecordField(label)) = self;
         let prefix = format!("{label}: {what} {}", type_text(target));
-        let msg = quote! { format!("{}: {e}", #prefix) };
+        let msg = quote! { ::std::format!("{}: {e}", #prefix) };
         match self {
-            DecodeCtx::Column(_) => quote! { typedpg::Error::Deserialize(#msg) },
+            DecodeCtx::Column(_) => quote! { ::typedpg::Error::Deserialize(#msg) },
             DecodeCtx::RecordField(_) => quote! {
                 <::std::boxed::Box<
                     dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync,
@@ -3000,8 +3167,19 @@ fn decode_value(
             nullable_elems,
         } => {
             let err = ctx.wrap_err("failed to deserialize", inner);
+            // `json` elements have no version byte to strip, as above.
+            let is_json = matches!(
+                innermost_type(ty),
+                Type::Array { element, .. }
+                    if matches!(innermost_type(element), Type::Basic { name, .. } if name == "json")
+            );
+            let variant = if is_json {
+                quote! { JSON_ARRAY }
+            } else {
+                quote! { JSONB_ARRAY }
+            };
             let hint = Some(quote! {
-                &::typedpg::__private::tokio_postgres::types::Type::JSONB_ARRAY
+                &::typedpg::__private::tokio_postgres::types::Type::#variant
             });
             let convert = quote! { ::serde_json::from_value::<#inner>(__v).map_err(|e| #err) };
             Ok(decode_vec(
@@ -3138,8 +3316,15 @@ fn column_get_expr(
 }
 
 /// A Rust type as source text, for messages: `::crate::T`, `Vec<i32>`.
+///
+/// The generated code names the prelude types by their full paths (a
+/// caller's own `Vec` or `Option` must not shadow them); messages name them
+/// the way users write them.
 fn type_text(ty: &syn::Type) -> String {
-    quote!(#ty).to_string().replace(' ', "")
+    let text = quote!(#ty).to_string().replace(' ', "");
+    ["::std::vec::", "::std::option::", "::std::string::"]
+        .iter()
+        .fold(text, |text, prefix| text.replace(prefix, ""))
 }
 
 /// How an error message names a PG type: its name, schema-qualified (and
@@ -3155,6 +3340,15 @@ fn pg_type_label(ty: &Type) -> String {
                 name.clone()
             } else {
                 QualifiedName::new(schema.clone(), name.clone()).to_string()
+            }
+        }
+        Type::Array {
+            name: Some(name), ..
+        } => {
+            if name.schema == "pg_catalog" {
+                name.name.clone()
+            } else {
+                name.to_string()
             }
         }
         Type::Array { element, .. } => format!("{}[]", pg_type_label(element)),
@@ -3619,7 +3813,8 @@ mod tests {
             ],
         };
         let oid = |o: u32| format!("ParamType :: Oid ({o})");
-        let code = spread_param_types(Some(&wire), &[true, false]).to_string();
+        let code = spread_param_types(Some(&wire), &[true, false], &quote::quote! { __budget })
+            .to_string();
         assert!(
             code.contains(&format!(
                 "extend_from_slice (& [:: typedpg :: __private :: {}])",
@@ -3627,7 +3822,10 @@ mod tests {
             )),
             "{code}"
         );
-        assert!(code.contains("uses_arrays (__len_0 , true)"), "{code}");
+        assert!(
+            code.contains("uses_arrays (__len_0 , 1 , __budget , true)"),
+            "{code}"
+        );
         assert!(code.contains(&oid(1007)), "{code}");
         assert!(code.contains("for _ in 0 .. __len_1"), "{code}");
         assert!(code.contains("name : \"mood\""), "{code}");
@@ -3635,16 +3833,17 @@ mod tests {
         assert!(!code.contains("__typedpg_types"), "{code}");
         // Bound as arrays without a stable array type: untyped above the
         // threshold, typed per item below it.
-        let code = spread_param_types(Some(&wire), &[true, true]).to_string();
+        let code =
+            spread_param_types(Some(&wire), &[true, true], &quote::quote! { __budget }).to_string();
         assert!(code.starts_with("'__typedpg_types : {"), "{code}");
         assert!(
             code.contains(
-                "if :: typedpg :: __private :: uses_arrays (__len_1 , true) { \
+                "if :: typedpg :: __private :: uses_arrays (__len_1 , 2 , __budget , true) { \
                  break '__typedpg_types :: std :: option :: Option :: None ; } else { for _ in 0 .. __len_1"
             ),
             "{code}"
         );
-        let code = spread_param_types(None, &[]).to_string();
+        let code = spread_param_types(None, &[], &quote::quote! { __budget }).to_string();
         assert_eq!(code, ":: std :: option :: Option :: None");
     }
 }

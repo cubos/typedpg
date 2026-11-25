@@ -145,7 +145,7 @@ export const exportedExecute = sql(`INSERT INTO users (id, org_id, name) VALUES 
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     // Every offending call, named as written, at its own line.
     for (line, method) in [
         (9, "fetchOne"),
@@ -163,7 +163,9 @@ export const exportedExecute = sql(`INSERT INTO users (id, org_id, name) VALUES 
         );
     }
     assert_eq!(
-        stdout.matches("warning[fetch_may_return_many]").count(),
+        stdout
+            .matches("error[correctness/fetch_one_multiple_rows]")
+            .count(),
         6,
         "{stdout}"
     );
@@ -201,7 +203,10 @@ fn fix_removes_returning_of_a_direct_execute() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:3:2]"), "{stdout}");
-    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(
+        stdout.contains("info[redundant/unused_returning]"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("`.execute()` discards the RETURNING rows"),
         "{stdout}"
@@ -255,10 +260,13 @@ fn inline_calls_are_linted_before_the_module_is_generated() {
     // ... but the calls on `sql()` imported from it are linted all the same.
     assert!(stderr.contains("checked 3 queries"), "{stderr}");
     assert!(stdout.contains("src/app/users.ts:2:70]"), "{stdout}");
-    assert!(stdout.contains("info[unused_returning]"), "{stdout}");
+    assert!(
+        stdout.contains("info[redundant/unused_returning]"),
+        "{stdout}"
+    );
     assert!(stdout.contains("src/app/users.ts:3:49]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
     // A query that doesn't analyze fails the run, as it fails `gen`.
@@ -336,10 +344,10 @@ fn a_sql_file_imported_directly_is_linted_at_the_calls() {
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:2:10]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
     assert!(
@@ -379,10 +387,10 @@ SELECT id FROM users WHERE org_id = $org;
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:2:10]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
 }
@@ -417,10 +425,10 @@ fn a_sql_file_imported_through_its_declaration_is_linted_at_the_calls() {
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stdout.contains("src/app.ts:2:10]"), "{stdout}");
     assert!(
-        stdout.contains("warning[fetch_may_return_many]"),
+        stdout.contains("error[correctness/fetch_one_multiple_rows]"),
         "{stdout}"
     );
 }
@@ -515,7 +523,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 #[test]
-fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
+fn deployed_query_breakage_checks_the_previous_deployments_queries() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -563,9 +571,11 @@ fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
         let output = run(root, &["lint", flag, "HEAD"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
         assert_eq!(
-            stdout.matches("warning[breaks_deployed_queries]").count(),
+            stdout
+                .matches("error[correctness/deployed_query_breakage]")
+                .count(),
             2,
             "{stdout}"
         );
@@ -587,7 +597,7 @@ fn breaks_deployed_queries_checks_the_previous_deployments_queries() {
 
     let output = run(root, &["lint"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("breaks_deployed_queries"), "{stdout}");
+    assert!(!stdout.contains("deployed_query_breakage"), "{stdout}");
 }
 
 #[test]
@@ -643,7 +653,7 @@ fn queries_are_linted_as_the_databases_roles() {
 }
 
 #[test]
-fn breaks_deployed_queries_checks_the_previous_deployments_copy_in_targets() {
+fn deployed_query_breakage_checks_the_previous_deployments_copy_in_targets() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
@@ -687,9 +697,11 @@ fn breaks_deployed_queries_checks_the_previous_deployments_copy_in_targets() {
     let output = run(root, &["lint", "--previous-deployment", "HEAD"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
     assert_eq!(
-        stdout.matches("warning[breaks_deployed_queries]").count(),
+        stdout
+            .matches("error[correctness/deployed_query_breakage]")
+            .count(),
         2,
         "{stdout}"
     );
@@ -754,10 +766,11 @@ fn queries_imported_through_tsconfig_paths_are_linted() {
         let output = run(root, &["lint"]);
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{when}: {stdout}\n{stderr}");
+        // `LIMIT 1 OFFSET 0` without ORDER BY is a correctness error.
+        assert_eq!(output.status.code(), Some(1), "{when}: {stdout}\n{stderr}");
         assert!(stderr.contains("checked 3 queries"), "{when}: {stderr}");
         assert_eq!(
-            stdout.matches("info[redundant_distinct]").count(),
+            stdout.matches("info[redundant/redundant_distinct]").count(),
             2,
             "{when}: {stdout}"
         );
@@ -846,4 +859,110 @@ fn allow_comments_around_sql_file_queries_belong_to_a_query() {
         ],
         "{stdout}"
     );
+}
+
+#[test]
+fn json_stringify_param_is_reported_at_the_stringify_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["src/*.sql"] }
+        }"#,
+    );
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE DOMAIN prefs AS jsonb;\n\
+         CREATE TABLE docs (id int4 PRIMARY KEY, body jsonb NOT NULL, raw json, \
+         settings prefs, tags jsonb[], title text);\n",
+    );
+    write(
+        &root.join("src/queries.sql"),
+        "/* @name saveDoc */\nUPDATE docs SET body = $body WHERE id = $id;\n\n\
+         /* @name saveAllowed */\n-- typedpg-lint: allow(json_stringify_param)\n\
+         UPDATE docs SET body = $body WHERE id = $id;\n",
+    );
+    let app = concat!(
+        "import { sql, copyIn } from './db';\n",
+        "import { saveDoc, saveAllowed } from './queries';\n",
+        "\n",
+        "sql(`UPDATE docs SET body = $body WHERE id = $id`).execute(pool, { id, body: JSON.stringify(doc) });\n",
+        "const q = sql(`UPDATE docs SET raw = $raw, settings = $settings WHERE id = $id`);\n",
+        "q.execute(pool, { id, raw: (JSON.stringify(doc) as string), settings: JSON.stringify(doc)! });\n",
+        "sql(`UPDATE docs SET tags = $tags WHERE id = $id`).execute(pool, { id, tags: [JSON.stringify(doc)] });\n",
+        "sql(`INSERT INTO docs (id, body) VALUES $..rows { id, body }`).execute(pool, { rows: [{ id, body: JSON.stringify(doc) }] });\n",
+        "saveDoc.execute(pool, { id, body: JSON.stringify(doc) });\n",
+        "copyIn(`docs (id, body)`).execute(pool, [{ id, body: JSON.stringify(doc) }]);\n",
+        // Not reported: a text column, the value itself, a value from a
+        // variable, the allowed query.
+        "sql(`UPDATE docs SET title = $title WHERE id = $id`).execute(pool, { id, title: JSON.stringify(doc) });\n",
+        "sql(`UPDATE docs SET body = $body WHERE id = $id`).execute(pool, { id, body: doc });\n",
+        "const text = JSON.stringify(doc);\n",
+        "sql(`UPDATE docs SET body = $body WHERE id = $id`).execute(pool, { id, body: text });\n",
+        "saveAllowed.execute(pool, { id, body: JSON.stringify(doc) });\n",
+    );
+    write(&root.join("src/app.ts"), app);
+    generate(root);
+
+    let output = run(root, &["lint", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // An error by default: the run fails.
+    assert!(!output.status.success(), "{stdout}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let found: Vec<(u64, u64, u64, String)> = json["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{stdout}"))
+        .iter()
+        .filter(|finding| finding["rule"] == "json_stringify_param")
+        .map(|finding| {
+            assert_eq!(finding["severity"], "error", "{stdout}");
+            (
+                finding["line"].as_u64().unwrap(),
+                finding["column"].as_u64().unwrap(),
+                finding["endColumn"].as_u64().unwrap(),
+                finding["message"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let message = |subject: &str| {
+        format!("{subject}, and `JSON.stringify(…)` stores a JSON string, not the value")
+    };
+    // Each finding spans the `JSON.stringify(doc)` call (19 characters).
+    let at = |line: u64, column: u64, subject: &str| (line, column, column + 19, message(subject));
+    assert_eq!(
+        found,
+        [
+            at(4, 78, "parameter $body is jsonb"),
+            at(6, 29, "parameter $raw is json"),
+            at(
+                6,
+                71,
+                "parameter $settings is public.prefs, a domain over jsonb"
+            ),
+            at(7, 79, "an element of parameter $tags is jsonb"),
+            at(8, 99, "field body of $..rows is jsonb"),
+            at(9, 35, "parameter $body is jsonb"),
+            at(10, 54, "column body is jsonb"),
+        ],
+        "{stdout}"
+    );
+
+    // Off in the configuration, nothing is reported.
+    write(
+        &root.join("typedpg.config.json"),
+        r#"{
+            "include": ["src"],
+            "out": "src/db.ts",
+            "sql": { "include": ["src/*.sql"] },
+            "lint": { "jsonStringifyParam": "off" }
+        }"#,
+    );
+    let output = run(root, &["lint"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("json_stringify_param"), "{stdout}");
 }

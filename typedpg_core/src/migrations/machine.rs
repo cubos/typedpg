@@ -48,7 +48,11 @@
 //! must rethrow the driver error it replied to the machine with (the
 //! original error object, not a message).
 
-use super::{HASH_VERSION, drift_message, hash, locate_position, split_statements};
+use std::ops::Range;
+
+use super::{
+    HASH_VERSION, drift_message, hash, hash_with_version, locate_position, split_statements,
+};
 use crate::config::validate_table_name;
 
 /// What a run does.
@@ -138,6 +142,10 @@ pub struct DbError {
     pub internal_position: Option<u32>,
     /// That internally generated query.
     pub internal_query: Option<String>,
+    /// The server's CONTEXT field (`where`): the call stack of a failure
+    /// inside a function, a `DO` block or a trigger — which line of the
+    /// body failed.
+    pub context: Option<String>,
 }
 
 /// The driver's answer to the step the machine emitted.
@@ -241,6 +249,10 @@ pub struct Migrator {
     status_rows: Vec<StatusRow>,
     /// The tracking table's rows, as `Status` reads them.
     status_applied: Vec<(String, StatusInfo)>,
+    /// The statements of the file run without the machine's transaction,
+    /// as byte ranges of its text: split once, not once per statement (a
+    /// data migration can hold many thousands).
+    statements: Vec<Range<usize>>,
 }
 
 /// What a tracking-table row says about drift.
@@ -252,15 +264,25 @@ struct AppliedRow {
 
 impl AppliedRow {
     /// Whether the stored hash differs from the file's, computed with the
-    /// current algorithm. A row without a hash (no `sql_source` stored, from
-    /// before that column existed) is not checked, and neither is one whose
-    /// hash predates the current algorithm — `Up` re-hashes it first.
+    /// algorithm the row's `hash_version` names. A row without a hash (no
+    /// `sql_source` stored, from before that column existed) is not checked,
+    /// and neither is one of a version this release does not know. `Up`
+    /// re-hashes older rows from their `sql_source` first; one without it
+    /// keeps its version and is compared with that algorithm.
     fn drifted(&self, sql: &str) -> bool {
-        self.hash_version == Some(HASH_VERSION)
-            && self
-                .hash
-                .as_deref()
-                .is_some_and(|stored| stored != hash(sql))
+        stored_hash_differs(self.hash.as_deref(), self.hash_version, sql)
+    }
+}
+
+/// Whether `stored`, a hash of `version`, differs from the file `sql`'s
+/// under the same algorithm; `false` when there is nothing to compare.
+fn stored_hash_differs(stored: Option<&str>, version: Option<i32>, sql: &str) -> bool {
+    match (
+        stored,
+        version.and_then(|version| hash_with_version(sql, version)),
+    ) {
+        (Some(stored), Some(file)) => stored != file,
+        _ => false,
     }
 }
 
@@ -269,6 +291,7 @@ impl AppliedRow {
 struct StatusInfo {
     applied_at: Option<String>,
     hash: Option<String>,
+    hash_version: Option<i32>,
 }
 
 /// What to do after the lock and tracking table are ready.
@@ -293,6 +316,10 @@ enum Stage {
     /// The backoff sleep; `next_delay_ms` is the delay of the next attempt.
     LockSleep {
         next_delay_ms: u64,
+        then: Then,
+    },
+    /// Whether the tracking table and each of its later columns exist.
+    TableColumns {
         then: Then,
     },
     /// The tracking-table script.
@@ -424,7 +451,20 @@ impl Migrator {
             apply_index: 0,
             status_rows: Vec::new(),
             status_applied: Vec::new(),
+            statements: Vec::new(),
         }
+    }
+
+    /// Statement `stmt` of `sql`, the file whose [`Self::statements`] were
+    /// split.
+    fn statement_sql(&self, sql: &str, stmt: usize) -> Option<String> {
+        let range = self.statements.get(stmt)?;
+        Some(sql[range.clone()].to_string())
+    }
+
+    /// The byte offset of statement `stmt` in its file.
+    fn statement_offset(&self, stmt: usize) -> usize {
+        self.statements.get(stmt).map_or(0, |range| range.start)
     }
 
     /// Advance the machine: answer the step it emitted (starting with
@@ -436,7 +476,11 @@ impl Migrator {
 
             (Stage::TryLock { delay_ms, then }, Reply::Rows(rows)) => {
                 if is_true(first_value(&rows)) {
-                    self.ensure_table(then)
+                    self.stage = Stage::TableColumns { then };
+                    Step::Query {
+                        sql: self.status_columns_sql(),
+                        params: vec![Some(self.config.table.clone())],
+                    }
                 } else {
                     self.stage = Stage::LockSleep {
                         next_delay_ms: (delay_ms * 2).min(500),
@@ -454,20 +498,27 @@ impl Migrator {
                 _,
             ) => self.try_lock(next_delay_ms, then),
 
-            (Stage::EnsureTable { then }, Reply::Done) => match then {
-                Then::Up => self.backfill_select(then),
-                Then::Revert => self.read_applied(then),
-                // An accept of a name no file has runs no query, as the
-                // runners already do.
-                Then::Accept => match &self.action {
-                    Action::Accept { name } if !self.migrations.iter().any(|m| &m.name == name) => {
-                        self.fail_locked(Failure::Message(format!(
-                            "no migration file named '{name}'"
-                        )))
+            (Stage::TableColumns { then }, Reply::Rows(rows)) => {
+                let row = rows.first().cloned().unwrap_or_default();
+                let has = |i: usize| is_true(row.get(i).and_then(|v| v.as_deref()));
+                if !has(0) {
+                    self.ensure_table(then, None)
+                } else {
+                    let missing: Vec<&str> = [(1, "sql_source"), (2, "hash"), (3, "hash_version")]
+                        .into_iter()
+                        .filter(|&(i, _)| !has(i))
+                        .map(|(_, column)| column)
+                        .collect();
+                    if missing.is_empty() {
+                        self.table_ready(then)
+                    } else {
+                        self.ensure_table(then, Some(&missing))
                     }
-                    _ => self.read_applied(then),
-                },
-            },
+                }
+            }
+            (Stage::TableColumns { .. }, _) => self.fail_locked(Failure::Db),
+
+            (Stage::EnsureTable { then }, Reply::Done) => self.table_ready(then),
             (Stage::EnsureTable { .. }, _) => self.fail_locked(Failure::Db),
 
             (Stage::BackfillSelect { then }, Reply::Rows(rows)) => {
@@ -580,25 +631,19 @@ impl Migrator {
             (Stage::UpCommit { .. }, _) => self.up_rollback(Failure::Db),
 
             (Stage::UpStatement { index, stmt }, Reply::Done) => {
-                let statements = split_statements(&self.migrations[index].sql);
-                if let Some(statement) = statements.get(stmt + 1) {
+                if let Some(sql) = self.statement_sql(&self.migrations[index].sql, stmt + 1) {
                     self.stage = Stage::UpStatement {
                         index,
                         stmt: stmt + 1,
                     };
-                    Step::Execute {
-                        sql: (*statement).to_string(),
-                    }
+                    Step::Execute { sql }
                 } else {
                     self.probe(index, false, None)
                 }
             }
             (Stage::UpStatement { index, stmt }, Reply::DbError(error)) => {
                 let migration = &self.migrations[index];
-                let statements = split_statements(&migration.sql);
-                let statement = statements.get(stmt).copied().unwrap_or_default();
-                // `split_statements` returns slices of the migration.
-                let base = statement.as_ptr() as usize - migration.sql.as_ptr() as usize;
+                let base = self.statement_offset(stmt);
                 let message = format!(
                     "failed to apply migration {} (statement {}): {}",
                     migration.name,
@@ -658,31 +703,29 @@ impl Migrator {
             (Stage::RevertCommit { .. }, _) => self.revert_rollback(Failure::Db),
 
             (Stage::RevertStatement { index, stmt }, Reply::Done) => {
-                let down = self.migrations[index].down_sql.clone().unwrap_or_default();
-                let statements = split_statements(&down);
-                if let Some(statement) = statements.get(stmt + 1) {
+                let down = self.migrations[index]
+                    .down_sql
+                    .as_deref()
+                    .unwrap_or_default();
+                if let Some(sql) = self.statement_sql(down, stmt + 1) {
                     self.stage = Stage::RevertStatement {
                         index,
                         stmt: stmt + 1,
                     };
-                    Step::Execute {
-                        sql: (*statement).to_string(),
-                    }
+                    Step::Execute { sql }
                 } else {
                     self.probe(index, true, None)
                 }
             }
             (Stage::RevertStatement { index, stmt }, Reply::DbError(error)) => {
                 let migration = &self.migrations[index];
-                let down = migration.down_sql.clone().unwrap_or_default();
-                let statements = split_statements(&down);
-                let statement = statements.get(stmt).copied().unwrap_or_default();
-                let base = statement.as_ptr() as usize - down.as_ptr() as usize;
+                let down = migration.down_sql.as_deref().unwrap_or_default();
+                let base = self.statement_offset(stmt);
                 let message = format!(
                     "failed to revert migration {} (statement {}): {}",
                     migration.name,
                     stmt + 1,
-                    format_db_error(&error, &down, base)
+                    format_db_error(&error, down, base)
                 );
                 self.probe(index, true, Some(message))
             }
@@ -825,11 +868,8 @@ impl Migrator {
                         name,
                         StatusInfo {
                             applied_at,
-                            hash: if version == Some(HASH_VERSION) {
-                                stored_hash
-                            } else {
-                                None
-                            },
+                            hash: stored_hash,
+                            hash_version: version,
                         },
                     ));
                 }
@@ -860,6 +900,7 @@ impl Migrator {
                             .find(|(applied, _)| *applied == name)
                     {
                         info.hash = Some(hash(&sql));
+                        info.hash_version = Some(HASH_VERSION);
                     }
                 }
                 self.build_status(0)
@@ -909,25 +950,60 @@ impl Migrator {
         }
     }
 
-    /// Create or upgrade the tracking table. Under the lock: two runners
-    /// racing on a fresh database would otherwise both find it missing, and
-    /// one `CREATE TABLE IF NOT EXISTS` fails on the other's catalog rows.
-    fn ensure_table(&mut self, then: Then) -> Step {
+    /// Create the tracking table (`missing` is `None`), or add the columns
+    /// of it that are `missing`. Under the lock: two runners racing on a
+    /// fresh database would otherwise both find it missing, and one `CREATE
+    /// TABLE IF NOT EXISTS` fails on the other's catalog rows.
+    ///
+    /// A complete table gets no DDL at all ([`Self::table_ready`]): `ALTER
+    /// TABLE` needs its ownership even when the column exists, and a role
+    /// granted the table's privileges must still be able to run migrations.
+    fn ensure_table(&mut self, then: Then, missing: Option<&[&str]>) -> Step {
         self.stage = Stage::EnsureTable { then };
-        Step::Execute {
-            sql: format!(
-                "CREATE TABLE IF NOT EXISTS {} (
+        let table = &self.config.table;
+        let sql = match missing {
+            None => format!(
+                "CREATE TABLE IF NOT EXISTS {table} (
             name         TEXT PRIMARY KEY,
             applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
             sql_source   TEXT,
             hash         TEXT,
             hash_version INTEGER
         );
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS sql_source TEXT;
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS hash TEXT;
-        ALTER TABLE {0} ADD COLUMN IF NOT EXISTS hash_version INTEGER;",
-                self.config.table
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS sql_source TEXT;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash TEXT;
+        ALTER TABLE {table} ADD COLUMN IF NOT EXISTS hash_version INTEGER;"
             ),
+            Some(missing) => missing
+                .iter()
+                .map(|&column| {
+                    let ty = if column == "hash_version" {
+                        "INTEGER"
+                    } else {
+                        "TEXT"
+                    };
+                    format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ty};")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        Step::Execute { sql }
+    }
+
+    /// What follows a complete tracking table.
+    fn table_ready(&mut self, then: Then) -> Step {
+        match then {
+            Then::Up => self.backfill_select(then),
+            Then::Revert => self.read_applied(then),
+            // An accept of a name no file has runs no query, as the
+            // runners already do.
+            Then::Accept => match &self.action {
+                Action::Accept { name } if !self.migrations.iter().any(|m| &m.name == name) => self
+                    .fail_locked(Failure::Message(format!(
+                        "no migration file named '{name}'"
+                    ))),
+                _ => self.read_applied(then),
+            },
         }
     }
 
@@ -1052,14 +1128,11 @@ impl Migrator {
             };
         }
 
-        let sql = migration.sql.clone();
-        let statements = split_statements(&sql);
-        match statements.first() {
-            Some(statement) => {
+        self.statements = statement_ranges(&migration.sql);
+        match self.statement_sql(&self.migrations[index].sql, 0) {
+            Some(sql) => {
                 self.stage = Stage::UpStatement { index, stmt: 0 };
-                Step::Execute {
-                    sql: (*statement).to_string(),
-                }
+                Step::Execute { sql }
             }
             None => self.up_no_transaction_insert(index),
         }
@@ -1179,12 +1252,11 @@ impl Migrator {
                         sql: "BEGIN".to_string(),
                     };
                 }
-                match split_statements(&down).first() {
-                    Some(statement) => {
+                self.statements = statement_ranges(&down);
+                match self.statement_sql(&down, 0) {
+                    Some(sql) => {
                         self.stage = Stage::RevertStatement { index, stmt: 0 };
-                        Step::Execute {
-                            sql: (*statement).to_string(),
-                        }
+                        Step::Execute { sql }
                     }
                     None => {
                         self.stage = Stage::RevertNoTransactionDelete { index };
@@ -1266,9 +1338,9 @@ impl Migrator {
                 .iter()
                 .find(|(applied, _)| *applied == name)
                 .map(|(_, info)| info);
-            let drifted = info
-                .and_then(|info| info.hash.as_deref())
-                .is_some_and(|stored| stored != hash(&sql));
+            let drifted = info.is_some_and(|info| {
+                stored_hash_differs(info.hash.as_deref(), info.hash_version, &sql)
+            });
             self.status_rows.push(StatusRow {
                 name: name.clone(),
                 applied: info.is_some(),
@@ -1451,6 +1523,18 @@ pub const LEFT_TRANSACTION_OPEN: &str = "left a transaction block open (a BEGIN 
 /// What to do about [`LEFT_TRANSACTION_OPEN`].
 pub const LEFT_TRANSACTION_OPEN_HINT: &str = "Add a COMMIT at the end of the transaction block.";
 
+/// The statements [`split_statements`] finds in `sql`, as byte ranges.
+fn statement_ranges(sql: &str) -> Vec<Range<usize>> {
+    split_statements(sql)
+        .into_iter()
+        .map(|statement| {
+            // `split_statements` returns slices of `sql`.
+            let start = statement.as_ptr() as usize - sql.as_ptr() as usize;
+            start..start + statement.len()
+        })
+        .collect()
+}
+
 /// The first cell of the first row.
 fn first_value(rows: &[Vec<Option<String>>]) -> Option<&str> {
     rows.first()
@@ -1463,30 +1547,42 @@ fn is_true(value: Option<&str>) -> bool {
     matches!(value, Some("true") | Some("t"))
 }
 
-/// Format a database error the way both runners report it: severity and
-/// message, DETAIL and HINT, and PG's position as a line of the migration
-/// with a caret. `sql` is the migration's text and `base` the byte offset in
-/// it of the text that was sent (0 when the whole migration was).
+/// Format a database error the way both runners report it, which is psql's
+/// report at its default verbosity (libpq's `pqBuildErrorMessage3`,
+/// `PQERRORS_DEFAULT` with context shown for errors): `SEVERITY:  message`,
+/// the error's position as a line and a caret, then `DETAIL:  `, `HINT:  `,
+/// `QUERY:  ` and `CONTEXT:  `, in that order. The caret is under the sent
+/// text (`sql` from the byte offset `base`, its line counted in the whole
+/// migration) or, for an `INTERNAL POSITION`, under the internal query.
+/// libpq ends each line with a newline; the last one is left out here.
 fn format_db_error(error: &DbError, sql: &str, base: usize) -> String {
     let mut out = match &error.severity {
-        Some(severity) => format!("{severity}: {}", error.message),
+        Some(severity) => format!("{severity}:  {}", error.message),
         None => error.message.clone(),
     };
-    if let Some(detail) = &error.detail {
-        out.push_str("\nDETAIL: ");
-        out.push_str(detail);
-    }
-    if let Some(hint) = &error.hint {
-        out.push_str("\nHINT: ");
-        out.push_str(hint);
-    }
-    if let Some(position) = error.position {
-        out.push_str(&locate_position(sql, base, position));
-    } else if let Some(position) = error.internal_position {
-        out.push_str(&format!(
-            "\nINTERNAL POSITION: {position}\nQUERY: {}",
-            error.internal_query.as_deref().unwrap_or_default()
-        ));
+    // libpq: the statement's position wins; an internal one points into the
+    // internal query, or is spelled out when there is no query to show.
+    let caret = match (error.position, error.internal_position) {
+        (Some(position), _) => locate_position(sql, base, position),
+        (None, Some(position)) => match &error.internal_query {
+            Some(query) => locate_position(query, 0, position),
+            None => {
+                out.push_str(&format!(" at character {position}"));
+                String::new()
+            }
+        },
+        (None, None) => String::new(),
+    };
+    out.push_str(&caret);
+    for (label, field) in [
+        ("DETAIL", &error.detail),
+        ("HINT", &error.hint),
+        ("QUERY", &error.internal_query),
+        ("CONTEXT", &error.context),
+    ] {
+        if let Some(text) = field {
+            out.push_str(&format!("\n{label}:  {text}"));
+        }
     }
     out
 }
@@ -1549,6 +1645,7 @@ mod tests {
             position,
             internal_position: None,
             internal_query: None,
+            context: None,
         })
     }
 
@@ -1668,6 +1765,7 @@ mod tests {
         ];
         let (steps, result) = drive(input(Action::Up, migrations, config()), |step| match step {
             Step::Execute { sql } if is_ensure(sql) => done(),
+            Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
             Step::Execute { sql } if sql == "BEGIN" || sql == "COMMIT" => done(),
             Step::Execute { sql } if sql.starts_with("CREATE TABLE") => done(),
             Step::Query { sql, .. } if is_lock(sql) => locked(),
@@ -1714,6 +1812,7 @@ mod tests {
         let mut attempts = 0;
         let (steps, result) = drive(input(Action::Up, vec![], config()), |step| match step {
             Step::Execute { sql } if is_ensure(sql) => done(),
+            Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
             Step::Query { sql, .. } if is_lock(sql) => {
                 attempts += 1;
                 if attempts <= 2 {
@@ -1758,6 +1857,7 @@ mod tests {
             input(Action::Up, migrations, config()),
             move |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![vec![
@@ -1825,6 +1925,7 @@ mod tests {
             ),
             move |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
@@ -1862,6 +1963,7 @@ mod tests {
             input(Action::Up, vec![migration("0001_bad", sql, None)], config()),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { sql } if sql == "BEGIN" => done(),
                 Step::Execute { sql: executed } if executed == sql => {
                     error("syntax error at or near \"TABL\"", Some(35))
@@ -1880,7 +1982,7 @@ mod tests {
         };
         assert_eq!(
             message,
-            "failed to apply migration 0001_bad: ERROR: syntax error at or near \"TABL\"\n\
+            "failed to apply migration 0001_bad: ERROR:  syntax error at or near \"TABL\"\n\
              LINE 2: CREATE TABL bad (a int);\n               ^"
         );
         let rollback = steps
@@ -1913,6 +2015,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { sql } if sql.contains("CREATE TABLE ok2") => done(),
                 Step::Execute { sql } if sql.contains("CREATE TABL bad") => {
                     error("syntax error at or near \"TABL\"", Some(9))
@@ -1932,7 +2035,7 @@ mod tests {
         };
         assert!(
             message.starts_with(
-                "failed to apply migration 0001_partial (statement 2): ERROR: syntax error at or near \"TABL\"\nLINE 3: CREATE TABL bad;\n               ^"
+                "failed to apply migration 0001_partial (statement 2): ERROR:  syntax error at or near \"TABL\"\nLINE 3: CREATE TABL bad;\n               ^"
             ),
             "{message}"
         );
@@ -1946,6 +2049,115 @@ mod tests {
             "the unlock comes right before the failure"
         );
         assert!(!queries(&steps).any(is_insert));
+    }
+
+    /// A complete tracking table gets no DDL: `ALTER TABLE ... ADD COLUMN IF
+    /// NOT EXISTS` needs the table's ownership even when the column exists,
+    /// which made a role granted the table's privileges unable to run any
+    /// action. A table missing later columns gets only those.
+    #[test]
+    fn only_a_missing_table_or_column_is_created() {
+        for (columns, ddl) in [
+            (["true", "true", "true", "true"], None),
+            (
+                ["true", "true", "true", "false"],
+                Some(
+                    "ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS hash_version INTEGER;",
+                ),
+            ),
+            (
+                ["true", "false", "false", "true"],
+                Some(
+                    "ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS sql_source TEXT;\n\
+                     ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS hash TEXT;",
+                ),
+            ),
+        ] {
+            let row: Vec<Option<String>> = columns.iter().map(|c| Some(c.to_string())).collect();
+            let (steps, result) = drive(input(Action::Up, vec![], config()), |step| match step {
+                Step::Query { sql, params } if is_status_columns(sql) => {
+                    assert_eq!(params, &[Some("public._migrations".to_string())]);
+                    rows(vec![row.clone()])
+                }
+                Step::Execute { sql } if sql.starts_with("ALTER TABLE") => done(),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { .. } => rows(vec![]),
+                other => panic!("unexpected step: {other:?}"),
+            });
+            assert_eq!(result, Ok(Outcome::Applied(vec![])));
+            let executed: Vec<&str> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Execute { sql } => Some(sql.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(executed, ddl.into_iter().collect::<Vec<_>>(), "{columns:?}");
+        }
+    }
+
+    /// A data migration of many statements, run without a transaction:
+    /// every statement is sent once, in order, and the file is split once —
+    /// re-splitting it per statement took minutes for this one (quadratic
+    /// in its size).
+    #[test]
+    fn a_no_transaction_file_of_many_statements_is_split_once() {
+        const COUNT: usize = 50_000;
+        let body: String = (0..COUNT)
+            .map(|i| format!("INSERT INTO t VALUES ({i}, 'row; {i}');\n"))
+            .collect();
+        let up = format!("-- no-transaction\n{body}");
+        let down = format!("-- no-transaction\n{body}");
+        let answer = |step: &Step| match step {
+            Step::Execute { .. } => done(),
+            Step::Query { sql, .. } if is_lock(sql) => locked(),
+            Step::Query { sql, .. } if is_probe_read(sql) => closed(),
+            Step::Query { sql, .. } if is_applied_select(sql) => {
+                rows(vec![vec![Some("0001_data".to_string()), None, None]])
+            }
+            Step::Query { .. } => rows(vec![]),
+            other => panic!("unexpected step: {other:?}"),
+        };
+        let started = std::time::Instant::now();
+        for action in [
+            Action::Up,
+            Action::Revert {
+                name: None,
+                force: false,
+            },
+        ] {
+            let pending = matches!(action, Action::Up);
+            let migrations = vec![migration("0001_data", &up, Some(&down))];
+            let (steps, result) = drive(input(action, migrations, config()), |step| {
+                match step {
+                    // The up finds nothing applied, the revert its row.
+                    Step::Query { sql, .. } if pending && is_applied_select(sql) => rows(vec![]),
+                    _ => answer(step),
+                }
+            });
+            assert!(result.is_ok(), "{result:?}");
+            let sent: Vec<&str> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Execute { sql } if sql.contains("INSERT INTO t") => Some(sql.trim()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sent.len(), COUNT);
+            assert_eq!(
+                sent[0],
+                "-- no-transaction\nINSERT INTO t VALUES (0, 'row; 0');"
+            );
+            assert_eq!(
+                sent[COUNT - 1],
+                "INSERT INTO t VALUES (49999, 'row; 49999');"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A session, as far as transaction blocks go: the files' `BEGIN`,
@@ -1980,6 +2192,7 @@ mod tests {
                 position: None,
                 internal_position: None,
                 internal_query: None,
+                context: None,
             })
         }
 
@@ -1987,6 +2200,7 @@ mod tests {
             let aborted = self.block == Some(true);
             match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { sql } if !aborted && sql.contains("AND CHAIN") => {
                     self.block = Some(false);
                     self.probe = None;
@@ -2178,7 +2392,7 @@ mod tests {
         };
         assert!(
             message.starts_with(
-                "failed to apply migration 0001_a (statement 3): ERROR: syntax error at or near \"TABL\""
+                "failed to apply migration 0001_a (statement 3): ERROR:  syntax error at or near \"TABL\""
             ),
             "{message}"
         );
@@ -2247,6 +2461,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![vec![
                     Some("0001_a".to_string()),
@@ -2394,6 +2609,157 @@ mod tests {
         ));
     }
 
+    const LF_FUNCTION: &str = "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
+    const CRLF_FUNCTION: &str = "CREATE FUNCTION f() RETURNS text AS $$\r\nBEGIN\r\n  RETURN 'a\r\nb';\r\nEND\r\n$$ LANGUAGE plpgsql;\r\n";
+    /// `LF_FUNCTION`'s hash as typedpg 0.6 to 0.8 stored it (version 1).
+    const LF_FUNCTION_V1_HASH: &str = "36008b21f609949ea9d09c40c9aad1d0";
+
+    /// An `up` over the given applied rows (`name`, `hash`, `hash_version`),
+    /// none of them left for the backfill (no stored text).
+    fn up_over(
+        file: &str,
+        applied: Vec<Vec<Option<String>>>,
+    ) -> (Vec<Step>, Result<Outcome, Failure>) {
+        drive(
+            input(Action::Up, vec![migration("0001_a", file, None)], config()),
+            move |step| match step {
+                Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { sql, .. } if is_backfill_select(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_applied_select(sql) => rows(applied.clone()),
+                Step::Query { sql, .. } if is_stored_sql(sql) => rows(vec![vec![None]]),
+                Step::Query { sql, .. } if is_unlock(sql) => locked(),
+                other => panic!("unexpected step: {other:?}"),
+            },
+        )
+    }
+
+    /// A version-1 row the backfill cannot re-hash (no stored text) keeps
+    /// being compared with version 1's algorithm: the hash the previous
+    /// release stored is no drift, and an edit still is.
+    #[test]
+    fn a_version_1_row_without_its_text_is_compared_with_version_1() {
+        let row = |hash: &str| {
+            vec![vec![
+                Some("0001_a".to_string()),
+                Some(hash.to_string()),
+                Some("1".to_string()),
+            ]]
+        };
+        let (_, result) = up_over(LF_FUNCTION, row(LF_FUNCTION_V1_HASH));
+        assert_eq!(result, Ok(Outcome::Applied(vec![])));
+
+        let edited = LF_FUNCTION.replace("'a", "'z");
+        let (steps, result) = up_over(&edited, row(LF_FUNCTION_V1_HASH));
+        assert!(
+            matches!(&result, Err(Failure::Message(m)) if m.starts_with("migration '0001_a' has been modified")),
+            "{result:?}"
+        );
+        assert!(!queries(&steps).any(is_insert));
+
+        // A version this release does not know is not compared.
+        let (_, result) = up_over(&edited, {
+            let mut rows = row(LF_FUNCTION_V1_HASH);
+            rows[0][2] = Some((HASH_VERSION + 1).to_string());
+            rows
+        });
+        assert_eq!(result, Ok(Outcome::Applied(vec![])));
+    }
+
+    /// The backfill re-hashes a version-1 row from its stored text with the
+    /// current algorithm, so a CRLF checkout of the LF file it applied is
+    /// no drift once upgraded.
+    #[test]
+    fn backfill_upgrades_version_1_rows_to_the_current_hash() {
+        let (steps, result) = drive(
+            input(
+                Action::Up,
+                vec![migration("0001_a", CRLF_FUNCTION, None)],
+                config(),
+            ),
+            |step| match step {
+                Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_lock(sql) => locked(),
+                Step::Query { sql, params } if is_backfill_select(sql) => {
+                    assert_eq!(params, &[Some(HASH_VERSION.to_string())]);
+                    rows(vec![vec![
+                        Some("0001_a".to_string()),
+                        Some(LF_FUNCTION.to_string()),
+                    ]])
+                }
+                Step::Query { sql, .. } if is_backfill_update(sql) => rows(vec![]),
+                Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![vec![
+                    Some("0001_a".to_string()),
+                    Some(hash(LF_FUNCTION)),
+                    Some(HASH_VERSION.to_string()),
+                ]]),
+                Step::Query { sql, .. } if is_unlock(sql) => locked(),
+                other => panic!("unexpected step: {other:?}"),
+            },
+        );
+        assert_eq!(result, Ok(Outcome::Applied(vec![])));
+        let update = steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Query { sql, params } if is_backfill_update(sql) => Some(params.clone()),
+                _ => None,
+            })
+            .expect("no backfill update");
+        assert_eq!(update[0], Some(hash(CRLF_FUNCTION)));
+        assert_eq!(update[1], Some(HASH_VERSION.to_string()));
+    }
+
+    /// `status` over version-1 rows: one with its text is re-hashed in
+    /// memory (a CRLF checkout is no drift), one without is compared with
+    /// version 1 (the released hash is no drift, an edit is).
+    #[test]
+    fn status_reads_version_1_rows() {
+        let status = |file: &str, stale: Vec<Vec<Option<String>>>| {
+            drive(
+                input(
+                    Action::Status,
+                    vec![migration("0001_a", file, None)],
+                    config(),
+                ),
+                move |step| match step {
+                    Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![vec![
+                        Some("true".to_string()),
+                        Some("true".to_string()),
+                        Some("true".to_string()),
+                        Some("true".to_string()),
+                    ]]),
+                    Step::Query { sql, .. } if is_status_rows(sql) => rows(vec![vec![
+                        Some("0001_a".to_string()),
+                        Some("2026-01-02T03:04:05.000000Z".to_string()),
+                        Some(LF_FUNCTION_V1_HASH.to_string()),
+                        Some("1".to_string()),
+                    ]]),
+                    Step::Query { sql, .. } if is_status_stale(sql) => rows(stale.clone()),
+                    Step::Warn(_) => done(),
+                    other => panic!("unexpected step: {other:?}"),
+                },
+            )
+            .1
+        };
+        let drifted = |result: Result<Outcome, Failure>| match result {
+            Ok(Outcome::Status(statuses)) => statuses[0].drifted,
+            other => panic!("expected statuses, got {other:?}"),
+        };
+        let with_text = vec![vec![
+            Some("0001_a".to_string()),
+            Some(LF_FUNCTION.to_string()),
+        ]];
+        assert!(!drifted(status(CRLF_FUNCTION, with_text.clone())));
+        assert!(drifted(status(
+            &CRLF_FUNCTION.replace("'a", "'z"),
+            with_text
+        )));
+        assert!(!drifted(status(LF_FUNCTION, vec![])));
+        assert!(drifted(status(&LF_FUNCTION.replace("'a", "'z"), vec![])));
+    }
+
     /// `accept` rejects an unknown file without reading the table, and an
     /// unapplied one without writing.
     #[test]
@@ -2410,6 +2776,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
                 other => panic!("unexpected step: {other:?}"),
@@ -2433,6 +2800,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
@@ -2470,6 +2838,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
                     rows(vec![vec![one("0001_a")[0].clone(), None, None]])
@@ -2500,6 +2869,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
                     rows(vec![vec![one("0001_a")[0].clone(), None, None]])
@@ -2524,6 +2894,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
@@ -2577,6 +2948,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => {
@@ -2612,6 +2984,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Execute { .. } => done(),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![
@@ -2637,6 +3010,7 @@ mod tests {
             ),
             |step| match step {
                 Step::Execute { sql } if is_ensure(sql) => done(),
+                Step::Query { sql, .. } if is_status_columns(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_lock(sql) => locked(),
                 Step::Query { sql, .. } if is_applied_select(sql) => rows(vec![]),
                 Step::Query { sql, .. } if is_unlock(sql) => locked(),
@@ -2668,5 +3042,68 @@ mod tests {
              'x; DROP TABLE y' is not a valid PostgreSQL identifier"
         );
         assert!(matches!(steps.as_slice(), [Step::Fail(_)]));
+    }
+
+    fn pg_error(message: &str) -> DbError {
+        DbError {
+            code: Some("XX000".to_string()),
+            message: message.to_string(),
+            severity: Some("ERROR".to_string()),
+            detail: None,
+            hint: None,
+            position: None,
+            internal_position: None,
+            internal_query: None,
+            context: None,
+        }
+    }
+
+    /// psql's layout (libpq's `pqBuildErrorMessage3`): the caret right
+    /// after the message, then DETAIL, HINT, QUERY and CONTEXT, each label
+    /// followed by two spaces. The internal query's caret, not the sent
+    /// text's, for an internal position; a statement position wins.
+    #[test]
+    fn db_errors_follow_psqls_layout() {
+        let error = DbError {
+            detail: Some("the detail".to_string()),
+            hint: Some("the hint".to_string()),
+            internal_position: Some(9),
+            internal_query: Some("(SELECT nosuch FROM t2)".to_string()),
+            context: Some("PL/pgSQL function f() line 3 at RETURN".to_string()),
+            ..pg_error("column \"nosuch\" does not exist")
+        };
+        assert_eq!(
+            format_db_error(&error, "SELECT f();", 0),
+            "ERROR:  column \"nosuch\" does not exist\n\
+             LINE 1: (SELECT nosuch FROM t2)\n                ^\n\
+             DETAIL:  the detail\n\
+             HINT:  the hint\n\
+             QUERY:  (SELECT nosuch FROM t2)\n\
+             CONTEXT:  PL/pgSQL function f() line 3 at RETURN"
+        );
+        let statement = DbError {
+            position: Some(8),
+            ..error.clone()
+        };
+        assert!(
+            format_db_error(&statement, "SELECT f();", 0)
+                .starts_with("ERROR:  column \"nosuch\" does not exist\nLINE 1: SELECT f();\n               ^\nDETAIL:  ")
+        );
+        // An internal position without its query is spelled out, as libpq
+        // does when it has no query to show.
+        let bare = DbError {
+            internal_position: Some(9),
+            ..pg_error("boom")
+        };
+        assert_eq!(
+            format_db_error(&bare, "SELECT f();", 0),
+            "ERROR:  boom at character 9"
+        );
+        // A client-side failure has no severity.
+        let client = DbError {
+            severity: None,
+            ..pg_error("connection reset")
+        };
+        assert_eq!(format_db_error(&client, "SELECT 1;", 0), "connection reset");
     }
 }

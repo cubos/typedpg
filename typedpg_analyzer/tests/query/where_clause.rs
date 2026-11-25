@@ -584,6 +584,35 @@ fn where_valid_aggregate_reports_placement_error() {
 }
 
 #[test]
+fn misplaced_aggregate_comes_before_its_enclosing_operator() {
+    // PG raises the placement error as it transforms the aggregate, before
+    // it looks up the operator over it (`bigint << bigint` doesn't exist);
+    // an operand transformed before the aggregate fails first.
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT id FROM users WHERE pg_try_advisory_xact_lock(1::bigint << count(*))",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT id FROM users WHERE (count(*) << 1::bigint) > 0",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT u.id FROM users u JOIN users v ON (1::bigint << max(u.id)) > 0",
+            "aggregate functions are not allowed in JOIN conditions",
+        ),
+        (
+            "SELECT id FROM users WHERE nosuch + count(*) > 0",
+            "column \"nosuch\" does not exist",
+        ),
+    ] {
+        let err = db.analyze(sql).unwrap_err();
+        assert!(err.to_string().starts_with(msg), "{sql}\n  got: {err}");
+    }
+}
+
+#[test]
 fn join_on_non_boolean_uses_pg_wording() {
     let db = setup();
     let err = db

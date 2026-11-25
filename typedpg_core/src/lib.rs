@@ -19,6 +19,7 @@
 
 pub mod build;
 pub mod config;
+pub mod display_width;
 mod keywords;
 pub mod loader_cache;
 pub mod migration_marker;

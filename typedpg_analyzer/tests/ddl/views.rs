@@ -1627,3 +1627,94 @@ fn a_conditional_rule_cannot_notify() {
          CREATE RULE r2 AS ON INSERT TO t WHERE new.a > 0 DO ALSO SELECT 1;",
     )]);
 }
+
+#[test]
+fn a_view_selecting_a_field_of_a_row_depends_on_that_column() {
+    // `(t).a` is the Var of column `a` (ParseComplexProjection), not a
+    // whole-row read: the view depends on the column.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE t (a int, b int);
+         CREATE VIEW v AS SELECT (t).a FROM t;",
+    )]);
+    for (sql, message) in [
+        (
+            "ALTER TABLE t DROP COLUMN a;",
+            "cannot drop column a of table t because other objects depend on it (view v \
+             depends on column a of table t)",
+        ),
+        (
+            "ALTER TABLE t ALTER a TYPE bigint;",
+            "cannot alter type of a column used by a view or rule",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(err.to_string().starts_with(message), "{sql}\n  got: {err}");
+    }
+    db.apply_sql("ALTER TABLE t DROP COLUMN b;").unwrap();
+}
+
+#[test]
+fn unlogged_materialized_view_is_rejected() {
+    // PG 19 transformCreateTableAsStmt: 0A000.
+    assert_ddl_rejections(&[(
+        "CREATE TABLE t (a int);",
+        "CREATE UNLOGGED MATERIALIZED VIEW mv AS SELECT a FROM t;",
+        "materialized views cannot be unlogged",
+    )]);
+}
+
+#[test]
+fn a_stored_query_cannot_hold_a_role_or_database_constant() {
+    // find_expr_references_walker records no dependency on a role or a
+    // database: a view, a materialized view, a rule or a SQL-standard
+    // body holding a `regrole` / `regdatabase` constant is refused. A
+    // regclass one names a relation, a string body is stored as text and
+    // a plain CREATE TABLE AS keeps no query.
+    let mut db = build_db(&[("0001.sql", "CREATE TABLE t (a int);")]);
+    for (sql, typname) in [
+        (
+            "CREATE VIEW v AS SELECT 'postgres'::regrole AS r;",
+            "regrole",
+        ),
+        (
+            "CREATE VIEW v AS SELECT 'postgres'::regdatabase AS r;",
+            "regdatabase",
+        ),
+        (
+            "CREATE VIEW v AS SELECT 'postgres'::regrole::oid AS r;",
+            "regrole",
+        ),
+        (
+            "CREATE VIEW v AS SELECT r FROM (SELECT 'postgres'::regrole AS r) s;",
+            "regrole",
+        ),
+        (
+            "CREATE MATERIALIZED VIEW v AS SELECT 'postgres'::regrole AS r;",
+            "regrole",
+        ),
+        (
+            "CREATE RULE r AS ON INSERT TO t DO ALSO SELECT 'postgres'::regrole;",
+            "regrole",
+        ),
+        (
+            "CREATE FUNCTION f() RETURNS regrole LANGUAGE sql RETURN 'postgres'::regrole;",
+            "regrole",
+        ),
+    ] {
+        let err = db.apply_sql(sql).expect_err(sql);
+        assert!(
+            err.to_string().starts_with(&format!(
+                "constant of the type {typname} cannot be used here"
+            )),
+            "{sql}\n  got: {err}"
+        );
+    }
+    db.apply_sql(
+        "CREATE VIEW v AS SELECT 'pg_class'::regclass AS r;
+         CREATE VIEW w AS SELECT NULL::regrole AS r;
+         CREATE TABLE c AS SELECT 'postgres'::regrole AS r;
+         CREATE FUNCTION f() RETURNS regrole LANGUAGE sql AS 'SELECT ''postgres''::regrole';",
+    )
+    .unwrap();
+}

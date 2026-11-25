@@ -12,6 +12,9 @@
 /** How a value is converted; the generator writes one per column and parameter. */
 export type Codec =
   | "text"
+  // `box` as older generated modules write it: text, whose arrays
+  // separate their elements with `;` (now `["array", "text", ";"]`).
+  | "box"
   | "bool"
   | "number"
   | "bigint"
@@ -25,7 +28,12 @@ export type Codec =
   | "vector"
   | "hstore"
   | "void"
+  // The elements' delimiter (`pg_type.typdelim`) when it isn't `,`: `;`
+  // for `box`.
   | readonly ["array", Codec]
+  | readonly ["array", Codec, string]
+  // `int2vector` / `oidvector`: `1 2 3`, the elements space-separated.
+  | readonly ["spaced", Codec]
   | readonly ["range", Codec]
   | readonly ["multirange", Codec]
   | readonly ["record", readonly (readonly [string, Codec])[]];
@@ -83,7 +91,9 @@ export function decode(codec: Codec, text: string): unknown {
   if (typeof codec !== "string") {
     switch (codec[0]) {
       case "array":
-        return parseArray(text, codec[1]);
+        return parseArray(text, codec[1], delimiter(codec));
+      case "spaced":
+        return parseSpaced(text, codec[1]);
       case "range":
         return parseRange(text, codec[1]);
       case "multirange":
@@ -94,6 +104,7 @@ export function decode(codec: Codec, text: string): unknown {
   }
   switch (codec) {
     case "text":
+    case "box":
       return text;
     case "bool":
       return text === "t";
@@ -131,7 +142,9 @@ export function encode(codec: Codec, value: unknown): string | null {
   if (typeof codec !== "string") {
     switch (codec[0]) {
       case "array":
-        return encodeArray(codec[1], value as readonly unknown[]);
+        return encodeArray(codec[1], delimiter(codec), value as readonly unknown[]);
+      case "spaced":
+        return encodeSpaced(codec[1], value as readonly unknown[]);
       case "range":
         return encodeRange(codec[1], value as Range<unknown>);
       case "multirange":
@@ -162,11 +175,14 @@ export function encode(codec: Codec, value: unknown): string | null {
       // Bytes, not text: `Buffer.from` would take a string's UTF-8 bytes,
       // storing a hex digest's text, silently.
       if (typeof value === "string") {
-        throw new TypeError("typedpg: a bytea parameter must be a Uint8Array, not a string");
+        throw new TypeError("typedpg: a bytea parameter must be a Buffer or a Uint8Array, not a string");
       }
       return "\\x" + Buffer.from(value as Uint8Array).toString("hex");
     case "interval":
       return formatInterval(value);
+    case "number":
+      // `String(-0)` is `0`: a float's negative zero would be lost.
+      return Object.is(value, -0) ? "-0" : String(value);
     case "vector":
       return "[" + (value as readonly number[]).join(",") + "]";
     case "hstore":
@@ -178,6 +194,11 @@ export function encode(codec: Codec, value: unknown): string | null {
   }
 }
 
+/** What the array codec `codec` separates its elements with (`pg_type.typdelim`). */
+function delimiter(codec: readonly ["array", Codec] | readonly ["array", Codec, string]): string {
+  return codec[2] ?? (codec[1] === "box" ? ";" : ",");
+}
+
 /** `"…"` with `"` and `\` escaped, as array, record and range literals read it. */
 function quote(text: string): string {
   return '"' + text.replace(/[\\"]/g, "\\$&") + '"';
@@ -185,12 +206,31 @@ function quote(text: string): string {
 
 const quoteHstore = quote;
 
-function encodeArray(codec: Codec, items: readonly unknown[]): string {
+function encodeArray(codec: Codec, delim: string, items: readonly unknown[]): string {
   const parts = items.map((item) => {
     const text = encode(codec, item);
     return text === null ? "NULL" : quote(text);
   });
-  return "{" + parts.join(",") + "}";
+  return "{" + parts.join(delim) + "}";
+}
+
+/** `1 2 3`, as `int2vectorin` / `oidvectorin` read it: no element is NULL. */
+function encodeSpaced(codec: Codec, items: readonly unknown[]): string {
+  return items
+    .map((item) => {
+      const text = encode(codec, item);
+      if (text === null) throw new TypeError("typedpg: an int2vector or oidvector element cannot be null");
+      return text;
+    })
+    .join(" ");
+}
+
+/** `1 2 3` (the empty one: nothing) as its elements. */
+function parseSpaced(text: string, codec: Codec): unknown[] {
+  return text
+    .split(" ")
+    .filter((item) => item !== "")
+    .map((item) => decode(codec, item));
 }
 
 function encodeRecord(fields: readonly (readonly [string, Codec])[], value: Record<string, unknown>): string {
@@ -258,11 +298,17 @@ function readItem(text: string, i: number, stops: string, doubled: boolean): [st
 }
 
 /**
- * `{a,"b c",NULL}` (with an optional `[1:3]=` bounds decoration) as an array.
+ * `{a,"b c",NULL}` (with an optional `[1:3]=` bounds decoration, and `delim`
+ * between the elements: `;` for a `box[]`) as an array.
  * A multidimensional array is an error, as on the Rust side: its type is the
  * one-dimensional one's.
  */
-function parseArray(text: string, codec: Codec): unknown[] {
+function parseArray(text: string, codec: Codec, delim: string): unknown[] {
+  // An `int2vector` / `oidvector` (`1 2 3`), as older generated modules
+  // describe it: an array of `int2` / `oid` (now a `spaced` codec).
+  if (text[0] !== "{" && text[0] !== "[") {
+    return parseSpaced(text, codec);
+  }
   let i = 0;
   if (text[0] === "[") {
     i = text.indexOf("=") + 1;
@@ -275,11 +321,11 @@ function parseArray(text: string, codec: Codec): unknown[] {
     if (text[i] === "{") {
       throw new DecodeError("typedpg: multidimensional arrays are not supported");
     }
-    const [item, quoted, next] = readItem(text, i, ",}", false);
+    const [item, quoted, next] = readItem(text, i, delim + "}", false);
     i = next;
     out.push(!quoted && item.toUpperCase() === "NULL" ? null : decode(codec, item));
     if (text[i] === "}") return out;
-    if (text[i] !== ",") throw new DecodeError(`typedpg: malformed array: ${text}`);
+    if (text[i] !== delim) throw new DecodeError(`typedpg: malformed array: ${text}`);
     i++;
   }
 }
@@ -385,9 +431,9 @@ function unmark(value: unknown): unknown {
 }
 
 /** The hex format (`\x0102`, the default `bytea_output`) or the escape one. */
-function parseBytea(text: string): Uint8Array {
+function parseBytea(text: string): Buffer {
   if (text.startsWith("\\x")) {
-    return new Uint8Array(Buffer.from(text.slice(2), "hex"));
+    return Buffer.from(text.slice(2), "hex");
   }
   // `bytea_output = escape`: printable ASCII as is, `\\` and `\ooo` octal.
   const out: number[] = [];
@@ -405,7 +451,7 @@ function parseBytea(text: string): Uint8Array {
       i++;
     }
   }
-  return new Uint8Array(out);
+  return Buffer.from(out);
 }
 
 /**

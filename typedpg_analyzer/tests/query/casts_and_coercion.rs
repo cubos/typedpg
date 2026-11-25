@@ -1587,21 +1587,31 @@ fn arrays_coerce_element_wise() {
         "SELECT GREATEST(ARRAY[1], ARRAY[2.5]) AS a",
     ] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        // (Only the UNION's arms carry their elements' nullability.)
-        let element_nullable = sql.contains("UNION").then_some(false);
+        // An `integer` converted to `numeric` is never NULL: the elements
+        // stay known.
         let expected = Type::Array {
             element: Box::new(numeric()),
-            element_nullable,
+            element_nullable: Some(false),
+            name: None,
         };
         assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }
-    for sql in [
-        "SELECT ARRAY[ARRAY[1], ARRAY[2.5]] AS a",
-        "SELECT ARRAY[[1], [2.5]] AS a",
-        "SELECT ARRAY[arr, ARRAY[1.5]] AS a FROM ta",
+    let known = |element| Type::Array {
+        element: Box::new(element),
+        element_nullable: Some(false),
+        name: None,
+    };
+    for (sql, expected) in [
+        ("SELECT ARRAY[ARRAY[1], ARRAY[2.5]] AS a", known(numeric())),
+        ("SELECT ARRAY[[1], [2.5]] AS a", known(numeric())),
+        // A table's array column says nothing of its elements.
+        (
+            "SELECT ARRAY[arr, ARRAY[1.5]] AS a FROM ta",
+            array_of(numeric()),
+        ),
     ] {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-        assert_eq!(s.columns[0].pg_type, array_of(numeric()), "{sql}");
+        assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }
     let s = db
         .analyze("SELECT ARRAY[ARRAY[1]::int[], ARRAY[2]::bigint[]] AS a")
@@ -2110,4 +2120,67 @@ fn a_value_cast_to_unknown_is_no_literal() {
         let s = db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert_eq!(s.columns[0].pg_type, expected, "{sql}");
     }
+}
+
+#[test]
+fn casts_of_non_null_stable_functions_are_never_null() {
+    // now() & co. are never NULL, and finite: `time(timestamp)`,
+    // `time(timestamptz)` and `timetz(timestamptz)` — the casts' functions
+    // too — are NULL only for an infinite timestamp, so they are never NULL
+    // over one. Over a column or a literal that may be infinite they stay
+    // nullable (`'infinity'::timestamp::time` is NULL).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE tt (ts timestamp NOT NULL, tz timestamptz NOT NULL);
+         CREATE TABLE tf (fin timestamptz NOT NULL CHECK (isfinite(fin)));",
+    )
+    .unwrap();
+    let nullability = |sql: &str| -> Vec<(String, bool)> {
+        db.analyze(sql)
+            .unwrap()
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.nullable))
+            .collect()
+    };
+    let expect = |cols: &[(&str, bool)]| -> Vec<(String, bool)> {
+        cols.iter().map(|(n, b)| (n.to_string(), *b)).collect()
+    };
+    assert_eq!(
+        nullability(
+            "SELECT now()::time AS a, current_timestamp::date AS b, localtimestamp::time AS c, \
+             now()::date AS d, current_date::timestamp AS e, CAST(now() AS timestamp) AS f, \
+             statement_timestamp()::time AS g, current_time::time AS h, now()::text AS i, \
+             now()::timetz AS j, pg_catalog.time(now()) AS k, \
+             pg_catalog.timetz(clock_timestamp()) AS l, (now() + interval '1 day')::time AS m, \
+             ts::time AS o, tz::time AS p, 'infinity'::timestamp::time AS q, \
+             pg_catalog.time(ts) AS r, (now() + interval 'infinity')::time AS s \
+             FROM tt"
+        ),
+        expect(&[
+            ("a", false),
+            ("b", false),
+            ("c", false),
+            ("d", false),
+            ("e", false),
+            ("f", false),
+            ("g", false),
+            ("h", false),
+            ("i", false),
+            ("j", false),
+            ("k", false),
+            ("l", false),
+            ("m", false),
+            ("o", true),
+            ("p", true),
+            ("q", true),
+            ("r", true),
+            ("s", true),
+        ])
+    );
+    // A column CHECKed finite.
+    assert_eq!(
+        nullability("SELECT fin::time AS n, fin::timetz AS t FROM tf"),
+        expect(&[("n", false), ("t", false)])
+    );
 }

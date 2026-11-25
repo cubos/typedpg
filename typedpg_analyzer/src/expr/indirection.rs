@@ -240,13 +240,9 @@ pub(crate) fn column_ref_is_column(cr: &ast::ColumnRef, scope: &Scope) -> bool {
     if parts.len() != cr.fields.len() {
         return false; // `t.*`
     }
-    let (table, column) = match parts.as_slice() {
-        [col] => (None, col.as_str()),
-        [tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-        _ => return false,
-    };
-    scope.resolve_column(table, column, None).is_ok()
+    scope
+        .resolve_column_names(&parts, None)
+        .is_some_and(|r| r.is_ok())
 }
 
 /// PG's `expandRecordVariable`: the row shape of a `record` column (of a
@@ -677,19 +673,34 @@ pub(crate) fn transform_array_expr_typed(
     // Its elements are the listed values (unless it is multidimensional,
     // where they are the sub-arrays' elements), each converted to the
     // element type — which may map one to NULL (`int4(jsonb)` for a JSON
-    // null, a user's non-strict cast).
-    let elem_nullable = (!multidims).then(|| {
-        elems.iter().any(|t| {
+    // null, a user's non-strict cast). A multidimensional one's are known
+    // when every sub-array's are, converted element by element (a NULL
+    // sub-array adds none; it fails unless all are empty).
+    let elem_nullable = if multidims {
+        merge_elem_nullable(arr.elements.iter().zip(&elems).filter_map(|(e, t)| {
+            if matches!(e.as_ref(), Some(ast::Node::AConst(c)) if c.isnull) {
+                return None;
+            }
+            Some(
+                if t.type_oid == oid::UNKNOWN
+                    || super::literals::array_cast_runs_function(t.type_oid, coerce_type, snapshot)
+                {
+                    None
+                } else if super::coercion_can_null_elements(t.type_oid, coerce_type, snapshot) {
+                    Some(true)
+                } else {
+                    t.elem_nullable
+                },
+            )
+        }))
+    } else {
+        Some(elems.iter().any(|t| {
             t.nullable
                 || (t.type_oid != oid::UNKNOWN
                     && t.type_oid != coerce_type
-                    && super::literals::cast_function_can_return_null(
-                        t.type_oid,
-                        coerce_type,
-                        snapshot,
-                    ))
-        })
-    });
+                    && super::literals::value_cast_can_return_null(t, coerce_type, snapshot))
+        }))
+    };
     // What its non-NULL elements are: each listed value's (a sub-array's
     // elements'), converted to the element type; a NULL constant is none.
     let parts: Vec<crate::refine::Refinement> = arr
@@ -715,13 +726,26 @@ pub(crate) fn transform_array_expr_typed(
             .iter()
             .zip(&elems)
             .all(|(alone, t)| alone.unwrap_or(t.type_oid == coerce_type));
-    Ok((
-        ExprType::scalar_with_typmod(array_type, false, typmod)
-            .with_collation(state)
-            .with_elem_nullable(elem_nullable)
-            .with_elem_refine(elem_refine),
-        typed,
-    ))
+    let mut out = ExprType::scalar_with_typmod(array_type, false, typmod)
+        .with_collation(state)
+        .with_elem_nullable(elem_nullable)
+        .with_elem_refine(elem_refine);
+    // An array of records: its elements' row shape, when they all agree on
+    // one (a NULL element has none to agree on); a sub-array's is its
+    // elements'.
+    if array_type == oid::RECORD_ARRAY {
+        out.record_fields = super::merge_value_shapes(
+            arr.elements
+                .iter()
+                .zip(&elems)
+                .filter(|(e, t)| {
+                    t.type_oid != oid::UNKNOWN
+                        && !matches!(e.as_ref(), Some(ast::Node::AConst(c)) if c.isnull)
+                })
+                .map(|(_, t)| t.record_fields.as_ref()),
+        );
+    }
+    Ok((out, typed))
 }
 
 /// Whether an `ARRAY[…]` element of type `t` is a sub-array, making the
@@ -1097,7 +1121,9 @@ const MAXDIM: usize = 6;
 /// fetches and assignments (`UPDATE … SET arr[1] = …`): the returned type is
 /// both the fetched value's type and the type an assigned value must have.
 ///
-/// - A domain subscripts as its base type (`transformContainerType`).
+/// - A domain subscripts as its base type (`transformContainerType`), and
+///   `int2vector` / `oidvector` as `int2[]` / `oid[]` (a slice of one is
+///   one of those: it may not have the vector's dimensions).
 /// - A type is subscriptable iff it has a subscript handler: every type with
 ///   a `typelem` (true arrays, `int2vector`, `name`, `point`, …) uses the
 ///   array handler, and `jsonb` its own. Anything else is `cannot subscript
@@ -1116,7 +1142,11 @@ pub(crate) fn transform_container_subscripts(
     params: &mut ParamCollector,
 ) -> Result<ExprType, AnalyzeError> {
     let snapshot = ctx.snapshot;
-    let base = snapshot.unwrap_domain(container.type_oid);
+    let base = match snapshot.unwrap_domain(container.type_oid) {
+        oid::INT2VECTOR => oid::INT2ARRAY,
+        oid::OIDVECTOR => oid::OIDARRAY,
+        base => base,
+    };
     let typmod = if base == container.type_oid {
         container.typmod
     } else {
@@ -1244,18 +1274,32 @@ pub(crate) fn transform_container_subscripts(
     if is_slice {
         // `arr[lo:hi]` keeps the (base) array type. NULL iff the array or a
         // bound is NULL — out-of-range bounds yield an empty array.
-        Ok(
+        let mut out =
             ExprType::scalar_with_typmod(base, container.nullable || any_bound_nullable, typmod)
                 .with_collation(derive_collation([container], base, snapshot)?)
-                // Some of its elements.
-                .with_elem_refine(container.elem_refine.clone()),
-        )
+                // Some of its elements (the bounds are clipped to the
+                // array's: a slice adds no NULL element).
+                .with_elem_nullable(container.elem_nullable)
+                .with_elem_refine(container.elem_refine.clone());
+        if base == oid::RECORD_ARRAY {
+            out.record_fields.clone_from(&container.record_fields);
+        }
+        Ok(out)
     } else {
         // `arr[i]` is always nullable (out-of-bounds → NULL, even with a
         // non-null array and index).
-        Ok(ExprType::scalar_with_typmod(elem, true, typmod)
+        let mut out = ExprType::scalar_with_typmod(elem, true, typmod)
             .with_collation(derive_collation([container], elem, snapshot)?)
             // One of its elements.
-            .with_refine(container.elem_refine.clone()))
+            .with_refine(container.elem_refine.clone());
+        // An element of a `record[]` has its row shape, which PG doesn't
+        // see (a SubscriptingRef is typed plain `record`).
+        if base == oid::RECORD_ARRAY {
+            out.record_fields = container
+                .record_fields
+                .as_ref()
+                .map(|s| RecordShape::hidden(s.fields.clone()));
+        }
+        Ok(out)
     }
 }

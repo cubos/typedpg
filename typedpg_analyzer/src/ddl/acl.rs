@@ -243,6 +243,7 @@ pub(crate) enum AclObjectKind {
     Schema,
     Type,
     Language,
+    LargeObject,
 }
 
 impl AclObjectKind {
@@ -254,6 +255,7 @@ impl AclObjectKind {
             AclObjectKind::Schema => bits::SCHEMA,
             AclObjectKind::Type => bits::TYPE,
             AclObjectKind::Language => bits::LANGUAGE,
+            AclObjectKind::LargeObject => bits::LARGEOBJECT,
         }
     }
 
@@ -267,6 +269,7 @@ impl AclObjectKind {
             AclObjectKind::Schema => (0, bits::SCHEMA),
             AclObjectKind::Type => (bits::USAGE, bits::TYPE),
             AclObjectKind::Language => (bits::USAGE, bits::LANGUAGE),
+            AclObjectKind::LargeObject => (0, bits::LARGEOBJECT),
         }
     }
 }
@@ -282,6 +285,7 @@ pub(crate) enum DefaultAclClass {
     Function,
     Type,
     Schema,
+    LargeObject,
 }
 
 impl DefaultAclClass {
@@ -294,6 +298,7 @@ impl DefaultAclClass {
             | ObjectType::ObjectRoutine => DefaultAclClass::Function,
             ObjectType::ObjectType | ObjectType::ObjectDomain => DefaultAclClass::Type,
             ObjectType::ObjectSchema => DefaultAclClass::Schema,
+            ObjectType::ObjectLargeobject => DefaultAclClass::LargeObject,
             _ => return None,
         })
     }
@@ -305,6 +310,7 @@ impl DefaultAclClass {
             DefaultAclClass::Function => AclObjectKind::Function,
             DefaultAclClass::Type => AclObjectKind::Type,
             DefaultAclClass::Schema => AclObjectKind::Schema,
+            DefaultAclClass::LargeObject => AclObjectKind::LargeObject,
         }
     }
 
@@ -317,6 +323,7 @@ impl DefaultAclClass {
             DefaultAclClass::Function => 'f',
             DefaultAclClass::Type => 'T',
             DefaultAclClass::Schema => 'n',
+            DefaultAclClass::LargeObject => 'L',
         }
     }
 }
@@ -524,11 +531,17 @@ fn grant_options_held(
     if bits == 0 {
         return 0;
     }
-    if db.roles.has_privs_of_role(role, owner) || db.roles.is_superuser(role) {
+    if db.roles.has_privs_of_role(role, owner)
+        || db.roles.is_superuser(role)
+        || may_have_gained_privileges(db, role)
+    {
         return bits;
     }
     let mut result = 0;
     for item in acl {
+        if may_have_lost(db, item) {
+            continue;
+        }
         let matches = match item.grantee {
             Grantee::Public => true,
             Grantee::Role(grantee) => grantee == role || db.roles.has_privs_of_role(role, grantee),
@@ -605,6 +618,45 @@ fn select_best_grantor(
     (grantor, grant_options)
 }
 
+/// Whether `role` may hold privileges the catalog doesn't record, when
+/// checks read the upper bound of an uncertain catalog (see
+/// [`super::uncertain`]): it, or a role whose privileges it has, may have
+/// been granted some by code the analyzer couldn't follow.
+fn may_have_gained_privileges(db: &PgCatalog, role: RoleId) -> bool {
+    let uncertain = &db.roles.uncertain;
+    if super::uncertain::bound() != super::uncertain::Bound::Upper {
+        return false;
+    }
+    if uncertain.catalog {
+        return true;
+    }
+    if uncertain.gained_privileges.is_empty() && uncertain.roles.is_empty() {
+        return false;
+    }
+    db.roles.roles_with_privs_of(role).into_iter().any(|other| {
+        let name = db.roles.name(other);
+        // A role whose attributes may differ may be a superuser.
+        uncertain.gained_privileges.contains(name) || uncertain.roles.contains(name)
+    })
+}
+
+/// Whether ACL entry `item` may be gone, when checks read the lower bound
+/// of an uncertain catalog (see [`super::uncertain`]).
+fn may_have_lost(db: &PgCatalog, item: &AclItem) -> bool {
+    let uncertain = &db.roles.uncertain;
+    if super::uncertain::bound() != super::uncertain::Bound::Lower
+        || (uncertain.lost_privileges.is_empty() && !uncertain.catalog)
+    {
+        return false;
+    }
+    match item.grantee {
+        Grantee::Public => uncertain.lost_privileges.all || uncertain.catalog,
+        Grantee::Role(grantee) => {
+            uncertain.catalog || uncertain.lost_privileges.contains(db.roles.name(grantee))
+        }
+    }
+}
+
 /// `aclmask` of plain privileges (`pg_class_aclmask` & co.'s core): the ACL
 /// entries for `role`, for PUBLIC, and for every role it has the privileges
 /// of.
@@ -618,15 +670,19 @@ fn aclmask_privileges(
     if mask == 0 {
         return 0;
     }
+    if may_have_gained_privileges(db, role) {
+        return mask;
+    }
+    let acl: Vec<&AclItem> = acl.iter().filter(|item| !may_have_lost(db, item)).collect();
     let mut result = 0;
-    for item in acl {
+    for item in acl.iter().copied() {
         if matches!(item.grantee, Grantee::Public) || item.grantee == Grantee::Role(role) {
             result |= item.privileges & mask;
         }
     }
     let remaining = mask & !result;
     if remaining != 0 {
-        for item in acl {
+        for item in acl.iter().copied() {
             let Grantee::Role(grantee) = item.grantee else {
                 continue;
             };
@@ -662,9 +718,28 @@ pub(crate) struct Acls {
     /// `pg_parameter_acl`: by lowercased parameter name, the row's OID and
     /// its ACL. Absent means no row (no privilege granted).
     parameters: HashMap<String, (u32, Vec<AclItem>)>,
+    /// The grantees of a `GRANT CREATE` (or `ALL`) `ON DATABASE`: the
+    /// database's own ACL isn't modelled, only who was granted CREATE on
+    /// it ([`has_database_create`]).
+    database_create: Vec<Grantee>,
+    /// A `REVOKE … ON DATABASE` or a new database owner: who may create
+    /// in it is unknown.
+    database_unknown: bool,
 }
 
 impl Acls {
+    /// The `pg_default_acl` rows of a schema (`ALTER DEFAULT PRIVILEGES IN
+    /// SCHEMA`), as `(role, schema, defaclobjtype)` (for the catalog
+    /// oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn schema_defaults(
+        &self,
+    ) -> impl Iterator<Item = (RoleId, PgNamespaceOid, char)> + '_ {
+        self.defaults
+            .keys()
+            .filter_map(|(role, ns, class)| Some((*role, (*ns)?, class.objtype())))
+    }
+
     pub(crate) fn forget_object(&mut self, object: AclObject) {
         self.owners.remove(&object);
         self.items.remove(&object);
@@ -1203,10 +1278,21 @@ pub fn grant(interp: &mut PgCatalog, stmt: &GrantStmt) -> Result<(), DdlError> {
     }
     let grantees = resolve_grantees(interp, &stmt.grantees)?;
     let privileges = check_privileges(objtype, &stmt.privileges, false)?;
+    if objtype == ObjectType::ObjectDatabase {
+        if !stmt.is_grant {
+            interp.acls.database_unknown = true;
+        } else if privileges.all || privileges.mask & bits::CREATE != 0 {
+            interp.acls.database_create.extend(grantees.iter().copied());
+        }
+    }
     for target in &targets {
         check_target(interp, objtype, target, &privileges)?;
     }
-    check_grant_option(stmt, &grantees)?;
+    // merge_acl_with_grant checks the grant option per object: `ALL … IN
+    // SCHEMA` finding none checks nothing.
+    if !(targtype == GrantTargetType::AclTargetAllInSchema && targets.is_empty()) {
+        check_grant_option(stmt, &grantees)?;
+    }
     let behavior = stmt.behavior;
     let current = current_role(interp);
     // select_best_grantor (PostgreSQL 19): `GRANTED BY` names the grantor,
@@ -1596,6 +1682,27 @@ fn apply_parameter_grant(
         .parameters
         .insert(name.to_owned(), (oid, new_acl));
     Ok(())
+}
+
+/// Whether `role` has CREATE on the current database (`object_aclcheck`
+/// on it): its owner — the migrations' user — or a superuser does, and
+/// whoever a `GRANT CREATE ON DATABASE` reached; anyone once the
+/// database's privileges are unknown, or once the role may hold
+/// privileges the catalog doesn't record.
+pub(crate) fn has_database_create(db: &PgCatalog, role: RoleId) -> bool {
+    db.acls.database_unknown
+        || db.roles.has_privs_of_role(role, db.roles.migrations_user)
+        || may_have_gained_privileges(db, role)
+        || db.acls.database_create.iter().any(|g| match g {
+            Grantee::Public => true,
+            Grantee::Role(r) => db.roles.has_privs_of_role(role, *r),
+        })
+}
+
+/// Who may create in the current database is no longer known (a new
+/// database owner).
+pub(crate) fn forget_database_privileges(db: &mut PgCatalog) {
+    db.acls.database_unknown = true;
 }
 
 /// What `aclcheck_error` names an object: its kind and unqualified name
@@ -2432,6 +2539,7 @@ fn default_acl_noun(class: DefaultAclClass) -> &'static str {
         DefaultAclClass::Function => "functions",
         DefaultAclClass::Type => "types",
         DefaultAclClass::Schema => "schemas",
+        DefaultAclClass::LargeObject => "large objects",
     }
 }
 

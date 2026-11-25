@@ -23,12 +23,17 @@ fn c_isspace(b: u8) -> bool {
 }
 
 /// A parsed range literal (`range_parse`).
-struct RangeParts {
-    empty: bool,
-    lower: Option<String>,
-    upper: Option<String>,
-    lower_inc: bool,
-    upper_inc: bool,
+pub(crate) struct RangeParts {
+    pub(crate) empty: bool,
+    pub(crate) lower: Option<String>,
+    pub(crate) upper: Option<String>,
+    pub(crate) lower_inc: bool,
+    pub(crate) upper_inc: bool,
+}
+
+/// [`parse_range`], for the printer of stored constants.
+pub(crate) fn range_parts(content: &str) -> Option<RangeParts> {
+    parse_range(content).ok()
 }
 
 /// `range_parse` + `range_parse_bound`: the literal's structure, with each

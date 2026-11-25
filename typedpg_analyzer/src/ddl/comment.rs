@@ -78,6 +78,9 @@ pub fn alter_owner(interp: &mut PgCatalog, stmt: &AlterOwnerStmt) -> Result<(), 
     let Some(owner) = new_owner else {
         return Ok(());
     };
+    if objtype == ObjectType::ObjectDatabase {
+        acl::forget_database_privileges(interp);
+    }
     match objtype {
         ObjectType::ObjectTable
         | ObjectType::ObjectView
@@ -531,6 +534,16 @@ pub(crate) fn resolve_object(
         ObjectType::ObjectLanguage => {
             if let ast::Node::String(s) = object {
                 super::languages::check(interp, &s.sval)?;
+            }
+        }
+        ObjectType::ObjectExtension => {
+            if let ast::Node::String(s) = object
+                && !interp.extension_by_name.contains_key(&s.sval)
+            {
+                return Err(DdlError::TypeNotFound(format!(
+                    "extension \"{}\" does not exist",
+                    s.sval
+                )));
             }
         }
         _ => {}

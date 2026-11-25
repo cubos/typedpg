@@ -306,6 +306,9 @@ pub(crate) struct TableSource {
     /// `new.*`, a whole-row `new`) but never by an unqualified column name
     /// or the bare `*`. Rule OLD / NEW and RETURNING's OLD / NEW rows.
     pub table_only: bool,
+    /// A namespace item sharing another entry's range-table entry
+    /// (RETURNING's OLD / NEW): no range-table entry is named after it.
+    pub shares_rte: bool,
     /// The whole row may be absent (NULL): RETURNING's `old` for an INSERT,
     /// `new` for a DELETE. Its columns are then nullable too.
     pub null_row: bool,
@@ -343,6 +346,17 @@ pub(crate) struct TableSource {
     /// whose alias is then a fresh one: names may repeat across hidden
     /// entries (`(t a JOIN u b) j, (t a JOIN u b) k`).
     pub hidden: Option<HiddenEntry>,
+    /// When the entry was built ([`next_source_seq`]): a level's FROM items
+    /// are built in the order PG adds their range-table entries (left to
+    /// right, a join after its sides), so this orders them like the range
+    /// table, which `transformLockingClause` searches for a name.
+    pub seq: u64,
+}
+
+/// A fresh, increasing [`TableSource::seq`].
+pub(crate) fn next_source_seq() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// What a hidden entry was: its name in the query, and the alias of the
@@ -356,8 +370,11 @@ pub(crate) struct HiddenEntry {
 /// Why a locking clause can't be pushed into a view or subquery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LockBlock {
-    /// `CheckSelectLocking`: `FOR UPDATE is not allowed with <construct>`.
-    NotAllowedWith(&'static str),
+    /// `CheckSelectLocking`: `FOR UPDATE is not allowed with <construct>` —
+    /// the parser's (a subquery's, pushed down by `transformLockingClause`)
+    /// or, through a view whose query only the rewriter brings in, the
+    /// planner's (`true`).
+    NotAllowedWith(&'static str, bool),
     /// `make_outerjoininfo`: a marked relation on an outer join's nullable
     /// side.
     NullableSide,
@@ -396,6 +413,8 @@ pub(crate) enum SourceKind {
     Cte,
     /// A FROM function (`RTE_FUNCTION`).
     Function,
+    /// A `JSON_TABLE` (`RTE_TABLEFUNC`).
+    TableFunc,
     /// A join (`RTE_JOIN`): an aliased one, or the merged columns of a
     /// `JOIN USING` — named by its `AS` alias when `using_alias`, a name
     /// in the join's namespace only, not the range table's.
@@ -463,6 +482,7 @@ impl TableSource {
             lateral_blocked: false,
             kind: SourceKind::Other,
             table_only: false,
+            shares_rte: false,
             null_row: false,
             dml_target: false,
             whole_row: WholeRow::Record,
@@ -472,6 +492,7 @@ impl TableSource {
             only: false,
             min_one_row: false,
             hidden: None,
+            seq: next_source_seq(),
         }
     }
 
@@ -584,6 +605,7 @@ impl TableSource {
             join_hidden: Default::default(),
             lateral_blocked: false,
             table_only: true,
+            shares_rte: true,
             null_row,
             ..self.clone()
         }
@@ -1110,6 +1132,9 @@ impl Scope {
             crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::relation(relid));
         }
         self.sources.push(TableSource {
+            // An entry named otherwise than its relation (`UPDATE t AS x`,
+            // EXCLUDED) has an alias.
+            aliased: alias != qn.name,
             system_columns: system_columns_for(alias),
             source_qn: Some(qn),
             relid,
@@ -1186,13 +1211,7 @@ impl Scope {
             return None;
         }
         let parts = crate::expr::extract_string_fields(&c.fields);
-        let (table, column) = match parts.as_slice() {
-            [col] => (None, col.as_str()),
-            [tbl, col] => (Some(tbl.as_str()), col.as_str()),
-            [_schema, tbl, col] => (Some(tbl.as_str()), col.as_str()),
-            _ => return None,
-        };
-        self.resolve_column(table, column, None).ok()
+        self.resolve_column_names(&parts, None)?.ok()
     }
 
     /// Set aside the visible entry named `alias`, if any, before a FROM
@@ -1236,7 +1255,29 @@ impl Scope {
                 continue;
             }
             if self.sources.iter().any(|s| s.alias == alias) {
-                return Err(crate::pgmsg::duplicate_table_alias(&alias, span).finalize_implicit());
+                // checkNameSpaceConflicts: two relations named without an
+                // alias may share a name when they are different relations
+                // (`public.t, s2.t`); the earlier one then stays set aside,
+                // answering to the name — a qualifier only it and the new
+                // entry answer to is ambiguous.
+                let plain_relation =
+                    |s: &TableSource| matches!(s.kind, SourceKind::Relation) && !s.aliased;
+                let earlier = beside
+                    .clone()
+                    .filter(|&i| self.sources[i].answers_to(&alias));
+                let compatible = earlier.into_iter().all(|i| {
+                    let e = &self.sources[i];
+                    self.sources
+                        .iter()
+                        .filter(|s| s.alias == alias)
+                        .all(|n| plain_relation(e) && plain_relation(n) && e.relid != n.relid)
+                });
+                if !compatible {
+                    return Err(
+                        crate::pgmsg::duplicate_table_alias(&alias, span).finalize_implicit()
+                    );
+                }
+                continue;
             }
             self.sources[at].rename(&alias);
             if self.lateral_blocked_aliases.remove(&key) {
@@ -1273,6 +1314,145 @@ impl Scope {
     pub(crate) fn column_source(&self, col: &ScopeColumn) -> Option<&TableSource> {
         self.all_tiers()
             .find(|s| s.columns.iter().any(|c| std::ptr::eq(c, col)))
+    }
+
+    /// The entry a schema-qualified reference `schema.table.…` names —
+    /// PG's `refnameNamespaceItem` with a schema: the nearest level's
+    /// entry scanning the relation `schema.table` under its own name
+    /// (`scanNameSpaceForRelid`: an aliased entry never matches).
+    /// Otherwise PG's `errorMissingRTE` for `schema.table`.
+    pub(crate) fn schema_qualified_source(
+        &self,
+        schema: &str,
+        table: &str,
+        span: Option<SourceSpan>,
+    ) -> Result<&TableSource, AnalyzeError> {
+        // The entry scans the relation `schema.table` (a relation is one
+        // name in one schema).
+        let scans = |s: &TableSource| {
+            matches!(s.kind, SourceKind::Relation)
+                && s.source_qn
+                    .as_ref()
+                    .is_some_and(|qn| qn.schema == schema && qn.name == table)
+        };
+        let unaliased_scan =
+            |s: &&TableSource| scans(s) && !s.aliased && !s.table_only && s.hidden.is_none();
+        if let Some(source) = self
+            .tiers()
+            .find_map(|tier| tier.iter().find(unaliased_scan))
+        {
+            if source.lateral_blocked {
+                return Err(lateral_blocked_error(source, span));
+            }
+            return Ok(source);
+        }
+        // errorMissingRTE: an entry of any enclosing range table scanning
+        // the relation or named `table` (searchRangeTableForRel).
+        let entry = self
+            .all_tiers()
+            .chain(self.shadowed_sources.iter())
+            .filter(|s| !s.shares_rte)
+            .find(|s| scans(s) || s.refname() == table || s.answers_to(table));
+        let Some(entry) = entry else {
+            return Err(RawError::new(
+                AnalyzeError::UndefinedTable(format!(
+                    "missing FROM-clause entry for table \"{table}\""
+                )),
+                span,
+                self.missing_entry_hint(table),
+            )
+            .with_primary_label("no FROM-clause entry by this name")
+            .finalize_implicit());
+        };
+        let refname = aside_original(&entry.alias).unwrap_or_else(|| entry.refname());
+        // An aliased entry the alias reaches: the relation's real name was
+        // used instead of the alias.
+        let alias_visible = entry.aliased
+            && refname != table
+            && !is_hidden_alias(refname)
+            && self
+                .find_source(refname)
+                .is_some_and(|s| std::ptr::eq(s, entry));
+        let (hint, note) = if alias_visible {
+            (
+                Some(format!(
+                    "Perhaps you meant to reference the table alias \"{refname}\"."
+                )),
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(format!(
+                    "There is an entry for table \"{refname}\", but it cannot be referenced \
+                     from this part of the query."
+                )),
+            )
+        };
+        let mut err = RawError::new(
+            AnalyzeError::UndefinedTable(format!(
+                "invalid reference to FROM-clause entry for table \"{table}\""
+            )),
+            span,
+            hint,
+        )
+        .with_primary_label("not referencable here");
+        if let Some(note) = note {
+            err = err.with_note(note);
+        }
+        Err(err.finalize_implicit())
+    }
+
+    /// `schema.table.column`: the column of the entry
+    /// [`Self::schema_qualified_source`] finds.
+    pub(crate) fn resolve_schema_qualified_column(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+        span: Option<SourceSpan>,
+    ) -> Result<&ScopeColumn, AnalyzeError> {
+        let source = self.schema_qualified_source(schema, table, span)?;
+        let mut found = source
+            .columns
+            .iter()
+            .chain(source.system_columns.iter())
+            .filter(|c| c.name == column);
+        match (found.next(), found.next()) {
+            (Some(col), None) => {
+                source.note_column(column);
+                Ok(col)
+            }
+            (Some(_), Some(_)) => {
+                let qn = QualifiedName::new(table, column).to_string();
+                Err(ambiguous_column_error(column, &[qn.clone(), qn], span))
+            }
+            // errorMissingColumn: "column %s.%s does not exist" — the
+            // entry's name and the column as written, unquoted.
+            (None, _) => Err(undefined_column_error(
+                self,
+                Some(table),
+                column,
+                format!("column {table}.{column} does not exist"),
+                span,
+            )),
+        }
+    }
+
+    /// The column a column reference's names (`c`, `t.c`, `s.t.c`) reach:
+    /// [`Self::resolve_column`], or [`Self::resolve_schema_qualified_column`]
+    /// for a schema-qualified one. `None` for any other count of names.
+    pub(crate) fn resolve_column_names(
+        &self,
+        parts: &[String],
+        span: Option<SourceSpan>,
+    ) -> Option<Result<&ScopeColumn, AnalyzeError>> {
+        Some(match parts {
+            [col] => self.resolve_column(None, col, span),
+            [tbl, col] => self.resolve_column(Some(tbl), col, span),
+            [schema, tbl, col] => self.resolve_schema_qualified_column(schema, tbl, col, span),
+            _ => return None,
+        })
     }
 
     pub fn resolve_column(

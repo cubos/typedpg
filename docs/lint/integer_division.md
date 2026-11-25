@@ -3,9 +3,9 @@
 An integer division, which truncates, whose result is then used as a
 `numeric` or floating-point value.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -18,7 +18,7 @@ SELECT id FROM stats WHERE done / total > 0.5;
 ```
 
 ```
-warning[integer_division]: integer division truncates before its result is used as numeric: the fraction is already lost
+warning[suspicious/integer_division]: integer division truncates before its result is used as numeric: the fraction is already lost
    ╭─[queries.sql:2:18]
  2 │ SELECT id, round(done / total * 100.0, 1) AS pct FROM stats;
    ·                  ────────────

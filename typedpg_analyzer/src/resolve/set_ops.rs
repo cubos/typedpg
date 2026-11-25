@@ -238,9 +238,13 @@ pub(crate) fn analyze_set_operation(
                 // PG (SQLSTATE 42804): `UNION types A and B cannot be
                 // matched` — INTERSECT/EXCEPT use their own name. Use
                 // `Invalid` to keep `TypeMismatch::Display`'s generic prefix
-                // from leaking.
-                let a = crate::ddl::util::format_type_for_message(snapshot, l.type_oid);
-                let b = crate::ddl::util::format_type_for_message(snapshot, r.type_oid);
+                // from leaking. select_common_type names the domains'
+                // base types (it smashes them before comparing).
+                let name = |t| {
+                    crate::ddl::util::format_type_for_message(snapshot, snapshot.unwrap_domain(t))
+                };
+                let a = name(l.type_oid);
+                let b = name(r.type_oid);
                 return Err(crate::pgmsg::types_cannot_be_matched(
                     op_label,
                     &a,

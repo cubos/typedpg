@@ -30,14 +30,14 @@
 static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     // (schema, pg_name, rust_type)
     ("pg_catalog", "bool", "bool"),
-    ("pg_catalog", "bytea", "Vec<u8>"),
+    ("pg_catalog", "bytea", "::std::vec::Vec<u8>"),
     // The single-byte `"char"`, as rust-postgres reads it.
     ("pg_catalog", "char", "i8"),
-    ("pg_catalog", "name", "String"),
+    ("pg_catalog", "name", "::std::string::String"),
     ("pg_catalog", "int8", "i64"),
     ("pg_catalog", "int2", "i16"),
     ("pg_catalog", "int4", "i32"),
-    ("pg_catalog", "text", "String"),
+    ("pg_catalog", "text", "::std::string::String"),
     ("pg_catalog", "oid", "u32"),
     ("pg_catalog", "xid", "u32"),
     ("pg_catalog", "cid", "u32"),
@@ -50,8 +50,8 @@ static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     ("pg_catalog", "float8", "f64"),
     ("pg_catalog", "macaddr", "::eui48::MacAddress"),
     ("pg_catalog", "inet", "::cidr::IpInet"),
-    ("pg_catalog", "bpchar", "String"),
-    ("pg_catalog", "varchar", "String"),
+    ("pg_catalog", "bpchar", "::std::string::String"),
+    ("pg_catalog", "varchar", "::std::string::String"),
     ("pg_catalog", "date", "::chrono::NaiveDate"),
     ("pg_catalog", "time", "::chrono::NaiveTime"),
     ("pg_catalog", "timestamp", "::chrono::NaiveDateTime"),
@@ -79,7 +79,7 @@ static BUILTIN_MAP: &[(&str, &str, &str)] = &[
     // UNKNOWN pseudo type — surfaces for empty VALUES lists and some literals
     // whose type PG hasn't finalized. Its values travel as text, which
     // `String` reads.
-    ("pg_catalog", "unknown", "String"),
+    ("pg_catalog", "unknown", "::std::string::String"),
     // `void` carries no value (`void_send` sends zero bytes); the codegen
     // reads it without decoding anything.
     ("pg_catalog", "void", "()"),

@@ -2,9 +2,9 @@
 
 A `json` column instead of `jsonb`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| off | the final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| performance | warning | the final schema | — |
 
 ## Example
 
@@ -17,7 +17,7 @@ CREATE TABLE webhooks (
 ```
 
 ```
-info[prefer_jsonb]: public.webhooks.payload is json: it has no equality operator, so DISTINCT, GROUP BY, UNION and = fail on it, and every read parses the text again
+info[performance/prefer_jsonb]: public.webhooks.payload is json: it has no equality operator, so DISTINCT, GROUP BY, UNION and = fail on it, and every read parses the text again
    ╭─[migrations/002_webhooks.sql:1:1]
  1 │ CREATE TABLE webhooks (
    · ───────────────────────

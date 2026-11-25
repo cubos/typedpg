@@ -416,6 +416,16 @@ pub struct PgType {
     /// name;` (or a C function returning a not-yet-defined type) creates
     /// until the full `CREATE TYPE` defines it.
     pub typisdefined: bool,
+    /// `pg_type.typdelim`: what separates the elements of an array of the
+    /// type in its text form — `,` but for `box` (`;`), a domain over it,
+    /// and a base type created with another `DELIMITER`. An array type
+    /// carries its element's.
+    #[serde(default = "comma")]
+    pub typdelim: char,
+}
+
+fn comma() -> char {
+    ','
 }
 
 /// `pg_enum`: one row per enum label.

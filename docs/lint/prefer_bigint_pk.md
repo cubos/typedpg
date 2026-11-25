@@ -3,9 +3,9 @@
 A `smallint` or `integer` primary key column, which runs out at 32767 or
 2147483647.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| off | final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| pedantic | off | final schema | — |
 
 ## Example
 
@@ -18,14 +18,14 @@ CREATE TABLE countries (code smallint PRIMARY KEY);
 ```
 
 ```
-info[prefer_bigint_pk]: public.users.id is an int4 primary key: it runs out at 2147483647
+info[pedantic/prefer_bigint_pk]: public.users.id is an int4 primary key: it runs out at 2147483647
    ╭─[migrations/0001_init.sql:1:1]
  1 │ CREATE TABLE users (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, email text NOT NULL);
    · ─────────────────────────────────────────────────────────────────────────────────────────────
    ╰────
   help: use bigint
 
-info[prefer_bigint_pk]: public.countries.code is an int2 primary key: it runs out at 32767
+info[pedantic/prefer_bigint_pk]: public.countries.code is an int2 primary key: it runs out at 32767
    ╭─[migrations/0001_init.sql:2:1]
  2 │ CREATE TABLE countries (code smallint PRIMARY KEY);
    · ──────────────────────────────────────────────────
@@ -80,6 +80,6 @@ See [Configuring rules](README.md#configuring-rules).
 
 - [`fk_type_mismatch`](fk_type_mismatch.md): changing the key's type means
   changing every referencing column too.
-- [`missing_primary_key`](missing_primary_key.md): a table without a key.
+- [`table_without_primary_key`](table_without_primary_key.md): a table without a key.
 - [`prefer_identity`](prefer_identity.md): an identity column instead of
   `serial`.

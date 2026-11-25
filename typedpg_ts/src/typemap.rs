@@ -12,10 +12,14 @@
 //! intervals are the global `Temporal`'s types (the runtime's declarations
 //! reference TypeScript's `esnext.temporal` lib).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 
-use typedpg_analyzer::{RecordField, Refinement, Type};
+use oxc_syntax::identifier::{is_identifier_part, is_identifier_start};
+
+use typedpg_analyzer::{PgCatalog, RecordField, Refinement, Type};
 use typedpg_core::QualifiedName;
 
 /// The namespace the generated module imports the runtime's types under.
@@ -45,7 +49,7 @@ pub enum Codec {
     Date,
     /// `time` ↔ `Temporal.PlainTime`.
     Time,
-    /// `bytea` ↔ `Uint8Array`.
+    /// `bytea` ↔ `Buffer` (parameters take any `Uint8Array`).
     Bytea,
     /// `interval` ↔ `Temporal.Duration`.
     Interval,
@@ -55,8 +59,16 @@ pub enum Codec {
     Hstore,
     /// `void`: no value.
     Void,
-    /// A PG array of the element codec.
-    Array(Box<Codec>),
+    /// A PG array of the element codec, whose text form separates the
+    /// elements with `delimiter` (the element type's `pg_type.typdelim`:
+    /// `;` for `box`, as a box's own text holds commas).
+    Array {
+        element: Box<Codec>,
+        delimiter: char,
+    },
+    /// `int2vector` / `oidvector`: the elements separated by spaces, with
+    /// no braces (`1 2 3`), never NULL.
+    Spaced(Box<Codec>),
     /// A composite or anonymous record, field by field.
     Record(Vec<(String, Codec)>),
     /// A range over the subtype's codec.
@@ -85,7 +97,14 @@ impl Codec {
             Codec::Vector => json!("vector"),
             Codec::Hstore => json!("hstore"),
             Codec::Void => json!("void"),
-            Codec::Array(inner) => json!(["array", inner.to_json()]),
+            // The delimiter only when it isn't `,`.
+            Codec::Array { element, delimiter } if *delimiter == ',' => {
+                json!(["array", element.to_json()])
+            }
+            Codec::Array { element, delimiter } => {
+                json!(["array", element.to_json(), delimiter.to_string()])
+            }
+            Codec::Spaced(inner) => json!(["spaced", inner.to_json()]),
             Codec::Range(inner) => json!(["range", inner.to_json()]),
             Codec::Multirange(inner) => json!(["multirange", inner.to_json()]),
             Codec::Record(fields) => json!([
@@ -114,12 +133,13 @@ impl Codec {
             Codec::Timestamp => "Temporal.PlainDateTime".into(),
             Codec::Date => "Temporal.PlainDate".into(),
             Codec::Time => "Temporal.PlainTime".into(),
-            Codec::Bytea => "Uint8Array".into(),
+            Codec::Bytea => "Buffer".into(),
             Codec::Interval => "Temporal.Duration".into(),
             Codec::Vector => "readonly number[]".into(),
             Codec::Hstore => "Readonly<Record<string, string | null>>".into(),
             Codec::Void => "undefined".into(),
-            Codec::Array(c) => format!("readonly ({} | null)[]", c.fits()),
+            Codec::Array { element, .. } => format!("readonly ({} | null)[]", element.fits()),
+            Codec::Spaced(c) => format!("readonly {}[]", c.fits()),
             Codec::Record(fields) => {
                 let members: Vec<String> = fields
                     .iter()
@@ -153,6 +173,9 @@ pub struct TypeMapper<'a> {
     pub overrides: &'a HashMap<QualifiedName, String>,
     /// The overrides' TS names mapped since this was last taken.
     pub used: RefCell<BTreeSet<String>>,
+    /// The schema the types are of: what separates an array's elements
+    /// (`pg_type.typdelim`) is in its rows.
+    pub catalog: &'a PgCatalog,
 }
 
 impl TypeMapper<'_> {
@@ -229,6 +252,7 @@ impl TypeMapper<'_> {
         let Type::Array {
             element,
             element_nullable,
+            name: None,
         } = array
         else {
             return self.map_refined(ty, refinement);
@@ -285,23 +309,12 @@ impl TypeMapper<'_> {
                     None => base,
                 }
             }
-            Type::Enum {
-                schema,
-                name,
-                labels,
-                ..
-            } => {
-                let ts = self.override_for(schema, name).unwrap_or_else(|| {
-                    if labels.is_empty() {
-                        "never".to_owned()
-                    } else {
-                        labels
-                            .iter()
-                            .map(|l| js_string(l))
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    }
-                });
+            Type::Enum { schema, name, .. } => {
+                // The enum's name in the module, which exports it as the
+                // union of its labels ([`EnumNames`]).
+                let ts = self
+                    .override_for(schema, name)
+                    .unwrap_or_else(|| enum_mark(&QualifiedName::new(schema, name)));
                 same(ts, Codec::Text)
             }
             Type::Range {
@@ -336,7 +349,28 @@ impl TypeMapper<'_> {
             }
             Type::Array {
                 element,
+                name: Some(name),
+                ..
+            } => {
+                let elem = self.map(element);
+                if name.schema == "pg_catalog"
+                    && matches!(name.name.as_str(), "int2vector" | "oidvector")
+                {
+                    TsType {
+                        output: array_of(&elem.output),
+                        input: format!("readonly {}", array_of(&elem.input)),
+                        codec: Codec::Spaced(Box::new(elem.codec)),
+                    }
+                } else {
+                    // An array type of an extension's own: its text form is
+                    // its own too.
+                    same("string".to_owned(), Codec::Text)
+                }
+            }
+            Type::Array {
+                element,
                 element_nullable,
+                name: None,
             } => {
                 let elem = self.map(element);
                 // An element is nullable unless the analysis proved it isn't.
@@ -348,7 +382,10 @@ impl TypeMapper<'_> {
                 TsType {
                     output: array_of(&out_elem),
                     input: format!("readonly {}", array_of(&format!("{} | null", elem.input))),
-                    codec: Codec::Array(Box::new(elem.codec)),
+                    codec: Codec::Array {
+                        element: Box::new(elem.codec),
+                        delimiter: self.delimiter(element),
+                    },
                 }
             }
             Type::Composite {
@@ -364,6 +401,29 @@ impl TypeMapper<'_> {
                 }
             }
             Type::AnonymousRecord { fields } => self.record(fields),
+        }
+    }
+
+    /// What separates the elements of an array of `element` in its text
+    /// form: the type's `pg_type.typdelim` (a domain's is its base type's),
+    /// the innermost element's for a multidimensional array.
+    pub fn delimiter(&self, element: &Type) -> char {
+        let named = |schema: &str, name: &str| {
+            self.catalog
+                .resolve_type_by_name(Some(schema), name)
+                .map_or(',', |t| t.typdelim)
+        };
+        match element {
+            Type::Basic { schema, name, .. }
+            | Type::Domain { schema, name, .. }
+            | Type::Enum { schema, name, .. }
+            | Type::Range { schema, name, .. }
+            | Type::Composite { schema, name, .. } => named(schema, name),
+            Type::Array {
+                name: Some(name), ..
+            } => named(&name.schema, &name.name),
+            Type::Array { element, .. } => self.delimiter(element),
+            Type::AnonymousRecord { .. } => ',',
         }
     }
 
@@ -449,9 +509,12 @@ impl TypeMapper<'_> {
                 input: "string | number".into(),
                 codec: Codec::Text,
             },
+            // Any value but `null` / `undefined`: a parameter's `null` is SQL
+            // NULL, so the parameter's own nullability adds it; the JSON
+            // `null` is the runtime's `jsonNull`.
             "json" | "jsonb" => TsType {
                 output: format!("{RUNTIME_NS}.JsonValue"),
-                input: "unknown".into(),
+                input: "{}".into(),
                 codec: Codec::Json,
             },
             // Temporal's types, never a string: a parameter of one is never
@@ -470,7 +533,13 @@ impl TypeMapper<'_> {
             // `timetz` stays text: Temporal has no time of day with an
             // offset.
             "interval" => same("Temporal.Duration".into(), Codec::Interval),
-            "bytea" => same("Uint8Array".into(), Codec::Bytea),
+            // Node's own APIs speak `Buffer`; a parameter takes any `Uint8Array`
+            // (a `Buffer` is one).
+            "bytea" => TsType {
+                output: "Buffer".into(),
+                input: "Uint8Array".into(),
+                codec: Codec::Bytea,
+            },
             "void" => same("undefined".into(), Codec::Void),
             _ => text(),
         }
@@ -535,6 +604,183 @@ pub fn js_string(s: &str) -> String {
     serde_json::to_string(s).expect("a string always serializes")
 }
 
+/// What an enum's name is written as in a generated type: its qualified
+/// name between NULs, which no identifier, label or type name holds. Each
+/// module names the enums itself and replaces the marks
+/// ([`EnumNames::render`]), so a query's types are generated once for every
+/// module that has it.
+pub(crate) fn enum_mark(qn: &QualifiedName) -> String {
+    format!("\0{qn}\0")
+}
+
+/// The global types the generated types use: an enum can't shadow them.
+const GLOBAL_TYPES: &[&str] = &[
+    "Buffer",
+    "Date",
+    "Readonly",
+    "Record",
+    "Temporal",
+    "Uint8Array",
+];
+
+/// An enum the generated modules name and export.
+#[derive(Debug, Clone)]
+pub struct EnumType {
+    pub qn: QualifiedName,
+    pub labels: Vec<String>,
+    /// An extension's: the database module exports it only when one of
+    /// its queries uses it.
+    pub extension: bool,
+}
+
+/// The enums of a database the modules name: every one `types` doesn't
+/// map, in the order they claim their names — the user's in `public` first,
+/// then those of other schemas, then extensions'; each by schema and name.
+#[derive(Debug, Clone, Default)]
+pub struct Enums(Vec<EnumType>);
+
+impl Enums {
+    pub fn new(catalog: &PgCatalog, overrides: &HashMap<QualifiedName, String>) -> Self {
+        Self::from_types(catalog.enum_types(), overrides)
+    }
+
+    pub fn from_types(types: Vec<Type>, overrides: &HashMap<QualifiedName, String>) -> Self {
+        let mut enums: Vec<EnumType> = types
+            .into_iter()
+            .filter_map(|ty| match ty {
+                Type::Enum {
+                    schema,
+                    name,
+                    labels,
+                    extension,
+                } => Some(EnumType {
+                    qn: QualifiedName::new(schema, name),
+                    labels,
+                    extension: extension.is_some(),
+                }),
+                _ => None,
+            })
+            .filter(|e| !overrides.contains_key(&e.qn))
+            .collect();
+        enums.sort_by_key(|e| (e.extension, e.qn.schema != "public", e.qn.clone()));
+        Enums(enums)
+    }
+
+    /// The enums' names in a module that binds `taken` already: PascalCase
+    /// of the name (the schema's before it outside `public`); on a
+    /// collision, qualified with the schema, then numbered.
+    pub fn names<'a>(&self, taken: impl IntoIterator<Item = &'a str>) -> EnumNames {
+        let mut taken: HashSet<String> = taken.into_iter().map(str::to_owned).collect();
+        taken.extend(GLOBAL_TYPES.iter().map(|s| (*s).to_owned()));
+        let mut names = EnumNames::default();
+        for e in &self.0 {
+            let own = pascal(&e.qn.name).unwrap_or_else(|| "Enum".to_owned());
+            let schema = pascal(&e.qn.schema).unwrap_or_else(|| "Schema".to_owned());
+            let qualified = identifier(format!("{schema}{own}"));
+            let base = if e.qn.schema == "public" {
+                identifier(own)
+            } else {
+                qualified.clone()
+            };
+            let name = [base, qualified.clone()]
+                .into_iter()
+                .chain((2..).map(|n| format!("{qualified}_{n}")))
+                .find(|n| !taken.contains(n))
+                .expect("a name not taken");
+            taken.insert(name.clone());
+            names.by_mark.insert(enum_mark(&e.qn), name.clone());
+            names.enums.push((name, e.clone()));
+        }
+        names.enums.sort_by(|a, b| a.0.cmp(&b.0));
+        names
+    }
+}
+
+/// The names a module gives the enums ([`Enums::names`]).
+#[derive(Debug, Clone, Default)]
+pub struct EnumNames {
+    by_mark: HashMap<String, String>,
+    /// Sorted by name.
+    enums: Vec<(String, EnumType)>,
+}
+
+impl EnumNames {
+    /// `text`, a generated type, with each enum's mark replaced by its
+    /// name.
+    pub fn render<'t>(&self, text: &'t str) -> Cow<'t, str> {
+        if !text.contains('\0') {
+            return Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len());
+        for (i, part) in text.split('\0').enumerate() {
+            if i % 2 == 0 {
+                out.push_str(part);
+            } else {
+                let name = self.by_mark.get(&format!("\0{part}\0"));
+                out.push_str(name.expect("every enum a type marks is named"));
+            }
+        }
+        Cow::Owned(out)
+    }
+
+    /// `export type <Name> = "a" | "b";` (the union of its labels as
+    /// declared) for each enum one of `types` names and, with `user`, each
+    /// not an extension's; by name.
+    pub fn declarations<'t>(&self, types: impl IntoIterator<Item = &'t str>, user: bool) -> String {
+        let mut named: HashSet<&str> = HashSet::new();
+        for text in types {
+            named.extend(text.split('\0').skip(1).step_by(2));
+        }
+        let mut out = String::new();
+        let exported = self
+            .enums
+            .iter()
+            .filter(|(_, e)| (user && !e.extension) || named.contains(e.qn.to_string().as_str()));
+        for (name, e) in exported {
+            let labels = if e.labels.is_empty() {
+                "never".to_owned()
+            } else {
+                e.labels
+                    .iter()
+                    .map(|l| js_string(l))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
+            let _ = writeln!(out, "export type {name} = {labels};");
+        }
+        out
+    }
+}
+
+/// `name` in PascalCase: each run of identifier characters (`_` and what
+/// an identifier can't hold separate them) capitalized; `None` when it
+/// has none.
+fn pascal(name: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut word_start = true;
+    for c in name.chars() {
+        if c == '_' || !is_identifier_part(c) {
+            word_start = true;
+        } else if word_start {
+            out.extend(c.to_uppercase());
+            word_start = false;
+        } else {
+            out.push(c);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// `name`, made of identifier characters, as an identifier: `_` before it
+/// when it starts with what can't start one (a digit).
+fn identifier(name: String) -> String {
+    if name.starts_with(is_identifier_start) {
+        name
+    } else {
+        format!("_{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,9 +797,11 @@ mod tests {
 
     fn with<R>(f: impl FnOnce(&TypeMapper) -> R) -> R {
         let overrides = HashMap::new();
+        let catalog = PgCatalog::new().unwrap();
         f(&TypeMapper {
             overrides: &overrides,
             used: Default::default(),
+            catalog: &catalog,
         })
     }
 
@@ -590,6 +838,10 @@ mod tests {
             assert_eq!(m.map(&basic_ty("interval")).output, "Temporal.Duration");
             assert_eq!(m.map(&basic_ty("interval")).input, "Temporal.Duration");
             assert_eq!(m.map(&basic_ty("jsonb")).output, "typedpg.JsonValue");
+            // Not `unknown`, which holds `null`: SQL NULL comes from the
+            // parameter's nullability, the JSON `null` is `jsonNull`.
+            assert_eq!(m.map(&basic_ty("jsonb")).input, "{}");
+            assert_eq!(m.map(&basic_ty("json")).input, "{}");
         });
     }
 
@@ -597,7 +849,13 @@ mod tests {
     fn what_codecs_read_values_as() {
         let record = Codec::Record(vec![
             ("x".into(), Codec::Number),
-            ("a b".into(), Codec::Array(Box::new(Codec::Json))),
+            (
+                "a b".into(),
+                Codec::Array {
+                    element: Box::new(Codec::Json),
+                    delimiter: ',',
+                },
+            ),
         ]);
         assert_eq!(
             record.fits(),
@@ -605,9 +863,112 @@ mod tests {
         );
         assert_eq!(Codec::Vector.fits(), "readonly number[]");
         assert_eq!(
+            Codec::Spaced(Box::new(Codec::Number)).fits(),
+            "readonly number[]"
+        );
+        assert_eq!(
             Codec::Multirange(Box::new(Codec::Timestamptz)).fits(),
             "readonly typedpg.Range<Temporal.Instant>[]"
         );
+    }
+
+    /// A `box[]` separates its elements with `;` (its `typdelim`), as does
+    /// an array of a domain over box, or of a type created with another
+    /// `DELIMITER`: the array's codec says so.
+    #[test]
+    fn an_array_codec_carries_its_delimiter() {
+        let overrides = HashMap::new();
+        let mut catalog = PgCatalog::new().unwrap();
+        catalog
+            .apply_sql(
+                "CREATE DOMAIN frame AS box;
+                 CREATE TYPE semi;
+                 CREATE FUNCTION semi_in(cstring) RETURNS semi
+                     LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+                 CREATE FUNCTION semi_out(semi) RETURNS cstring
+                     LANGUAGE internal IMMUTABLE STRICT AS 'textout';
+                 CREATE TYPE semi (INPUT = semi_in, OUTPUT = semi_out, DELIMITER = '|');",
+            )
+            .unwrap();
+        let m = TypeMapper {
+            overrides: &overrides,
+            used: Default::default(),
+            catalog: &catalog,
+        };
+        let array = |element: Type| Type::Array {
+            element: Box::new(element),
+            element_nullable: None,
+            name: None,
+        };
+        let mapped = m.map(&array(basic_ty("box")));
+        assert_eq!(mapped.output, "(string | null)[]");
+        assert_eq!(
+            mapped.codec.to_json(),
+            serde_json::json!(["array", "text", ";"])
+        );
+        let frame = Type::Domain {
+            schema: "public".into(),
+            name: "frame".into(),
+            base: Box::new(basic_ty("box")),
+            extension: None,
+            typmod: None,
+            collation: None,
+        };
+        assert_eq!(
+            m.map(&array(frame)).codec.to_json(),
+            serde_json::json!(["array", "text", ";"])
+        );
+        let semi = Type::Basic {
+            schema: "public".into(),
+            name: "semi".into(),
+            extension: None,
+            typmod: None,
+            collation: None,
+        };
+        assert_eq!(
+            m.map(&array(semi)).codec.to_json(),
+            serde_json::json!(["array", "text", "|"])
+        );
+        // The default `,` is left out; a box alone is text.
+        assert_eq!(
+            m.map(&array(basic_ty("point"))).codec.to_json(),
+            serde_json::json!(["array", "text"])
+        );
+        assert_eq!(m.map(&basic_ty("box")).codec, Codec::Text);
+    }
+
+    /// `int2vector` / `oidvector` are arrays of numbers, written `1 2 3`.
+    #[test]
+    fn int2vector_and_oidvector_are_spaced_arrays() {
+        with(|m| {
+            let vector = |name: &str, element: &str| Type::Array {
+                element: Box::new(basic_ty(element)),
+                element_nullable: None,
+                name: Some(QualifiedName::new("pg_catalog", name)),
+            };
+            let mapped = m.map(&vector("int2vector", "int2"));
+            assert_eq!(mapped.output, "number[]");
+            assert_eq!(mapped.input, "readonly number[]");
+            assert_eq!(
+                mapped.codec.to_json(),
+                serde_json::json!(["spaced", "number"])
+            );
+            assert_eq!(
+                m.map(&vector("oidvector", "oid")).codec.to_json(),
+                serde_json::json!(["spaced", "number"])
+            );
+            // An array of them is a plain array of spaced arrays.
+            let arrays = Type::Array {
+                element: Box::new(vector("int2vector", "int2")),
+                element_nullable: None,
+                name: None,
+            };
+            assert_eq!(
+                m.map(&arrays).codec.to_json(),
+                serde_json::json!(["array", ["spaced", "number"]])
+            );
+            assert_eq!(m.map(&arrays).output, "(number[] | null)[]");
+        });
     }
 
     #[test]
@@ -616,6 +977,7 @@ mod tests {
             let arr = |n| Type::Array {
                 element: Box::new(basic_ty("text")),
                 element_nullable: n,
+                name: None,
             };
             assert_eq!(m.map(&arr(Some(false))).output, "string[]");
             assert_eq!(m.map(&arr(None)).output, "(string | null)[]");
@@ -658,6 +1020,11 @@ mod tests {
             assert_eq!(m.map(&ext("vector", "vector")).codec, Codec::Vector);
             assert_eq!(m.map(&ext("vector", "halfvec")).output, "number[]");
             assert_eq!(m.map(&ext("vector", "sparsevec")).output, "string");
+            // PostGIS's text output: hex EWKB, read and sent as is.
+            for name in ["geometry", "geography", "box2d"] {
+                let ty = m.map(&ext("postgis", name));
+                assert_eq!((ty.output.as_str(), ty.codec), ("string", Codec::Text));
+            }
             assert_eq!(
                 m.map(&ext("hstore", "hstore")).output,
                 "Record<string, string | null>"
@@ -666,17 +1033,135 @@ mod tests {
         });
     }
 
+    fn enum_ty(schema: &str, name: &str, labels: &[&str], extension: Option<&str>) -> Type {
+        Type::Enum {
+            schema: schema.into(),
+            name: name.into(),
+            labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+            extension: extension.map(str::to_owned),
+        }
+    }
+
+    fn output(ty: &Type) -> String {
+        with(|m| m.map(ty).output)
+    }
+
+    /// An enum is its name in the module, which exports it as the union of
+    /// its labels.
     #[test]
-    fn enums_are_label_unions() {
+    fn enums_are_named_label_unions() {
+        let mood = enum_ty("public", "mood", &["happy", "it's \"ok\""], None);
+        let empty = enum_ty("public", "nothing", &[], None);
+        let names = Enums::from_types(vec![mood.clone(), empty.clone()], &HashMap::new()).names([]);
         with(|m| {
-            let ty = Type::Enum {
-                schema: "public".into(),
-                name: "mood".into(),
-                labels: vec!["happy".into(), "it's \"ok\"".into()],
-                extension: None,
+            let mapped = m.map(&mood);
+            assert_eq!(names.render(&mapped.output), "Mood");
+            assert_eq!(names.render(&mapped.input), "Mood");
+            assert_eq!(mapped.codec, Codec::Text);
+            let array = Type::Array {
+                element: Box::new(mood.clone()),
+                element_nullable: None,
+                name: None,
             };
-            assert_eq!(m.map(&ty).output, r#""happy" | "it's \"ok\"""#);
+            let mapped = m.map(&array);
+            assert_eq!(names.render(&mapped.output), "(Mood | null)[]");
+            assert_eq!(names.render(&mapped.input), "readonly (Mood | null)[]");
+            assert_eq!(names.render(&m.map(&empty).output), "Nothing");
         });
+        let mood_type = r#"export type Mood = "happy" | "it's \"ok\"";"#;
+        assert_eq!(
+            names.declarations([], true),
+            format!("{mood_type}\nexport type Nothing = never;\n")
+        );
+        // Only the enums a type names, unless all the user's are wanted.
+        let text = format!("{{ m: {} }}", output(&mood));
+        assert_eq!(
+            names.declarations([text.as_str()], false),
+            format!("{mood_type}\n")
+        );
+        assert_eq!(names.declarations(["{ x: string }"], false), "");
+    }
+
+    /// PascalCase of the name, the schema's before it outside `public`;
+    /// any name made a valid identifier.
+    #[test]
+    fn enum_names() {
+        let names = |types: Vec<Type>, taken: &[&str]| {
+            let names =
+                Enums::from_types(types.clone(), &HashMap::new()).names(taken.iter().copied());
+            types
+                .iter()
+                .map(|t| names.render(&output(t)).into_owned())
+                .collect::<Vec<_>>()
+        };
+        let e = |schema: &str, name: &str| enum_ty(schema, name, &["a"], None);
+        assert_eq!(
+            names(
+                vec![
+                    e("public", "mood"),
+                    e("public", "post_status"),
+                    e("billing", "status"),
+                    e("public", "myEnum"),
+                    e("public", "2fa method"),
+                    e("public", "café-état"),
+                    e("public", "???"),
+                    e("Sales Data", "x"),
+                ],
+                &[]
+            ),
+            [
+                "Mood",
+                "PostStatus",
+                "BillingStatus",
+                "MyEnum",
+                "_2faMethod",
+                "CaféÉtat",
+                "Enum",
+                "SalesDataX"
+            ]
+        );
+        // Collisions: with what the module binds (and the global types the
+        // generated types use), then between enums — the user's in
+        // `public` first, extensions' last — schema-qualified, then
+        // numbered.
+        assert_eq!(
+            names(
+                vec![
+                    e("public", "queries"),
+                    e("public", "date"),
+                    e("public", "record"),
+                    e("public", "user_prefs"),
+                ],
+                &["Queries", "UserPrefs"]
+            ),
+            [
+                "PublicQueries",
+                "PublicDate",
+                "PublicRecord",
+                "PublicUserPrefs"
+            ]
+        );
+        assert_eq!(
+            names(
+                vec![
+                    e("billing", "status"),
+                    e("public", "billing_status"),
+                    e("public", "BillingStatus"),
+                    enum_ty("public", "billing__status", &["a"], Some("ext")),
+                ],
+                &[]
+            ),
+            [
+                "BillingStatus_2",
+                "PublicBillingStatus",
+                "BillingStatus",
+                "PublicBillingStatus_2"
+            ]
+        );
+        // `types` maps it: the override wins, and the enum takes no name.
+        let overrides = HashMap::from([(QualifiedName::new("public", "mood"), "Mood".to_owned())]);
+        let names = Enums::from_types(vec![e("public", "mood")], &overrides).names(["Mood"]);
+        assert_eq!(names.declarations([], true), "");
     }
 
     #[test]
@@ -706,10 +1191,8 @@ mod tests {
                 extension: None,
             };
             assert_eq!(out(&mood, &["ok", "happy"]), r#""happy" | "ok""#);
-            assert_eq!(
-                out(&mood, &["ok", "happy", "sad"]),
-                r#""sad" | "ok" | "happy""#
-            );
+            // Every label: the enum itself.
+            assert_eq!(out(&mood, &["ok", "happy", "sad"]), m.map(&mood).output);
             // Unrefined, and the input: any value of the type.
             assert_eq!(
                 m.map_refined(&basic_ty("text"), &Refinement::NONE).output,
@@ -731,6 +1214,7 @@ mod tests {
         let arr = |name: &str, n| Type::Array {
             element: Box::new(basic_ty(name)),
             element_nullable: n,
+            name: None,
         };
         with(|m| {
             let out =
@@ -776,9 +1260,11 @@ mod tests {
             (QualifiedName::new("pg_catalog", "text"), "Name".to_owned()),
             (QualifiedName::new("public", "tags"), "Tags".to_owned()),
         ]);
+        let catalog = PgCatalog::new().unwrap();
         let m = TypeMapper {
             overrides: &overrides,
             used: RefCell::default(),
+            catalog: &catalog,
         };
         assert_eq!(
             m.map_column(
@@ -830,6 +1316,7 @@ mod tests {
                         ty: Type::Array {
                             element: Box::new(inner),
                             element_nullable: Some(false),
+                            name: None,
                         },
                         nullable: false,
                         refinement: Refinement::NONE,
@@ -844,6 +1331,7 @@ mod tests {
             let nullable_records = Type::Array {
                 element: Box::new(ty.clone()),
                 element_nullable: None,
+                name: None,
             };
             assert_eq!(
                 m.map(&nullable_records).output,
@@ -885,6 +1373,7 @@ mod tests {
                     Type::Array {
                         element: Box::new(basic_ty("text")),
                         element_nullable: Some(false),
+                        name: None,
                     },
                     false,
                     &[],
@@ -912,6 +1401,7 @@ mod tests {
                     fields: vec![field("r", ty.clone(), false, &[], &[])],
                 }),
                 element_nullable: Some(false),
+                name: None,
             };
             assert_eq!(
                 m.map(&outer).output,
@@ -944,9 +1434,11 @@ mod tests {
             QualifiedName::new("public", "prefs"),
             "UserPreferences".to_owned(),
         );
+        let catalog = PgCatalog::new().unwrap();
         let m = TypeMapper {
             overrides: &o,
             used: Default::default(),
+            catalog: &catalog,
         };
         let ty = Type::Domain {
             schema: "public".into(),
@@ -964,6 +1456,7 @@ mod tests {
         let arr = Type::Array {
             element: Box::new(ty),
             element_nullable: None,
+            name: None,
         };
         assert_eq!(m.map(&arr).output, "(UserPreferences | null)[]");
     }

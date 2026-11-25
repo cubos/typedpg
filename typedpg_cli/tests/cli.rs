@@ -162,6 +162,28 @@ fn create_leaves_nothing_behind_when_the_down_file_exists() {
     panic!("the create never landed in the same second as the down file");
 }
 
+/// A name the runner would not read back as the new migration writes
+/// nothing: an empty one made `<timestamp>_.sql`, which every later `up`
+/// rejected ("no description after prefix"); `x.down` made an up file that
+/// reads as a down file; a path wrote outside the migrations directory.
+#[test]
+fn create_refuses_names_the_runner_would_not_read_back() {
+    let dir = project(&[]);
+    for (name, reason) in [
+        ("", "it is empty"),
+        ("a/b", "not a path"),
+        ("..\\b", "not a path"),
+        ("undo.down", "ending in `.down`"),
+    ] {
+        let stderr = failed(&cli(dir.path(), None, &["migrate", "create", name]));
+        assert!(
+            stderr.contains(&format!("invalid migration name {name:?}")) && stderr.contains(reason),
+            "{name:?}: {stderr}"
+        );
+    }
+    assert_eq!(fs::read_dir(dir.path().join("db")).unwrap().count(), 0);
+}
+
 #[test]
 fn database_commands_need_database_url() {
     let dir = project(&[]);
@@ -243,7 +265,7 @@ async fn up_status_and_down() {
     );
     assert_eq!(
         failed(&run(&["migrate", "down"])),
-        "Error: No applied migrations to revert\n"
+        "Error: migration error: no applied migrations to revert\n"
     );
 
     // Editing an applied migration shows in status, and blocks up.
@@ -272,6 +294,17 @@ async fn up_status_and_down() {
     assert_eq!(ok(&run(&["migrate", "up"])), "No pending migrations\n");
     let status = ok(&run(&["migrate", "status"]));
     assert!(!status.contains("[MODIFIED]"), "{status}");
+
+    // `down` picks the last applied migration under the runner's lock, and
+    // reads no status: an edited migration warned on every `down` before.
+    fs::write(
+        dir.path().join("db/0001_users.sql"),
+        "CREATE TABLE users (id SMALLINT);",
+    )
+    .unwrap();
+    let out = run(&["migrate", "down"]);
+    assert_eq!(ok(&out), "Reverting 0002_posts... done\n");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
 }
 
 /// The server has TLS on with a self-signed certificate. libpq does not
@@ -288,6 +321,7 @@ async fn sslmode_is_honored() {
         "?sslmode=prefer",
         "?sslmode=require",
         "?sslmode=disable",
+        "?sslmode=allow",
     ] {
         let out = ok(&status(format!("{url}{query}")));
         assert!(out.contains("0001_users"), "{query}: {out}");
@@ -312,6 +346,8 @@ async fn sslmode_prefer_keeps_the_connection_encrypted() {
         ("prefer", true),
         ("require", true),
         ("disable", false),
+        // libpq tries a plain connection first, TLS only if that fails.
+        ("allow", false),
     ] {
         let query = if mode.is_empty() {
             String::new()

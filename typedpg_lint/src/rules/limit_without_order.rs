@@ -1048,7 +1048,7 @@ mod tests {
         let findings = lint(&db, sql);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, Rule::LimitWithoutOrder);
-        assert_eq!(findings[0].severity, Severity::Warning);
+        assert_eq!(findings[0].severity, Severity::Error);
         assert_eq!(
             findings[0].message,
             "LIMIT without ORDER BY returns arbitrary rows"

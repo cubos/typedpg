@@ -2,9 +2,9 @@
 
 A `CASE` that is `COALESCE(x, y)`, or just its own condition.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | rewrites it to `COALESCE` or the condition |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | rewrites it to `COALESCE` or the condition |
 
 ## Example
 
@@ -18,14 +18,14 @@ SELECT id, CASE WHEN score > 10 THEN true ELSE false END AS popular FROM posts;
 ```
 
 ```
-info[simplifiable_case]: this CASE is COALESCE(name, email)
+info[redundant/simplifiable_case]: this CASE is COALESCE(name, email)
    ╭─[queries.sql:2:8]
  2 │ SELECT CASE WHEN name IS NULL THEN email ELSE name END AS display FROM users;
    ·        ───────────────────────────────────────────────
    ╰────
   help: write COALESCE(name, email)
 
-info[simplifiable_case]: CASE WHEN … THEN true ELSE false END is its condition
+info[redundant/simplifiable_case]: CASE WHEN … THEN true ELSE false END is its condition
    ╭─[queries.sql:6:12]
  6 │ SELECT id, CASE WHEN score > 10 THEN true ELSE false END AS popular FROM posts;
    ·            ─────────────────────────────────────────────
@@ -64,8 +64,10 @@ A `CASE` with one `WHEN` and an `ELSE`, of either shape:
 ## Fix not offered
 
 - The condition may be NULL.
-- The `CASE` is a whole output column without an alias: its column is named
-  `case`, and the rewrite would rename it. Add `AS` and the fix applies.
+- The `CASE` is a whole output column without an alias, also under a
+  cast or as another `CASE`'s `ELSE`: its column is named after it, and the
+  rewrite would rename it. Add
+  `AS` and the fix applies.
 
 ## Configuration
 

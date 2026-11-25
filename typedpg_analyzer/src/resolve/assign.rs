@@ -60,6 +60,27 @@ pub(crate) fn assignment_target(
                 let container = expr::ExprType::scalar(ty, true);
                 let elem =
                     expr::transform_container_subscripts(&container, &run, ctx, params)?.type_oid;
+                // transformAssignmentSubscripts: an `int2vector` / `oidvector`
+                // is assigned into as the `int2[]` / `oid[]` it subscripts as
+                // (transformContainerType), which has no cast back to it.
+                let smashed = match snapshot.unwrap_domain(ty) {
+                    crate::pg_catalog::oid::INT2VECTOR => Some(crate::pg_catalog::oid::INT2ARRAY),
+                    crate::pg_catalog::oid::OIDVECTOR => Some(crate::pg_catalog::oid::OIDARRAY),
+                    _ => None,
+                };
+                if let Some(array) = smashed {
+                    let format = |t| crate::ddl::util::format_type_for_message(snapshot, t);
+                    return Err(crate::error::RawError::new(
+                        AnalyzeError::CannotCoerce(format!(
+                            "cannot cast type {} to {}",
+                            format(array),
+                            format(ty)
+                        )),
+                        None,
+                        None,
+                    )
+                    .finalize_implicit());
+                }
                 ty = elem;
                 last_step = Some((true, target_name.clone()));
             }

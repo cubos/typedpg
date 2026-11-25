@@ -3,9 +3,9 @@
 A `sql!` binding `x = x`, or a bare `x`, for a parameter that captures the
 variable `x` without it.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | `sql!` bindings (Rust only) | removes the binding |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | `sql!` bindings (Rust only) | removes the binding |
 
 ## Example
 
@@ -19,7 +19,7 @@ pub async fn post_title(pool: &typedpg::Pool, id: i64) -> typedpg::Result<()> {
 ```
 
 ```
-warning[redundant_binding]: `id = id` binds `$id` to the variable it captures without a binding
+info[redundant/redundant_binding]: `id = id` binds `$id` to the variable it captures without a binding
    ╭─[src/posts.rs:6:70]
  6 │     let title = sql!(pool, "SELECT title FROM posts WHERE id = $id", id = id)
    ·                                                                      ───────

@@ -54,3 +54,13 @@ test("a query without junk is untouched", () => {
   assert.equal(stripTrailingJunk("SELECT 1 "), "SELECT 1");
   assert.equal(stripTrailingJunk(""), "");
 });
+
+test("a dollar inside an identifier quotes nothing", () => {
+  // `a$x$` is one identifier (scan.l's `ident_cont`): what follows is still
+  // a trailing comment.
+  assert.equal(stripTrailingJunk("SELECT 1 AS a$x$ -- note $x$"), "SELECT 1 AS a$x$");
+  assert.equal(stripTrailingJunk("SELECT 1 AS a$x$; /* $x$ */"), "SELECT 1 AS a$x$");
+  assert.equal(stripTrailingJunk("SELECT é$x$ FROM t; -- $x$"), "SELECT é$x$ FROM t");
+  // A dollar quote still starts a token.
+  assert.equal(stripTrailingJunk("SELECT $x$ -- $x$ AS a"), "SELECT $x$ -- $x$ AS a");
+});

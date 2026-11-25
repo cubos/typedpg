@@ -1,0 +1,6 @@
+error: parameter `id` is bound more than once: an argument binds its parameter once
+ --> src/bin/sql_duplicate_argument.rs:8:9
+  |
+8 |         id = 2i64
+  |         ^^
+

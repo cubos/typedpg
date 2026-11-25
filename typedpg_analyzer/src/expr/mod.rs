@@ -171,8 +171,14 @@ impl<'a> Ctx<'a> {
     }
 
     /// Record that the untyped string literal at `location` was coerced to
-    /// `type_oid`.
+    /// `type_oid` — a `Const` of that type, which an expression stored in
+    /// the catalog depends on (find_expr_references_walker).
     pub fn note_literal_type(&self, literal: &ast::AConst, type_oid: PgTypeOid) {
+        // (A domain's constant is its base type's, coerced to the domain.)
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(type_oid));
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(
+            self.snapshot.unwrap_domain(type_oid),
+        ));
         if let Some(log) = self.strict_log {
             log.note_literal_type(literal.location, type_oid);
         }
@@ -252,10 +258,41 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// Record the I/O functions a cast from `from` to `to` runs when it is
+    /// an I/O conversion (CoerceViaIO): the source type's output function,
+    /// then the target's input function. The catalog keeps no type's I/O
+    /// functions, so they are named by kind of type (records, arrays,
+    /// ranges, multiranges and enums share theirs) and, for a built-in base
+    /// type, by name; an extension's base type is taken to have immutable
+    /// ones.
+    pub fn note_io_coercion(&self, from: PgTypeOid, to: PgTypeOid) {
+        if self.used_procs.is_none()
+            || !IO_FUNCTIONS.with(std::cell::Cell::get)
+            || crate::coerce::coercion_pathway(to, from, CoercionContext::Explicit, self.snapshot)
+                != Some(crate::coerce::CoercionPath::CoerceViaIo)
+        {
+            return;
+        }
+        let output = io_function_name(self.snapshot, from, false);
+        let input = io_function_name(self.snapshot, to, true);
+        for name in [output, input].into_iter().flatten() {
+            self.note_proc(
+                self.snapshot
+                    .find_functions(Some("pg_catalog"), name)
+                    .first()
+                    .map(|p| p.oid),
+            );
+        }
+    }
+
     /// Record the cast function an implicit coercion from `from` to `to`
     /// runs (an argument coerced to a function's / operator's declared
     /// type), if any.
     pub fn note_coercion(&self, from: PgTypeOid, to: PgTypeOid) {
+        // A stored expression depends on the node the coercion builds.
+        if !crate::polymorphic::is_polymorphic(to) && to != PgTypeOid::from_raw(2276) {
+            crate::ddl::depend::note_coercion(self.snapshot, from, to);
+        }
         if self.used_procs.is_none() || from == to || from == oid::UNKNOWN {
             return;
         }
@@ -270,6 +307,58 @@ impl<'a> Ctx<'a> {
                 .and_then(|oid| self.snapshot.pg_cast.get(oid))
                 .and_then(|c| c.castfunc),
         );
+    }
+}
+
+/// The `pg_catalog` input (`input`) or output function of `typ` (a domain
+/// reads its base type's), for the types whose I/O functions are not all
+/// immutable; `None` for the others.
+fn io_function_name(snapshot: &PgCatalog, typ: PgTypeOid, input: bool) -> Option<&'static str> {
+    // The first OID of an object created after initdb.
+    const FIRST_NORMAL_OBJECT_ID: u32 = 16_384;
+    let typ = snapshot.unwrap_domain(typ);
+    let t = snapshot.get_type(typ)?;
+    let pick = |i: &'static str, o: &'static str| Some(if input { i } else { o });
+    match t.typtype {
+        TypType::Composite => return pick("record_in", "record_out"),
+        TypType::Range => return pick("range_in", "range_out"),
+        TypType::Multirange => return pick("multirange_in", "multirange_out"),
+        TypType::Enum => return pick("enum_in", "enum_out"),
+        _ => {}
+    }
+    if t.typcategory == TypCategory::Array
+        && t.typelem.is_some()
+        && !matches!(t.typname.as_str(), "int2vector" | "oidvector")
+    {
+        return pick("array_in", "array_out");
+    }
+    if typ.get() >= FIRST_NORMAL_OBJECT_ID {
+        return None;
+    }
+    match t.typname.as_str() {
+        "record" => pick("record_in", "record_out"),
+        "date" => pick("date_in", "date_out"),
+        "time" => pick("time_in", "time_out"),
+        "timetz" => pick("timetz_in", "timetz_out"),
+        "timestamp" => pick("timestamp_in", "timestamp_out"),
+        "timestamptz" => pick("timestamptz_in", "timestamptz_out"),
+        "interval" => pick("interval_in", "interval_out"),
+        "money" => pick("cash_in", "cash_out"),
+        "xml" => pick("xml_in", "xml_out"),
+        "aclitem" => pick("aclitemin", "aclitemout"),
+        "regclass" => pick("regclassin", "regclassout"),
+        "regcollation" => pick("regcollationin", "regcollationout"),
+        "regconfig" => pick("regconfigin", "regconfigout"),
+        "regdatabase" => pick("regdatabasein", "regdatabaseout"),
+        "regdictionary" => pick("regdictionaryin", "regdictionaryout"),
+        "regnamespace" => pick("regnamespacein", "regnamespaceout"),
+        "regoper" => pick("regoperin", "regoperout"),
+        "regoperator" => pick("regoperatorin", "regoperatorout"),
+        "regproc" => pick("regprocin", "regprocout"),
+        "regprocedure" => pick("regprocedurein", "regprocedureout"),
+        "regrole" => pick("regrolein", "regroleout"),
+        "regtype" => pick("regtypein", "regtypeout"),
+        _ => None,
     }
 }
 
@@ -402,6 +491,9 @@ pub(crate) struct ExprType {
     pub no_collation: Option<NoCollation>,
     /// What planning makes of this node's collation (see [`Planned`]).
     pub planned: Planned,
+    /// The row shape of the value's records: the value's own for a
+    /// `record` (or a composite read from a relation), its elements' for a
+    /// `record[]` (at any depth).
     pub record_fields: Option<RecordShape>,
     /// For an array value, whether its elements can be NULL, where known
     /// (see [`crate::types::Type::Array`]); `None` otherwise.
@@ -489,6 +581,54 @@ pub(crate) fn merge_set_op_shapes(
         fields,
         hidden: left.hidden,
     })
+}
+
+/// The row shape of a value that is one of several records, or arrays of
+/// them (a CASE's or COALESCE's branches, an `ARRAY[…]`'s elements, the
+/// arguments of `array_append`): known only when every one's is, and they
+/// agree field for field — names and types — a field NULL where any
+/// one's may be. PG keeps no tuple descriptor for the result (an
+/// expression over records is typed plain `record`, typmod -1): the shape
+/// is hidden from it.
+pub(crate) fn merge_value_shapes<'a>(
+    shapes: impl IntoIterator<Item = Option<&'a RecordShape>>,
+) -> Option<RecordShape> {
+    fn merge(left: &RecordShape, right: &RecordShape) -> Option<RecordShape> {
+        if left.len() != right.len() {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(left.len());
+        for (l, r) in left.iter().zip(right.iter()) {
+            if l.name != r.name || l.ty.type_oid != r.ty.type_oid {
+                return None;
+            }
+            let mut ty = l.ty.clone();
+            ty.nullable |= r.ty.nullable;
+            ty.elem_nullable = merge_elem_nullable([l.ty.elem_nullable, r.ty.elem_nullable]);
+            ty.refine = crate::refine::Refinement::either([&l.ty.refine, &r.ty.refine]);
+            ty.elem_refine =
+                crate::refine::Refinement::either([&l.ty.elem_refine, &r.ty.elem_refine]);
+            // A nested record's shape is known where both sides' are.
+            ty.record_fields = match (&l.ty.record_fields, &r.ty.record_fields) {
+                (Some(l), Some(r)) => merge(l, r),
+                _ => None,
+            };
+            fields.push(RecordField {
+                name: l.name.clone(),
+                ty,
+            });
+        }
+        Some(RecordShape {
+            fields,
+            hidden: true,
+        })
+    }
+    let mut shapes = shapes.into_iter();
+    let mut out = RecordShape::hidden(shapes.next()??.fields.clone());
+    for shape in shapes {
+        out = merge(&out, shape?)?;
+    }
+    Some(out)
 }
 
 impl From<Vec<RecordField>> for RecordShape {
@@ -680,6 +820,11 @@ impl ExprType {
         }
         if literals::coercion_can_null_elements(self.type_oid, to, snapshot) {
             self.elem_nullable = Some(true);
+        } else if self.type_oid != to
+            && literals::array_cast_runs_function(self.type_oid, to, snapshot)
+        {
+            // A cast function between the array types returns any elements.
+            self.elem_nullable = None;
         }
         self.elem_refine = self.elem_refine_converted(to, snapshot);
         self.refine = self.refine.converted(self.type_oid, to, snapshot);
@@ -859,6 +1004,7 @@ pub(crate) fn derive_collation<'a>(
     // `InvalidOid` (an implicit one without a collation).
     let mut implicit: Option<Collation> = None;
     let mut conflict: Option<(Collation, Collation)> = None;
+    let mut saw_default = false;
     for t in inputs {
         match t.no_collation {
             Some(NoCollation::Conflict(a, b)) => {
@@ -876,9 +1022,16 @@ pub(crate) fn derive_collation<'a>(
             }
             Some(NoCollation::Unset) | None => {}
         }
-        let Some(c) = t.collation else {
+        // `None` is the input's type's default: `name`'s is "C".
+        let Some(c) = t.collation.or_else(|| {
+            t.no_collation
+                .is_none()
+                .then(|| snapshot.get_type(t.type_oid).and_then(|ty| ty.typcollation))
+                .flatten()
+        }) else {
             continue;
         };
+        saw_default |= c == DEFAULT_COLLATION;
         if t.explicit_collation {
             match explicit {
                 Some(e) if e != c => {
@@ -903,11 +1056,14 @@ pub(crate) fn derive_collation<'a>(
             }
         }
     }
-    let collatable = snapshot
-        .get_type(result_type)
-        .is_some_and(|t| t.typcollation.is_some());
-    if !collatable {
+    let type_default = snapshot.get_type(result_type).and_then(|t| t.typcollation);
+    if type_default.is_none() {
         return Ok(DerivedCollation::default());
+    }
+    // Only the default collation came in: the result has it, also when its
+    // type's default is another one (`text_expr::name`).
+    if implicit.is_none() && saw_default && type_default != Some(DEFAULT_COLLATION) {
+        implicit = Some(Some(DEFAULT_COLLATION));
     }
     Ok(match (explicit, conflict) {
         (Some(e), _) => DerivedCollation {
@@ -1702,7 +1858,7 @@ fn infer_expr_unlocated(
                 // skipped: `ROW(NULL, NULL) IS NULL` is true, so its `IS
                 // NULL` follows different semantics.
                 let composite = arg_type.type_oid == oid::RECORD
-                    || arg_type.record_fields.is_some()
+                    || (arg_type.record_fields.is_some() && arg_type.type_oid != oid::RECORD_ARRAY)
                     || crate::coerce::is_complex(arg_type.type_oid, snapshot);
                 if !composite {
                     // A parameter may be passed NULL whatever its own
@@ -1720,6 +1876,18 @@ fn infer_expr_unlocated(
                 // would pin int4. A param typed *before* this point is fine.
                 if let Some(p) = bare_param(arg.as_ref(), snapshot) {
                     params.mark_indeterminate_locked(p.number);
+                }
+                // A scalar never NULL here decides the test: `x IS NOT
+                // NULL` is TRUE, `x IS NULL` FALSE — what `CASE WHEN x IS
+                // NOT NULL THEN true ELSE false END` is known to be too.
+                if !composite && !arg_type.nullable && !has_param_ref(arg.as_ref()) {
+                    let value = t.nulltesttype == ast::NullTestType::IsNotNull;
+                    return Ok(ExprType::scalar(oid::BOOL, false).with_refine(
+                        crate::refine::Refinement {
+                            values: Some(std::iter::once(value.to_string()).collect()),
+                            ..Default::default()
+                        },
+                    ));
                 }
             }
             Ok(ExprType::scalar(oid::BOOL, false))
@@ -1851,11 +2019,17 @@ fn infer_expr_unlocated(
                 }
                 refine.range = (range != crate::refine::IntRange::default()).then_some(range);
             }
-            Ok(
-                ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
-                    .with_collation(derive_collation(&args, resolved_type, snapshot)?)
-                    .with_refine(refine),
-            )
+            let mut out = ExprType::scalar_with_typmod(resolved_type, nullable, typmod)
+                .with_collation(derive_collation(&args, resolved_type, snapshot)?)
+                // The result is one of the (coerced) arguments.
+                .with_elem_nullable(conditional::branches_elem_nullable(
+                    &branches,
+                    resolved_type,
+                    snapshot,
+                ))
+                .with_refine(refine);
+            out.record_fields = conditional::branches_record_fields(&branches, resolved_type);
+            Ok(out)
         }
         ast::Node::AIndirection(ind) => infer_indirection(ind, ctx, params),
         ast::Node::AArrayExpr(arr) => infer_array_expr(arr, ctx, params),
@@ -1936,7 +2110,6 @@ fn infer_expr_unlocated(
             let arg = &c.arg;
             arg.as_ref()
                 .ok_or_else(|| AnalyzeError::Internal("CollateClause without arg".into()))?;
-            // PG rejects unknown collation names up front; mirror that.
             // `collname` is a list of identifier nodes (`["pg_catalog", "C"]`
             // when fully qualified, just `["C"]` otherwise).
             let parts: Vec<&str> = c
@@ -1954,6 +2127,27 @@ fn infer_expr_unlocated(
                     return Err(AnalyzeError::Invalid("malformed COLLATE clause".into()));
                 }
             };
+            let result = match infer_expr(arg.as_ref(), ctx, params, goal) {
+                Ok(t) => t,
+                // The argument isn't of the type the context wants: PG
+                // transforms it (with no goal) and checks it is collatable
+                // before the context coerces the result, so a
+                // non-collatable argument is reported first.
+                Err(e @ AnalyzeError::TypeMismatch { .. }) => {
+                    let mut scratch = params.clone();
+                    match infer_expr(arg.as_ref(), ctx, &mut scratch, TypeGoal::NONE) {
+                        Ok(t) => {
+                            check_collatable(&t, arg.as_ref(), snapshot)?;
+                            return Err(e);
+                        }
+                        Err(_) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            check_collatable(&result, arg.as_ref(), snapshot)?;
+            // transformCollateClause looks the collation up only once the
+            // argument is transformed and found collatable.
             let resolved_collation = if parts.is_empty() {
                 None
             } else {
@@ -1973,50 +2167,6 @@ fn infer_expr_unlocated(
                 crate::ddl::policies::note_collation_ref(c.location, r.oid);
                 Some(r.oid)
             };
-            let result = infer_expr(arg.as_ref(), ctx, params, goal)?;
-            // PG rejects `COLLATE` on non-collatable types with
-            // `collations are not supported by type X`. Collatable means
-            // string-category — or an *array* of a collatable element
-            // (`tags COLLATE "C"` is valid; the collation applies to the
-            // elements). Accept UNKNOWN (untyped literal/param) — the
-            // parser already coerces it through the surrounding goal.
-            if result.type_oid != oid::UNKNOWN {
-                let base = snapshot.unwrap_domain(result.type_oid);
-                let category_of = |t: PgTypeOid| {
-                    snapshot
-                        .get_type(t)
-                        .map(|ty| ty.typcategory)
-                        .unwrap_or(TypCategory::UserDefined)
-                };
-                let mut effective = base;
-                if category_of(effective) == TypCategory::Array
-                    && let Some(elem) = snapshot.get_type(effective).and_then(|t| t.typelem)
-                {
-                    effective = snapshot.unwrap_domain(elem);
-                }
-                let category = category_of(effective);
-                if category != TypCategory::String {
-                    // PG renders the bare type name here (search-path
-                    // aware) — keep the SQL-standard aliases for built-ins
-                    // (`int4` → `integer`) but drop the schema prefix for
-                    // user types so a `public.address` column reads the
-                    // same way PG would: `... by type address`.
-                    let formatted = crate::ddl::util::format_type_for_message(snapshot, base);
-                    let type_name = match formatted.rsplit_once('.') {
-                        Some((_, bare)) => bare.to_owned(),
-                        None => formatted,
-                    };
-                    let span = crate::error::node_location(arg.as_ref())
-                        .and_then(crate::error::SourceSpan::from_node_qname);
-                    return Err(crate::error::RawError::invalid(
-                        format!("collations are not supported by type {type_name}"),
-                        span,
-                        None,
-                    )
-                    .with_primary_label(format!("this is {type_name}, not a collatable type"))
-                    .finalize_implicit());
-                }
-            }
             // Explicit COLLATE overrides whatever collation was inherited
             // from the inner expression (PG's "explicit" derivation tier).
             return Ok(ExprType {
@@ -2105,6 +2255,14 @@ fn infer_expr_unlocated(
         && matches!(ac.val, Some(ast::AConstValue::String(_)))
     {
         ctx.note_literal_type(ac, goal.type_oid);
+    }
+    // An untyped NULL coerced to a type is a `Const` of it too.
+    if goal.has_expectation()
+        && result.type_oid == oid::UNKNOWN
+        && let Some(ast::Node::AConst(ac)) = node
+        && ac.isnull
+    {
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(goal.type_oid));
     }
     if goal.has_expectation()
         && result.type_oid == oid::UNKNOWN
@@ -2628,6 +2786,15 @@ pub(crate) fn inconsistent_param_error(
 thread_local! {
     static PLAN_TIME_CHECKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REWRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static IO_FUNCTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` recording the I/O functions of I/O conversions too
+/// ([`Ctx::note_io_coercion`]): what CheckMutability judges, unlike the
+/// privilege checks (a CoerceViaIO needs no EXECUTE).
+pub(crate) fn with_io_functions_recorded<R>(f: impl FnOnce() -> R) -> R {
+    let _io = FlagGuard::set(&IO_FUNCTIONS, true);
+    f()
 }
 
 /// Sets a thread-local flag for its lifetime and restores the previous
@@ -3230,6 +3397,59 @@ pub(crate) fn extract_string_fields(nodes: &[Option<ast::Node>]) -> Vec<String> 
             _ => None,
         })
         .collect()
+}
+
+/// transformCollateClause: `COLLATE` on a value of a non-collatable type
+/// is `collations are not supported by type X`.
+fn check_collatable(
+    result: &ExprType,
+    arg: Option<&ast::Node>,
+    snapshot: &PgCatalog,
+) -> Result<(), AnalyzeError> {
+    // PG rejects `COLLATE` on non-collatable types with
+    // `collations are not supported by type X`. Collatable means
+    // string-category — or an *array* of a collatable element
+    // (`tags COLLATE "C"` is valid; the collation applies to the
+    // elements). Accept UNKNOWN (untyped literal/param) — the
+    // parser already coerces it through the surrounding goal.
+    if result.type_oid != oid::UNKNOWN {
+        let base = snapshot.unwrap_domain(result.type_oid);
+        let category_of = |t: PgTypeOid| {
+            snapshot
+                .get_type(t)
+                .map(|ty| ty.typcategory)
+                .unwrap_or(TypCategory::UserDefined)
+        };
+        let mut effective = base;
+        if category_of(effective) == TypCategory::Array
+            && let Some(elem) = snapshot.get_type(effective).and_then(|t| t.typelem)
+        {
+            effective = snapshot.unwrap_domain(elem);
+        }
+        let category = category_of(effective);
+        if category != TypCategory::String {
+            // PG renders the bare type name here (search-path
+            // aware) — keep the SQL-standard aliases for built-ins
+            // (`int4` → `integer`) but drop the schema prefix for
+            // user types so a `public.address` column reads the
+            // same way PG would: `... by type address`.
+            let formatted = crate::ddl::util::format_type_for_message(snapshot, base);
+            let type_name = match formatted.rsplit_once('.') {
+                Some((_, bare)) => bare.to_owned(),
+                None => formatted,
+            };
+            let span = crate::error::node_location(arg)
+                .and_then(crate::error::SourceSpan::from_node_qname);
+            return Err(crate::error::RawError::invalid(
+                format!("collations are not supported by type {type_name}"),
+                span,
+                None,
+            )
+            .with_primary_label(format!("this is {type_name}, not a collatable type"))
+            .finalize_implicit());
+        }
+    }
+    Ok(())
 }
 
 /// PG's `DeconstructQualifiedName` over an already-split name (a function

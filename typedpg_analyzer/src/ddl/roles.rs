@@ -82,6 +82,9 @@ pub(crate) struct Roles {
     pub(crate) row_security: std::collections::HashMap<RoleId, bool>,
     /// `ALTER ROLE ALL SET row_security`: every role's.
     pub(crate) all_row_security: Option<bool>,
+    /// What code the analyzer couldn't follow may have changed (see
+    /// [`super::uncertain`]).
+    pub(crate) uncertain: super::uncertain::Uncertain,
 }
 
 impl Default for Roles {
@@ -103,6 +106,7 @@ impl Roles {
             all_search_path: None,
             row_security: std::collections::HashMap::new(),
             all_row_security: None,
+            uncertain: super::uncertain::Uncertain::default(),
         };
         // Built-in roles first: their ids stay small and stable.
         roles.bootstrap = roles.add("postgres", false, true);
@@ -291,10 +295,12 @@ impl Roles {
             let mut added: Vec<RoleId> = self
                 .memberships
                 .iter()
-                .filter(|m| m.member == current && m.inherit)
+                .filter(|m| m.member == current && m.inherit && !self.may_be_lost(m))
                 .map(|m| m.role)
                 .collect();
+            added.extend(self.maybe_gained_roles_of(current));
             added.sort();
+            added.dedup();
             for role in added {
                 if !found.contains(&role) {
                     found.push(role);
@@ -324,7 +330,7 @@ impl Roles {
             let current = seen[next];
             next += 1;
             for m in &self.memberships {
-                if self.same_real_role(m.member, current) && m.set {
+                if self.same_real_role(m.member, current) && m.set && !self.may_be_lost(m) {
                     if self.same_real_role(m.role, role) {
                         return true;
                     }
@@ -333,8 +339,50 @@ impl Roles {
                     }
                 }
             }
+            for gained in self.maybe_gained_roles_of(current) {
+                if self.same_real_role(gained, role) {
+                    return true;
+                }
+                if !seen.contains(&gained) {
+                    seen.push(gained);
+                }
+            }
         }
         false
+    }
+
+    /// Whether membership `m` may be gone, when checks read the lower bound
+    /// of an uncertain catalog (see [`super::uncertain`]).
+    fn may_be_lost(&self, m: &Membership) -> bool {
+        super::uncertain::bound() == super::uncertain::Bound::Lower
+            && self
+                .uncertain
+                .membership_may_be_lost(self.name(m.role), self.name(m.member))
+    }
+
+    /// The roles `member` may be a member of without the catalog recording
+    /// it (with every option), when checks read the upper bound of an
+    /// uncertain catalog (see [`super::uncertain`]).
+    fn maybe_gained_roles_of(&self, member: RoleId) -> Vec<RoleId> {
+        if super::uncertain::bound() != super::uncertain::Bound::Upper
+            || (self.uncertain.gained_memberships.is_empty() && !self.uncertain.catalog)
+        {
+            return Vec::new();
+        }
+        let member_name = self.name(member);
+        let mut roles: Vec<RoleId> = self
+            .roles
+            .iter()
+            .filter(|&(&id, role)| {
+                id != member
+                    && self
+                        .uncertain
+                        .membership_may_be_gained(&role.name, member_name)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        roles.sort();
+        roles
     }
 
     /// `select_best_admin` (acl.c): the role closest to `member` (itself
@@ -345,9 +393,12 @@ impl Roles {
             return None;
         }
         self.roles_with_privs_of(member).into_iter().find(|&other| {
-            self.memberships
-                .iter()
-                .any(|m| m.role == role && self.same_real_role(m.member, other) && m.admin)
+            self.memberships.iter().any(|m| {
+                m.role == role
+                    && self.same_real_role(m.member, other)
+                    && m.admin
+                    && !self.may_be_lost(m)
+            }) || self.maybe_gained_roles_of(other).contains(&role)
         })
     }
 
@@ -377,7 +428,10 @@ impl Roles {
 /// The role `spec` names (`get_rolespec_oid`). `None` for `PUBLIC`, which
 /// never is a role. `CURRENT_USER` / `CURRENT_ROLE` / `SESSION_USER` are the
 /// migrations' user while the session leaves them unnamed.
-fn role_spec_name(interp: &PgCatalog, spec: &typedpg_pg_query::ast::RoleSpec) -> Option<String> {
+pub(crate) fn role_spec_name(
+    interp: &PgCatalog,
+    spec: &typedpg_pg_query::ast::RoleSpec,
+) -> Option<String> {
     match spec.roletype {
         RoleSpecType::RolespecCstring => Some(spec.rolename.clone()),
         RoleSpecType::RolespecCurrentRole | RoleSpecType::RolespecCurrentUser => Some(
@@ -1246,6 +1300,14 @@ pub fn rename_role(interp: &mut PgCatalog, old: &str, new_name: &str) -> Result<
     }
     let id = interp.roles.id_or_intern(&old);
     if new_name != old {
+        // A stored `regrole` constant names the role.
+        super::stored_exprs::follow_rename(
+            interp,
+            super::stored_exprs::Renamed::Role {
+                old: &old,
+                new: new_name,
+            },
+        );
         interp.roles.rename(id, new_name.to_owned());
     }
     Ok(())

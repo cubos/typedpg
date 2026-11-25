@@ -3,9 +3,9 @@
 A `sql!` binding `p = v` whose only effect is to rename the variable `v` to
 the parameter `$p`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | `sql!` bindings (Rust only) | writes `$v` in the SQL and removes the binding |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | `sql!` bindings (Rust only) | writes `$v` in the SQL and removes the binding |
 
 ## Example
 
@@ -19,7 +19,7 @@ pub async fn titles(pool: &typedpg::Pool, user_id: i64) -> typedpg::Result<()> {
 ```
 
 ```
-info[renaming_binding]: `user = user_id` only renames the variable `user_id`
+info[redundant/renaming_binding]: `user = user_id` only renames the variable `user_id`
     ╭─[src/posts.rs:13:78]
  13 │     let titles = sql!(pool, "SELECT title FROM posts WHERE user_id = $user", user = user_id)
     ·                                                                              ──────────────

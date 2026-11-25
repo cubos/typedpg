@@ -4,7 +4,6 @@
 //! that file, a query already analyzed is not analyzed again, and a
 //! generated module is rewritten only when its content changes.
 
-use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
@@ -24,12 +23,12 @@ use crate::config::{
 use crate::emit::{Embedded, Module, TypeCheck};
 use crate::generate::{GenError, Generated, generate};
 use crate::scan::{
-    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, QueryExport,
+    Export, FileScan, Kind, LineIndex, Literal, ModuleExports, Position, QueryExport, Stringified,
     module_exports, scan,
 };
 use crate::sqlfile::{ModuleNames, SqlFile};
 use crate::sqlmodule::{Mapped, SqlModule, SqlQuery, generated_source, source_from};
-use crate::typemap::{RUNTIME_NS, TypeMapper};
+use crate::typemap::{EnumNames, Enums, RUNTIME_NS, TypeMapper};
 
 /// A problem to report, at a place in a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +69,7 @@ pub struct Project {
     resolver: ResolverGeneric<ProjectFs>,
     files: BTreeMap<PathBuf, FileScan>,
     /// The re-exports of each module a source imports from, parsed once.
-    modules: RefCell<HashMap<PathBuf, Option<ModuleExports>>>,
+    modules: std::sync::Mutex<HashMap<PathBuf, Option<ModuleExports>>>,
     /// Whether TypeScript sources are scanned (not to compile `.sql` files
     /// alone).
     scan_sources: bool,
@@ -117,21 +116,84 @@ struct Database {
     cache: HashMap<(Kind, String), Result<Generated, GenError>>,
 }
 
+/// A database's migrations as its directories hold them and the catalog
+/// they build, set up for analyzing its queries; or why they could not be
+/// read.
+struct LoadedMigrations {
+    /// The configured directories that don't exist.
+    missing_dirs: Vec<PathBuf>,
+    #[allow(clippy::type_complexity)]
+    migrations: Result<(Vec<(String, String)>, Result<PgCatalog, String>), String>,
+}
+
+/// Read the migrations of the database `config` configures (relative paths
+/// against `root`) and build its catalog, as
+/// [`Project::reload_migrations`] does for a database that has none yet.
+fn load_migrations(
+    config: &DatabaseConfig,
+    overrides: &HashMap<QualifiedName, String>,
+    root: &Path,
+) -> LoadedMigrations {
+    let dirs = config.migrations_dirs();
+    LoadedMigrations {
+        missing_dirs: dirs.iter().filter(|d| !d.is_dir()).cloned().collect(),
+        migrations: collect_migrations(&dirs, root).map(|migrations| {
+            let catalog = build_catalog(&migrations, config.runner.use_transaction).and_then(
+                |mut catalog| {
+                    prepare_catalog(config, overrides, &mut catalog)?;
+                    Ok(catalog)
+                },
+            );
+            (migrations, catalog)
+        }),
+    }
+}
+
+/// Set a catalog built from the migrations of the database `config`
+/// configures (`overrides` its `types`) up for analyzing its queries.
+fn prepare_catalog(
+    config: &DatabaseConfig,
+    overrides: &HashMap<QualifiedName, String>,
+    catalog: &mut PgCatalog,
+) -> Result<(), String> {
+    // Parameters bound from a Temporal value are never infinite.
+    let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
+        .iter()
+        .map(|t| QualifiedName::new("pg_catalog", *t))
+        .filter(|q| !overrides.contains_key(q))
+        .collect();
+    catalog.assume_finite_parameters(&finite)?;
+    catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
+        &config.simplify,
+    ));
+    Ok(())
+}
+
 impl Database {
     /// Set a catalog built from the database's migrations up for analyzing
     /// its queries.
     fn prepare_catalog(&self, catalog: &mut PgCatalog) -> Result<(), String> {
-        // Parameters bound from a Temporal value are never infinite.
-        let finite: Vec<QualifiedName> = crate::typemap::FINITE_PARAMETER_TYPES
+        prepare_catalog(&self.config, &self.overrides, catalog)
+    }
+
+    /// The names the database's enums take in its module (`file: None`) or
+    /// the module of `.sql` file `file`: clear of every name either kind of
+    /// module declares or imports, so an enum is named alike in each — but
+    /// where a `.sql` file's queries or their types take the name.
+    fn enum_names(&self, enums: &Enums, file: Option<&SqlFile>) -> EnumNames {
+        let mut taken: Vec<String> = crate::emit::MODULE_BINDINGS
             .iter()
-            .map(|t| QualifiedName::new("pg_catalog", *t))
-            .filter(|q| !self.overrides.contains_key(q))
+            .chain(crate::sqlmodule::MODULE_BINDINGS)
+            .map(|s| (*s).to_owned())
+            .chain(self.config.types.values().map(|o| o.export.clone()))
             .collect();
-        catalog.assume_finite_parameters(&finite)?;
-        catalog.set_simplify_options(typedpg_analyzer::SimplifyOptions::from_config(
-            &self.config.simplify,
-        ));
-        Ok(())
+        if let (Some(file), Some(sql)) = (file, &self.config.sql) {
+            for q in &file.queries {
+                let (params, row) = sql.type_names.of(&q.name);
+                taken.extend([q.name.clone(), params, row]);
+            }
+        }
+        enums.names(taken.iter().map(String::as_str))
     }
 
     /// Read `source`, one of the database's `.sql` files.
@@ -193,6 +255,8 @@ pub struct LintCopyIn<'a> {
     /// The target as written: `table (columns)`.
     pub target: String,
     pub pos: Position,
+    /// Its `execute` calls, on the expression or a local binding of it.
+    pub calls: Vec<LintCall<'a>>,
 }
 
 /// A call on a [`LintQuery`], in the file that calls it.
@@ -204,6 +268,9 @@ pub struct LintCall<'a> {
     pub span: Range<usize>,
     pub file: &'a Path,
     pub lines: &'a LineIndex,
+    /// The `JSON.stringify(…)` calls it passes as values, each placed at its
+    /// own span in [`Self::file`].
+    pub stringified: Vec<Stringified>,
 }
 
 impl LintCall<'_> {
@@ -213,6 +280,7 @@ impl LintCall<'_> {
             method: call_method(&self.method).expect("only known methods become lint calls"),
             name: self.method.clone(),
             language: Language::TypeScript,
+            stringified: self.stringified.iter().map(|s| s.value.clone()).collect(),
         }
     }
 }
@@ -409,7 +477,7 @@ impl Project {
             dbs,
             resolver,
             files: BTreeMap::new(),
-            modules: RefCell::new(HashMap::new()),
+            modules: std::sync::Mutex::new(HashMap::new()),
             scan_sources,
             scan_without_modules,
             sql_files: BTreeMap::new(),
@@ -417,10 +485,46 @@ impl Project {
             sql_generated: BTreeSet::new(),
             sql_problems: Vec::new(),
         };
-        for i in 0..project.dbs.len() {
-            project.reload_migrations(i);
+        // Each database's catalog is built while the sources are scanned:
+        // neither reads the other.
+        let root = project.config.root.clone();
+        let sources: Vec<(DatabaseConfig, HashMap<QualifiedName, String>)> = project
+            .dbs
+            .iter()
+            .map(|db| (db.config.clone(), db.overrides.clone()))
+            .collect();
+        let loaded: Vec<LoadedMigrations> = std::thread::scope(|scope| {
+            let builds: Vec<_> = sources
+                .iter()
+                .map(|(config, overrides)| {
+                    let root = &root;
+                    std::thread::Builder::new()
+                        .stack_size(typedpg_lint::parallel::STACK)
+                        .spawn_scoped(scope, move || load_migrations(config, overrides, root))
+                        .expect("failed to spawn a thread")
+                })
+                .collect();
+            project.rescan_all();
+            builds
+                .into_iter()
+                .map(|build| {
+                    build
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                })
+                .collect()
+        });
+        for (db, loaded) in project.dbs.iter_mut().zip(loaded) {
+            db.missing_dirs = loaded.missing_dirs;
+            match loaded.migrations {
+                Ok((migrations, catalog)) => {
+                    db.catalog = catalog;
+                    db.migrations = migrations;
+                }
+                Err(e) => db.catalog = Err(e),
+            }
+            db.cache.clear();
         }
-        project.rescan_all();
         Ok(project)
     }
 
@@ -559,7 +663,10 @@ impl Project {
     /// Whether a source's re-exports were followed through `path`: a change
     /// to it can change what other sources' imports are.
     pub fn is_reexporter(&self, path: &Path) -> bool {
-        self.modules.borrow().contains_key(&canonical(path))
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&canonical(path))
     }
 
     /// The index of each database whose migrations `path` is in.
@@ -580,7 +687,10 @@ impl Project {
     pub fn rescan_all(&mut self) {
         self.collect_sql();
         self.resolver.clear_cache();
-        self.modules.borrow_mut().clear();
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.files.clear();
         if !self.scan_sources
             || (!self.scan_without_modules && !self.dbs.iter().any(|db| db.config.out.is_some()))
@@ -593,9 +703,35 @@ impl Project {
         }
         sources.sort();
         sources.dedup();
-        for path in sources {
-            if self.is_source(&path) {
-                self.rescan(&path);
+        let sources: Vec<PathBuf> = sources
+            .into_iter()
+            .filter(|path| self.is_source(path))
+            .collect();
+        // Each source is read and scanned on its own, resolving its imports
+        // against the project: neither a scan nor a resolution reads what
+        // another writes.
+        let scanned: Vec<(PathBuf, Option<FileScan>)> = {
+            let project = &*self;
+            typedpg_lint::parallel::map(&sources, |path| {
+                let source = std::fs::read_to_string(path).ok()?;
+                let result = scan(path, &source, &mut |spec, name| {
+                    project.resolve_export(path, spec, name, 0)
+                });
+                Some((path.clone(), result))
+            })
+        }
+        .into_iter()
+        .flatten()
+        .collect();
+        for (path, result) in scanned {
+            match result {
+                Some(scan) => {
+                    self.files.insert(path, scan);
+                }
+                // Unparseable: keep the queries it had.
+                None => {
+                    self.files.entry(path).or_default();
+                }
             }
         }
     }
@@ -655,15 +791,26 @@ impl Project {
         if name == "*" || depth >= MAX_REEXPORT_DEPTH || !followable {
             return None;
         }
-        let exports = {
-            let mut modules = self.modules.borrow_mut();
-            modules
-                .entry(path.to_path_buf())
-                .or_insert_with(|| {
-                    let source = std::fs::read_to_string(path).ok()?;
-                    module_exports(path, &source)
-                })
-                .clone()?
+        // The module's exports, read once: a file's exports are a
+        // function of its text, so a concurrent read may compute the same.
+        let cached = self
+            .modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+            .cloned();
+        let exports = match cached {
+            Some(exports) => exports?,
+            None => {
+                let exports = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|source| module_exports(path, &source));
+                self.modules
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(path.to_path_buf(), exports.clone());
+                exports?
+            }
         };
         // `export const x = sql(…)`, or a local one exported later.
         if exports.queries.iter().any(|query| query == name) {
@@ -835,7 +982,9 @@ impl Project {
         let mapper = TypeMapper {
             overrides: &db.overrides,
             used: Default::default(),
+            catalog,
         };
+        let enums = Enums::new(catalog, &db.overrides);
         // Drop what no source uses anymore.
         db.cache.retain(|(kind, text), _| {
             queries.contains_key(&(*kind, text.as_str()))
@@ -845,11 +994,28 @@ impl Project {
             .keys()
             .copied()
             .chain(sql_texts.iter().map(|&t| (Kind::Query, t)));
+        // Each query not analyzed yet, once, analyzed across the machine's
+        // cores.
+        let mut fresh = Vec::new();
+        let mut seen = HashSet::new();
         for (kind, text) in wanted {
-            if let Entry::Vacant(e) = db.cache.entry((kind, text.to_owned())) {
-                report.analyzed += 1;
-                e.insert(generate(catalog, &mapper, kind, text, &db.config.roles));
+            if !db.cache.contains_key(&(kind, text.to_owned())) && seen.insert((kind, text)) {
+                fresh.push((kind, text));
             }
+        }
+        let overrides = &db.overrides;
+        let roles = &db.config.roles;
+        let generated = typedpg_lint::parallel::map(&fresh, |&(kind, text)| {
+            let mapper = TypeMapper {
+                overrides,
+                used: Default::default(),
+                catalog,
+            };
+            generate(catalog, &mapper, kind, text, roles)
+        });
+        for ((kind, text), result) in fresh.into_iter().zip(generated) {
+            report.analyzed += 1;
+            db.cache.insert((kind, text.to_owned()), result);
         }
         let note = missing_dirs_note(&db.missing_dirs, root);
         let with_note = |e: &GenError| {
@@ -927,12 +1093,14 @@ impl Project {
             let dir = first.parent().unwrap_or(Path::new("."));
             let imports = override_imports(&db.config, dir);
             let queries = sql_queries(file, &db.cache, &checks);
+            let enum_names = db.enum_names(&enums, Some(file));
             let module = SqlModule {
                 runtime: &config.runtime,
                 source: source_from(first, path),
                 imports: &imports,
                 queries: &queries,
                 type_names: &sql.type_names,
+                enums: &enum_names,
             };
             let contents = match sql.emit {
                 Emit::Ts => {
@@ -999,10 +1167,12 @@ impl Project {
             None
         };
         let imports = override_imports(&db.config, out.parent().unwrap_or(Path::new(".")));
+        let enum_names = db.enum_names(&enums, None);
         let module = Module {
             runtime: &config.runtime,
             imports: &imports,
             checks: &checks,
+            enums: &enum_names,
             queries: &entries[0],
             copies: &entries[1],
             migrations: embedded.as_deref().map(|migrations| Embedded {
@@ -1067,6 +1237,7 @@ impl Project {
         let mapper = TypeMapper {
             overrides: &db.overrides,
             used: Default::default(),
+            catalog,
         };
         for q in &file.queries {
             if let Entry::Vacant(e) = db.cache.entry((Kind::Query, q.text.clone())) {
@@ -1114,12 +1285,14 @@ impl Project {
         let name = path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let enum_names = db.enum_names(&Enums::new(catalog, &db.overrides), Some(&file));
         let module = SqlModule {
             runtime: &self.config.runtime,
             source: name,
             imports: &imports,
             queries: &queries,
             type_names: &type_names,
+            enums: &enum_names,
         };
         let Mapped { text, exports } = module.mapped();
         let mappings = exports
@@ -1153,8 +1326,13 @@ impl Project {
         let mut remote: HashMap<(PathBuf, String), Vec<LintCall<'_>>> = HashMap::new();
         for (path, scan) in &self.files {
             for call in &scan.remote_calls {
-                let Some(lint) = lint_call(path, &scan.lines, &call.method, call.span.clone())
-                else {
+                let Some(lint) = lint_call(
+                    path,
+                    &scan.lines,
+                    &call.method,
+                    call.span.clone(),
+                    &call.stringified,
+                ) else {
                     continue;
                 };
                 remote
@@ -1174,7 +1352,13 @@ impl Project {
                     .calls
                     .iter()
                     .filter_map(|call| {
-                        lint_call(path, &scan.lines, &call.method, call.span.clone())
+                        lint_call(
+                            path,
+                            &scan.lines,
+                            &call.method,
+                            call.span.clone(),
+                            &call.stringified,
+                        )
                     })
                     .collect();
                 let key = canonical(path);
@@ -1228,8 +1412,8 @@ impl Project {
     }
 
     /// Every `copyIn()` target in the sources, sorted by file and position:
-    /// the targets `breaks_deployed_queries` checks in the previous
-    /// deployment.
+    /// the targets `deployed_query_breakage` checks in the previous
+    /// deployment, with the calls `json_stringify_param` checks.
     pub fn lint_copy_ins(&self) -> Vec<LintCopyIn<'_>> {
         let mut out = Vec::new();
         for (path, scan) in &self.files {
@@ -1240,6 +1424,20 @@ impl Project {
                         file: path,
                         target: query.text.clone(),
                         pos: query.pos,
+                        calls: query
+                            .calls
+                            .iter()
+                            .filter(|call| call.method == "execute")
+                            .filter_map(|call| {
+                                lint_call(
+                                    path,
+                                    &scan.lines,
+                                    &call.method,
+                                    call.span.clone(),
+                                    &call.stringified,
+                                )
+                            })
+                            .collect(),
                     });
                 }
             }
@@ -1251,6 +1449,12 @@ impl Project {
     /// Database `db`'s catalog, or why it could not be built.
     pub fn catalog(&self, db: usize) -> Result<&PgCatalog, String> {
         self.dbs[db].catalog.as_ref().map_err(Clone::clone)
+    }
+
+    /// Database `db`'s type overrides (`types`): the TypeScript type name
+    /// each overridden PG type maps to.
+    pub fn type_overrides(&self, db: usize) -> &HashMap<QualifiedName, String> {
+        &self.dbs[db].overrides
     }
 
     /// The migrations `typedpg lint` runs for database `i`: the runner's
@@ -1321,12 +1525,14 @@ fn lint_call<'a>(
     lines: &'a LineIndex,
     method: &str,
     span: Range<usize>,
+    stringified: &[Stringified],
 ) -> Option<LintCall<'a>> {
     call_method(method).map(|_| LintCall {
         method: method.to_owned(),
         span,
         file: path,
         lines,
+        stringified: stringified.to_vec(),
     })
 }
 
@@ -1614,6 +1820,7 @@ fn ensure_exists(out: &Path, kind: OutKind, runtime: &str) -> Result<(), String>
         runtime,
         imports: &[],
         checks: &[],
+        enums: &EnumNames::default(),
         queries: &[],
         copies: &[],
         migrations: None,

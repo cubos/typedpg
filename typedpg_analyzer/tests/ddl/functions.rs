@@ -1835,3 +1835,99 @@ fn inline_bodies_hold_queries_and_transforms_can_be_dropped() {
          DROP TRANSFORM IF EXISTS FOR text LANGUAGE sql;",
     )]);
 }
+
+#[test]
+fn routine_settings_of_transaction_parameters() {
+    // PG 19: the check hooks run as the SET item is validated
+    // (check_transaction_isolation refuses a change, check_transaction_
+    // deferrable any value once a snapshot is taken); ProcedureCreate then
+    // applies the settings for the validator, which GUC_NO_RESET refuses.
+    let f =
+        |set: &str| format!("CREATE FUNCTION f() RETURNS int LANGUAGE sql {set} AS 'SELECT 1';");
+    assert_ddl_rejections(&[
+        (
+            "",
+            &f("SET transaction_isolation = 'serializable'"),
+            "SET TRANSACTION ISOLATION LEVEL must be called before any query",
+        ),
+        (
+            "",
+            &f("SET transaction_deferrable = on"),
+            "SET TRANSACTION [NOT] DEFERRABLE must be called before any query",
+        ),
+        (
+            "",
+            &f("SET transaction_isolation = 'read committed'"),
+            "parameter \"transaction_isolation\" cannot be set locally in functions",
+        ),
+        (
+            "",
+            &f("SET transaction_read_only = on"),
+            "parameter \"transaction_read_only\" cannot be set locally in functions",
+        ),
+    ]);
+    // Not applied with check_function_bodies off; ALTER FUNCTION only
+    // validates.
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "SET check_function_bodies = off; {}
+             RESET check_function_bodies;
+             ALTER FUNCTION f() SET transaction_read_only = on;",
+            f("SET transaction_isolation = 'read committed'")
+        ),
+    )]);
+}
+
+#[test]
+fn create_transform_checks_its_type_and_functions() {
+    // PG 19 CreateTransform / check_transform_function (42P17, 42809).
+    let setup = "CREATE FUNCTION f_int(int) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+                 CREATE FUNCTION f_vol(internal) RETURNS internal LANGUAGE internal AS 'int4in';
+                 CREATE FUNCTION f_two(internal, internal) RETURNS internal LANGUAGE internal IMMUTABLE AS 'int4in';
+                 CREATE FUNCTION f_ok(internal) RETURNS internal LANGUAGE internal IMMUTABLE AS 'int4in';
+                 CREATE FUNCTION f_to(internal) RETURNS int LANGUAGE internal IMMUTABLE AS 'int4in';
+                 CREATE DOMAIN dom AS int;";
+    let t = |rest: &str| format!("CREATE TRANSFORM FOR {rest});");
+    assert_ddl_rejections(&[
+        (
+            setup,
+            &t("int LANGUAGE sql (FROM SQL WITH FUNCTION f_int(int)"),
+            "return data type of FROM SQL function must be internal",
+        ),
+        (
+            setup,
+            &t("int LANGUAGE sql (FROM SQL WITH FUNCTION f_vol(internal)"),
+            "transform function must not be volatile",
+        ),
+        (
+            setup,
+            &t("int LANGUAGE sql (FROM SQL WITH FUNCTION f_two(internal, internal)"),
+            "transform function must take one argument",
+        ),
+        (
+            setup,
+            &t("int LANGUAGE sql (TO SQL WITH FUNCTION f_ok(internal)"),
+            "return data type of TO SQL function must be the transform data type",
+        ),
+        (
+            setup,
+            &t("dom LANGUAGE sql (FROM SQL WITH FUNCTION f_ok(internal)"),
+            "data type dom is a domain",
+        ),
+        (
+            setup,
+            &t("anyelement LANGUAGE sql (FROM SQL WITH FUNCTION f_ok(internal)"),
+            "data type anyelement is a pseudo-type",
+        ),
+    ]);
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup} {}",
+            t(
+                "int LANGUAGE sql (FROM SQL WITH FUNCTION f_ok(internal), TO SQL WITH FUNCTION f_to(internal)"
+            )
+        ),
+    )]);
+}

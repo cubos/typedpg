@@ -409,6 +409,36 @@ fn drop_table_referenced_by_fk_with_cascade_drops_fk_too() {
 // ── DROP COLUMN with constraints ───────────────────────────────────────────
 
 #[test]
+fn a_primary_key_using_an_index_reports_incompatible_not_nulls_as_set_not_null() {
+    // ADD PRIMARY KEY USING INDEX sets the columns' not-null constraints as
+    // SET NOT NULL does, and reports an incompatible one as it does.
+    for (setup, message) in [
+        (
+            "CREATE TABLE a (r int); ALTER TABLE a ADD CONSTRAINT k NOT NULL r NOT VALID;
+             CREATE UNIQUE INDEX ia ON a (r);",
+            "incompatible NOT VALID constraint \"k\" on relation \"a\" (You might need to \
+             validate it using ALTER TABLE ... VALIDATE CONSTRAINT.)",
+        ),
+        (
+            "CREATE TABLE a (r int CONSTRAINT k NOT NULL NO INHERIT);
+             CREATE UNIQUE INDEX ia ON a (r);",
+            "cannot change NO INHERIT status of NOT NULL constraint \"k\" on relation \"a\" (You \
+             might need to make the existing constraint inheritable using ALTER TABLE ... ALTER \
+             CONSTRAINT ... INHERIT.)",
+        ),
+    ] {
+        let result = try_apply(&[
+            ("0001.sql", setup),
+            (
+                "0002.sql",
+                "ALTER TABLE a ADD CONSTRAINT pa PRIMARY KEY USING INDEX ia;",
+            ),
+        ]);
+        assert_ddl_err!(result, DdlError::Parse(_), message);
+    }
+}
+
+#[test]
 fn drop_column_with_pkey_dependency_drops_pkey_silently() {
     // PG drops the PK constraint along with the column it covers (only
     // *external* dependencies block DROP COLUMN without CASCADE — local
@@ -2609,4 +2639,60 @@ fn new_partitioned_index_adopts_an_invalid_on_only_index() {
          ALTER TABLE t0 ATTACH PARTITION t1 FOR VALUES IN (1);",
     )]);
     assert_eq!((count(&db, "t1"), count(&db, "t2")), (2, 1));
+}
+
+#[test]
+fn check_reading_the_whole_row_keys_attno_zero() {
+    // PG 19 StoreRelCheck: the whole-row Var is attno 0 in conkey, and
+    // names nothing (the constraint is `e_check`).
+    use typedpg_analyzer::ConType;
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE TABLE e (c int, CHECK (e IS NOT NULL), CHECK (c > 0 OR e.* IS NULL));",
+    )]);
+    let mut keys: Vec<(String, Vec<i16>)> = db
+        .constraints_of_table("e")
+        .into_iter()
+        .filter(|c| c.contype == ConType::Check)
+        .map(|c| (c.conname, c.conkey))
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            ("e_check".to_owned(), vec![0]),
+            ("e_check1".to_owned(), vec![1, 0]),
+        ]
+    );
+}
+
+#[test]
+fn foreign_key_collations_must_agree_when_one_is_nondeterministic() {
+    // PG 19 ATAddForeignKeyConstraint: 42P21.
+    let setup =
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                 CREATE TABLE v (k text COLLATE ci PRIMARY KEY);
+                 CREATE TABLE w (k text COLLATE \"C\" PRIMARY KEY);";
+    assert_ddl_rejections(&[
+        (
+            setup,
+            "CREATE TABLE e (c text COLLATE \"C\" REFERENCES v);",
+            "foreign key constraint \"e_c_fkey\" cannot be implemented (Key columns \"c\" of the \
+             referencing table and \"k\" of the referenced table have incompatible collations: \
+             \"C\" and \"ci\".  If either collation is nondeterministic, then both collations \
+             have to be the same.)",
+        ),
+        (
+            setup,
+            "CREATE TABLE e (c text COLLATE ci REFERENCES w);",
+            "foreign key constraint \"e_c_fkey\" cannot be implemented",
+        ),
+    ]);
+    build_db(&[(
+        "0001.sql",
+        &format!(
+            "{setup}
+             CREATE TABLE e (c text COLLATE ci REFERENCES v, d text COLLATE \"POSIX\" REFERENCES w);"
+        ),
+    )]);
 }

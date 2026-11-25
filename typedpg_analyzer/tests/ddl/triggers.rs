@@ -715,3 +715,197 @@ fn drop_extension_takes_a_marked_partitioned_index_with_its_partitions_indexes()
     }
     db.apply_sql("CREATE INDEX pi ON p (b);").unwrap();
 }
+
+/// Apply `sql`, which must fail with an error starting with `message`.
+fn expect_failure(db: &mut PgCatalog, sql: &str, message: &str) {
+    let err = db.apply_sql(sql).expect_err(sql);
+    assert!(
+        err.to_string().starts_with(message),
+        "{sql}\n  expected: {message}\n       got: {err}"
+    );
+}
+
+const WHEN_SETUP: &str = "CREATE TABLE t (a int, b int, c text);
+     CREATE FUNCTION tf() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+     CREATE FUNCTION pos(int) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';";
+
+#[test]
+fn a_trigger_when_condition_reads_its_columns_by_attnum() {
+    // PG 19 stores tgqual with attnums (recordDependencyOnExpr): the
+    // trigger keeps working after RENAME COLUMN / RENAME TO, DROP COLUMN of
+    // a column it reads needs CASCADE (which drops the trigger), and ALTER
+    // COLUMN TYPE of one is refused (RememberAllDependentForRebuilding). A
+    // column added under the old name is another column.
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{WHEN_SETUP}
+             CREATE TRIGGER tr BEFORE UPDATE ON t FOR EACH ROW
+                 WHEN (old.a IS DISTINCT FROM new.a) EXECUTE FUNCTION tf();"
+        ),
+    )]);
+    db.apply_sql("ALTER TABLE t RENAME a TO z; ALTER TABLE t RENAME TO u;")
+        .unwrap();
+    expect_failure(
+        &mut db,
+        "ALTER TABLE u DROP COLUMN z;",
+        "cannot drop column z of table u because other objects depend on it (trigger tr on \
+         table u depends on column z of table u)",
+    );
+    expect_failure(
+        &mut db,
+        "ALTER TABLE u ALTER z TYPE bigint;",
+        "cannot alter type of a column used in a trigger definition",
+    );
+    db.apply_sql(
+        "ALTER TABLE u ADD COLUMN a int;
+         ALTER TABLE u DROP COLUMN a;
+         ALTER TABLE u DROP COLUMN z CASCADE;
+         CREATE TRIGGER tr BEFORE UPDATE ON u FOR EACH ROW EXECUTE FUNCTION tf();",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_trigger_when_condition_reads_the_columns_it_selects_from_a_row() {
+    // `(new).a` is transformed into the Var of column `a`
+    // (ParseComplexProjection): a column dependency, as `new.a` is. A
+    // comparison of the whole rows reads no column in particular.
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{WHEN_SETUP}
+             CREATE TRIGGER tr BEFORE UPDATE ON t FOR EACH ROW
+                 WHEN ((new).a > 0 AND (old).b > 0) EXECUTE FUNCTION tf();
+             CREATE TRIGGER whole BEFORE UPDATE ON t FOR EACH ROW
+                 WHEN (new IS DISTINCT FROM old) EXECUTE FUNCTION tf();"
+        ),
+    )]);
+    db.apply_sql("ALTER TABLE t RENAME a TO z;").unwrap();
+    expect_failure(
+        &mut db,
+        "ALTER TABLE t DROP COLUMN z;",
+        "cannot drop column z of table t because other objects depend on it (trigger tr on \
+         table t depends on column z of table t)",
+    );
+    expect_failure(
+        &mut db,
+        "ALTER TABLE t ALTER b TYPE bigint;",
+        "cannot alter type of a column used in a trigger definition",
+    );
+    db.apply_sql("ALTER TABLE t ALTER c TYPE varchar; ALTER TABLE t DROP COLUMN c;")
+        .unwrap();
+}
+
+#[test]
+fn a_trigger_when_condition_depends_on_what_it_calls() {
+    // recordDependencyOnExpr over tgqual: the functions the condition
+    // calls, its operators, the cast functions it runs and the types it
+    // names. Each needs CASCADE to drop, which drops the trigger; a rename
+    // or a move doesn't affect it.
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{WHEN_SETUP}
+             CREATE TYPE e AS ENUM ('x', 'y');
+             CREATE SCHEMA s;
+             CREATE FUNCTION ieq(int, int) RETURNS bool LANGUAGE sql IMMUTABLE
+                 AS 'SELECT $1 = $2';
+             CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, FUNCTION = ieq);
+             CREATE TYPE ct AS (x int);
+             CREATE FUNCTION ct_int(ct) RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+             CREATE CAST (ct AS int) WITH FUNCTION ct_int(ct);
+             ALTER TABLE t ADD COLUMN k ct;
+             CREATE TRIGGER f AFTER INSERT ON t FOR EACH ROW
+                 WHEN (pos(new.a)) EXECUTE FUNCTION tf();
+             CREATE TRIGGER o AFTER UPDATE ON t FOR EACH ROW
+                 WHEN (new.a === old.a) EXECUTE FUNCTION tf();
+             CREATE TRIGGER c AFTER INSERT ON t FOR EACH ROW
+                 WHEN (new.k::int > 0) EXECUTE FUNCTION tf();
+             CREATE TRIGGER ty AFTER INSERT ON t FOR EACH ROW
+                 WHEN (new.c::e IS NOT NULL) EXECUTE FUNCTION tf();"
+        ),
+    )]);
+    db.apply_sql(
+        "ALTER FUNCTION pos(int) RENAME TO pos2;
+         ALTER OPERATOR === (int, int) SET SCHEMA s;
+         ALTER TYPE e RENAME TO e2;",
+    )
+    .unwrap();
+    for (sql, message) in [
+        (
+            "DROP FUNCTION pos2(int);",
+            "cannot drop function pos2(integer) because other objects depend on it",
+        ),
+        (
+            "DROP OPERATOR s.=== (int, int);",
+            "cannot drop operator s.===(integer,integer) because other objects depend on it",
+        ),
+        // The cast's function, not the cast (the FuncExpr it became).
+        (
+            "DROP CAST (ct AS int); DROP FUNCTION ct_int(ct);",
+            "cannot drop function ct_int(ct) because other objects depend on it",
+        ),
+        (
+            "DROP TYPE e2;",
+            "cannot drop type e2 because other objects depend on it",
+        ),
+    ] {
+        expect_failure(&mut db, sql, message);
+    }
+    db.apply_sql(
+        "DROP FUNCTION pos2(int) CASCADE;
+         DROP OPERATOR s.=== (int, int) CASCADE;
+         DROP FUNCTION ct_int(ct) CASCADE;
+         DROP TYPE e2 CASCADE;
+         CREATE TRIGGER f AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+         CREATE TRIGGER o AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+         CREATE TRIGGER c AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();
+         CREATE TRIGGER ty AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION tf();",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_partitioned_tables_trigger_when_condition_blocks_dropping_the_column() {
+    // ATExecDropColumn deletes the parent's column with its partitions'
+    // (performMultipleDeletions): a dependent is one of "the desired
+    // objects". The clones follow the parent's renames and go with it.
+    let mut db = build_db(&[(
+        "0001.sql",
+        &format!(
+            "{WHEN_SETUP}
+             CREATE TABLE p (a int, b int) PARTITION BY RANGE (b);
+             CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);
+             CREATE TRIGGER tr BEFORE UPDATE ON p FOR EACH ROW
+                 WHEN (new.a > 0) EXECUTE FUNCTION tf();
+             ALTER TABLE p RENAME a TO z;
+             CREATE TABLE p2 PARTITION OF p FOR VALUES FROM (10) TO (20);
+             CREATE TABLE p3 (x int, z int, b int);
+             ALTER TABLE p3 DROP COLUMN x;
+             ALTER TABLE p ATTACH PARTITION p3 FOR VALUES FROM (20) TO (30);"
+        ),
+    )]);
+    expect_failure(
+        &mut db,
+        "ALTER TABLE p DROP COLUMN z;",
+        "cannot drop desired object(s) because other objects depend on them",
+    );
+    expect_failure(
+        &mut db,
+        "ALTER TABLE p1 DROP COLUMN z;",
+        "cannot drop inherited column \"z\"",
+    );
+    expect_failure(
+        &mut db,
+        "ALTER TABLE p ALTER z TYPE bigint;",
+        "cannot alter type of a column used in a trigger definition",
+    );
+    db.apply_sql(
+        "ALTER TABLE p DETACH PARTITION p3;
+         ALTER TABLE p3 DROP COLUMN z;
+         ALTER TABLE p DROP COLUMN z CASCADE;
+         CREATE TRIGGER tr BEFORE UPDATE ON p1 FOR EACH ROW EXECUTE FUNCTION tf();",
+    )
+    .unwrap();
+}

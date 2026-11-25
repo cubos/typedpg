@@ -1000,3 +1000,98 @@ fn inherited_expressions_compare_as_transformed() {
         );
     }
 }
+
+#[test]
+fn dropping_a_column_children_lose_too_reports_the_desired_objects() {
+    // ATExecDropColumn collects the column and every child's copy that
+    // goes with it (inherited from this parent only), and deletes them
+    // together: with more than one object, performMultipleDeletions names
+    // none of them. A child keeping its own copy leaves one object.
+    let setup = "CREATE TABLE p (a int, b int);
+         CREATE TABLE c () INHERITS (p);
+         CREATE TABLE p2 (a int, b int);
+         CREATE TABLE c2 (a int) INHERITS (p2);
+         CREATE TABLE q (a int, b int);
+         CREATE TABLE qc () INHERITS (q);
+         CREATE TABLE g (a int, b int GENERATED ALWAYS AS (a + 1) STORED);
+         CREATE TABLE gc () INHERITS (g);
+         CREATE VIEW v AS SELECT a FROM p;
+         CREATE VIEW v2 AS SELECT a FROM p2;
+         CREATE VIEW vq AS SELECT a FROM ONLY qc;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE p DROP COLUMN a;",
+            "cannot drop desired object(s) because other objects depend on them",
+        ),
+        (
+            "ALTER TABLE p2 DROP COLUMN a;",
+            "cannot drop column a of table p2 because other objects depend on it",
+        ),
+        (
+            "ALTER TABLE q DROP COLUMN a;",
+            "cannot drop desired object(s) because other objects depend on them",
+        ),
+        (
+            "ALTER TABLE g DROP COLUMN a;",
+            "cannot drop desired object(s) because other objects depend on them",
+        ),
+        (
+            "ALTER TABLE ONLY p DROP COLUMN a;",
+            "cannot drop column a of table p because other objects depend on it",
+        ),
+    ] {
+        let err = try_apply(&[("0001.sql", setup), ("0002.sql", stmt)]).expect_err(stmt);
+        assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+    }
+    build_db(&[
+        ("0001.sql", setup),
+        (
+            "0002.sql",
+            "ALTER TABLE p DROP COLUMN a CASCADE;
+             ALTER TABLE q DROP COLUMN a CASCADE;
+             ALTER TABLE g DROP COLUMN a CASCADE;",
+        ),
+    ]);
+}
+
+#[test]
+fn drop_column_taking_child_copies_reports_no_original_object() {
+    // PG 19: ATExecDropColumn deletes the column and the child copies it
+    // takes along in one performMultipleDeletions — a blocked drop then
+    // names no original object (2BP01).
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int);
+         CREATE TABLE c () INHERITS (p);
+         CREATE VIEW v AS SELECT b FROM c;
+         ALTER TABLE p DROP COLUMN b;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop desired object(s) because other objects depend on them"),
+        "got: {err}"
+    );
+    // What belongs to a copy going too is no blocker: the child's copied
+    // serial default on the parent's owned sequence.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE p (id serial PRIMARY KEY, a int);
+         CREATE TABLE c (x text) INHERITS (p);
+         ALTER TABLE p DROP COLUMN id;",
+    )]);
+    // A child copy that stays (a local column) leaves one object.
+    let err = try_apply(&[(
+        "0001.sql",
+        "CREATE TABLE p (a int, b int);
+         CREATE TABLE c (b int) INHERITS (p);
+         CREATE VIEW v AS SELECT b FROM p;
+         ALTER TABLE p DROP COLUMN b;",
+    )])
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop column b of table p because other objects depend on it"),
+        "got: {err}"
+    );
+}

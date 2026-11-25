@@ -177,11 +177,9 @@ pub(crate) fn validate_with_typmod(
         // Internal statistics / parse-tree / index-support types whose
         // input functions unconditionally refuse input. The message string
         // is the input function's own (note `pg_brin_minmax_multi_summary`'s
-        // drops the prefix) — verified against PG 18.
+        // drops the prefix) — verified against PG 18 (`pg_ndistinct` and `pg_dependencies` take input since PG 19).
         name @ ("pg_node_tree"
         | "gtsvector"
-        | "pg_ndistinct"
-        | "pg_dependencies"
         | "pg_mcv_list"
         | "pg_brin_bloom_summary"
         | "pg_brin_minmax_multi_summary"
@@ -209,6 +207,9 @@ pub(crate) fn validate_with_typmod(
             };
             Err(format!("cannot accept a value of type {msg_name}"))
         }
+        // PostgreSQL 19 reads the JSON form these print.
+        "pg_ndistinct" => validate_pg_ndistinct(content),
+        "pg_dependencies" => validate_pg_dependencies(content),
         "bit" | "varbit" => validate_bit(content),
         "money" => validate_money(content),
         "bytea" => validate_bytea(content),
@@ -1041,6 +1042,293 @@ impl JsonParser<'_> {
         }
         Some(())
     }
+}
+
+// ─── pg_ndistinct / pg_dependencies ─────────────────────────────────────────
+
+/// A JSON value as the extended-statistics input functions' semantic
+/// callbacks see it: a scalar is its token — a string de-escaped, a number,
+/// `true`, `false` or `null` as written — and an object keeps its keys in
+/// order, duplicates included.
+enum StatsJson {
+    Scalar { token: String, is_null: bool },
+    Array(Vec<StatsJson>),
+    Object(Vec<(String, StatsJson)>),
+}
+
+/// Parse `content`, already known to be valid JSON (see [`validate_json`]),
+/// into a [`StatsJson`].
+fn stats_json(content: &str) -> Option<StatsJson> {
+    fn ws(b: &[u8], p: &mut usize) {
+        while matches!(b.get(*p), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            *p += 1;
+        }
+    }
+    fn string(b: &[u8], p: &mut usize) -> Option<String> {
+        *p += 1; // opening quote
+        let mut out: Vec<u16> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+        let flush = |out: &mut Vec<u16>, bytes: &mut Vec<u8>| {
+            if !out.is_empty() {
+                bytes.extend(String::from_utf16_lossy(out).into_bytes());
+                out.clear();
+            }
+        };
+        loop {
+            let c = *b.get(*p)?;
+            *p += 1;
+            match c {
+                b'"' => {
+                    flush(&mut out, &mut bytes);
+                    return String::from_utf8(bytes).ok();
+                }
+                b'\\' => {
+                    let e = *b.get(*p)?;
+                    *p += 1;
+                    let simple = match e {
+                        b'"' => Some(b'"'),
+                        b'\\' => Some(b'\\'),
+                        b'/' => Some(b'/'),
+                        b'b' => Some(8),
+                        b'f' => Some(12),
+                        b'n' => Some(b'\n'),
+                        b'r' => Some(b'\r'),
+                        b't' => Some(b'\t'),
+                        _ => None,
+                    };
+                    match simple {
+                        Some(s) => {
+                            flush(&mut out, &mut bytes);
+                            bytes.push(s);
+                        }
+                        None => {
+                            let hex = std::str::from_utf8(b.get(*p..*p + 4)?).ok()?;
+                            out.push(u16::from_str_radix(hex, 16).ok()?);
+                            *p += 4;
+                        }
+                    }
+                }
+                c => {
+                    flush(&mut out, &mut bytes);
+                    bytes.push(c);
+                }
+            }
+        }
+    }
+    fn value(b: &[u8], p: &mut usize, depth: u32) -> Option<StatsJson> {
+        if depth > 256 {
+            return None;
+        }
+        ws(b, p);
+        match *b.get(*p)? {
+            b'[' => {
+                *p += 1;
+                let mut items = Vec::new();
+                ws(b, p);
+                if b.get(*p) == Some(&b']') {
+                    *p += 1;
+                    return Some(StatsJson::Array(items));
+                }
+                loop {
+                    items.push(value(b, p, depth + 1)?);
+                    ws(b, p);
+                    match *b.get(*p)? {
+                        b',' => *p += 1,
+                        b']' => {
+                            *p += 1;
+                            return Some(StatsJson::Array(items));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'{' => {
+                *p += 1;
+                let mut fields = Vec::new();
+                ws(b, p);
+                if b.get(*p) == Some(&b'}') {
+                    *p += 1;
+                    return Some(StatsJson::Object(fields));
+                }
+                loop {
+                    ws(b, p);
+                    let key = string(b, p)?;
+                    ws(b, p);
+                    *p += 1; // ':'
+                    fields.push((key, value(b, p, depth + 1)?));
+                    ws(b, p);
+                    match *b.get(*p)? {
+                        b',' => *p += 1,
+                        b'}' => {
+                            *p += 1;
+                            return Some(StatsJson::Object(fields));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => Some(StatsJson::Scalar {
+                token: string(b, p)?,
+                is_null: false,
+            }),
+            _ => {
+                let start = *p;
+                while b.get(*p).is_some_and(|c| {
+                    !matches!(c, b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+                }) {
+                    *p += 1;
+                }
+                let token = std::str::from_utf8(&b[start..*p]).ok()?.to_owned();
+                Some(StatsJson::Scalar {
+                    is_null: token == "null",
+                    token,
+                })
+            }
+        }
+    }
+    let b = content.as_bytes();
+    let mut p = 0;
+    value(b, &mut p, 0)
+}
+
+/// `STATS_MAX_DIMENSIONS` (statistics.h): the most columns an extended
+/// statistics object covers.
+const STATS_MAX_DIMENSIONS: i32 = 8;
+
+/// An attribute number of an extended statistics item (`pg_strtoint16`): a
+/// column (positive) or an expression (`-1` to `-STATS_MAX_DIMENSIONS`).
+fn stats_attnum(token: &str) -> Option<i32> {
+    let v = parse_pg_integer(token)?;
+    let v = i16::try_from(v).ok()? as i32;
+    (v != 0 && v >= -STATS_MAX_DIMENSIONS).then_some(v)
+}
+
+/// An `attributes` array: non-empty, attribute numbers in canonical order
+/// (columns ascending, then expressions descending — `valid_subsequent_attnum`).
+fn stats_attributes(value: &StatsJson) -> Option<Vec<i32>> {
+    let StatsJson::Array(items) = value else {
+        return None;
+    };
+    let mut out: Vec<i32> = Vec::with_capacity(items.len());
+    for item in items {
+        let StatsJson::Scalar { token, is_null } = item else {
+            return None;
+        };
+        if *is_null {
+            return None;
+        }
+        let cur = stats_attnum(token)?;
+        if let Some(&prev) = out.last() {
+            let ok = if prev > 0 {
+                cur > prev || cur < 0
+            } else {
+                cur < prev
+            };
+            if !ok {
+                return None;
+            }
+        }
+        out.push(cur);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The items of the top-level array: objects whose keys are among `keys`,
+/// each at most once — every item's fields by key, in `keys`' order.
+fn stats_items<'a>(root: &'a StatsJson, keys: &[&str]) -> Option<Vec<Vec<Option<&'a StatsJson>>>> {
+    let StatsJson::Array(items) = root else {
+        return None;
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let StatsJson::Object(fields) = item else {
+            return None;
+        };
+        let mut found: Vec<Option<&StatsJson>> = vec![None; keys.len()];
+        for (k, v) in fields {
+            let i = keys.iter().position(|key| key == k)?;
+            if found[i].is_some() {
+                return None;
+            }
+            found[i] = Some(v);
+        }
+        out.push(found);
+    }
+    Some(out)
+}
+
+/// Mirrors `pg_ndistinct_in` (pg_ndistinct.c, PostgreSQL 19): a non-empty
+/// JSON array of `{"attributes": [...], "ndistinct": n}` items — 2 to
+/// `STATS_MAX_DIMENSIONS` attribute numbers each, an int4 `ndistinct`, no
+/// attribute set twice, every set a subset of the first longest one.
+fn validate_pg_ndistinct(content: &str) -> Result<(), String> {
+    let accepted = (|| {
+        validate_json(content, true).ok()?;
+        let root = stats_json(content)?;
+        let mut sets: Vec<Vec<i32>> = Vec::new();
+        for item in stats_items(&root, &["attributes", "ndistinct"])? {
+            let attrs = stats_attributes(item[0]?)?;
+            let StatsJson::Scalar { token, .. } = item[1]? else {
+                return None;
+            };
+            let n = parse_pg_integer(token)?;
+            i32::try_from(n).ok()?;
+            if attrs.len() < 2 || attrs.len() > STATS_MAX_DIMENSIONS as usize {
+                return None;
+            }
+            sets.push(attrs);
+        }
+        for (i, s) in sets.iter().enumerate() {
+            if sets[..i].contains(s) {
+                return None;
+            }
+        }
+        let longest = sets.iter().fold(
+            &sets[0],
+            |best, s| if s.len() > best.len() { s } else { best },
+        );
+        sets.iter()
+            .all(|s| s.iter().all(|a| longest.contains(a)))
+            .then_some(())
+    })();
+    accepted.ok_or_else(|| format!("malformed pg_ndistinct: \"{content}\""))
+}
+
+/// Mirrors `pg_dependencies_in` (pg_dependencies.c, PostgreSQL 19): a
+/// non-empty JSON array of `{"attributes": [...], "dependency": d,
+/// "degree": x}` items — 1 to `STATS_MAX_DIMENSIONS - 1` attribute numbers,
+/// a `dependency` attribute number not among them, a float8 `degree`, no
+/// item twice.
+fn validate_pg_dependencies(content: &str) -> Result<(), String> {
+    let accepted = (|| {
+        validate_json(content, true).ok()?;
+        let root = stats_json(content)?;
+        let mut deps: Vec<Vec<i32>> = Vec::new();
+        for item in stats_items(&root, &["attributes", "dependency", "degree"])? {
+            let mut attrs = stats_attributes(item[0]?)?;
+            let StatsJson::Scalar { token, .. } = item[1]? else {
+                return None;
+            };
+            let dependency = stats_attnum(token)?;
+            let StatsJson::Scalar { token, .. } = item[2]? else {
+                return None;
+            };
+            validate_float(token, "double precision").ok()?;
+            if attrs.len() >= STATS_MAX_DIMENSIONS as usize || attrs.contains(&dependency) {
+                return None;
+            }
+            attrs.push(dependency);
+            if deps.contains(&attrs) {
+                return None;
+            }
+            deps.push(attrs);
+        }
+        Some(())
+    })();
+    accepted.ok_or_else(|| format!("malformed pg_dependencies: \"{content}\""))
 }
 
 // ─── bit strings ────────────────────────────────────────────────────────────
@@ -2136,20 +2424,13 @@ fn validate_bytea(content: &str) -> Result<(), String> {
 /// recursively through [`validate`] for non-NULL elements, and through the
 /// domain's NOT NULL constraint for NULL ones (`domain_in` is not strict).
 ///
-/// The element delimiter is the element type's `typdelim`: `;` for `box`,
-/// `,` for every other built-in. A base type defined outside `pg_catalog`
-/// (an extension's, with a `DELIMITER` we don't record) only gets the
-/// opening-shape check.
+/// The element delimiter is the element type's `typdelim` ([`array_delimiter`]).
 fn validate_array(content: &str, elem: PgTypeOid, snapshot: &PgCatalog) -> Result<(), String> {
     if snapshot.get_type(snapshot.unwrap_domain(elem)).is_none() {
         return Ok(());
     }
     let Some(delim) = array_delimiter(elem, snapshot) else {
-        let trimmed = content.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if trimmed.starts_with('{') || (trimmed.starts_with('[') && trimmed.contains("={")) {
-            return Ok(());
-        }
-        return Err(format!("malformed array literal: \"{content}\""));
+        return Ok(());
     };
     crate::array_input::parse_array(content, delim, &mut |e| match e {
         Some(value) => {
@@ -2178,20 +2459,11 @@ fn check_domain_accepts_value(
     }
 }
 
-/// The `typdelim` `array_in` splits an array of `elem` on: `;` for `box`,
-/// `,` for every other built-in. `None` for a base type defined outside
-/// `pg_catalog` (an extension's, with a `DELIMITER` we don't record) — or
-/// one the catalog doesn't know.
+/// The `typdelim` `array_in` splits an array of `elem` on: `;` for `box`
+/// (and a domain over it), `,` for every other built-in, what a base type's
+/// `DELIMITER` says. `None` for a type the catalog doesn't know.
 pub(crate) fn array_delimiter(elem: PgTypeOid, snapshot: &PgCatalog) -> Option<u8> {
-    let base_type = snapshot.get_type(snapshot.unwrap_domain(elem))?;
-    let in_pg_catalog = snapshot.namespace_name(base_type.typnamespace) == Some("pg_catalog");
-    if in_pg_catalog && base_type.typname == "box" {
-        Some(b';')
-    } else if base_type.typtype == TypType::Base && !in_pg_catalog {
-        None
-    } else {
-        Some(b',')
-    }
+    snapshot.get_type(elem).map(|t| t.typdelim as u32 as u8)
 }
 
 /// `domain_check_input` on a NULL value: any NOT NULL constraint along the

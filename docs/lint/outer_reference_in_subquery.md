@@ -3,9 +3,9 @@
 An unqualified column in a subquery that resolves to an outer query, because
 no table of the subquery has it.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -19,14 +19,14 @@ SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM posts WHERE title = name);
 ```
 
 ```
-warning[outer_reference_in_subquery]: column email is not a column of this subquery's relations: it is users.email of the outer query
+warning[suspicious/outer_reference_in_subquery]: column email is not a column of this subquery's relations: it is users.email of the outer query
    ╭─[queries.sql:2:45]
  2 │ SELECT id FROM users WHERE email IN (SELECT email FROM posts);
    ·                                             ─────
    ╰────
   help: write users.email if the outer column is meant, or name a column of the subquery
 
-warning[outer_reference_in_subquery]: column name is not a column of this subquery's relations: it is u.name of the outer query
+warning[suspicious/outer_reference_in_subquery]: column name is not a column of this subquery's relations: it is u.name of the outer query
    ╭─[queries.sql:4:72]
  4 │ SELECT id FROM users u WHERE EXISTS (SELECT 1 FROM posts WHERE title = name);
    ·                                                                        ────

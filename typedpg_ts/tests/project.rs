@@ -566,6 +566,89 @@ fn sql_files_get_their_modules_beside_them() {
     assert_eq!(r.analyzed, 1);
 }
 
+/// The database's module exports each of the user's enums; a `.sql` file's,
+/// those its types name. Each is named alike in every module, but where a
+/// name the module declares takes it.
+#[test]
+fn enums_are_exported_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("migrations/0001.sql"),
+        "CREATE TYPE mood AS ENUM ('happy', 'sad');\n\
+         CREATE SCHEMA billing; CREATE TYPE billing.status AS ENUM ('paid', 'due');\n\
+         CREATE TYPE queries AS ENUM ('q'); CREATE TYPE mapped AS ENUM ('m');\n\
+         CREATE TYPE empty AS ENUM (); CREATE TYPE unused AS ENUM ('u');\n\
+         CREATE TABLE t (m mood NOT NULL, s billing.status, q queries, o mapped);",
+    );
+    write(
+        &root.join("src/a.ts"),
+        "import { sql } from './db';\nsql('SELECT m, q, o FROM t WHERE m = $m');\n\
+         sql(\"SELECT m FROM t WHERE m <> 'sad'\");\n",
+    );
+    write(
+        &root.join("src/q.sql"),
+        "/* @name billingStatus */ SELECT s FROM t;\n\
+         /* @name moods */ SELECT m FROM t WHERE m IN $..moods;\n\
+         /* @name narrowed */ SELECT m FROM t WHERE m = 'happy';\n",
+    );
+    let config = |out: &str, emit: &str| {
+        write(
+            &root.join("typedpg.config.json"),
+            &format!(
+                r#"{{ "include": ["src"], "out": "{out}",
+                     "sql": {{ "include": ["src/*.sql"], "emit": "{emit}",
+                               "typeNames": {{ "params": "{{Name}}Params", "row": "{{Name}}" }} }},
+                     "types": {{ "mapped": "./src/types.ts#Mapped" }} }}"#
+            ),
+        );
+    };
+    config("src/db.ts", "ts");
+    let r = project(root, false).sync(false);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    // Every enum of the user's but the one `types` maps, by name;
+    // `queries` would be the module's `Queries`.
+    let enums = "export type BillingStatus = \"paid\" | \"due\";\nexport type Empty = never;\n\
+                 export type Mood = \"happy\" | \"sad\";\nexport type PublicQueries = \"q\";\n\
+                 export type Unused = \"u\";\n";
+    let db = read(&root.join("src/db.ts"));
+    assert!(
+        db.contains(&format!(
+            "import type {{ Mapped }} from \"./types.ts\";\n\n{enums}\n"
+        )),
+        "{db}"
+    );
+    assert!(
+        db.contains(
+            "params: {\n      m: Mood;\n    };\n    row: {\n      m: Mood;\n      q: PublicQueries | null;\n      o: Mapped | null;"
+        ),
+        "{db}"
+    );
+    // Narrowed to some labels: their union.
+    assert!(db.contains("m: \"happy\";"), "{db}");
+    // The `.sql` file's module: the enums its types name. Its query
+    // `billingStatus`'s row type takes `BillingStatus`.
+    let q = read(&root.join("src/q.ts"));
+    let q_enums = "export type BillingStatus_2 = \"paid\" | \"due\";\n\
+                   export type Mood = \"happy\" | \"sad\";\n";
+    assert!(q.contains(&format!("\n{q_enums}\n")), "{q}");
+    assert!(
+        q.contains("export interface BillingStatus {\n  s: BillingStatus_2 | null;\n}"),
+        "{q}"
+    );
+    assert!(q.contains("moods: readonly Mood[];"), "{q}");
+    assert!(q.contains("m: \"happy\";"), "{q}");
+    assert!(!q.contains("Empty") && !q.contains("Unused"), "{q}");
+
+    // The declarations alone: the same types; the JavaScript has none.
+    config("src/db.js", "dts");
+    let r = project(root, false).sync(false);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert!(read(&root.join("src/db.d.ts")).contains(enums));
+    assert!(!read(&root.join("src/db.js")).contains("export type"));
+    assert!(read(&root.join("src/q.d.sql.ts")).contains(q_enums));
+}
+
 #[test]
 fn modules_of_gone_files_are_deleted_and_files_not_generated_kept() {
     let dir = tempfile::tempdir().unwrap();

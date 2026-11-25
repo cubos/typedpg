@@ -83,7 +83,8 @@ pub struct RecordField {
 /// - `Domain` — `CREATE DOMAIN` wrappers. The base type is preserved so
 ///   consumers can either treat the domain opaquely or unwrap to the base.
 /// - `Array` — PG array (`int4[]`). Multidimensional arrays share a type
-///   with their one-dimensional form.
+///   with their one-dimensional form. `int2vector` and `oidvector` are
+///   arrays too, carrying their own name.
 /// - `Enum` — `CREATE TYPE ... AS ENUM (...)` with the labels in declaration
 ///   order.
 /// - `Range` — `CREATE TYPE ... AS RANGE (...)` / built-in range types.
@@ -140,6 +141,11 @@ pub enum Type {
         /// array most expressions make (a subquery, CTE or view keeps what
         /// its query knows).
         element_nullable: Option<bool>,
+        /// The array type's own name, when it is not its element's array
+        /// type (`pg_type.typarray`): `int2vector` and `oidvector`, true
+        /// arrays of `int2` / `oid` with their own text form, binary checks
+        /// and operators. `None` for `int2[]`.
+        name: Option<QualifiedName>,
     },
     Enum {
         schema: String,
@@ -241,6 +247,15 @@ impl Type {
             | Type::Composite { schema, name, .. } => {
                 QualifiedName::new(schema.clone(), name.clone()).to_string()
             }
+            Type::Array {
+                name: Some(name), ..
+            } => {
+                if name.schema == "pg_catalog" {
+                    name.name.clone()
+                } else {
+                    name.to_string()
+                }
+            }
             Type::Array { element, .. } => format!("{}[]", element.describe()),
             Type::AnonymousRecord { .. } => "record".to_owned(),
         }
@@ -249,7 +264,8 @@ impl Type {
     /// The schema-qualified PG name to use for an explicit cast
     /// (`::pg_catalog.jsonb`, `::public.vector`). Domains are unwrapped to
     /// their base type. Arrays return the canonical element name suffixed
-    /// with `[]`. Anonymous records have no cast name.
+    /// with `[]`, but an array type of its own (`int2vector`) its own name.
+    /// Anonymous records have no cast name.
     ///
     /// The name is rendered via [`QualifiedName`]'s `Display`, which quotes
     /// identifiers when needed — safe to interpolate into SQL.
@@ -262,6 +278,9 @@ impl Type {
                 Some(QualifiedName::new(schema.clone(), name.clone()).to_string())
             }
             Type::Domain { base, .. } => base.cast_name(),
+            Type::Array {
+                name: Some(name), ..
+            } => Some(name.to_string()),
             Type::Array { element, .. } => element.cast_name().map(|n| format!("{n}[]")),
             Type::AnonymousRecord { .. } => None,
         }

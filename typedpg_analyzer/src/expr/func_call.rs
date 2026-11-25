@@ -456,6 +456,9 @@ pub(crate) fn infer_func_call(
     if let Some(outer) = ctx.strict_log {
         outer.absorb(&filter_log);
     }
+    if resolved.is_aggregate && func.over.is_none() {
+        crate::grouping::check_aggregate_placement(func, ctx.scope)?;
+    }
     let mut args = args;
     // A parameter the call typed: finite when its type is one the
     // generator binds finite (see `PgCatalog::assume_finite_parameters`).
@@ -512,7 +515,7 @@ pub(crate) fn infer_func_call(
     // indirection sees the named columns with their substituted polymorphic
     // types (e.g. `_pg_expandarray(oid[]).x` → `oid`, not `anyelement`).
     let record_fields = if resolved.out_args.is_empty() {
-        None
+        builtin_record_fields(func, &resolved, &args)
     } else {
         let mut fields = RecordField::from_out_args(&resolved.out_args);
         // The rows a strict catalog SRF emits (`jsonb_each(j)`: a key, and
@@ -745,7 +748,10 @@ fn builtin_array_elem_nullable(
         )
     };
     match resolved.signature.as_str() {
-        // (`array_agg(anyarray)` builds a multidimensional array.)
+        // `array_agg(anyarray)` builds a multidimensional array of its
+        // arguments' elements (a NULL argument fails, "cannot accumulate
+        // null arrays").
+        "array_agg(anyarray)" => elems(0),
         "array_agg(anynonarray)"
         | "array_fill(anyelement,_int4)"
         | "array_fill(anyelement,_int4,_int4)" => value(0),
@@ -784,6 +790,74 @@ fn builtin_array_elem_nullable(
         | "regexp_matches(text,text,text)" => Some(true),
         _ => None,
     }
+}
+
+/// The row shape of the records a `pg_catalog` routine returns (a
+/// `record`, or the elements of a `record[]`), for the routines whose
+/// result is made of their arguments' records: an aggregate, constructor
+/// or rearrangement of values or arrays, a window function returning a
+/// row's value. Known when every argument it may take a record from
+/// agrees on one (see [`super::merge_value_shapes`]); `None` for the rest
+/// — `jsonb_populate_record(anyelement, jsonb)` returns its argument's
+/// row type, but with other values.
+fn builtin_record_fields(
+    func: &ast::FuncCall,
+    resolved: &functions::ResolvedFunction,
+    args: &FuncArgs,
+) -> Option<RecordShape> {
+    if resolved.schema != "pg_catalog"
+        || !matches!(resolved.return_type_oid, oid::RECORD | oid::RECORD_ARRAY)
+    {
+        return None;
+    }
+    let sources: &[usize] = match resolved.signature.as_str() {
+        "array_agg(anynonarray)"
+        | "array_agg(anyarray)"
+        | "array_fill(anyelement,_int4)"
+        | "array_fill(anyelement,_int4,_int4)"
+        | "array_remove(anycompatiblearray,anycompatible)"
+        | "array_reverse(anyarray)"
+        | "array_shuffle(anyarray)"
+        | "array_sample(anyarray,int4)"
+        | "array_sort(anyarray)"
+        | "array_sort(anyarray,bool)"
+        | "array_sort(anyarray,bool,bool)"
+        | "trim_array(anyarray,int4)"
+        | "unnest(anyarray)"
+        | "any_value(anyelement)"
+        | "first_value(anyelement)"
+        | "last_value(anyelement)"
+        | "nth_value(anyelement,int4)"
+        | "lag(anyelement)"
+        | "lag(anyelement,int4)"
+        | "lead(anyelement)"
+        | "lead(anyelement,int4)" => &[0],
+        "array_append(anycompatiblearray,anycompatible)"
+        | "array_prepend(anycompatible,anycompatiblearray)"
+        | "array_cat(anycompatiblearray,anycompatiblearray)" => &[0, 1],
+        "array_replace(anycompatiblearray,anycompatible,anycompatible)"
+        | "lag(anycompatible,int4,anycompatible)"
+        | "lead(anycompatible,int4,anycompatible)" => &[0, 2],
+        _ => return None,
+    };
+    let is_null_const = |i: usize| {
+        matches!(
+            func.args.get(i).and_then(|a| a.as_ref()),
+            Some(ast::Node::AConst(c)) if c.isnull
+        )
+    };
+    super::merge_value_shapes(
+        sources
+            .iter()
+            .filter(|&&i| {
+                !is_null_const(i)
+                    && args
+                        .exprs
+                        .get(i)
+                        .is_some_and(|t| t.type_oid != oid::UNKNOWN)
+            })
+            .map(|&i| args.exprs.get(i).and_then(|t| t.record_fields.as_ref())),
+    )
 }
 
 /// What every non-NULL element of the array a `pg_catalog` routine
@@ -1390,7 +1464,7 @@ fn inline_parameter_usage(
     Some(counts.into_iter().map(|c| c > 0).collect())
 }
 
-/// Record, for the lint's `count_not_null` rule, whether the argument of a
+/// Record, for the lint's `redundant_count_argument` rule, whether the argument of a
 /// `pg_catalog.count("any")` call may be NULL — read over the rows its
 /// `FILTER` passes. A `DISTINCT` or `*` call records nothing, nor does a
 /// row / composite argument (whose NULL test differs from its null flag);
@@ -1417,7 +1491,7 @@ fn note_count_arg(
         return;
     };
     let composite = arg.type_oid == oid::RECORD
-        || arg.record_fields.is_some()
+        || (arg.record_fields.is_some() && arg.type_oid != oid::RECORD_ARRAY)
         || crate::coerce::is_complex(arg.type_oid, snapshot);
     if composite {
         return;
@@ -2057,6 +2131,8 @@ fn is_zero_string(s: &str) -> bool {
 ///   infinity, a column CHECKed `isfinite`, … see [`crate::refine`]);
 /// - `extract` / `date_part` over such a finite timestamp or date has no
 ///   infinite input to be NULL for;
+/// - `time(timestamp)`, `time(timestamptz)` and `timetz(timestamptz)` are
+///   NULL only for an infinite timestamp;
 /// - `array_length` / `array_lower` / `array_upper` (dimension literal 1),
 ///   `array_ndims` and `array_dims` of a non-empty `ARRAY[…]` of scalars,
 ///   a one-dimensional array.
@@ -2118,6 +2194,11 @@ fn value_gated_non_null(
                     .exprs
                     .get(1)
                     .is_some_and(|a| finite_value(a, ctx.snapshot))
+        }
+        _ if crate::builtin_nullability::NULL_ONLY_ON_INFINITE
+            .contains(&resolved.signature.as_str()) =>
+        {
+            args.exprs.iter().all(|a| finite_value(a, ctx.snapshot))
         }
         "array_length" | "array_lower" | "array_upper"
             if func.args.len() == 2 && positional.len() == 2 =>

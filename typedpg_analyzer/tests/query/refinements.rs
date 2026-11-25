@@ -1782,7 +1782,8 @@ fn empty_and_null_arrays() {
     for (sql, nullable) in [
         ("SELECT i FROM a WHERE i < ALL('{}'::int[])", true),
         ("SELECT i FROM a WHERE i < ALL(ARRAY[ARRAY[]::int[]])", true),
-        ("SELECT i FROM a WHERE i < ALL(ARRAY[small])", true),
+        // One element (of a scalar column): `i < NULL` is never TRUE either.
+        ("SELECT i FROM a WHERE i < ALL(ARRAY[small])", false),
         ("SELECT i FROM a WHERE i < ALL('{5}')", false),
         ("SELECT i FROM a WHERE i > ANY('{}'::int[])", false),
         ("SELECT i FROM a WHERE NOT (i > ANY('{}'::int[]))", true),
@@ -1833,7 +1834,8 @@ fn equal_to_any_element_takes_what_the_elements_are() {
         ],
     );
     // Unknown elements, a nondeterministic collation (`'A'` matches
-    // `'a'`), or a negation narrow nothing.
+    // `'a'`), or a negation narrow no value (a NULL `free` still makes the
+    // negation NULL).
     assert_nullable_values(
         &db,
         "SELECT i, free FROM a WHERE i = ANY(ns) AND free = ANY(ARRAY[kind] COLLATE ci)",
@@ -1842,12 +1844,12 @@ fn equal_to_any_element_takes_what_the_elements_are() {
     assert_nullable_values(
         &db,
         "SELECT free FROM a WHERE NOT (free = ANY(ARRAY[kind]))",
-        &[("free", true, None)],
+        &[("free", false, None)],
     );
     assert_nullable_values(
         &db,
         "SELECT free FROM a WHERE free <> ALL(ARRAY[kind])",
-        &[("free", true, None)],
+        &[("free", false, None)],
     );
     assert_bounds(
         &db,

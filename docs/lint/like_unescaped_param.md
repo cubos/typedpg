@@ -3,13 +3,11 @@
 A `LIKE` / `ILIKE` pattern built from a parameter whose `%` and `_` are not
 escaped.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| off | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
-
-With `like_unescaped_param = "warning"`:
 
 ```sql
 CREATE TABLE users (id bigint PRIMARY KEY, name text NOT NULL);
@@ -19,7 +17,7 @@ SELECT id FROM users WHERE name LIKE concat($p::text, '%');
 ```
 
 ```
-warning[like_unescaped_param]: the pattern concatenates a parameter unescaped: a `%` or `_` in it matches any characters
+error[correctness/like_unescaped_param]: the pattern concatenates a parameter unescaped: a `%` or `_` in it matches any characters
    ╭─[queries.sql:2:39]
  2 │ SELECT id FROM users WHERE name ILIKE '%' || $q || '%';
    ·                                       ────────────────
@@ -32,8 +30,10 @@ warning[like_unescaped_param]: the pattern concatenates a parameter unescaped: a
 `%`, `_` and `\` keep their pattern meaning inside the parameter: a search
 for `50%` matches everything containing `50`, and a search for `%` returns
 the whole table. It is not SQL injection, but user input controls the
-pattern, and can turn a cheap search into a slow one. Off by default, since
-some projects want users to type wildcards.
+pattern, and can turn a cheap search into a slow one. It is a correctness
+error: a search for `50%` silently matches every row containing `50`. A
+project that wants users to type wildcards can set
+`like_unescaped_param = "off"`.
 
 ## Reported when
 

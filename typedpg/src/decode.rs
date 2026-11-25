@@ -72,7 +72,8 @@ pub fn read_named_column<'a, T: FromSql<'a>>(row: &'a Row, field: &str) -> Resul
 /// The Rust identifier `sql!` gives the output field of a column named
 /// `name`: a trailing nullability annotation dropped, every character that
 /// can't be in an identifier replaced by `_`, a leading digit prefixed with
-/// `_` (Rust keywords become raw identifiers, whose name is the same).
+/// `_` (Rust keywords become raw identifiers, whose name is the same — but
+/// a path keyword has no raw form, and gets a trailing `_`: `self_`).
 pub fn field_name_of_column(name: &str) -> String {
     let name = name
         .strip_suffix('!')
@@ -95,6 +96,8 @@ pub fn field_name_of_column(name: &str) -> String {
         "_unnamed".to_string()
     } else if sanitized.starts_with(|c: char| c.is_ascii_digit()) {
         format!("_{sanitized}")
+    } else if matches!(sanitized.as_str(), "self" | "Self" | "super" | "crate") {
+        format!("{sanitized}_")
     } else {
         sanitized
     }
@@ -184,5 +187,12 @@ mod tests {
         assert_eq!(field_name_of_column("1st"), "_1st");
         assert_eq!(field_name_of_column("type"), "type");
         assert_eq!(field_name_of_column(""), "_unnamed");
+        // `sql!` names these `self_`, … (no raw form): a `FromRow` field
+        // of that name must find its column.
+        assert_eq!(field_name_of_column("self"), "self_");
+        assert_eq!(field_name_of_column("Self!"), "Self_");
+        assert_eq!(field_name_of_column("super"), "super_");
+        assert_eq!(field_name_of_column("crate"), "crate_");
+        assert_eq!(field_name_of_column("selfie"), "selfie");
     }
 }

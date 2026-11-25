@@ -11,11 +11,12 @@ use typedpg_pg_query::ast::{
 
 use crate::{Ctx, RawFinding, Rule};
 
+mod boolean_comparison;
 mod cartesian_join;
 mod case_without_else;
 mod check_violation;
+mod comma_join;
 mod constant_condition;
-mod count_not_null;
 mod float_equality;
 mod insert_without_columns;
 mod integer_division;
@@ -25,16 +26,18 @@ mod limit_without_order;
 mod non_sargable_predicate;
 #[cfg(feature = "pg_sanity")]
 pub(crate) mod oracle;
+mod ordinal_reference;
 mod outer_reference_in_subquery;
 mod redundant_alias;
 mod redundant_cast;
+mod redundant_count_argument;
 mod redundant_distinct;
 mod redundant_group_by;
 mod redundant_join;
 mod redundant_limit;
 mod redundant_null_check;
 mod redundant_order_by;
-mod scalar_subquery_may_return_many;
+mod scalar_subquery_multiple_rows;
 mod self_assignment;
 mod simplifiable_case;
 mod timestamp_timezone_mix;
@@ -69,7 +72,7 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::SimplifiableCase => simplifiable_case::findings(ctx),
         Rule::LikeUnescapedParam => like_unescaped_param::findings(ctx),
         Rule::RedundantJoin => redundant_join::findings(ctx),
-        Rule::ScalarSubqueryMayReturnMany => scalar_subquery_may_return_many::findings(ctx),
+        Rule::ScalarSubqueryMultipleRows => scalar_subquery_multiple_rows::findings(ctx),
         Rule::TimestampTimezoneMix => timestamp_timezone_mix::findings(ctx),
         Rule::IntegerDivision => integer_division::findings(ctx),
         Rule::LeftJoinNullified => left_join_nullified::findings(ctx),
@@ -77,28 +80,31 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         Rule::UnstableOrder => unstable_order::findings(ctx),
         Rule::RedundantOrderBy => redundant_order_by::findings(ctx),
         Rule::RedundantGroupBy => redundant_group_by::findings(ctx),
-        Rule::CountNotNull => count_not_null::findings(ctx),
+        Rule::RedundantCountArgument => redundant_count_argument::findings(ctx),
+        Rule::CommaJoin => comma_join::findings(ctx),
+        Rule::OrdinalReference => ordinal_reference::findings(ctx),
+        Rule::BooleanComparison => boolean_comparison::findings(ctx),
         Rule::NonSargablePredicate => non_sargable_predicate::findings(ctx),
         Rule::FloatEquality => float_equality::findings(ctx),
         // The migration and schema rules run over a migration's statements,
         // not over a query.
         Rule::CreateIndexBlocking
-        | Rule::ConstraintValidating
+        | Rule::AddConstraintScan
         | Rule::SetNotNullScan
-        | Rule::TableRewrite
+        | Rule::AlterTableRewrite
         | Rule::FkWithoutIndex
         | Rule::RedundantIndex
         | Rule::FkTypeMismatch
-        | Rule::MissingLockTimeout
+        | Rule::LockWithoutTimeout
         | Rule::DropIndexBlocking
-        | Rule::BlockingRebuild
+        | Rule::RebuildBlocking
         | Rule::DetachPartitionBlocking
-        | Rule::ValidateInSameTransaction
+        | Rule::ValidateConstraintBlocking
         | Rule::AttachPartitionScan
-        | Rule::MissingPrimaryKey
-        | Rule::RlsPolicyNotEnforced
-        | Rule::RlsNoPolicy
-        | Rule::SecurityDefinerSearchPath
+        | Rule::TableWithoutPrimaryKey
+        | Rule::PolicyWithoutRls
+        | Rule::RlsWithoutPolicy
+        | Rule::SecurityDefinerWithoutSearchPath
         | Rule::PreferTimestamptz
         | Rule::PreferIdentity
         | Rule::PreferText
@@ -108,12 +114,13 @@ pub(crate) fn findings(rule: Rule, ctx: &Ctx<'_>) -> Vec<RawFinding> {
         // invocation, in `typedpg_cli`, which alone sees it.
         | Rule::RedundantBinding
         | Rule::RenamingBinding
-        | Rule::FetchMayReturnMany
+        | Rule::FetchOneMultipleRows
         | Rule::FetchAllSingleRow
         | Rule::UnusedReturning
+        | Rule::JsonStringifyParam
         // It compares the deployed code's queries across two schemas, in
         // `deployed`.
-        | Rule::BreaksDeployedQueries
+        | Rule::DeployedQueryBreakage
         | Rule::InvalidAllow
         | Rule::InternalError => Vec::new(),
     }
@@ -553,7 +560,14 @@ pub(super) fn condition_span(
     let start = expression_start(ctx, node)?;
     let or = matches!(node, N::BoolExpr(b) if b.boolop == BoolExprType::OrExpr);
     let mut between = false;
+    // `IS [NOT] DISTINCT FROM`: its `FROM` starts no clause.
+    let mut distinct = false;
     let (end, _) = scan_until(ctx, start, |text| {
+        let after_distinct =
+            std::mem::replace(&mut distinct, text.eq_ignore_ascii_case("DISTINCT"));
+        if after_distinct && text.eq_ignore_ascii_case("FROM") {
+            return false;
+        }
         if text.eq_ignore_ascii_case("BETWEEN") {
             between = true;
             return false;
@@ -580,13 +594,63 @@ pub(super) fn clause_item_spans(
     items
         .iter()
         .map(|item| {
-            let start = node_span(ctx, (*item)?.to_ref())?.start;
+            // An item wrapped whole in parentheses, `(id)`, is a list item
+            // with them.
+            let start = wrapping_parens(ctx, node_span(ctx, (*item)?.to_ref())?).start;
             let (end, _) = scan_until(ctx, start, |text| {
                 text == "," || (starts_clause(text) && !text.eq_ignore_ascii_case("USING"))
             });
             Some(start..end.max(start + 1))
         })
         .collect()
+}
+
+/// The expressions that name an output column without an alias
+/// (`FigureColname`): a select list or `RETURNING` item's expression, and
+/// what it takes its name from — a cast's or `COLLATE`'s operand, a
+/// `CASE`'s `ELSE`. Rewriting one of them may rename the column.
+pub(super) fn naming_expressions<'a>(ctx: &'a Ctx<'_>) -> Vec<&'a Node> {
+    let mut out = Vec::new();
+    for (node, _) in ctx.tree.nodes() {
+        if let NodeRef::ResTarget(target) = node
+            && target.name.is_empty()
+        {
+            let mut value = target.val.as_ref();
+            while let Some(node) = value {
+                out.push(node);
+                value = match node {
+                    N::TypeCast(cast) => cast.arg.as_ref(),
+                    N::CollateClause(collate) => collate.arg.as_ref(),
+                    N::CaseExpr(case) => case.defresult.as_ref(),
+                    _ => None,
+                };
+            }
+        }
+    }
+    out
+}
+
+/// `span` widened over the parentheses wrapping it whole: `(x)` and `((x))`
+/// for `x`. Only for a span no call or other syntax can enclose in
+/// parentheses of its own (a list item of a clause, a `WHEN` condition).
+pub(super) fn wrapping_parens(
+    ctx: &Ctx<'_>,
+    span: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let mut span = span;
+    loop {
+        let before = ctx.tokens.iter().rfind(|token| token.end <= span.start);
+        let after = ctx.tokens.iter().find(|token| token.start >= span.end);
+        match (before, after) {
+            (Some(open), Some(close))
+                if &ctx.sql[open.start..open.end] == "("
+                    && &ctx.sql[close.start..close.end] == ")" =>
+            {
+                span = open.start..close.end;
+            }
+            _ => return span,
+        }
+    }
 }
 
 /// The edit removing item `index` of a comma-separated list whose items

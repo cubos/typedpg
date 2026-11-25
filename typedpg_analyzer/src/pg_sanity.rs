@@ -31,11 +31,13 @@
 //! Every accepted query is also executed over adversarial data to check
 //! the analyzer's nullability: see [`soundness`].
 
+mod catalog_depend;
+mod catalog_exprs;
 mod catalog_extras;
 mod catalog_state;
 mod soundness;
 
-/// What the `breaks_deployed_queries` oracle (`typedpg_lint`) reuses of
+/// What the `deployed_query_breakage` oracle (`typedpg_lint`) reuses of
 /// the mirror: scratch databases, the seeder, text-format parameters, raw
 /// results and the nullability oracle's value checks.
 #[doc(hidden)]
@@ -193,6 +195,44 @@ pub(crate) struct PgSanityServer {
     /// The catalog oracle reported this catalog once already: what follows
     /// inherits the divergence.
     catalog_diverged: bool,
+    /// Held while the mirror runs in a database named by the test (see
+    /// [`Self::spawn_in`]); dropped after the database is.
+    _db_lock: Option<NamedDatabaseLock>,
+    /// The database's `search_path` setting the query session follows (see
+    /// [`Self::sync_query_search_path`]).
+    database_search_path: Option<String>,
+}
+
+/// One catalog at a time in a database a test names (see
+/// [`PgSanityServer::spawn_in`]), across every test process sharing the
+/// cluster: a file lock, as [`SharedCatalogLock`].
+struct NamedDatabaseLock(std::fs::File);
+
+impl NamedDatabaseLock {
+    fn acquire(admin_conn_str: &str, name: &str) -> NamedDatabaseLock {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (admin_conn_str, name).hash(&mut hasher);
+        let path = std::env::temp_dir().join(format!(
+            "typedpg-pg-sanity-database-{:016x}.lock",
+            hasher.finish()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("pg_sanity: opening {} failed: {e}", path.display()));
+        file.lock()
+            .unwrap_or_else(|e| panic!("pg_sanity: locking {} failed: {e}", path.display()));
+        NamedDatabaseLock(file)
+    }
+}
+
+impl Drop for NamedDatabaseLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Serializes the migrations writing a shared (cluster-wide) catalog
@@ -305,8 +345,11 @@ fn writes_shared_catalog(sql: &str) -> bool {
 
 impl PgSanityServer {
     /// Read `POSTGRES_URL`, create a per-instance scratch database with a
-    /// random name, and return a client connected to it.
-    pub(crate) fn spawn() -> Result<Self, String> {
+    /// random name — or database `name` when given (see
+    /// `PgCatalog::pg_sanity_database`: whatever a previous run left of it
+    /// goes first, and every catalog using that name waits for the one
+    /// using it now) — and return a client connected to it.
+    pub(crate) fn spawn_in(name: Option<&str>) -> Result<Self, String> {
         let admin_conn_str = std::env::var("POSTGRES_URL").map_err(|_| {
             "pg_sanity: POSTGRES_URL is not set. Run tests via `scripts/run-pg-sanity.sh`, \
              which spins up a Docker PostgreSQL and exports the URL."
@@ -317,7 +360,8 @@ impl PgSanityServer {
         // wall-clock nanos gives us enough entropy that concurrent test
         // binaries don't collide; underscore-prefix keeps it valid as an
         // unquoted SQL identifier.
-        let db_name = scratch_db_name();
+        let db_name = name.map_or_else(scratch_db_name, str::to_owned);
+        let db_lock = name.map(|name| NamedDatabaseLock::acquire(&admin_conn_str, name));
 
         // Connect to the admin database (whatever `POSTGRES_URL` points at)
         // and CREATE DATABASE. Drop the admin client immediately — we keep
@@ -328,6 +372,13 @@ impl PgSanityServer {
                     "pg_sanity: connect to admin DB failed (POSTGRES_URL={admin_conn_str:?}): {e}"
                 )
             })?;
+            if db_lock.is_some() {
+                admin
+                    .batch_execute(&format!(
+                        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                    ))
+                    .map_err(|e| format!("pg_sanity: DROP DATABASE \"{db_name}\" failed: {e}"))?;
+            }
             admin
                 .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
                 .map_err(|e| format!("pg_sanity: CREATE DATABASE \"{db_name}\" failed: {e}"))?;
@@ -358,6 +409,8 @@ impl PgSanityServer {
             mirror_only: std::env::var("PG_SANITY_MIRROR_ONLY").is_ok_and(|v| v == "1"),
             history: Vec::new(),
             catalog_diverged: false,
+            _db_lock: db_lock,
+            database_search_path: None,
         })
     }
 
@@ -435,6 +488,9 @@ impl PgSanityServer {
             });
         }
         drop(lock);
+        if pg_result.is_ok() {
+            self.sync_query_search_path();
+        }
         self.history.push(match &pg_result {
             Ok(()) => format!("{sql}\n-- (succeeded)"),
             Err(e) => format!("{sql}\n-- (failed: {})", render_pg_error(e)),
@@ -444,6 +500,45 @@ impl PgSanityServer {
         self.type_name_cache.clear();
         self.soundness.schema_changed();
         pg_result
+    }
+
+    /// The application's queries run in new sessions, which start with the
+    /// database's `search_path` (`ALTER DATABASE ... SET`, which a
+    /// migration — or an extension's script — may have changed since the
+    /// query session connected): give the query session the one a new
+    /// session would have now.
+    fn sync_query_search_path(&mut self) {
+        let setting: Option<String> = self
+            .client
+            .query_opt(
+                "SELECT o.option_value \
+                 FROM pg_catalog.pg_db_role_setting s, \
+                      pg_catalog.pg_options_to_table(s.setconfig) o \
+                 WHERE o.option_name = 'search_path' AND s.setrole = 0 \
+                   AND s.setdatabase = (SELECT oid FROM pg_catalog.pg_database \
+                                        WHERE datname = pg_catalog.current_database())",
+                &[],
+            )
+            .unwrap_or_else(|e| panic!("pg_sanity: reading the database's settings failed: {e}"))
+            .map(|row| row.get(0));
+        if setting == self.database_search_path {
+            return;
+        }
+        let path = match &setting {
+            Some(path) => path.clone(),
+            None => self
+                .query_client
+                .query_one(
+                    "SELECT boot_val FROM pg_catalog.pg_settings WHERE name = 'search_path'",
+                    &[],
+                )
+                .unwrap_or_else(|e| panic!("pg_sanity: reading search_path's default failed: {e}"))
+                .get(0),
+        };
+        self.query_client
+            .batch_execute(&format!("SET search_path TO {path}"))
+            .unwrap_or_else(|e| panic!("pg_sanity: SET search_path TO {path} failed: {e}"));
+        self.database_search_path = setting;
     }
 
     /// [`Self::compare_apply_matches`] for a migration that creates, alters
@@ -842,13 +937,49 @@ impl PgSanityServer {
                     Err(exec_err) => {
                         let our_err = our_result.as_ref().unwrap_err();
                         let our_msg = format!("{our_err}");
-                        check_error_prefix(
+                        let divergence = check_error_prefix(
                             &our_msg,
                             our_err.sqlstate(),
                             &exec_err,
                             analysis_sql,
                             "analyze (execute fallback)",
-                        )
+                        );
+                        // A NULL parameter can fail first on its own (a
+                        // NOT NULL column PG checks before the one the
+                        // analyzer's literal fills): the analyzer's error
+                        // must then be the one the execution raises with
+                        // non-NULL parameters.
+                        if divergence.is_none() || n_params == 0 {
+                            return divergence;
+                        }
+                        let Some(samples) =
+                            self.soundness.sample_params(&mut self.query_client, stmt)
+                        else {
+                            return divergence;
+                        };
+                        let sample_refs: Vec<&(dyn ToSql + Sync)> =
+                            samples.iter().map(|p| p as _).collect();
+                        let retry = match self.query_client.transaction() {
+                            Ok(mut tx) => tx.execute(stmt, &sample_refs),
+                            Err(e) => panic!(
+                                "pg_sanity: BEGIN failed in execute-fallback for {analysis_sql}: {e}"
+                            ),
+                        };
+                        match retry {
+                            Err(retry_err)
+                                if check_error_prefix(
+                                    &our_msg,
+                                    our_err.sqlstate(),
+                                    &retry_err,
+                                    analysis_sql,
+                                    "analyze (execute fallback)",
+                                )
+                                .is_none() =>
+                            {
+                                None
+                            }
+                            _ => divergence,
+                        }
                     }
                 }
             }
@@ -892,8 +1023,11 @@ impl PgSanityServer {
             .unwrap_or_else(|e| panic!("pg_sanity: privilege comparison BEGIN failed: {e}"));
         let mut divergence = None;
         // Every created role, plus the predefined roles that carry implicit
-        // privileges: they exercise the model's special cases.
+        // privileges: they exercise the model's special cases. A role code
+        // the analyzer couldn't follow may have dropped may not exist (see
+        // `ddl::uncertain`).
         let mut subjects = created;
+        subjects.retain(|role| !db.roles.uncertain.roles.contains(role));
         for role in [
             "pg_read_all_data",
             "pg_write_all_data",
@@ -933,10 +1067,30 @@ impl PgSanityServer {
         }
         let ignored = std::env::var("PG_SANITY_CATALOG_IGNORE").unwrap_or_default();
         let ignored: Vec<&str> = ignored.split('|').filter(|s| !s.is_empty()).collect();
+        // Routines code the analyzer couldn't follow may have redefined
+        // (see `ddl::uncertain`) are compared only for existing — not their
+        // parameter defaults nor what they depend on (a language, a
+        // transform, a SQL-standard body's objects); triggers it may have
+        // enabled or disabled, but for their state; default privileges it
+        // may have altered, but for what their rows depend on.
+        let routines_uncertain = db.roles.uncertain.routines;
+        let triggers_uncertain = db.roles.uncertain.triggers;
+        let default_acls_uncertain = db.roles.uncertain.default_acls;
         let differences: Vec<String> = self
             .catalog_differences(db)
             .into_iter()
             .filter(|line| !ignored.iter().any(|s| line.contains(s)))
+            .filter(|line| {
+                !(routines_uncertain
+                    && (line.starts_with("pg_proc ")
+                        && (line.contains(" in the analyzer, ") || line.contains(") defaults"))
+                        || line.starts_with("pg_depend function ")))
+                    && !(triggers_uncertain
+                        && line.starts_with("pg_trigger ")
+                        && line.contains(": tgenabled is "))
+                    && !(default_acls_uncertain
+                        && line.starts_with("pg_depend default privileges of "))
+            })
             .collect();
         if differences.is_empty() {
             return;
@@ -973,6 +1127,32 @@ impl PgSanityServer {
     /// The catalog oracle's comparison: every difference between the
     /// server's user rows and the analyzer's, normalized.
     fn catalog_differences(&mut self, db: &crate::pg_catalog::PgCatalog) -> Vec<String> {
+        let (ours, pg) = self.catalog_dumps(db);
+        let mut differences = catalog_state::diff(&ours, &pg);
+        differences.extend(
+            catalog_exprs::differences(&mut self.client, db).unwrap_or_else(|e| {
+                panic!("pg_sanity: catalog export failed: {}", render_pg_error(&e))
+            }),
+        );
+        differences.extend(self.stored_expression_text_differences(db));
+        differences
+    }
+
+    /// The server's user catalog rows, normalized as the catalog oracle
+    /// compares them, one line each (for the extension oracle, which also
+    /// compares two server states).
+    pub(crate) fn server_catalog_lines(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+    ) -> Vec<String> {
+        self.catalog_dumps(db).1.lines()
+    }
+
+    /// The analyzer's and the server's user catalog rows, normalized.
+    fn catalog_dumps(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+    ) -> (catalog_state::Dump, catalog_state::Dump) {
         let fail = |e: postgres::Error| -> ! {
             panic!("pg_sanity: catalog export failed: {}", render_pg_error(&e))
         };
@@ -997,6 +1177,7 @@ impl PgSanityServer {
             .map(|r| r.get::<_, u32>(0))
             .collect();
         catalog_state::hide_namespaces(&mut pg, &hidden);
+        catalog_exprs::default_types(&mut self.client, db, &mut pg).unwrap_or_else(|e| fail(e));
         let mut pg_aux = catalog_state::Aux {
             extras: catalog_extras::from_server(&mut self.client).unwrap_or_else(|e| fail(e)),
             ..Default::default()
@@ -1039,6 +1220,9 @@ impl PgSanityServer {
             extras: catalog_extras::from_model(db, &|role| pg_role_name(db, role, &session_user)),
             ..Default::default()
         };
+        ours.pg_depend = catalog_depend::model_depend(db, &mut our_aux.extras, &|role| {
+            pg_role_name(db, role, &session_user)
+        });
         for (name, oid) in &db.access_method_oids {
             our_aux
                 .names
@@ -1049,10 +1233,152 @@ impl PgSanityServer {
                 .names
                 .insert((2328, oid.get()), format!("foreign-data wrapper {name}"));
         }
-        catalog_state::diff(
-            &catalog_state::normalize(&ours, db, &our_aux),
-            &catalog_state::normalize(&pg, db, &pg_aux),
+        (
+            catalog_state::normalize(&ours, db, &our_aux),
+            catalog_state::normalize(&pg, db, &pg_aux),
         )
+    }
+
+    /// The stored expressions' text: what the analyzer prints for each CHECK
+    /// constraint, index expression and index predicate (the text ALTER
+    /// COLUMN TYPE rebuilds them from, see [`crate::ddl::cooked::deparse`])
+    /// must be what `pg_get_expr` / `pg_get_indexdef` print, under the same
+    /// search path. Only the expressions the analyzer prints exactly are
+    /// compared.
+    fn stored_expression_text_differences(
+        &mut self,
+        db: &crate::pg_catalog::PgCatalog,
+    ) -> Vec<String> {
+        use crate::ddl::tables::check_inherit::StoredExpr;
+        use std::collections::BTreeMap;
+        let user = |ns: crate::oid::PgNamespaceOid| {
+            db.namespace_name(ns)
+                .filter(|n| !n.starts_with("pg_") && *n != "information_schema")
+        };
+        let mut ours: BTreeMap<String, String> = BTreeMap::new();
+        for (oid, def) in db.check_defs.iter() {
+            let StoredExpr::Written(expr) = &def.expr else {
+                continue;
+            };
+            let Some(con) = db.pg_constraint.get(oid) else {
+                continue;
+            };
+            let Some(class) = db.pg_class.get(&con.conrelid) else {
+                continue;
+            };
+            let Some(ns) = user(class.relnamespace) else {
+                continue;
+            };
+            if let Some(text) =
+                crate::ddl::cooked::ruleutils_text(db, con.conrelid, (**expr).as_ref())
+            {
+                ours.insert(
+                    format!("CHECK {ns}.{}.{}", class.relname, con.conname),
+                    text,
+                );
+            }
+        }
+        for index in db.pg_index.values() {
+            let Some(class) = db.pg_class.get(&index.indexrelid) else {
+                continue;
+            };
+            let Some(ns) = user(class.relnamespace) else {
+                continue;
+            };
+            let nkeys = usize::try_from(index.indnkeyatts).unwrap_or(0);
+            let mut exprs = index.indexprs.iter();
+            for (i, key) in index.indkey.iter().enumerate().take(nkeys) {
+                if *key != 0 {
+                    continue;
+                }
+                let Some(e) = exprs.next() else {
+                    break;
+                };
+                if let Some(text) = crate::ddl::cooked::ruleutils_index_column_text(
+                    db,
+                    index.indrelid,
+                    e.ast.as_ref(),
+                ) {
+                    ours.insert(
+                        format!("index {ns}.{} column {}", class.relname, i + 1),
+                        text,
+                    );
+                }
+            }
+            if let Some(pred) = &index.indpred
+                && let Some(text) =
+                    crate::ddl::cooked::ruleutils_text(db, index.indrelid, pred.ast.as_ref())
+            {
+                ours.insert(format!("index {ns}.{} predicate", class.relname), text);
+            }
+        }
+        if ours.is_empty() {
+            return Vec::new();
+        }
+        let fail = |e: postgres::Error| -> ! {
+            panic!(
+                "pg_sanity: reading stored expressions failed: {}",
+                render_pg_error(&e)
+            )
+        };
+        let path: Vec<String> = db
+            .search_path
+            .iter()
+            .filter_map(|ns| db.namespace_name(*ns))
+            .map(|n| format!("\"{}\"", n.replace('"', "\"\"")))
+            .collect();
+        let path = path.join(", ");
+        self.client
+            .batch_execute("BEGIN")
+            .unwrap_or_else(|e| fail(e));
+        let mut theirs: BTreeMap<String, String> = BTreeMap::new();
+        let result = (|| -> Result<(), postgres::Error> {
+            self.client.execute(
+                "SELECT pg_catalog.set_config('search_path', $1, true)",
+                &[&path],
+            )?;
+            for row in self.client.query(
+                "SELECT 'CHECK ' || n.nspname || '.' || c.relname || '.' || con.conname, \
+                        pg_catalog.pg_get_expr(con.conbin, con.conrelid) \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE con.contype = 'c' AND con.conrelid >= 16384 \
+                 UNION ALL \
+                 SELECT 'index ' || n.nspname || '.' || i.relname || ' column ' || k, \
+                        pg_catalog.pg_get_indexdef(x.indexrelid, k, false) \
+                 FROM pg_catalog.pg_index x \
+                 JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace, \
+                      pg_catalog.generate_series(1, x.indnkeyatts) k \
+                 WHERE x.indexrelid >= 16384 AND x.indkey[k - 1] = 0 \
+                 UNION ALL \
+                 SELECT 'index ' || n.nspname || '.' || i.relname || ' predicate', \
+                        pg_catalog.pg_get_expr(x.indpred, x.indrelid) \
+                 FROM pg_catalog.pg_index x \
+                 JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace \
+                 WHERE x.indexrelid >= 16384 AND x.indpred IS NOT NULL",
+                &[],
+            )? {
+                theirs.insert(row.get(0), row.get(1));
+            }
+            Ok(())
+        })();
+        self.client
+            .batch_execute("ROLLBACK")
+            .unwrap_or_else(|e| fail(e));
+        result.unwrap_or_else(|e| fail(e));
+        ours.into_iter()
+            .filter_map(|(key, text)| {
+                let pg = theirs.get(&key)?;
+                (*pg != text).then(|| {
+                    format!(
+                        "stored expression {key}: `{text}` in the analyzer, `{pg}` in PostgreSQL"
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Remember the roles the catalog has seen created. Called after every
@@ -1177,8 +1503,10 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_table_privilege(role, relid, privilege);
                 let theirs = pg_privs[at(i)];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_table_privilege(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1188,8 +1516,10 @@ impl PgSanityServer {
                         theirs,
                     ));
                 }
-                let ours = db.has_table_privilege_with_grant_option(role, relid, privilege);
                 let theirs = pg_privs[at(i) + 1];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_table_privilege_with_grant_option(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1209,8 +1539,10 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_any_column_privilege(role, relid, privilege);
                 let theirs = pg_privs[at(RELATION_PRIVS.len() + i)];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_any_column_privilege(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1220,8 +1552,10 @@ impl PgSanityServer {
                         theirs,
                     ));
                 }
-                let ours = db.has_any_column_privilege_with_grant_option(role, relid, privilege);
                 let theirs = pg_privs[at(RELATION_PRIVS.len() + i) + 1];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_any_column_privilege_with_grant_option(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1307,8 +1641,10 @@ impl PgSanityServer {
                 .into_iter()
                 .enumerate()
                 {
-                    let ours = db.has_column_privilege(role, class.oid, attr.attnum, privilege);
                     let theirs = pg_privs[i * 2];
+                    let ours = within_bounds(db, theirs, || {
+                        db.has_column_privilege(role, class.oid, attr.attnum, privilege)
+                    });
                     if ours != theirs {
                         return Some(privilege_mismatch(
                             role,
@@ -1322,13 +1658,15 @@ impl PgSanityServer {
                             theirs,
                         ));
                     }
-                    let ours = db.has_column_privilege_with_grant_option(
-                        role,
-                        class.oid,
-                        attr.attnum,
-                        privilege,
-                    );
                     let theirs = pg_privs[i * 2 + 1];
+                    let ours = within_bounds(db, theirs, || {
+                        db.has_column_privilege_with_grant_option(
+                            role,
+                            class.oid,
+                            attr.attnum,
+                            privilege,
+                        )
+                    });
                     if ours != theirs {
                         return Some(privilege_mismatch(
                             role,
@@ -1408,8 +1746,10 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_sequence_privilege(role, relid, privilege);
                 let theirs = pg_privs[i * 2];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_sequence_privilege(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1419,8 +1759,10 @@ impl PgSanityServer {
                         theirs,
                     ));
                 }
-                let ours = db.has_sequence_privilege_with_grant_option(role, relid, privilege);
                 let theirs = pg_privs[i * 2 + 1];
+                let ours = within_bounds(db, theirs, || {
+                    db.has_sequence_privilege_with_grant_option(role, relid, privilege)
+                });
                 if ours != theirs {
                     return Some(privilege_mismatch(
                         role,
@@ -1504,11 +1846,13 @@ impl PgSanityServer {
                 "{}({signature})",
                 crate::QualifiedName::new(schema.clone(), proname.clone())
             );
-            let ours = db.has_function_privilege(role, proc_oid);
+            let ours = within_bounds(db, pg_priv, || db.has_function_privilege(role, proc_oid));
             if ours != pg_priv {
                 return Some(privilege_mismatch(role, &object, "EXECUTE", ours, pg_priv));
             }
-            let ours = db.has_function_privilege_with_grant_option(role, proc_oid);
+            let ours = within_bounds(db, pg_option, || {
+                db.has_function_privilege_with_grant_option(role, proc_oid)
+            });
             if ours != pg_option {
                 return Some(privilege_mismatch(
                     role,
@@ -1569,7 +1913,9 @@ impl PgSanityServer {
             .into_iter()
             .enumerate()
             {
-                let ours = db.has_schema_privilege(role, ns_oid, privilege);
+                let ours = within_bounds(db, pg_privs[i * 2], || {
+                    db.has_schema_privilege(role, ns_oid, privilege)
+                });
                 if ours != pg_privs[i * 2] {
                     return Some(privilege_mismatch(
                         role,
@@ -1579,7 +1925,9 @@ impl PgSanityServer {
                         pg_privs[i * 2],
                     ));
                 }
-                let ours = db.has_schema_privilege_with_grant_option(role, ns_oid, privilege);
+                let ours = within_bounds(db, pg_privs[i * 2 + 1], || {
+                    db.has_schema_privilege_with_grant_option(role, ns_oid, privilege)
+                });
                 if ours != pg_privs[i * 2 + 1] {
                     return Some(privilege_mismatch(
                         role,
@@ -1638,11 +1986,13 @@ impl PgSanityServer {
                 ));
             };
             let object = crate::QualifiedName::new(schema.clone(), typname.clone()).to_string();
-            let ours = db.has_type_privilege(role, typ_oid);
+            let ours = within_bounds(db, pg_priv, || db.has_type_privilege(role, typ_oid));
             if ours != pg_priv {
                 return Some(privilege_mismatch(role, &object, "USAGE", ours, pg_priv));
             }
-            let ours = db.has_type_privilege_with_grant_option(role, typ_oid);
+            let ours = within_bounds(db, pg_option, || {
+                db.has_type_privilege_with_grant_option(role, typ_oid)
+            });
             if ours != pg_option {
                 return Some(privilege_mismatch(
                     role,
@@ -1678,7 +2028,9 @@ impl PgSanityServer {
                     language.lanname
                 ));
             };
-            let ours = db.has_language_privilege(role, language.oid);
+            let ours = within_bounds(db, pg_priv, || {
+                db.has_language_privilege(role, language.oid)
+            });
             if ours != pg_priv {
                 return Some(privilege_mismatch(
                     role,
@@ -1688,7 +2040,9 @@ impl PgSanityServer {
                     pg_priv,
                 ));
             }
-            let ours = db.has_language_privilege_with_grant_option(role, language.oid);
+            let ours = within_bounds(db, pg_option, || {
+                db.has_language_privilege_with_grant_option(role, language.oid)
+            });
             if ours != pg_option {
                 return Some(privilege_mismatch(
                     role,
@@ -1715,15 +2069,16 @@ impl PgSanityServer {
             ("pg_subscription", "SELECT"),
             ("pg_shadow", "SELECT"),
         ] {
-            let (ours, pg) = (
-                db.resolve_table(Some("pg_catalog"), name)
-                    .map(|c| db.has_table_privilege(role, c.oid, crate::Privilege::Select)),
-                self.query_one_bool(
-                    "SELECT has_table_privilege($2::name, $1::text::regclass, 'SELECT')",
-                    &format!("pg_catalog.{name}"),
-                    role,
-                ),
+            let pg = self.query_one_bool(
+                "SELECT has_table_privilege($2::name, $1::text::regclass, 'SELECT')",
+                &format!("pg_catalog.{name}"),
+                role,
             );
+            let ours = db.resolve_table(Some("pg_catalog"), name).map(|c| {
+                within_bounds(db, pg, || {
+                    db.has_table_privilege(role, c.oid, crate::Privilege::Select)
+                })
+            });
             if let Some(ours) = ours
                 && ours != pg
             {
@@ -1742,16 +2097,16 @@ impl PgSanityServer {
             ("lo_import", 1, "pg_catalog.lo_import(text)"),
             ("now", 0, "pg_catalog.now()"),
         ] {
-            let ours = db
-                .find_functions(Some("pg_catalog"), name)
-                .into_iter()
-                .find(|p| p.proargtypes.len() == args)
-                .map(|p| db.has_function_privilege(role, p.oid));
             let pg = self.query_one_bool(
                 "SELECT has_function_privilege($2::name, $1::text::regprocedure, 'EXECUTE')",
                 sql_name,
                 role,
             );
+            let ours = db
+                .find_functions(Some("pg_catalog"), name)
+                .into_iter()
+                .find(|p| p.proargtypes.len() == args)
+                .map(|p| within_bounds(db, pg, || db.has_function_privilege(role, p.oid)));
             if let Some(ours) = ours
                 && ours != pg
             {
@@ -1818,6 +2173,11 @@ impl PgSanityServer {
             })
             .filter(|(role, member, grantor, ..)| interesting(role, member, grantor))
             .collect();
+        // A membership code the analyzer couldn't follow may have granted
+        // or revoked is not compared (see `ddl::uncertain`).
+        let uncertain = &db.roles.uncertain;
+        pg_rows.retain(|(role, member, ..)| !uncertain.memberships_may_differ(role, member));
+        model_rows.retain(|(role, member, ..)| !uncertain.memberships_may_differ(role, member));
         pg_rows.sort();
         model_rows.sort();
         if pg_rows != model_rows {
@@ -1837,6 +2197,15 @@ impl PgSanityServer {
         db: &crate::pg_catalog::PgCatalog,
         created: &[String],
     ) -> Option<String> {
+        // A role code the analyzer couldn't follow may have created,
+        // altered or dropped is not compared (see `ddl::uncertain`).
+        let uncertain = &db.roles.uncertain;
+        let created: Vec<String> = created
+            .iter()
+            .filter(|name| !uncertain.roles.contains(name) && !uncertain.catalog)
+            .cloned()
+            .collect();
+        let created = created.as_slice();
         if created.is_empty() {
             return None;
         }
@@ -1905,6 +2274,11 @@ impl PgSanityServer {
         created: &[String],
         session_user: &str,
     ) -> Option<String> {
+        // Default privileges code the analyzer couldn't follow may have
+        // changed are not compared (see `ddl::uncertain`).
+        if db.roles.uncertain.default_acls || db.roles.uncertain.catalog {
+            return None;
+        }
         let mut names = created.to_vec();
         if !names.iter().any(|name| name == session_user) {
             names.push(session_user.to_owned());
@@ -2014,6 +2388,9 @@ impl PgSanityServer {
                             pg: &HashMap<(String, String), String>|
          -> Option<String> {
             let mut seen: Vec<(String, String)> = Vec::new();
+            // Owners code the analyzer couldn't follow may have changed are
+            // not compared (see `ddl::uncertain`).
+            let uncertain = &db.roles.uncertain.owners;
             for (key, owner) in ours {
                 let Some(pg_owner) = pg.get(&key) else {
                     return Some(format!(
@@ -2022,7 +2399,8 @@ impl PgSanityServer {
                     ));
                 };
                 let ours = pg_role_name(db, owner, session_user);
-                if ours != *pg_owner {
+                if ours != *pg_owner && !uncertain.contains(&ours) && !uncertain.contains(pg_owner)
+                {
                     return Some(format!(
                         "pg_sanity: owner mismatch of {what} {}: model says \"{ours}\", PG says \
                          \"{pg_owner}\"",
@@ -2191,7 +2569,7 @@ impl PgSanityServer {
     /// Resolve a PG type OID to its qualified name (`schema.type_name`) by
     /// querying `pg_catalog.pg_type`. Array types are flipped from their PG
     /// `_int4` underscore form into the bracketed `pg_catalog.int4[]` form
-    /// so they line up with [`Type::Array`]. Inlines the OID as a literal
+    /// so they line up with [`Type::Array`] (`int2vector` keeps its name). Inlines the OID as a literal
     /// (non-injectable: it's a u32 from PG itself) to dodge `to_sql` for
     /// the `oid` type.
     fn qualified_type_name(&mut self, oid: u32) -> Result<String, postgres::Error> {
@@ -2202,7 +2580,8 @@ impl PgSanityServer {
             &format!(
                 "SELECT n.nspname, t.typname, \
                  t.typsubscript = 'pg_catalog.array_subscript_handler'::pg_catalog.regproc, \
-                 t.typelem::int8 \
+                 t.typelem::int8, \
+                 (SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem) \
                  FROM pg_catalog.pg_type t \
                  JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid \
                  WHERE t.oid = {oid}"
@@ -2213,9 +2592,12 @@ impl PgSanityServer {
         let name: String = row.get(1);
         let true_array: bool = row.get(2);
         let typelem: u32 = row.get::<_, i64>(3) as u32;
+        let elements_array: Option<bool> = row.get(4);
 
-        // PG's IsTrueArrayType: `_record` (a pseudo-type) included.
-        let qualified = if true_array && typelem != 0 {
+        // PG's IsTrueArrayType: `_record` (a pseudo-type) included. But
+        // `int2vector` / `oidvector`, true arrays that aren't their
+        // element's array type, keep their own name, as `Type::Array` does.
+        let qualified = if true_array && typelem != 0 && elements_array == Some(true) {
             // Array — recurse to get the element's qname, then bracket.
             let elem_qname = self.qualified_type_name(typelem)?;
             format!("{elem_qname}[]")
@@ -2773,9 +3155,17 @@ impl Drop for PgSanityServer {
         // intentionally swallowed (a panic in Drop would mask the original
         // test failure); the script-level cleanup tears the whole cluster
         // down anyway.
-        let _ = self
-            .client
-            .batch_execute(&format!("DROP DATABASE IF EXISTS \"{}\"", self.db_name));
+        // A database a test named may have sessions of the server's own
+        // (pg_cron's launcher connects to cron.database_name).
+        let force = if self._db_lock.is_some() {
+            " WITH (FORCE)"
+        } else {
+            ""
+        };
+        let _ = self.client.batch_execute(&format!(
+            "DROP DATABASE IF EXISTS \"{}\"{force}",
+            self.db_name
+        ));
 
         // Roles are cluster-wide: drop the ones the migrations created so
         // concurrent test processes don't collide. Errors are swallowed (a
@@ -2805,6 +3195,13 @@ impl Drop for PgSanityServer {
 /// Build a unique-ish scratch database name: `pg_sanity_<pid>_<counter>_<nanos>`.
 /// Underscores-only so it doesn't need quoting; lowercase prefix dodges any
 /// PG identifier folding subtleties.
+/// The user `POSTGRES_URL` connects as, when it names one.
+pub(crate) fn connecting_user() -> Option<String> {
+    let url = std::env::var("POSTGRES_URL").ok()?;
+    let config: postgres::Config = url.parse().ok()?;
+    config.get_user().map(str::to_owned)
+}
+
 pub fn scratch_db_name() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let pid = std::process::id();
@@ -2903,6 +3300,22 @@ fn render_pg_error(e: &postgres::Error) -> String {
     }
 }
 
+/// The analyzer's answer to a privilege question PostgreSQL answered
+/// `theirs`: what `ours` says — at both bounds of an uncertain catalog (see
+/// `ddl::uncertain`), where PG agreeing with either bound agrees.
+fn within_bounds(db: &crate::pg_catalog::PgCatalog, theirs: bool, ours: impl Fn() -> bool) -> bool {
+    use crate::ddl::uncertain::{Bound, with_bound};
+    let upper = with_bound(Bound::Upper, &ours);
+    if upper == theirs || !db.roles.uncertain.privileges() {
+        return upper;
+    }
+    if with_bound(Bound::Lower, &ours) == theirs {
+        theirs
+    } else {
+        upper
+    }
+}
+
 /// Enforce the contract: the analyzer's error message must begin with the
 /// PG server-side message verbatim. Trailing detail (column names, hints)
 /// is allowed. When the wording prefix holds *and* the analyzer states an
@@ -2990,6 +3403,9 @@ fn check_error_prefix(
 fn qualified_type_name_for_compare(ty: &Type) -> String {
     match ty {
         Type::Domain { base, .. } => qualified_type_name_for_compare(base),
+        Type::Array {
+            name: Some(name), ..
+        } => name.to_string(),
         Type::Array { element, .. } => {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }
@@ -3010,6 +3426,9 @@ fn qualified_param_type_name_for_compare(ty: &Type) -> String {
         | Type::Range { schema, name, .. }
         | Type::Composite { schema, name, .. }
         | Type::Domain { schema, name, .. } => QualifiedName::new(schema, name).to_string(),
+        Type::Array {
+            name: Some(name), ..
+        } => name.to_string(),
         Type::Array { element, .. } => {
             format!("{}[]", qualified_param_type_name_for_compare(element))
         }

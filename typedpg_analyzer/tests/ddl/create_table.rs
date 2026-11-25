@@ -1303,6 +1303,43 @@ fn view_columns_keep_their_expression_collation() {
 }
 
 #[test]
+fn casts_keep_their_operand_collation() {
+    // PG 19 (assign_collations_walker): a cast's result takes its operand's
+    // collation — `name`'s "C" through a cast to varchar, the default
+    // collation of a text expression through a cast to name — and only an
+    // operand without one takes the result type's (PostGIS's
+    // geometry_columns and raster_overviews views).
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE VIEW v AS SELECT current_database()::varchar(256) AS a,
+                                 split_part('x.y', '.', 1)::name AS b,
+                                 relname::text AS c,
+                                 'x'::name AS d,
+                                 1::text::name AS e
+                          FROM pg_class;",
+    )]);
+    let info = db.analyze("SELECT a, b, c, d, e FROM v").unwrap();
+    let colls: Vec<Option<String>> = info
+        .columns
+        .iter()
+        .map(|c| match &c.pg_type {
+            Type::Basic { collation, .. } => collation.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        colls,
+        [
+            Some("C".to_owned()),
+            None,
+            Some("C".to_owned()),
+            Some("C".to_owned()),
+            None
+        ]
+    );
+}
+
+#[test]
 fn create_table_as_needs_a_derived_collation() {
     // PG 18 (42P22): a UNION ALL column whose arms carry different implicit
     // collations has none, which a table or view column can't store. A
@@ -2834,4 +2871,58 @@ fn rows_route_by_the_key_types_values() {
             .starts_with("no partition of relation \"f\" found for row"),
         "got: {err}"
     );
+}
+
+#[test]
+fn stored_expressions_and_columns_reject_what_ddl_cannot_hold() {
+    // PG 19: BuildDescForRelation / ATExecAddColumn refuse a SETOF column
+    // (42P16); transformParamRef has no hook in DDL (42P02).
+    assert_ddl_rejections(&[
+        (
+            "",
+            "CREATE TABLE e (c SETOF int);",
+            "column \"c\" cannot be declared SETOF",
+        ),
+        (
+            "CREATE TABLE e (c int);",
+            "ALTER TABLE e ADD COLUMN s SETOF int;",
+            "column \"s\" cannot be declared SETOF",
+        ),
+        (
+            "",
+            "CREATE TYPE c AS (x SETOF int);",
+            "column \"x\" cannot be declared SETOF",
+        ),
+        (
+            "",
+            "CREATE TABLE e (c int DEFAULT $1);",
+            "there is no parameter $1",
+        ),
+        (
+            "",
+            "CREATE TABLE e (c int CHECK (c > $2));",
+            "there is no parameter $2",
+        ),
+        (
+            "",
+            "CREATE DOMAIN d AS int DEFAULT $1;",
+            "there is no parameter $1",
+        ),
+        (
+            "",
+            "CREATE FUNCTION f(a int, b int DEFAULT $1) RETURNS int LANGUAGE sql AS 'SELECT 1';",
+            "there is no parameter $1",
+        ),
+        (
+            "CREATE TABLE e (c int);",
+            "CREATE INDEX ON e ((c + $1));",
+            "there is no parameter $1",
+        ),
+    ]);
+    // ALTER COLUMN TYPE and a domain take a SETOF type name as the type.
+    build_db(&[(
+        "0001.sql",
+        "CREATE TABLE e (c int); ALTER TABLE e ALTER COLUMN c TYPE SETOF int;
+         CREATE DOMAIN d AS SETOF int;",
+    )]);
 }

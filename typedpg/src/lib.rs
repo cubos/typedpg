@@ -23,7 +23,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! typedpg = "0.1"
+//! typedpg = "0.8"
 //! deadpool-postgres = "0.14"
 //! tokio-postgres = "0.7"
 //! tokio = { version = "1", features = ["full"] }
@@ -32,8 +32,9 @@
 //! migrations = "./migrations"
 //! ```
 //!
-//! Add a `build.rs` next to your `Cargo.toml` so the `sql!` macro is
-//! re-checked whenever a migration file changes (see the [`build`] module):
+//! Optionally, add a `build.rs` next to your `Cargo.toml` so that *adding*
+//! a migration file re-checks the `sql!` macros too (see [Rebuilding when
+//! migrations change](#rebuilding-when-migrations-change)):
 //!
 //! ```ignore
 //! // build.rs
@@ -44,7 +45,7 @@
 //!
 //! ```toml
 //! [build-dependencies]
-//! typedpg = "0.1"
+//! typedpg = "0.8"
 //! ```
 //!
 //! Create `migrations/0001_create_users.sql`:
@@ -76,12 +77,11 @@
 //!
 //! # Configuration
 //!
-//! The only required configuration is the migrations path. All other settings
-//! have sensible defaults:
+//! Every setting has a default; migrations are read from `./migrations`:
 //!
 //! ```toml
 //! [package.metadata.typedpg.database]
-//! migrations = "./migrations"             # required
+//! migrations = "./migrations"             # optional, the default
 //! extra_migrations = ["../shared/migrations"]  # optional, compile-time only
 //!
 //! [package.metadata.typedpg.migrations]
@@ -107,15 +107,16 @@
 //!
 //! # Rebuilding when migrations change
 //!
-//! The `sql!` macro reads your migration files at compile time, but a proc
-//! macro cannot, on stable Rust, declare those files as build inputs. Without
-//! help, editing or adding a migration would not trigger a rebuild and `sql!`
-//! would keep producing types from a stale schema.
+//! The `sql!` macro reads your migration files at compile time and records
+//! the ones it read as dependencies of the generated code (the way
+//! `include_str!` does): editing or deleting a migration recompiles the
+//! crate, re-running every `sql!`.
 //!
-//! The fix is a one-line `build.rs` calling [`build::track_migrations`]. It
-//! tells Cargo to watch every migration directory (recursively, so future
-//! files count too) and to recompile — re-running every `sql!` — when their
-//! contents change. See the [`build`] module for details.
+//! A file dependency can't see a file *added* to the directory. A one-line
+//! `build.rs` calling [`build::track_migrations`] tells Cargo to watch every
+//! migration directory (recursively, so future files count too) and to
+//! recompile when their contents change. See the [`build`] module for
+//! details.
 //!
 //! # The `sql!` macro
 //!
@@ -355,7 +356,7 @@
 //! ## With `bb8-postgres` (feature: `bb8`)
 //!
 //! ```toml
-//! typedpg = { version = "0.1", default-features = false, features = ["bb8"] }
+//! typedpg = { version = "0.8", default-features = false, features = ["bb8"] }
 //! bb8-postgres = "0.9"
 //! ```
 //!
@@ -443,7 +444,8 @@ pub use stream::{QueryStream, RowStream};
 /// Build-script helpers — re-exported from `typedpg_core`.
 ///
 /// Call [`build::track_migrations`] from your crate's `build.rs` so the `sql!`
-/// macro is re-checked whenever a migration file changes.
+/// macro is re-checked whenever a migration file is added (edits are tracked
+/// without it).
 pub use typedpg_core::build;
 
 pub use typedpg_macros::FromRow;
@@ -473,12 +475,14 @@ pub mod __private {
     pub use crate::executor::{
         ParamType, UnspecifiedKind, run_execute, run_query, run_query_stream,
     };
-    pub use crate::spread::{ARRAY_THRESHOLD, SqlPiece, ValuesItem, spread_sql, uses_arrays};
+    pub use crate::spread::{
+        ARRAY_THRESHOLD, MAX_PARAMS, SqlPiece, ValuesItem, spread_budget, spread_sql, uses_arrays,
+    };
     pub use bytes;
     pub use tokio_postgres;
 
     use bytes::{Buf, BytesMut};
-    use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
+    use tokio_postgres::types::{Format, FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
     /// Reads (and binds) a value as `T` through the type its binary format
     /// is that of, where `T`'s `FromSql` / `ToSql` impl would refuse the
@@ -490,10 +494,18 @@ pub mod __private {
     ///   domain — and `FromSql` impls (`Vec<i32>`, `Vec<serde_json::Value>`)
     ///   accept only their base element types;
     /// - the `reg*` OID alias types (`regclass`, `regtype`, …), `xid` and
-    ///   `cid` are `oid`s: an unsigned 4-byte integer, read as `u32`.
+    ///   `cid` are `oid`s: an unsigned 4-byte integer, read as `u32`;
+    /// - `record[]` is an array of `record`s: `tokio_postgres` knows it as a
+    ///   pseudo-type, which `Vec`'s impls refuse (and its `from_sql`
+    ///   panics on, expecting an array).
     ///
     /// Arrays of either are bound with their own element type OID in the
     /// array header, which `array_recv` checks.
+    ///
+    /// An `int2vector` / `oidvector` (read as a `Vec` of its elements) is
+    /// bound in its text form, `1 2 3`: its receive function refuses the
+    /// binary form of an empty one (`array_recv` makes it zero-dimensional,
+    /// and `int2vectorrecv` wants one dimension).
     #[doc(hidden)]
     #[derive(Debug)]
     pub struct BaseTyped<T>(pub T);
@@ -523,6 +535,14 @@ pub mod __private {
     fn wire_type(ty: &Type) -> Option<Type> {
         if is_oid_like(ty) {
             return Some(Type::OID);
+        }
+        if *ty == Type::RECORD_ARRAY {
+            return Some(Type::new(
+                ty.name().to_owned(),
+                ty.oid(),
+                Kind::Array(Type::RECORD),
+                ty.schema().to_owned(),
+            ));
         }
         let Kind::Array(member) = ty.kind() else {
             return None;
@@ -576,12 +596,78 @@ pub mod __private {
         }
     }
 
+    /// Whether `ty` is `int2vector` or `oidvector`, bound in text.
+    fn is_vector(ty: &Type) -> bool {
+        matches!(*ty, Type::INT2_VECTOR | Type::OID_VECTOR)
+    }
+
+    /// The text form (`1 2 3`) of the binary array `bytes` of `int2` or
+    /// `oid` elements (`ty`: `int2vector` or `oidvector`).
+    fn vector_text(
+        ty: &Type,
+        mut bytes: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+        let malformed = || format!("typedpg: malformed {} array", ty.name());
+        if bytes.len() < 12 {
+            return Err(malformed().into());
+        }
+        let ndim = bytes.get_i32();
+        bytes.advance(8); // the NULL flag and the element type
+        let mut count = 1i64;
+        for _ in 0..ndim {
+            if bytes.len() < 8 {
+                return Err(malformed().into());
+            }
+            count *= i64::from(bytes.get_i32());
+            bytes.advance(4); // the lower bound
+        }
+        if ndim == 0 {
+            count = 0;
+        }
+        let mut text = String::new();
+        for i in 0..count {
+            if bytes.len() < 4 {
+                return Err(malformed().into());
+            }
+            let len = bytes.get_i32();
+            if len < 0 {
+                return Err(
+                    format!("typedpg: an element of an {} cannot be NULL", ty.name()).into(),
+                );
+            }
+            let len = len as usize;
+            if bytes.len() < len {
+                return Err(malformed().into());
+            }
+            let value = match (*ty == Type::INT2_VECTOR, len) {
+                (true, 2) => i64::from(bytes.get_i16()),
+                (false, 4) => i64::from(bytes.get_u32()),
+                _ => return Err(malformed().into()),
+            };
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push_str(&value.to_string());
+        }
+        out.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+
     impl<T: ToSql> ToSql for BaseTyped<T> {
         fn to_sql(
             &self,
             ty: &Type,
             out: &mut BytesMut,
         ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+            if is_vector(ty) {
+                let mut binary = BytesMut::new();
+                let is_null = self.0.to_sql(ty, &mut binary)?;
+                if let IsNull::No = is_null {
+                    vector_text(ty, &binary, out)?;
+                }
+                return Ok(is_null);
+            }
             let Some(wire) = wire_type(ty) else {
                 return self.0.to_sql(ty, out);
             };
@@ -598,6 +684,14 @@ pub mod __private {
             match wire_type(ty) {
                 Some(wire) => T::accepts(&wire),
                 None => T::accepts(ty),
+            }
+        }
+
+        fn encode_format(&self, ty: &Type) -> Format {
+            if is_vector(ty) {
+                Format::Text
+            } else {
+                self.0.encode_format(ty)
             }
         }
 

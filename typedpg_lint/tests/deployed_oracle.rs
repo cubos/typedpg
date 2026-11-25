@@ -1,4 +1,4 @@
-//! The `breaks_deployed_queries` oracle's corpus run: generated migration
+//! The `deployed_query_breakage` oracle's corpus run: generated migration
 //! changes × deployed query shapes (and the docs page's example), each
 //! linted with the rule and checked by running the deployed queries on a
 //! real PostgreSQL before and after the change (see
@@ -21,7 +21,7 @@ use typedpg_analyzer::PgCatalog;
 use typedpg_lint::oracle::{DeployedCase, DeployedReport, run_deployed};
 use typedpg_lint::{
     Decoding, DeployedKind, DeployedQuery, Deployment, LintOptions, MigrationFile, MigrationLint,
-    NewSchema, breaks_deployed_queries,
+    NewSchema, deployed_query_breakage,
 };
 
 /// One case: the deployed schema's migrations, the new ones, the deployed
@@ -61,6 +61,12 @@ CREATE VIEW active_accounts AS
     SELECT id, email, name, balance, status FROM accounts WHERE status = 'active';
 CREATE FUNCTION account_name(i integer) RETURNS text LANGUAGE sql STABLE
     AS $$ SELECT name FROM accounts WHERE id = i $$;
+CREATE FUNCTION account_note(i integer) RETURNS text LANGUAGE plpgsql STABLE AS $$
+    DECLARE n text;
+    BEGIN
+        SELECT note INTO n FROM accounts WHERE id = i;
+        RETURN n;
+    END $$;
 GRANT SELECT, INSERT, UPDATE, DELETE ON accounts, posts, active_accounts TO app;
 ";
 
@@ -79,6 +85,7 @@ fn queries() -> Vec<(String, DeployedKind)> {
         ),
         q("SELECT * FROM active_accounts"),
         q("SELECT account_name($id) AS n"),
+        q("SELECT account_note($id) AS n"),
         q("SELECT count(*) AS n FROM accounts WHERE kind = $kind"),
         q("SELECT id FROM accounts WHERE name = $name AND balance > $min"),
         q("INSERT INTO accounts (id, email, name) VALUES ($id, $email, $name)"),
@@ -110,6 +117,14 @@ fn queries() -> Vec<(String, DeployedKind)> {
            ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, nick = $nick",
         ),
         q("DELETE FROM accounts WHERE id = $id"),
+        q("UPDATE accounts SET id = $new_id WHERE id = $id"),
+        // Through the view, the rows deleted or changed are `accounts`'.
+        q("DELETE FROM active_accounts WHERE id = $id"),
+        q("UPDATE active_accounts SET id = $new_id WHERE id = $id"),
+        q(
+            "MERGE INTO active_accounts a USING (SELECT $id::integer AS id) v ON a.id = v.id \
+           WHEN MATCHED THEN DELETE",
+        ),
         q(
             "MERGE INTO accounts a USING (SELECT $id::integer AS id, $name::varchar AS name) v ON a.id = v.id \
            WHEN MATCHED THEN UPDATE SET name = v.name \
@@ -430,6 +445,58 @@ fn changes() -> Vec<(&'static str, &'static str, String)> {
             "DROP FUNCTION account_name(integer);",
         ),
         (
+            "function body column renamed",
+            "",
+            "ALTER TABLE accounts RENAME COLUMN name TO full_name;",
+        ),
+        // The body names `public.audit`: the seeding runs it under its own
+        // search path (`pg_catalog, pg_temp`).
+        (
+            "trigger body broken",
+            "CREATE TABLE audit (id integer); GRANT INSERT ON audit TO app; CREATE FUNCTION audit_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO public.audit (id) VALUES (NEW.id); RETURN NEW; END $$; CREATE TRIGGER accounts_audit AFTER INSERT OR UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION audit_account();",
+            "ALTER TABLE audit RENAME COLUMN id TO account_id;",
+        ),
+        (
+            "trigger read-only rows",
+            "",
+            "CREATE FUNCTION read_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'read-only'; END $$; CREATE TRIGGER accounts_ro BEFORE UPDATE OR DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION read_only();",
+        ),
+        (
+            "trigger read-only statements",
+            "",
+            "CREATE FUNCTION read_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'read-only'; END $$; CREATE TRIGGER accounts_ro BEFORE INSERT OR DELETE ON accounts FOR EACH STATEMENT EXECUTE FUNCTION read_only();",
+        ),
+        (
+            "trigger read-only when",
+            "",
+            "CREATE FUNCTION read_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'read-only'; END $$; CREATE TRIGGER accounts_ro BEFORE INSERT ON accounts FOR EACH ROW WHEN (NEW.kind = 'b') EXECUTE FUNCTION read_only();",
+        ),
+        (
+            "trigger function replaced",
+            "CREATE FUNCTION check_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$; CREATE TRIGGER accounts_check BEFORE INSERT OR UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION check_account();",
+            "CREATE OR REPLACE FUNCTION check_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.nick IS NOT NULL THEN RAISE EXCEPTION 'no nick'; END IF; RETURN NEW; END $$;",
+        ),
+        (
+            "foreign key on a written column",
+            "CREATE TABLE names (name text PRIMARY KEY); INSERT INTO names VALUES ('a'), ('merge name');",
+            "ALTER TABLE accounts ADD CONSTRAINT accounts_name_fk FOREIGN KEY (name) REFERENCES names NOT VALID, ADD CONSTRAINT accounts_nick_fk FOREIGN KEY (nick) REFERENCES names NOT VALID;",
+        ),
+        (
+            "foreign key enforced",
+            "CREATE TABLE ages (age integer PRIMARY KEY); INSERT INTO ages SELECT generate_series(0, 10); ALTER TABLE accounts ADD CONSTRAINT accounts_age_fk FOREIGN KEY (age) REFERENCES ages NOT ENFORCED;",
+            "ALTER TABLE accounts ALTER CONSTRAINT accounts_age_fk ENFORCED;",
+        ),
+        (
+            "foreign key referencing a deleted table",
+            "",
+            "CREATE TABLE invoices (id integer PRIMARY KEY, account_id integer NOT NULL REFERENCES accounts ON UPDATE RESTRICT); INSERT INTO invoices SELECT id, id FROM accounts;",
+        ),
+        (
+            "foreign key cascading",
+            "",
+            "CREATE TABLE invoices (id integer PRIMARY KEY, account_id integer REFERENCES accounts ON DELETE CASCADE ON UPDATE CASCADE); INSERT INTO invoices SELECT id, id FROM accounts;",
+        ),
+        (
             "trigger rejects",
             "",
             "CREATE FUNCTION no_long() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF length(NEW.name) > 15 THEN RAISE EXCEPTION 'too long'; END IF; RETURN NEW; END $$; CREATE TRIGGER no_long BEFORE INSERT OR UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION no_long();",
@@ -522,12 +589,12 @@ fn cases() -> Vec<Case> {
     out
 }
 
-/// The docs page's example (`docs/lint/breaks_deployed_queries.md`): its
+/// The docs page's example (`docs/lint/deployed_query_breakage.md`): its
 /// first block's `migrations/0001`, queries and `migrations/0002`.
 fn docs_case() -> Case {
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../docs/lint/breaks_deployed_queries.md"
+        "/../docs/lint/deployed_query_breakage.md"
     ))
     .unwrap();
     let block = text
@@ -601,8 +668,9 @@ fn run_case(case: &Case) -> Result<DeployedReport, String> {
             });
         }
     }
-    let decoding = Decoding::TypeScript;
-    let findings = breaks_deployed_queries(
+    let types = std::collections::HashMap::new();
+    let decoding = Decoding::TypeScript { types: &types };
+    let findings = deployed_query_breakage(
         &Deployment {
             reference: "origin/main",
             catalog: &old_catalog,

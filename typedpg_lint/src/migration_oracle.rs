@@ -17,24 +17,24 @@
 //! - whether `lock_timeout` was set when it started.
 //!
 //! Each finding of a migration rule is then checked: the table it names is
-//! locked as strongly as it says (`missing_lock_timeout`'s "every query"
+//! locked as strongly as it says (`lock_without_timeout`'s "every query"
 //! is `ACCESS EXCLUSIVE`, "every write" a weaker mode that still conflicts
 //! with `ROW EXCLUSIVE`), rewritten, given a new index, or scanned. And the
 //! rules' silence is checked: on a table that existed when the file
 //! started,
 //!
 //! - the first statement waiting for a write-blocking lock with no
-//!   `lock_timeout` is the one `missing_lock_timeout` reports;
-//! - an `ALTER TABLE` that rewrites it is reported by `table_rewrite`
-//!   (`VACUUM FULL`, `CLUSTER`, `REPACK` by `blocking_rebuild`);
+//!   `lock_timeout` is the one `lock_without_timeout` reports;
+//! - an `ALTER TABLE` that rewrites it is reported by `alter_table_rewrite`
+//!   (`VACUUM FULL`, `CLUSTER`, `REPACK` by `rebuild_blocking`);
 //! - an index built on it outside `CONCURRENTLY` is reported by
 //!   `create_index_blocking` (or the rewrite / rebuild rule);
 //! - a scan of it under a write-blocking lock is reported by one of the
-//!   scan rules (`constraint_validating`, `set_not_null_scan`,
-//!   `attach_partition_scan`, `validate_in_same_transaction`).
+//!   scan rules (`add_constraint_scan`, `set_not_null_scan`,
+//!   `attach_partition_scan`, `validate_constraint_blocking`).
 //!
-//! The schema rules (`missing_primary_key`, `rls_*`,
-//! `security_definer_search_path`, `prefer_*`, `fk_type_mismatch`,
+//! The schema rules (`table_without_primary_key`, `rls_*`,
+//! `security_definer_without_search_path`, `prefer_*`, `fk_type_mismatch`,
 //! `fk_without_index`) are checked against PostgreSQL's catalog once every
 //! file is replayed: each finding names an object the catalog shows as the
 //! rule describes, and each such object is reported. `redundant_index` is
@@ -70,24 +70,24 @@ use crate::{LintOptions, Rule};
 
 /// The statement rules the oracle checks.
 const STATEMENT_RULES: [Rule; 10] = [
-    Rule::MissingLockTimeout,
+    Rule::LockWithoutTimeout,
     Rule::CreateIndexBlocking,
     Rule::DropIndexBlocking,
-    Rule::ConstraintValidating,
+    Rule::AddConstraintScan,
     Rule::SetNotNullScan,
-    Rule::TableRewrite,
-    Rule::BlockingRebuild,
+    Rule::AlterTableRewrite,
+    Rule::RebuildBlocking,
     Rule::AttachPartitionScan,
     Rule::DetachPartitionBlocking,
-    Rule::ValidateInSameTransaction,
+    Rule::ValidateConstraintBlocking,
 ];
 
 /// The rules that report a scan under a lock.
 const SCAN_RULES: [Rule; 4] = [
-    Rule::ConstraintValidating,
+    Rule::AddConstraintScan,
     Rule::SetNotNullScan,
     Rule::AttachPartitionScan,
-    Rule::ValidateInSameTransaction,
+    Rule::ValidateConstraintBlocking,
 ];
 
 const SHARE: u8 = 5;
@@ -620,7 +620,7 @@ pub(crate) fn check(
             continue;
         };
         // A timeout set from a value the lint does not evaluate.
-        if rule == Rule::MissingLockTimeout
+        if rule == Rule::LockWithoutTimeout
             && observation.lock_timeout
             && statements.iter().any(|earlier| {
                 earlier.file == statement.file
@@ -684,14 +684,14 @@ pub(crate) fn check(
             ));
         };
 
-        // missing_lock_timeout: the file's first statement waiting for a
+        // lock_without_timeout: the file's first statement waiting for a
         // write-blocking lock with no timeout.
         if !lock_reported_in.contains(&statement.file) {
-            if reported(statement, Rule::MissingLockTimeout) {
+            if reported(statement, Rule::LockWithoutTimeout) {
                 lock_reported_in.insert(statement.file);
             } else if observation.observable
                 && !observation.lock_timeout
-                && expects(options, file, statement, Rule::MissingLockTimeout)
+                && expects(options, file, statement, Rule::LockWithoutTimeout)
             {
                 // A materialized view is written by nobody but REFRESH: only
                 // ACCESS EXCLUSIVE, which blocks its readers, matters.
@@ -714,7 +714,7 @@ pub(crate) fn check(
                 if let Some((oid, mode)) = waits.first() {
                     lock_reported_in.insert(statement.file);
                     missed(
-                        Rule::MissingLockTimeout,
+                        Rule::LockWithoutTimeout,
                         format!(
                             "the statement waits for a lock of strength {mode} on {} with no \
                              lock_timeout (the file's first such statement)",
@@ -739,11 +739,11 @@ pub(crate) fn check(
             .filter(|oid| pre(oid))
             .collect();
         let rebuild_rule = match statement.node {
-            N::AlterTableStmt(_) => Some(Rule::TableRewrite),
-            N::VacuumStmt(_) | N::RepackStmt(_) => Some(Rule::BlockingRebuild),
+            N::AlterTableStmt(_) => Some(Rule::AlterTableRewrite),
+            N::VacuumStmt(_) | N::RepackStmt(_) => Some(Rule::RebuildBlocking),
             // TRUNCATE and REFRESH replace the storage by design.
             N::TruncateStmt(_) | N::RefreshMatViewStmt(_) => None,
-            _ => Some(Rule::TableRewrite),
+            _ => Some(Rule::AlterTableRewrite),
         };
         if let (Some(oid), Some(rule)) = (rewritten.first(), rebuild_rule)
             && !concurrent
@@ -777,8 +777,8 @@ pub(crate) fn check(
         {
             let covering = [
                 Rule::CreateIndexBlocking,
-                Rule::TableRewrite,
-                Rule::BlockingRebuild,
+                Rule::AlterTableRewrite,
+                Rule::RebuildBlocking,
             ];
             if !covering.iter().any(|rule| reported(statement, *rule))
                 && covering
@@ -815,7 +815,7 @@ pub(crate) fn check(
                     .all(|rule| expects(options, file, statement, *rule))
             {
                 missed(
-                    Rule::ConstraintValidating,
+                    Rule::AddConstraintScan,
                     format!(
                         "PostgreSQL scanned {} under a lock of strength {} (no scan rule \
                          reports it)",
@@ -837,7 +837,7 @@ pub(crate) fn check(
             &mut broken,
         );
     } else {
-        count(&mut stats, Rule::MissingLockTimeout, "replay incomplete");
+        count(&mut stats, Rule::LockWithoutTimeout, "replay incomplete");
     }
     record_stats(&stats);
     report_broken(broken);
@@ -1084,7 +1084,7 @@ fn claim(rule: Rule, message: &str, o: &Observation) -> Option<Result<(), String
         _ => None,
     };
     match rule {
-        Rule::MissingLockTimeout => {
+        Rule::LockWithoutTimeout => {
             if !o.observable {
                 return None;
             }
@@ -1166,9 +1166,7 @@ fn claim(rule: Rule, message: &str, o: &Observation) -> Option<Result<(), String
             )?,
             ACCESS_EXCLUSIVE,
         ),
-        Rule::ConstraintValidating => {
-            scanned(between(message, "validates every row of ", " under ")?)
-        }
+        Rule::AddConstraintScan => scanned(between(message, "validates every row of ", " under ")?),
         Rule::SetNotNullScan => scanned(between(message, "scans every row of ", " under a lock")?),
         Rule::AttachPartitionScan => {
             let table = match between(
@@ -1192,7 +1190,7 @@ fn claim(rule: Rule, message: &str, o: &Observation) -> Option<Result<(), String
             };
             and(scanned(table), locked(table, ACCESS_EXCLUSIVE))
         }
-        Rule::ValidateInSameTransaction => {
+        Rule::ValidateConstraintBlocking => {
             let table = between(message, "ADD CONSTRAINT's lock on ", " is still held")?;
             let oid = resolve(table)?;
             // The ADD may be an earlier command of the same statement.
@@ -1209,7 +1207,7 @@ fn claim(rule: Rule, message: &str, o: &Observation) -> Option<Result<(), String
             };
             and(lock, scanned(table))
         }
-        Rule::TableRewrite => {
+        Rule::AlterTableRewrite => {
             // SET TABLESPACE is reported even to the tablespace the table is
             // in (the catalog doesn't track tablespaces), a documented
             // over-report: only its lock is checked.
@@ -1219,7 +1217,7 @@ fn claim(rule: Rule, message: &str, o: &Observation) -> Option<Result<(), String
             let table = between(message, "rewrites every row of ", " under an ACCESS")?;
             and(rewritten(table), locked(table, ACCESS_EXCLUSIVE))
         }
-        Rule::BlockingRebuild => {
+        Rule::RebuildBlocking => {
             // REINDEX: the lock (it may rebuild only the TOAST table's
             // index, which the oracle doesn't follow).
             if let Some(table) = between(message, "blocks writes on ", ", and reads that") {
@@ -1287,7 +1285,7 @@ fn schema_queries() -> Vec<(Rule, String)> {
     let inner_is = |name: &str| format!("{INNER} = 'pg_catalog.{name}'::pg_catalog.regtype");
     vec![
         (
-            Rule::MissingPrimaryKey,
+            Rule::TableWithoutPrimaryKey,
             "SELECT n.nspname::text, c.relname::text, '' FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p') AND c.relpersistence <> 't' \
@@ -1298,7 +1296,7 @@ fn schema_queries() -> Vec<(Rule, String)> {
                 .to_owned(),
         ),
         (
-            Rule::RlsNoPolicy,
+            Rule::RlsWithoutPolicy,
             "SELECT n.nspname::text, c.relname::text, '' FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p') AND c.relrowsecurity \
@@ -1306,7 +1304,7 @@ fn schema_queries() -> Vec<(Rule, String)> {
                 .to_owned(),
         ),
         (
-            Rule::RlsPolicyNotEnforced,
+            Rule::PolicyWithoutRls,
             "SELECT n.nspname::text, c.relname::text, '' FROM pg_catalog.pg_class c \
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p') AND NOT c.relrowsecurity \
@@ -1316,7 +1314,7 @@ fn schema_queries() -> Vec<(Rule, String)> {
         // A BEGIN ATOMIC body resolves its names when it is created; an
         // extension's routines are not the migrations' to fix.
         (
-            Rule::SecurityDefinerSearchPath,
+            Rule::SecurityDefinerWithoutSearchPath,
             "SELECT n.nspname::text, p.proname::text, '' FROM pg_catalog.pg_proc p \
              JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
              WHERE p.prosecdef AND p.prosqlbody IS NULL AND n.nspname <> 'information_schema' \
@@ -1376,16 +1374,16 @@ fn schema_queries() -> Vec<(Rule, String)> {
 /// lists it.
 fn schema_key(rule: Rule, message: &str) -> Option<String> {
     match rule {
-        Rule::MissingPrimaryKey => message
+        Rule::TableWithoutPrimaryKey => message
             .strip_suffix(" has no primary key")
             .map(str::to_owned),
-        Rule::RlsNoPolicy => between(
+        Rule::RlsWithoutPolicy => between(
             message,
             "row-level security is enabled on ",
             ", which has no policy",
         )
         .map(str::to_owned),
-        Rule::RlsPolicyNotEnforced => {
+        Rule::PolicyWithoutRls => {
             let (subject, _) = message.split_once(": row-level security is not enabled")?;
             let subject = subject
                 .strip_suffix(" does nothing")
@@ -1394,7 +1392,7 @@ fn schema_key(rule: Rule, message: &str) -> Option<String> {
                 .rsplit_once(" on ")
                 .map(|(_, table)| table.to_owned())
         }
-        Rule::SecurityDefinerSearchPath => {
+        Rule::SecurityDefinerWithoutSearchPath => {
             let rest = message.strip_prefix("SECURITY DEFINER ")?;
             let rest = rest
                 .strip_prefix("function ")
@@ -1467,9 +1465,13 @@ fn foreign_key_expectations(
             typedpg_core::quote_identifier(&column)
         ));
     }
-    // An index serves the check when it is a btree whose leading key
-    // columns are the foreign key's (in any order), or a hash index on its
-    // one column.
+    // An index serves the check when it is a btree or hash index whose
+    // leading key columns are foreign-key columns: all of them (in any
+    // order), or some that reference columns a non-partial unique index of
+    // the referenced table makes unique by themselves. `<@` is qualified:
+    // with `intarray` installed in the search path, a bare `smallint[] <@
+    // smallint[]` is "operator is not unique" (its `int4[]` operator against
+    // the built-in `anyarray` one).
     let mut unindexed = HashMap::new();
     for row in scratch.client().query(
         "SELECT k.conname::text, n.nspname::text, c.relname::text, \
@@ -1479,13 +1481,23 @@ fn foreign_key_expectations(
                 (SELECT bool_or(i.indpred IS NULL) FROM pg_catalog.pg_index i \
                  JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid \
                  JOIN pg_catalog.pg_am am ON am.oid = ic.relam \
+                 CROSS JOIN LATERAL (SELECT ARRAY( \
+                     SELECT u.x FROM unnest((i.indkey::int2[])[0:i.indnkeyatts - 1]) \
+                         WITH ORDINALITY u(x, ord) \
+                     WHERE u.ord < coalesce((SELECT min(v.ord) \
+                         FROM unnest((i.indkey::int2[])[0:i.indnkeyatts - 1]) \
+                             WITH ORDINALITY v(y, ord) \
+                         WHERE NOT (v.y = ANY (k.conkey))), 2147483647)) AS lead) l \
                  WHERE i.indrelid = k.conrelid \
-                   AND (am.amname = 'btree' \
-                        OR (am.amname = 'hash' AND cardinality(k.conkey) = 1)) \
-                   AND i.indnkeyatts >= cardinality(k.conkey) \
-                   AND (SELECT array_agg(x ORDER BY x) FROM unnest(k.conkey) x) \
-                     = (SELECT array_agg(x ORDER BY x) FROM unnest( \
-                          (i.indkey::int2[])[0:cardinality(k.conkey) - 1]) x)) \
+                   AND am.amname IN ('btree', 'hash') \
+                   AND cardinality(l.lead) > 0 \
+                   AND (k.conkey OPERATOR(pg_catalog.<@) l.lead \
+                        OR EXISTS (SELECT FROM pg_catalog.pg_index ui \
+                            WHERE ui.indrelid = k.confrelid AND ui.indisunique \
+                              AND ui.indpred IS NULL AND ui.indnkeyatts > 0 \
+                              AND (ui.indkey::int2[])[0:ui.indnkeyatts - 1] OPERATOR(pg_catalog.<@) ARRAY( \
+                                  SELECT p.pk FROM unnest(k.conkey, k.confkey) p(fk, pk) \
+                                  WHERE p.fk = ANY (l.lead))))) \
          FROM pg_catalog.pg_constraint k \
          JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
          JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \

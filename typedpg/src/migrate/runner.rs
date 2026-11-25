@@ -202,6 +202,31 @@ pub async fn revert(
     }
 }
 
+/// Reverts the last applied migration — the last one of the source the
+/// tracking table records — and returns its name.
+///
+/// Like [`revert`], under the advisory lock; the migration is chosen under
+/// it too, so a run applying migrations meanwhile cannot make this revert
+/// one that is no longer the last.
+///
+/// # Errors
+///
+/// - [`Error::Migration`](crate::Error::Migration) if no migration of the
+///   source is applied, or as [`revert`].
+/// - [`Error::Database`](crate::Error::Database) on connection or lock errors.
+pub async fn revert_last(
+    client: &mut Client,
+    source: &MigrationSource,
+    force: bool,
+    config: &MigrationsConfig,
+) -> Result<String, crate::Error> {
+    let input = machine_input(source, config, Action::Revert { name: None, force });
+    match drive(client, input).await? {
+        Outcome::Reverted(name) => Ok(name),
+        outcome => Err(unexpected(&outcome)),
+    }
+}
+
 /// Records an applied migration's current file as applied, without running
 /// it.
 ///
@@ -361,6 +386,7 @@ fn describe_db_error(error: &tokio_postgres::Error) -> DbError {
             position: None,
             internal_position: None,
             internal_query: None,
+            context: None,
         };
     };
     use tokio_postgres::error::ErrorPosition;
@@ -380,6 +406,7 @@ fn describe_db_error(error: &tokio_postgres::Error) -> DbError {
         position,
         internal_position,
         internal_query,
+        context: db.where_().map(str::to_string),
     }
 }
 

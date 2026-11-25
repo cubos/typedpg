@@ -302,6 +302,8 @@ export interface MachineDbError {
   readonly position: number | null;
   readonly internalPosition: number | null;
   readonly internalQuery: string | null;
+  /** The CONTEXT field (`where`): where in a function or `DO` block it failed. */
+  readonly context: string | null;
 }
 
 /** The driver's answer to the step it was given. */
@@ -441,6 +443,7 @@ function encodeReply(reply: MachineReply): Uint8Array {
       writer.optionalU32(error.position);
       writer.optionalU32(error.internalPosition);
       writer.optionalString(error.internalQuery);
+      writer.optionalString(error.context);
       break;
     }
   }

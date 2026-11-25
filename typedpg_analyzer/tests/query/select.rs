@@ -1352,6 +1352,178 @@ fn database_qualified_names_are_cross_database_references() {
     );
 }
 
+/// `schema.table.column` (and `schema.table.*`) reaches only a FROM entry
+/// scanning that very relation under its own name: an aliased entry, an
+/// entry of the same name from another schema, a CTE or the target of an
+/// aliased UPDATE is PG's `invalid reference to FROM-clause entry` (or a
+/// `missing FROM-clause entry` when nothing is named so), never a match.
+#[test]
+fn schema_qualified_column_names_its_relation() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT x.users.id FROM users",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "SELECT pg_catalog.users.id FROM users",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "SELECT u.u.id FROM users u",
+            "invalid reference to FROM-clause entry for table \"u\"",
+        ),
+        (
+            "SELECT public.users.id FROM users u",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "SELECT public.users.id FROM users users",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "SELECT public.users.id FROM (users JOIN posts ON true) j",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "WITH users AS (SELECT 1 AS id) SELECT public.users.id FROM users",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "SELECT public.nosuch.id FROM users",
+            "missing FROM-clause entry for table \"nosuch\"",
+        ),
+        (
+            "SELECT x.users.* FROM users",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "SELECT row_to_json(public.users.*) FROM users u",
+            "invalid reference to FROM-clause entry for table \"users\"",
+        ),
+        (
+            "UPDATE posts p SET title = 'x' RETURNING old.p.title",
+            "invalid reference to FROM-clause entry for table \"p\"",
+        ),
+        (
+            "UPDATE posts p SET title = 'x' RETURNING public.posts.title",
+            "invalid reference to FROM-clause entry for table \"posts\"",
+        ),
+        (
+            "UPDATE posts SET title = 'x' RETURNING public.old.title",
+            "missing FROM-clause entry for table \"old\"",
+        ),
+        (
+            "MERGE INTO posts p USING users u ON p.user_id = u.id \
+             WHEN MATCHED THEN UPDATE SET title = u.name RETURNING new.u.name",
+            "invalid reference to FROM-clause entry for table \"u\"",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::UndefinedTable(_), msg);
+    }
+    assert_err_prefix!(
+        db.analyze("SELECT public.users.nosuch FROM users"),
+        AnalyzeError::UndefinedColumn(_),
+        "column users.nosuch does not exist"
+    );
+    // The relation's own entry, wherever it is: an inner entry merely
+    // named like it doesn't hide it.
+    for sql in [
+        "SELECT public.users.id, public.users.* FROM users",
+        "SELECT row_to_json(public.users.*) FROM users",
+        "SELECT public.users.id FROM users JOIN posts ON posts.user_id = users.id",
+        "SELECT (SELECT public.users.id FROM posts users LIMIT 1) FROM users",
+        "SELECT x.id FROM users, LATERAL (SELECT public.users.id) x",
+        "UPDATE posts SET title = 'x' RETURNING public.posts.title",
+        "INSERT INTO posts (user_id, title) VALUES (1, 'x') \
+         ON CONFLICT (id) DO UPDATE SET title = public.posts.title RETURNING public.posts.id",
+    ] {
+        db.analyze(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let q = db
+        .analyze("SELECT (SELECT public.users.name FROM posts users LIMIT 1) FROM users")
+        .unwrap();
+    assert_eq!(q.columns[0].pg_type, text());
+}
+
+/// checkNameSpaceConflicts: two different relations named without an alias
+/// may share a name (`public.t, s2.t`). Their columns resolve unqualified
+/// or schema-qualified; the bare name is an ambiguous table reference.
+#[test]
+fn same_named_relations_of_two_schemas_in_one_from() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b TEXT NOT NULL);
+         CREATE SCHEMA s2;
+         CREATE TABLE s2.t (id INT PRIMARY KEY, q TEXT);
+         CREATE SCHEMA s3;
+         CREATE TABLE s3.t (id INT PRIMARY KEY, r INT NOT NULL);",
+    )
+    .unwrap();
+    let q = db
+        .analyze("SELECT b, q, public.t.a, s2.t.id FROM public.t, s2.t")
+        .unwrap();
+    assert_cols(
+        &q,
+        vec![
+            c("b", text()),
+            cn("q", text()),
+            cn("a", int4()),
+            c("id", int4()),
+        ],
+    );
+    let q = db
+        .analyze("SELECT s2.t.q FROM public.t LEFT JOIN s2.t ON public.t.id = s2.t.id")
+        .unwrap();
+    assert_cols(&q, vec![cn("q", text())]);
+    let q = db.analyze("SELECT * FROM public.t, s2.t, s3.t").unwrap();
+    assert_eq!(q.columns.len(), 7);
+    for (sql, msg) in [
+        (
+            "SELECT t.id FROM public.t, s2.t",
+            "table reference \"t\" is ambiguous",
+        ),
+        (
+            "SELECT t.* FROM public.t, s2.t",
+            "table reference \"t\" is ambiguous",
+        ),
+        (
+            "UPDATE public.t SET a = 1 FROM s2.t WHERE t.id = 1",
+            "table reference \"t\" is ambiguous",
+        ),
+        (
+            "SELECT id FROM public.t, s2.t",
+            "column reference \"id\" is ambiguous",
+        ),
+        // The same relation twice, or an alias, still conflicts.
+        (
+            "SELECT 1 FROM public.t, s2.t, public.t",
+            "table name \"t\" specified more than once",
+        ),
+        (
+            "SELECT 1 FROM public.t, s2.t t",
+            "table name \"t\" specified more than once",
+        ),
+        (
+            "SELECT 1 FROM public.t t, s2.t",
+            "table name \"t\" specified more than once",
+        ),
+        // The primary key grouped is the other relation's.
+        (
+            "SELECT s2.t.q FROM public.t, s2.t GROUP BY public.t.id",
+            "column \"t.q\" must appear in the GROUP BY clause",
+        ),
+    ] {
+        let e = db.analyze(sql).unwrap_err().to_string();
+        assert!(
+            e.starts_with(msg),
+            "{sql}\n  expected: {msg}\n       got: {e}"
+        );
+    }
+    db.analyze("SELECT public.t.b FROM public.t, s2.t GROUP BY public.t.id")
+        .unwrap();
+}
+
 /// A database-qualified relation (`db.schema.rel`) in FROM or as a DML
 /// target is a cross-database reference like any other catalog qualifier.
 #[test]

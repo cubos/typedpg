@@ -20,9 +20,11 @@ use typedpg_core::loader_cache::{
 /// The identity the old TypeScript implementation produced for the fixture.
 const EXPECTED_IDENTITY: &str = "0c5150f3a5595a50853b2ee0e72de02671b22bf714ac5e86161ddadb89e4db0b";
 
-/// The key it produced for `q/users.sql`, at version 0.5.0: the key holds
-/// the version, so a release changes it on purpose.
+/// The key it produced for `q/users.sql`, at version 0.5.0 and format
+/// `typedpg-cache-1`: the key holds both, so a release or a new format
+/// changes it on purpose.
 const EXPECTED_KEY_VERSION: &str = "0.5.0";
+const EXPECTED_KEY_FORMAT: &str = "typedpg-cache-1";
 const EXPECTED_KEY: &str = "52cbab702fbc9a811464ba8661d29b45f6a85378c717c294a99e92e60f545d63";
 
 fn fixture() -> PathBuf {
@@ -69,6 +71,7 @@ fn the_new_recipe_matches_the_old_typescript_one() {
     let sql = root.join("q/users.sql");
     let content = std::fs::read_to_string(&sql).unwrap();
     let old = old_key(
+        typedpg_core::loader_cache::FORMAT,
         env!("CARGO_PKG_VERSION"),
         &old_identity,
         "q/users.sql",
@@ -77,7 +80,13 @@ fn the_new_recipe_matches_the_old_typescript_one() {
     let new_key = key(&new_identity, "q/users.sql", &content);
     assert_eq!(new_key, old);
     assert_eq!(
-        old_key(EXPECTED_KEY_VERSION, &old_identity, "q/users.sql", &content),
+        old_key(
+            EXPECTED_KEY_FORMAT,
+            EXPECTED_KEY_VERSION,
+            &old_identity,
+            "q/users.sql",
+            &content
+        ),
         EXPECTED_KEY
     );
 }
@@ -177,9 +186,15 @@ fn old_schema_identity(config: &[u8], databases: &[(String, Vec<PathBuf>)]) -> S
     hex(&h.finalize())
 }
 
-fn old_key(version: &str, identity: &str, relative_path: &str, content: &str) -> String {
+fn old_key(
+    format: &str,
+    version: &str,
+    identity: &str,
+    relative_path: &str,
+    content: &str,
+) -> String {
     let mut h = Sha256::new();
-    for part in ["typedpg-cache-1", version, identity, relative_path, content] {
+    for part in [format, version, identity, relative_path, content] {
         h.update(part.as_bytes());
         h.update(b"\n");
     }

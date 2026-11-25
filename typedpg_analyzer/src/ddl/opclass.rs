@@ -389,6 +389,7 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
         ));
     }
     let storage = storage_type(interp, &am, &stmt.items, intype)?;
+    let (family_name_for_order, am_for_order) = (family_name.clone(), am.clone());
     let oid = PgOpclassOid::from_nonzero(interp.alloc_oid()?);
     // The class depends on its family, and goes with it (DEPENDENCY_AUTO).
     let family = super::depend::named_address_of(
@@ -424,9 +425,17 @@ pub fn create_opclass(interp: &mut PgCatalog, stmt: &CreateOpClassStmt) -> Resul
     );
     // Its operators and support functions: hard members tie the class to
     // them (see opfamily_members).
+    let ordering = ordering_members(
+        interp,
+        &family_key,
+        (&family_name_for_order, family_ns, &am_for_order),
+        &stmt.items,
+        Some(intype),
+    )?;
     let mut members: Vec<super::opfamily_members::FamilyMember> = ops
         .iter()
         .map(|op| super::opfamily_members::operator_member(&family_key, op))
+        .chain(ordering)
         .chain(funcs)
         .collect();
     super::opfamily_members::adjust(
@@ -487,9 +496,10 @@ fn storage_type(
 
 /// DefineOpClass / AlterOpFamilyAdd: an `OPERATOR n name [(left, right)]`
 /// item becomes a search member (`pg_amop`) of the family — its operand
-/// types default to the opclass's input type. `FOR ORDER BY` operators and
-/// FUNCTION / STORAGE items are not recorded. The strategy number must be
-/// in the access method's range, and the operator must exist.
+/// types default to the opclass's input type — or, with `ordering`, a
+/// `FOR ORDER BY` one is resolved (a member of the family, not a search
+/// operator); FUNCTION / STORAGE items are not. The strategy number must
+/// be in the access method's range, and the operator must exist.
 fn family_operator(
     interp: &PgCatalog,
     family: &str,
@@ -497,6 +507,7 @@ fn family_operator(
     am: &str,
     item: &CreateOpClassItem,
     intype: Option<PgTypeOid>,
+    ordering: bool,
 ) -> Result<Option<PgAmop>, DdlError> {
     // OPCLASS_ITEM_OPERATOR.
     if item.itemtype != 1 {
@@ -519,8 +530,8 @@ fn family_operator(
             "operator argument types must be specified in ALTER OPERATOR FAMILY".into(),
         ));
     }
-    // Not FOR ORDER BY.
-    if !item.order_family.is_empty() {
+    // FOR ORDER BY or not, as asked.
+    if item.order_family.is_empty() == ordering {
         return Ok(None);
     }
     let (opr, left, right) = if owa.objargs.is_empty() {
@@ -616,12 +627,43 @@ fn family_operators(
     items: &[Option<typedpg_pg_query::ast::Node>],
     intype: Option<PgTypeOid>,
 ) -> Result<Vec<PgAmop>, DdlError> {
+    family_operators_for(interp, family, family_ns, am, items, intype, false)
+}
+
+/// The `FOR ORDER BY` OPERATOR items: ordering members of the family
+/// (`amoppurpose = 'o'`), which it holds and depends on like its search
+/// ones, but no search operators.
+fn ordering_members(
+    interp: &PgCatalog,
+    family_key: &super::opfamily_members::FamilyKey,
+    (family, family_ns, am): (&str, PgNamespaceOid, &str),
+    items: &[Option<typedpg_pg_query::ast::Node>],
+    intype: Option<PgTypeOid>,
+) -> Result<Vec<super::opfamily_members::FamilyMember>, DdlError> {
+    Ok(
+        family_operators_for(interp, family, family_ns, am, items, intype, true)?
+            .iter()
+            .map(|op| super::opfamily_members::operator_member(family_key, op))
+            .collect(),
+    )
+}
+
+fn family_operators_for(
+    interp: &PgCatalog,
+    family: &str,
+    family_ns: PgNamespaceOid,
+    am: &str,
+    items: &[Option<typedpg_pg_query::ast::Node>],
+    intype: Option<PgTypeOid>,
+    ordering: bool,
+) -> Result<Vec<PgAmop>, DdlError> {
     let mut ops: Vec<PgAmop> = Vec::new();
     for item in items {
         let Some(ast::Node::CreateOpClassItem(item)) = item.as_ref() else {
             continue;
         };
-        let Some(op) = family_operator(interp, family, family_ns, am, item, intype)? else {
+        let Some(op) = family_operator(interp, family, family_ns, am, item, intype, ordering)?
+        else {
             continue;
         };
         if ops.iter().any(|o| same_member(o, &op)) {
@@ -708,9 +750,17 @@ pub fn alter_opfamily(interp: &mut PgCatalog, stmt: &AlterOpFamilyStmt) -> Resul
                 )));
             }
         }
+        let ordering = ordering_members(
+            interp,
+            &family_key,
+            (&family, family_ns, &stmt.amname),
+            &stmt.items,
+            None,
+        )?;
         let mut members: Vec<super::opfamily_members::FamilyMember> = ops
             .iter()
             .map(|op| super::opfamily_members::operator_member(&family_key, op))
+            .chain(ordering)
             .chain(funcs)
             .collect();
         super::opfamily_members::adjust(
@@ -1164,10 +1214,16 @@ pub(crate) fn resolve_opclass(
         };
         return Ok(found.oid);
     }
+    // ResolveOpClass: LookupExplicitNamespace, then the class, named as
+    // written (NameListToString).
     let (schema, name) = split_name(opclass);
+    if let Some(schema) = &schema {
+        super::util::existing_namespace(interp, schema)?;
+    }
     let Some(found) = find_opclass(interp, schema.as_deref(), &name, am) else {
         return Err(DdlError::TypeNotFound(format!(
-            "operator class \"{name}\" does not exist for access method \"{am}\""
+            "operator class \"{}\" does not exist for access method \"{am}\"",
+            written(opclass)
         )));
     };
     check_opclass_accepts(interp, found, typ)?;

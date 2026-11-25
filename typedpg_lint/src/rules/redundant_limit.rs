@@ -16,6 +16,44 @@ use super::limit_without_order::implicit_fetch;
 use crate::{Ctx, RawFinding, SqlEdit};
 
 pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
+    // The statement's own SELECT, and whether it can raise nothing: a
+    // subquery's LIMIT keeps the planner from pulling it up into the
+    // query around it, where a constant it outputs is folded into that
+    // query's expressions at plan time (`SELECT x::int2 FROM (SELECT 40000
+    // AS x LIMIT 1) s WHERE false` succeeds, and fails without the LIMIT).
+    let root = match ctx.tree.stmts.first().and_then(|raw| raw.stmt.as_ref()) {
+        Some(ast::Node::SelectStmt(select)) => Some(&**select),
+        _ => None,
+    };
+    // Computed once, and only for a merged subquery's LIMIT.
+    let root_error_free = std::cell::OnceCell::new();
+    let root_error_free = || {
+        *root_error_free.get_or_init(|| {
+            root.is_some_and(|select| ctx.view.select_is_error_free(ctx.catalog, select))
+        })
+    };
+    // The selects the planner may merge into the query around them: a FROM
+    // subquery, a CTE, an `EXISTS` / `IN` subquery (a scalar subquery is
+    // never merged).
+    let mut mergeable: Vec<*const ast::SelectStmt> = Vec::new();
+    for (node, _) in ctx.tree.nodes() {
+        let inner = match node {
+            NodeRef::RangeSubselect(sub) => sub.subquery.as_ref(),
+            NodeRef::CommonTableExpr(cte) => cte.ctequery.as_ref(),
+            NodeRef::SubLink(link)
+                if matches!(
+                    link.sub_link_type,
+                    ast::SubLinkType::ExistsSublink | ast::SubLinkType::AnySublink
+                ) =>
+            {
+                link.subselect.as_ref()
+            }
+            _ => None,
+        };
+        if let Some(ast::Node::SelectStmt(select)) = inner {
+            mergeable.push(&**select);
+        }
+    }
     let mut out = Vec::new();
     for (node, _) in ctx.tree.nodes() {
         let NodeRef::SelectStmt(select) = node else {
@@ -39,7 +77,9 @@ pub(super) fn findings(ctx: &Ctx<'_>) -> Vec<RawFinding> {
         // Removing LIMIT lets PG evaluate the rest of the query on rows the
         // scan previously stopped before, so withhold the fix when an
         // expression of the select could raise on one of them.
-        let error_free = ctx.view.select_is_error_free(ctx.catalog, select);
+        let merged = mergeable.contains(&std::ptr::from_ref(select));
+        let error_free =
+            ctx.view.select_is_error_free(ctx.catalog, select) && (!merged || root_error_free());
         let message = match (clause.fetch, clause.count.clone()) {
             (None, Some(count)) => format!(
                 "LIMIT {} has no effect: the query returns at most one row",
@@ -297,6 +337,115 @@ mod tests {
     }
 
     #[test]
+    fn a_join_onto_a_single_row_side_is_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE memberships (
+                org text NOT NULL,
+                email text NOT NULL,
+                PRIMARY KEY (org, email)
+             );",
+        )
+        .unwrap();
+        // A one-row side, and the joined table's key pinned by its column:
+        // the join adds at most one row.
+        for sql in [
+            "SELECT u.id FROM (SELECT $email::text AS p) q \
+             LEFT JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $email::text AS p) q \
+             JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $email::text AS p) q, users u \
+             WHERE u.email = q.p LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(&sql[findings[0].span.clone()], "LIMIT 1", "{sql}");
+            assert_eq!(
+                findings[0].message, "LIMIT 1 has no effect: the query returns at most one row",
+                "{sql}"
+            );
+        }
+        // One column of a composite key, a side that may have many rows, a
+        // non-unique column, a FULL join and a set-returning function on the
+        // one-row side keep the LIMIT.
+        for sql in [
+            "SELECT m.email FROM (SELECT $email::text AS p) q \
+             JOIN memberships m ON m.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT email AS p FROM users) q \
+             JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $name::text AS p) q \
+             JOIN users u ON u.name = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT $email::text AS p) q \
+             FULL JOIN users u ON u.email = q.p LIMIT 1",
+            "SELECT u.id FROM (SELECT unnest(ARRAY[$email::text]) AS p) q \
+             JOIN users u ON u.email = q.p LIMIT 1",
+        ] {
+            assert!(limit_findings(&db, sql).is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_outer_join_onto_a_join_of_determined_rows_is_one_row() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TABLE principals (id bigint PRIMARY KEY, label text);
+             CREATE TABLE profiles (
+                id bigint PRIMARY KEY,
+                principal_id bigint NOT NULL UNIQUE,
+                bio text
+             );
+             CREATE TABLE profile_settings (profile_id bigint PRIMARY KEY, theme text);
+             CREATE TABLE loose_profiles (principal_id bigint NOT NULL, bio text);",
+        )
+        .unwrap();
+        // A one-row side pins `u`'s key, `u`'s key the profile's unique
+        // column: every relation of the nullable join tree is one row.
+        for sql in [
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT s.theme FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN ((principals u JOIN profiles pr ON pr.principal_id = u.id) \
+                        JOIN profile_settings s ON s.profile_id = pr.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u LEFT JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             RIGHT JOIN (SELECT $1::bigint AS p) q ON u.id = q.p LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+            assert_eq!(
+                findings[0].message, "LIMIT 1 has no effect: the query returns at most one row",
+                "{sql}"
+            );
+        }
+        // A non-unique nested join column, a FULL join inside, a preserved
+        // side with many rows and an `ON` pinning one relation only keep the
+        // LIMIT.
+        for sql in [
+            "SELECT lp.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN loose_profiles lp ON lp.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u FULL JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.p LIMIT 1",
+            "SELECT pr.bio FROM principals q \
+             LEFT JOIN (principals u JOIN profiles pr ON pr.principal_id = u.id) \
+             ON u.id = q.id LIMIT 1",
+            "SELECT pr.bio FROM (SELECT $1::bigint AS p) q \
+             LEFT JOIN (principals u JOIN profiles pr ON true) ON u.id = q.p LIMIT 1",
+        ] {
+            assert!(
+                limit_findings(&db, sql).is_empty(),
+                "{sql}: {:?}",
+                limit_findings(&db, sql)
+            );
+        }
+    }
+
+    #[test]
     fn aggregates_and_from_less_selects_are_one_row() {
         let db = catalog();
         let sql = "SELECT count(*) FROM users LIMIT 10";
@@ -407,6 +556,20 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_limit_under_a_query_that_may_raise_keeps_its_fix_withheld() {
+        let db = catalog();
+        // Without the LIMIT the subquery is pulled up and `40000::int2`
+        // folded at plan time: an error, even with no row to return.
+        let sql = "SELECT x::int2 AS y FROM (SELECT 40000 AS x LIMIT 1) s WHERE false";
+        let findings: Vec<_> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::RedundantLimit)
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
+    }
+
+    #[test]
     fn a_limit_that_can_change_the_rows_is_kept() {
         let db = catalog();
         for sql in [
@@ -469,6 +632,67 @@ mod tests {
          ) AS arr FROM exact_rows x WHERE x.id = 1";
         let findings = limit_findings(&db, exact);
         assert_eq!(findings.len(), 1, "{findings:?}");
+    }
+
+    #[test]
+    fn a_key_pinned_through_an_injective_cast_to_text_makes_the_limit_redundant() {
+        let mut db = catalog();
+        db.apply_sql(
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+             CREATE TABLE nodes (
+                id bigint PRIMARY KEY,
+                version_id uuid NOT NULL,
+                lineage_id uuid NOT NULL,
+                amount numeric UNIQUE,
+                flag boolean UNIQUE,
+                mood mood UNIQUE,
+                label varchar(20) UNIQUE,
+                code char(4) UNIQUE,
+                ratio float8 UNIQUE,
+                day date UNIQUE,
+                UNIQUE (version_id, lineage_id)
+             );",
+        )
+        .unwrap();
+        for sql in [
+            "SELECT id FROM nodes WHERE version_id::text = $v AND lineage_id::text = $l LIMIT 1",
+            "SELECT id FROM nodes WHERE id::text = $i LIMIT 1",
+            "SELECT id FROM nodes WHERE amount::text = '1.50' LIMIT 1",
+            "SELECT id FROM nodes WHERE flag::text = 'false' LIMIT 1",
+            "SELECT id FROM nodes WHERE mood::text = $m LIMIT 1",
+            "SELECT id FROM nodes WHERE label::text = $s LIMIT 1",
+            "SELECT id FROM nodes WHERE code::text = 'ab' LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert_eq!(findings.len(), 1, "{sql}: {findings:?}");
+        }
+        for sql in [
+            // Session-dependent text forms.
+            "SELECT id FROM nodes WHERE ratio::text = $s LIMIT 1",
+            "SELECT id FROM nodes WHERE day::text = $s LIMIT 1",
+            // A cast that rounds, or a typmod that truncates.
+            "SELECT id FROM nodes WHERE amount::int4 = 2 LIMIT 1",
+            "SELECT id FROM nodes WHERE label::varchar(1) = 'a' LIMIT 1",
+            // Half of the composite key.
+            "SELECT id FROM nodes WHERE version_id::text = $v LIMIT 1",
+        ] {
+            let findings = limit_findings(&db, sql);
+            assert!(findings.is_empty(), "{sql}: {findings:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_on_a_union_all_of_mutually_exclusive_rows_is_redundant() {
+        let db = catalog();
+        let sql = "WITH found AS (SELECT id FROM users WHERE email = $1) \
+                   SELECT id FROM users WHERE id = $2 AND EXISTS (SELECT 1 FROM found) \
+                   UNION ALL \
+                   SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM found) \
+                   LIMIT 1";
+        assert_eq!(limit_findings(&db, sql).len(), 1);
+        // Both branches may return their row.
+        let both = sql.replace("NOT EXISTS", "EXISTS");
+        assert!(limit_findings(&db, &both).is_empty());
     }
 
     #[test]

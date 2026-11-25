@@ -20,8 +20,8 @@ use typedpg_pg_query::ast::{self, CreateTableAsStmt, ObjectType, ViewStmt};
 use crate::oid::{PgClassOid, PgGenericOid, PgNamespaceOid, PgProcOid, PgRewriteOid, PgTypeOid};
 use crate::pg_catalog::{
     AstBinding, DepType, EvEnabled, EvType, PG_CLASS_RELID, PG_PROC_RELID, PG_TYPE_RELID,
-    PgAttribute, PgClass, PgDepend, PgRewrite, PgType, RelKind, SerializedAst, TypCategory,
-    TypStorage, TypType,
+    PgAttribute, PgClass, PgRewrite, PgType, RelKind, SerializedAst, TypCategory, TypStorage,
+    TypType,
 };
 
 use super::DdlError;
@@ -415,6 +415,11 @@ fn create_relation_as(
                  temporary {object}.)"
             )));
         }
+        if rv.relpersistence == "u" {
+            return Err(DdlError::UnsupportedDdl(
+                "materialized views cannot be unlogged".into(),
+            ));
+        }
     }
     if aliases.len() > resolved.columns.len() {
         return Err(DdlError::Parse(
@@ -709,20 +714,11 @@ pub fn refresh_materialized_view(
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
     };
-    let (schema, name) = super::util::range_var_names(rv, interp);
-    let class = interp
-        .namespace_oid(&schema)
-        .and_then(|ns| interp.class_by_qname.get(&(ns, name.clone())))
-        .and_then(|oid| interp.pg_class.get(oid));
-    match class {
-        None => Err(DdlError::TableNotFound(format!(
-            "relation \"{}\" does not exist",
-            if rv.schemaname.is_empty() {
-                name
-            } else {
-                crate::qualified_name::QualifiedName::new(&schema, &name).to_string()
-            }
-        ))),
+    // RangeVarGetRelidExtended: a missing schema, then a missing relation
+    // named as written.
+    let (_, relid) = super::util::lookup_relation(interp, rv)?;
+    match interp.pg_class.get(&relid) {
+        None => Err(DdlError::Internal(format!("relation oid {relid} missing"))),
         Some(c) if c.relkind != RelKind::MaterializedView => Err(DdlError::Parse(format!(
             "\"{}\" is not a materialized view",
             c.relname
@@ -941,6 +937,7 @@ fn install_relation(
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
     let phys = super::types::TypePhysical::array(interp, composite_oid);
     let array_name = super::types::make_array_type_name(interp, nsoid, &name);
@@ -964,6 +961,7 @@ fn install_relation(
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     // CREATE TABLE AS stores the query's rows, not the query: the table
@@ -988,55 +986,30 @@ fn install_relation(
 }
 
 /// Record the view's `pg_depend` edges: one row per column it reads, per whole
-/// relation it reads, per function it calls, and per named type it references.
-/// DROP of any referenced object without CASCADE must reject while the view is
-/// reachable through these edges.
+/// relation it reads (but for one it reads a column of:
+/// eliminate_duplicate_dependencies), per function it calls, and what else
+/// its analysis noted (a type only where a node of it is built: a cast to
+/// the type a value already has builds none) — all recorded at once, as recordDependencyOnExpr
+/// records its query's. DROP of any referenced object without CASCADE must
+/// reject while the view is reachable through these edges.
 fn record_view_dependencies(interp: &mut PgCatalog, class_oid: PgClassOid, deps: &ViewDeps) {
-    let class_obj = PgGenericOid::from_nonzero(class_oid.into_nonzero());
-    let dep = |refclassid: PgClassOid, refobjid: PgGenericOid, refobjsubid: i16| PgDepend {
-        classid: PG_CLASS_RELID,
-        objid: class_obj,
-        objsubid: 0,
-        refclassid,
-        refobjid,
-        refobjsubid,
-        deptype: DepType::Normal,
-    };
-    let mut whole_recorded = std::collections::HashSet::new();
-    for (refrelid, refattnum) in &deps.column_refs {
-        interp.add_dependency(dep(
-            PG_CLASS_RELID,
-            PgGenericOid::from_nonzero(refrelid.into_nonzero()),
-            *refattnum,
-        ));
-    }
-    for refrelid in &deps.relation_refs {
-        if whole_recorded.insert(*refrelid) {
-            interp.add_dependency(dep(
-                PG_CLASS_RELID,
-                PgGenericOid::from_nonzero(refrelid.into_nonzero()),
-                0,
-            ));
-        }
-    }
-    for proc_oid in &deps.function_refs {
-        interp.add_dependency(dep(
-            PG_PROC_RELID,
-            PgGenericOid::from_nonzero(proc_oid.into_nonzero()),
-            0,
-        ));
-    }
-    for type_oid in &deps.type_refs {
-        interp.add_dependency(dep(
-            PG_TYPE_RELID,
-            PgGenericOid::from_nonzero(type_oid.into_nonzero()),
-            0,
-        ));
-    }
-    super::depend::record_references(
+    use super::depend::ObjectAddress;
+    let mut referenced: Vec<ObjectAddress> = deps
+        .column_refs
+        .iter()
+        .map(|(rel, attnum)| ObjectAddress::column(*rel, *attnum))
+        .chain(
+            deps.relation_refs
+                .iter()
+                .map(|rel| ObjectAddress::relation(*rel)),
+        )
+        .chain(deps.function_refs.iter().map(|p| ObjectAddress::proc(*p)))
+        .collect();
+    referenced.extend(super::depend::reference_addresses(interp, &deps.references));
+    super::depend::record(
         interp,
-        super::depend::ObjectAddress::relation(class_oid),
-        &deps.references,
+        ObjectAddress::relation(class_oid),
+        referenced,
         DepType::Normal,
     );
 }
@@ -1136,6 +1109,36 @@ fn resolve_view_now(
     planned: bool,
 ) -> Result<ResolvedView, DdlError> {
     resolve_view_with_params(snapshot, query_node, aliases, &[], planned)
+}
+
+/// The output columns of a view: type, typmod, collation, NOT NULL.
+#[cfg(feature = "pg_sanity")]
+pub(crate) type ViewColumns = Vec<(
+    PgTypeOid,
+    Option<i32>,
+    Option<crate::oid::PgCollationOid>,
+    bool,
+)>;
+
+/// What CREATE VIEW makes of `query` (for the catalog oracle): each output
+/// column's type, typmod, collation and NOT NULL, and what it binds to (as
+/// `view_references` keeps it) — resolved as a migration's CREATE VIEW
+/// resolves it (no SQL body inlined, no execution error reported).
+#[cfg(feature = "pg_sanity")]
+pub(crate) fn view_shape(
+    interp: &PgCatalog,
+    query: &ast::Node,
+) -> Result<(ViewColumns, Vec<super::depend::Reference>), DdlError> {
+    let view = crate::expr::inline::resolving_only(|| {
+        crate::resolve::without_execution(|| resolve_view_now(interp, query, &[], false))
+    })?;
+    Ok((
+        view.columns
+            .iter()
+            .map(|c| (c.type_oid, c.typmod, c.collation, c.not_null))
+            .collect(),
+        bound_references(interp, &view.deps.references),
+    ))
 }
 
 /// [`resolve_view_now`] for a query whose `$n` have types (a prepared
@@ -1410,6 +1413,23 @@ impl BindingWalker {
             // are expressions of their own (a function under an indirection
             // is recorded like any other).
             ast::Node::AIndirection(ind) => {
+                // `(t).c` on the whole row of FROM item `t` (no column is
+                // named `t`: transformColumnRef prefers one) is its column
+                // `c` — ParseComplexProjection turns it into that column's
+                // Var — not a read of the whole row.
+                if let Some(ast::Node::ColumnRef(cr)) = ind.arg.as_ref()
+                    && let [Some(ast::Node::String(row))] = cr.fields.as_slice()
+                    && let Some(Some(ast::Node::String(field))) = ind.indirection.first()
+                    && resolve_column_unqualified(&row.sval, snapshot, stack).is_none()
+                    && let Some((relid, attnum)) =
+                        resolve_column_aliased(&row.sval, &field.sval, snapshot, stack)
+                {
+                    self.bindings.push(AstBinding::Column(relid, attnum));
+                    for step in ind.indirection.iter().skip(1).flatten() {
+                        self.walk_node(step, snapshot, stack);
+                    }
+                    return;
+                }
                 if let Some(arg) = ind.arg.as_ref() {
                     self.walk_node(arg, snapshot, stack);
                 }
@@ -2292,34 +2312,91 @@ pub(crate) fn view_updatability(interp: &PgCatalog, query: &ast::Node) -> ViewUp
         }
         Err(not_a_column)
     };
+    // The column a target list entry is (view_col_is_auto_updatable: a
+    // Var of the base relation once transformed).
+    fn target_column(
+        interp: &PgCatalog,
+        node: Option<&ast::Node>,
+        alias: &str,
+        base_attrs: &[crate::pg_catalog::PgAttribute],
+        column: &dyn Fn(&str, bool) -> Result<i16, &'static str>,
+        not_a_column: &'static str,
+    ) -> Result<i16, &'static str> {
+        match node {
+            Some(ast::Node::ColumnRef(cr)) => {
+                let parts: Vec<&str> = cr
+                    .fields
+                    .iter()
+                    .filter_map(|n| super::util::node_string(n.as_ref()))
+                    .collect();
+                match parts.as_slice() {
+                    [name] => column(name, false),
+                    [_, name] | [_, _, name] => column(name, true),
+                    _ => Err(not_a_column),
+                }
+            }
+            // ParseComplexProjection: a field of the whole row of the base
+            // relation (`(t).a`, the relation's name or alias not being a
+            // column's) is that column's Var.
+            Some(ast::Node::AIndirection(ind)) => {
+                let whole_row = matches!(ind.arg.as_ref(), Some(ast::Node::ColumnRef(cr))
+                    if matches!(cr.fields.as_slice(), [Some(ast::Node::String(s))]
+                        if s.sval == alias && !base_attrs.iter().any(|a| a.attname == alias)));
+                match ind.indirection.as_slice() {
+                    [Some(ast::Node::String(field))]
+                        if whole_row && base_attrs.iter().any(|a| a.attname == field.sval) =>
+                    {
+                        column(&field.sval, true)
+                    }
+                    _ => Err(not_a_column),
+                }
+            }
+            // coerce_type / coerce_type_typmod: a cast to the type and typmod
+            // the value already has builds nothing.
+            Some(ast::Node::TypeCast(tc)) => {
+                let attnum = target_column(
+                    interp,
+                    tc.arg.as_ref(),
+                    alias,
+                    base_attrs,
+                    column,
+                    not_a_column,
+                )?;
+                let attr = base_attrs.iter().find(|a| a.attnum == attnum);
+                let same = tc.type_name.as_ref().zip(attr).is_some_and(|(tn, attr)| {
+                    super::util::resolve_type_name(tn, interp) == Some(attr.atttypid)
+                        && crate::typmod::encode(interp, attr.atttypid, tn)
+                            .ok()
+                            .is_some_and(|t| t.is_none() || t == attr.atttypmod)
+                });
+                if same { Ok(attnum) } else { Err(not_a_column) }
+            }
+            _ => Err(not_a_column),
+        }
+    }
     let mut columns = Vec::new();
     for target in &sel.target_list {
         let Some(ast::Node::ResTarget(rt)) = target.as_ref() else {
             continue;
         };
-        let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref() else {
-            columns.push(Err(not_a_column));
-            continue;
-        };
-        let parts: Vec<&str> = cr
-            .fields
-            .iter()
-            .filter_map(|n| super::util::node_string(n.as_ref()))
-            .collect();
-        let star = matches!(
-            cr.fields.last().and_then(|f| f.as_ref()),
-            Some(ast::Node::AStar(_))
-        );
-        if star {
+        if let Some(ast::Node::ColumnRef(cr)) = rt.val.as_ref()
+            && matches!(
+                cr.fields.last().and_then(|f| f.as_ref()),
+                Some(ast::Node::AStar(_))
+            )
+        {
             // `*` / `alias.*`: every column of the base relation.
             columns.extend(base_attrs.iter().map(|a| Ok(a.attnum)));
             continue;
         }
-        columns.push(match parts.as_slice() {
-            [name] => column(name, false),
-            [_, name] | [_, _, name] => column(name, true),
-            _ => Err(not_a_column),
-        });
+        columns.push(target_column(
+            interp,
+            rt.val.as_ref(),
+            alias,
+            base_attrs,
+            &column,
+            not_a_column,
+        ));
     }
     ViewUpdatability {
         not_updatable: None,
@@ -2393,7 +2470,7 @@ pub(crate) fn sets_check_option(options: &[Option<ast::Node>]) -> bool {
 /// in the order it first did: each column by its attnum (a rename keeps
 /// it), each object once (the analysis looks some up again while
 /// narrowing).
-fn bound_references(
+pub(crate) fn bound_references(
     interp: &PgCatalog,
     references: &[super::depend::Reference],
 ) -> Vec<super::depend::Reference> {

@@ -34,7 +34,7 @@ use typedpg_core::config::MigrationsConfig;
 
 use crate::config::{OutKind, declaration_path};
 use crate::generate::{GenError, Generated};
-use crate::typemap::{RUNTIME_NS, js_string};
+use crate::typemap::{EnumNames, RUNTIME_NS, js_string};
 
 /// A query's or COPY target's text and what was generated for it.
 pub type Entry<'a> = (&'a str, &'a Result<Generated, GenError>);
@@ -62,6 +62,9 @@ pub struct Module<'a> {
     /// `(module, type name)` the type mappings need.
     pub imports: &'a [(String, String)],
     pub checks: &'a [TypeCheck],
+    /// The names the module gives the database's enums: it exports each of
+    /// the user's, and any other its types name.
+    pub enums: &'a EnumNames,
     pub queries: &'a [Entry<'a>],
     pub copies: &'a [Entry<'a>],
     pub migrations: Option<Embedded<'a>>,
@@ -114,6 +117,7 @@ impl Module<'_> {
         let _ = writeln!(out, "import {{ {} }} from {runtime};", values.join(", "));
         self.type_imports(&mut out);
         out.push('\n');
+        self.enum_types(&mut out);
         self.type_checks(&mut out);
         self.interfaces(&mut out);
         out.push('\n');
@@ -151,6 +155,7 @@ impl Module<'_> {
         );
         self.user_imports(&mut out);
         out.push('\n');
+        self.enum_types(&mut out);
         self.type_checks(&mut out);
         self.interfaces(&mut out);
         let _ = writeln!(
@@ -208,6 +213,20 @@ impl Module<'_> {
         }
     }
 
+    /// `export type Mood = "happy" | "sad";` for each enum.
+    fn enum_types(&self, out: &mut String) {
+        let types = self
+            .queries
+            .iter()
+            .chain(self.copies)
+            .filter_map(|(_, r)| r.as_ref().ok().map(|g| g.types.as_str()));
+        let declarations = self.enums.declarations(types, true);
+        if !declarations.is_empty() {
+            out.push_str(&declarations);
+            out.push('\n');
+        }
+    }
+
     /// A type that fails to compile where a type `types` maps to doesn't
     /// fit what its PG type is read as: the runtime would hand out values
     /// the type doesn't describe.
@@ -247,7 +266,7 @@ impl Module<'_> {
                             }
                             out.push_str("   */\n");
                         }
-                        let _ = writeln!(out, "  {key}: {};", g.types);
+                        let _ = writeln!(out, "  {key}: {};", self.enums.render(&g.types));
                     }
                     Err(e) => {
                         // The message's first line: the rest is the
@@ -285,7 +304,7 @@ impl Module<'_> {
                 out,
                 "], {{ table: {}, lockId: {}, useTransaction: {}, failOnDrift: {} }});",
                 js_string(&r.table),
-                r.lock_id,
+                js_lock_id(r.lock_id),
                 r.use_transaction,
                 r.fail_on_drift
             );
@@ -293,8 +312,31 @@ impl Module<'_> {
     }
 }
 
+/// The advisory lock's id as JavaScript: a number, or a BigInt literal past
+/// the integers a number holds exactly (2^53 - 1) — rounded, the npm runner
+/// would take another lock than `typedpg migrate`, and the two would no
+/// longer keep each other out.
+fn js_lock_id(lock_id: i64) -> String {
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    if lock_id.unsigned_abs() > MAX_SAFE_INTEGER {
+        format!("{lock_id}n")
+    } else {
+        lock_id.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_lock_id_past_a_javascript_number_is_a_bigint() {
+        use super::js_lock_id;
+        assert_eq!(js_lock_id(713705), "713705");
+        assert_eq!(js_lock_id(-713705), "-713705");
+        assert_eq!(js_lock_id(9_007_199_254_740_991), "9007199254740991");
+        assert_eq!(js_lock_id(9_007_199_254_740_993), "9007199254740993n");
+        assert_eq!(js_lock_id(i64::MIN), "-9223372036854775808n");
+    }
+
     use super::*;
 
     fn generated(types: &str) -> Result<Generated, GenError> {
@@ -326,6 +368,7 @@ mod tests {
             runtime: "@cubos/typedpg",
             imports: &imports,
             checks: &[],
+            enums: &EnumNames::default(),
             queries: &queries,
             copies: &[],
             migrations: None,
@@ -359,6 +402,7 @@ mod tests {
             runtime: "@cubos/typedpg",
             imports: &[],
             checks: &[],
+            enums: &EnumNames::default(),
             queries: &queries,
             copies: &[],
             migrations: None,
@@ -383,6 +427,7 @@ mod tests {
             runtime: "@cubos/typedpg",
             imports: &[],
             checks: &[],
+            enums: &EnumNames::default(),
             queries: &queries,
             copies: &[],
             migrations: Some(Embedded {
@@ -417,6 +462,39 @@ mod tests {
         assert!(files[0].1.contains("export const sql = createSql({"));
     }
 
+    /// A lock id a JS number can't hold exactly is written as a bigint:
+    /// rounded, it would be another lock than the Rust runner takes.
+    #[test]
+    fn a_large_lock_id_is_a_bigint() {
+        let lock = |lock_id: i64| {
+            let runner = MigrationsConfig {
+                lock_id,
+                ..MigrationsConfig::default()
+            };
+            let m = Module {
+                runtime: "@cubos/typedpg",
+                imports: &[],
+                checks: &[],
+                enums: &EnumNames::default(),
+                queries: &[],
+                copies: &[],
+                migrations: Some(Embedded {
+                    migrations: &[],
+                    runner: &runner,
+                }),
+            };
+            let ts = m.files(Path::new("/p/db.ts"), OutKind::TypeScript)[0]
+                .1
+                .clone();
+            let at = ts.find("lockId: ").expect("the runner's settings") + "lockId: ".len();
+            ts[at..].split(',').next().unwrap().to_owned()
+        };
+        assert_eq!(lock(9_007_199_254_740_991), "9007199254740991");
+        assert_eq!(lock(-9_007_199_254_740_991), "-9007199254740991");
+        assert_eq!(lock(9_007_199_254_740_993), "9007199254740993n");
+        assert_eq!(lock(i64::MIN), "-9223372036854775808n");
+    }
+
     /// Every name the module binds at its top level is an imported
     /// override or in `MODULE_BINDINGS`, in each form of the module; and
     /// each of `MODULE_BINDINGS` is bound by one.
@@ -425,12 +503,40 @@ mod tests {
         use crate::sqlmodule::top_level_bindings;
         use oxc_span::SourceType;
 
-        let q = generated("{ params: {}; row: { p: Prefs; r: typedpg.Range<number> } }");
+        // The user's enums, one named as the module's interface; an
+        // extension's a query names, and one none does.
+        let enum_ty =
+            |schema: &str, name: &str, extension: Option<&str>| typedpg_analyzer::Type::Enum {
+                schema: schema.into(),
+                name: name.into(),
+                labels: vec!["a".into()],
+                extension: extension.map(str::to_owned),
+            };
+        let mark = |schema: &str, name: &str| {
+            crate::typemap::enum_mark(&typedpg_core::QualifiedName::new(schema, name))
+        };
+        let enums = crate::typemap::Enums::from_types(
+            vec![
+                enum_ty("public", "mood", None),
+                enum_ty("public", "queries", None),
+                enum_ty("ext", "flag", Some("ext")),
+                enum_ty("ext", "unused", Some("ext")),
+            ],
+            &Default::default(),
+        )
+        .names(MODULE_BINDINGS.iter().copied().chain(["Prefs"]));
+        let q = generated(&format!(
+            "{{ params: {{}}; row: {{ p: Prefs; r: typedpg.Range<number>; f: {} }} }}",
+            mark("ext", "flag")
+        ));
         let e = Err(GenError {
             message: "column \"x\" does not exist".into(),
             offset: None,
         });
-        let c = generated("{ row: { p: Prefs } }");
+        let c = generated(&format!(
+            "{{ row: {{ p: Prefs; m: {} }} }}",
+            mark("public", "mood")
+        ));
         let queries = [("SELECT p, r", &q), ("SELECT x", &e)];
         let copies = [("t (p)", &c)];
         let imports = [("./domains".to_owned(), "Prefs".to_owned())];
@@ -445,6 +551,7 @@ mod tests {
             runtime: "@cubos/typedpg",
             imports: &imports,
             checks: &checks,
+            enums: &enums,
             queries: &queries,
             copies: &copies,
             migrations: Some(Embedded {
@@ -453,6 +560,15 @@ mod tests {
             }),
         };
         let ts = m.files(Path::new("/p/db.ts"), OutKind::TypeScript);
+        let declared = "\nexport type ExtFlag = \"a\";\nexport type Mood = \"a\";\n\
+                        export type PublicQueries = \"a\";\n\n";
+        assert!(ts[0].1.contains(declared), "{}", ts[0].1);
+        assert!(
+            ts[0].1.contains("f: ExtFlag } };") && ts[0].1.contains("m: Mood } };"),
+            "{}",
+            ts[0].1
+        );
+        let own = ["Prefs", "ExtFlag", "Mood", "PublicQueries"];
         let esm = m.files(Path::new("/p/db.js"), OutKind::EsModule);
         let cjs = m.files(Path::new("/p/db.cjs"), OutKind::CommonJs);
         let forms = [
@@ -465,7 +581,7 @@ mod tests {
         let mut bound = std::collections::BTreeSet::new();
         for (form, text, ty) in forms {
             for name in top_level_bindings(text, ty) {
-                if name != "Prefs" {
+                if !own.contains(&name.as_str()) {
                     assert!(
                         MODULE_BINDINGS.contains(&name.as_str()),
                         "{form}: `{name}` is not in MODULE_BINDINGS\n{text}"

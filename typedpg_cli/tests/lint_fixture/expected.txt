@@ -24,14 +24,14 @@ error: column "nope" does not exist
    ·                          ╰─ column does not exist
    ╰────
 
-warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build
+warning[locking/create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build
    ╭─[migrations/0002_hazards.sql:3:1]
  3 │ CREATE INDEX users_name_idx ON users (name);
    · ───────────────────────────────────────────
    ╰────
   help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
 
-warning[constraint_validating]: adding a constraint validates every row of public.posts under a lock
+warning[locking/add_constraint_scan]: adding a constraint validates every row of public.posts under a lock
    ╭─[migrations/0002_hazards.sql:5:1]
  5 │ ALTER TABLE posts ADD CONSTRAINT posts_author_fk
    · ────────────────────────────────────────────────
@@ -40,7 +40,7 @@ warning[constraint_validating]: adding a constraint validates every row of publi
    ╰────
   help: add it NOT VALID, then VALIDATE CONSTRAINT in a later migration
 
-warning[fk_without_index]: foreign key posts_author_fk on public.posts (author_id) has no index
+warning[performance/fk_without_index]: foreign key posts_author_fk on public.posts (author_id) has no index
    ╭─[migrations/0002_hazards.sql:5:1]
  5 │ ALTER TABLE posts ADD CONSTRAINT posts_author_fk
    · ────────────────────────────────────────────────
@@ -49,49 +49,49 @@ warning[fk_without_index]: foreign key posts_author_fk on public.posts (author_i
    ╰────
   help: CREATE INDEX ON public.posts (author_id)
 
-warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.things for the whole build
+warning[locking/create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.things for the whole build
    ╭─[other_migrations/0002_hazards.sql:3:1]
  3 │ CREATE INDEX things_name_idx ON things (name);
    · ─────────────────────────────────────────────
    ╰────
   help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
 
-error[null_comparison]: comparison with NULL is never true
+error[correctness/null_comparison]: comparison with NULL is never true
    ╭─[src/main.rs:8:45]
  8 │     sql!(pool, "SELECT id\nFROM users WHERE email = NULL").fetch_all().await?;
    ·                                             ────────────
    ╰────
   help: use IS NULL / IS NOT NULL
 
-error[null_comparison]: comparison with NULL is never true
+error[correctness/null_comparison]: comparison with NULL is never true
     ╭─[src/main.rs:10:46]
  10 │     sql!(pool, r#"SELECT id FROM users WHERE email = NULL"#).fetch_all().await?;
     ·                                              ────────────
     ╰────
    help: use IS NULL / IS NOT NULL
 
-warning[not_in_nullable]: NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL
+error[correctness/not_in_nullable]: NOT IN (SELECT …) returns no rows for a NULL left side when the subquery returns any row, or when the subquery returns a NULL
     ╭─[src/main.rs:12:44]
  12 │     sql!(pool, "SELECT id FROM users WHERE email NOT IN (SELECT title FROM posts)")
     ·                                            ──────────────────────────────────────
     ╰────
    help: use NOT EXISTS (SELECT 1 FROM … WHERE …), or make both sides NOT NULL
 
-error[unbounded_write]: UPDATE without WHERE changes every row of users
+warning[suspicious/unbounded_write]: UPDATE without WHERE changes every row of users
     ╭─[src/main.rs:16:17]
  16 │     sql!(pool, "UPDATE users SET name = 'x'").execute().await?;
     ·                 ────────────
     ╰────
    help: add a WHERE clause, or allow it with -- typedpg-lint: allow(unbounded_write)
 
-error[null_comparison]: comparison with NULL is never true
+error[correctness/null_comparison]: comparison with NULL is never true
     ╭─[src/main.rs:18:57]
  18 │     sql!(db = other, pool, "SELECT id FROM things WHERE name = NULL").fetch_all().await?;
     ·                                                         ───────────
     ╰────
    help: use IS NULL / IS NOT NULL
 
-warning[redundant_binding]: `id = id` binds `$id` to the variable it captures without a binding
+info[redundant/redundant_binding]: `id = id` binds `$id` to the variable it captures without a binding
     ╭─[src/main.rs:22:55]
  22 │     sql!(pool, "SELECT id FROM users WHERE id = $id", id = id)
     ·                                                       ───────

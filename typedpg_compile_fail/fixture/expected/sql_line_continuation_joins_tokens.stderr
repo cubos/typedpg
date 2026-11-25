@@ -1,0 +1,13 @@
+error: column "namefrom" does not exist
+         ╭────
+       1 │ SELECT nameFROM users
+         ·        ────┬───
+         ·            ╰─ column does not exist
+         ╰────
+       
+ --> src/bin/sql_line_continuation_joins_tokens.rs:8:9
+  |
+8 | /         "SELECT name\
+9 | |            FROM users"
+  | |______________________^
+

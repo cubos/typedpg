@@ -16,6 +16,8 @@ mod common;
 mod alter_table;
 #[path = "ddl/casts.rs"]
 mod casts;
+#[path = "ddl/catalog_depend.rs"]
+mod catalog_depend;
 #[path = "ddl/catalog_state.rs"]
 mod catalog_state;
 #[path = "ddl/constraints.rs"]
@@ -52,8 +54,12 @@ mod rename;
 mod schemas;
 #[path = "ddl/temporal.rs"]
 mod temporal;
+#[path = "ddl/third_party_extensions.rs"]
+mod third_party_extensions;
 #[path = "ddl/types.rs"]
 mod types;
+#[path = "ddl/uncertain.rs"]
+mod uncertain;
 #[path = "ddl/views.rs"]
 mod views;
 

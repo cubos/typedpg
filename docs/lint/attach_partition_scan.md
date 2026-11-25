@@ -4,9 +4,9 @@
 constraints don't imply the partition bound, or that scans the default
 partition.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -21,7 +21,7 @@ ALTER TABLE measurements ATTACH PARTITION measurements_2 FOR VALUES FROM (1000) 
 ```
 
 ```
-warning[attach_partition_scan]: ATTACH PARTITION scans every row of public.measurements_2 under an ACCESS EXCLUSIVE lock to check it fits the partition bound
+warning[locking/attach_partition_scan]: ATTACH PARTITION scans every row of public.measurements_2 under an ACCESS EXCLUSIVE lock to check it fits the partition bound
    ╭─[migrations/0002_attach.sql:1:1]
  1 │ ALTER TABLE measurements ATTACH PARTITION measurements_2 FOR VALUES FROM (1000) TO (2000);
    · ─────────────────────────────────────────────────────────────────────────────────────────
@@ -29,7 +29,7 @@ warning[attach_partition_scan]: ATTACH PARTITION scans every row of public.measu
   help: first add a CHECK constraint on public.measurements_2 that implies the bound, with NOT NULL on the key columns (NOT VALID, then VALIDATE CONSTRAINT in an earlier migration): PostgreSQL then skips the scan
 ```
 
-The statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md)
+The statement also gets a [`lock_without_timeout`](lock_without_timeout.md)
 finding. The fix (`id` is already `NOT NULL` as the primary key):
 
 ```sql
@@ -99,7 +99,7 @@ PostgreSQL also scans it for rows that belong to the new partition, and that
 is a second finding:
 
 ```
-warning[attach_partition_scan]: ATTACH PARTITION scans every row of the default partition public.e_def under an ACCESS EXCLUSIVE lock, for rows that belong to public.e1
+warning[locking/attach_partition_scan]: ATTACH PARTITION scans every row of the default partition public.e_def under an ACCESS EXCLUSIVE lock, for rows that belong to public.e1
 ```
 
 ## Not reported
@@ -129,9 +129,9 @@ See [Configuring rules](README.md#configuring-rules).
 
 - [`detach_partition_blocking`](detach_partition_blocking.md): the other
   direction.
-- [`constraint_validating`](constraint_validating.md): adding the `CHECK`
+- [`add_constraint_scan`](add_constraint_scan.md): adding the `CHECK`
   without a blocking scan.
-- [`validate_in_same_transaction`](validate_in_same_transaction.md): a
+- [`validate_constraint_blocking`](validate_constraint_blocking.md): a
   `VALIDATE` in the transaction that added the constraint.
-- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+- [`lock_without_timeout`](lock_without_timeout.md): the same statement
   waiting for its lock with no timeout.

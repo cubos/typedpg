@@ -37,6 +37,48 @@ export const constructed = sql(`
          '23:59:59.999999'::time AS last
 `);
 
+/**
+ * Anonymous records inside arrays, sublinks and CASE: each element an
+ * object of the row's fields, read from the array's text form (records
+ * quoted inside it, their own quotes and commas escaped twice).
+ */
+export const nestedRecords = sql(`
+  SELECT ARRAY[ROW(1, 'a"b,(c)'::text, 'quo"te'::color), ROW(2, NULL::text, 'with space'::color)] AS pairs,
+         ARRAY(SELECT ROW(n, ROW(n * 1.5::float8, n)::point2) FROM generate_series(1, 2) AS n) AS points,
+         (SELECT ROW(ARRAY[ROW('x,y'::text, ARRAY['{}'::text, NULL])], 'NULL'::color)) AS nested,
+         CASE WHEN random() >= 0 THEN ROW(1, 'yes'::text) ELSE ROW(0, 'no'::text) END AS picked,
+         (SELECT array_agg(ROW(n, n % 2 = 0) ORDER BY n) FROM generate_series(1, 3) AS n) AS agg
+`);
+
+/**
+ * Arrays whose text isn't `{a,b}`: a box array's elements are separated by
+ * `;` (a box's own text holds commas), as are those of a domain over box;
+ * an int2vector's and an oidvector's by spaces.
+ */
+// A JSON parameter's `null` is SQL NULL (`?`: the parameter takes one); `jsonNull` is the JSON one.
+export const jsonKind = sql("SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text");
+// A parameter that can't be NULL takes no `null`.
+export const thingsWithMeta = sql("SELECT label FROM things WHERE (shape).meta @> $sub ORDER BY id");
+
+export const oddArrays = sql(`
+  SELECT $boxes::box[] AS boxes,
+         ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,
+         $frames::frame[] AS frames,
+         '1 2 -3'::int2vector AS vec,
+         ''::int2vector AS empty_vec,
+         $vec::int2vector AS vec_param,
+         $oids::oidvector AS oids,
+         ARRAY[$vec::int2vector, ''::int2vector] AS vecs
+`);
+
+/** An int2vector parameter compared with a column's value, and a `box` spread. */
+export const vectorMatches = sql(`
+  SELECT v.indkey = $key AS same, v.indkey[0] AS first, array_length(v.indkey, 1) AS len
+  FROM (SELECT '3 1'::int2vector AS indkey) v
+`);
+
+export const boxSpread = sql("SELECT b::text AS b FROM unnest($boxes::box[]) AS b WHERE b IN $..wanted");
+
 /** A Duration's fields share one sign: this interval's don't. */
 export const mixedInterval = sql("SELECT interval '1 mon -1 days' AS iv");
 
@@ -84,7 +126,7 @@ export type Checks = [
         bigs: (bigint | null)[] | null;
         nums: (string | null)[] | null;
         flags: (boolean | null)[] | null;
-        blobs: (Uint8Array | null)[] | null;
+        blobs: (Buffer | null)[] | null;
         stamps: (Temporal.Instant | null)[] | null;
         docs: (import("@cubos/typedpg").JsonValue | null)[] | null;
         day: Temporal.PlainDate | null;
@@ -122,11 +164,13 @@ export type Checks = [
         color: Color | null;
         points: readonly (Point2 | null)[] | null;
         tags: readonly (string | null)[] | null;
-        meta: unknown;
+        meta: {} | null;
       } | null
     >
   >,
   Expect<Equal<Params<typeof labelsByColor>, { color: Color }>>,
+  Expect<Equal<Params<typeof jsonKind>, { doc: {} | null }>>,
+  Expect<Equal<Params<typeof thingsWithMeta>, { sub: {} }>>,
   Expect<
     Equal<
       Row<typeof constructed>,
@@ -148,4 +192,20 @@ export type Checks = [
       }
     >
   >,
+  // A record in an array, a sublink or a CASE: an object of its fields.
+  Expect<
+    Equal<
+      Row<typeof nestedRecords>,
+      {
+        pairs: { f1: 1 | 2; f2: string | null; f3: 'quo"te' | "with space" }[];
+        points: { f1: number; f2: Point2 }[];
+        nested: { f1: { f1: "x,y"; f2: ("{}" | null)[] }[]; f2: "NULL" };
+        picked: { f1: 0 | 1; f2: "no" | "yes" };
+        agg: { f1: number; f2: boolean }[];
+      }
+    >
+  >,
 ];
+
+// @ts-expect-error: `sub` can't be NULL, and a `null` there would be SQL NULL.
+export const nullSub: Params<typeof thingsWithMeta> = { sub: null };

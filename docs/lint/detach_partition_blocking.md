@@ -3,9 +3,9 @@
 `ALTER TABLE … DETACH PARTITION` without `CONCURRENTLY` on a partitioned
 table that already has rows.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -19,7 +19,7 @@ ALTER TABLE measurements DETACH PARTITION measurements_1;
 ```
 
 ```
-warning[detach_partition_blocking]: DETACH PARTITION without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on public.measurements, blocking every query on the partitioned table
+warning[locking/detach_partition_blocking]: DETACH PARTITION without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on public.measurements, blocking every query on the partitioned table
    ╭─[migrations/0002_detach.sql:1:1]
  1 │ ALTER TABLE measurements DETACH PARTITION measurements_1;
    · ────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ warning[detach_partition_blocking]: DETACH PARTITION without CONCURRENTLY takes 
   help: use DETACH PARTITION … CONCURRENTLY, in a migration whose first line is -- no-transaction
 ```
 
-The statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md)
+The statement also gets a [`lock_without_timeout`](lock_without_timeout.md)
 finding. The fix:
 
 ```sql
@@ -82,5 +82,5 @@ See [Configuring rules](README.md#configuring-rules).
 ## Related
 
 - [`attach_partition_scan`](attach_partition_scan.md): the other direction.
-- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+- [`lock_without_timeout`](lock_without_timeout.md): the same statement
   waiting for its lock with no timeout.

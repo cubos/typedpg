@@ -94,5 +94,25 @@ pub(crate) fn check_expr_kind(
     crate::resolve::check_no_srf_in_clause(expr, interp, kind.name())
         .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
     crate::clause::check_no_aggregates_or_windows(expr, interp, kind.name())
-        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))
+        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
+    reject_parameters(expr)
+}
+
+/// transformParamRef with no parameter hook: an expression a DDL statement
+/// stores (a default, a constraint, an index expression, ...) has no `$n`.
+pub(crate) fn reject_parameters(expr: Option<&ast::Node>) -> Result<(), DdlError> {
+    let Some(expr) = expr else {
+        return Ok(());
+    };
+    let number = match expr {
+        ast::Node::ParamRef(p) => Some(p.number),
+        _ => expr.nodes().find_map(|(n, ..)| match n {
+            NodeRef::ParamRef(p) => Some(p.number),
+            _ => None,
+        }),
+    };
+    match number {
+        Some(n) => Err(DdlError::Parse(format!("there is no parameter ${n}"))),
+        None => Ok(()),
+    }
 }

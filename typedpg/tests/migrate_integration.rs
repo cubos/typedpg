@@ -8,6 +8,7 @@ use std::path::Path;
 use tokio_postgres::Client;
 use typedpg::migrate::{self, MigrationSource};
 use typedpg_core::config::MigrationsConfig;
+use typedpg_core::migrations::{HASH_VERSION, hash, hash_with_version};
 
 /// A connection to a fresh, empty database, and that database's name.
 async fn fresh_db() -> (Client, String) {
@@ -461,6 +462,183 @@ async fn no_transaction_migration_with_several_statements() {
     assert!(table_exists(&client, "\"idx;email\"").await);
 }
 
+/// A role granted the tracking table's privileges, but not its owner, runs
+/// migrations: a complete table gets no `ALTER TABLE`, which needs the
+/// table's ownership even to `ADD COLUMN IF NOT EXISTS` an existing column
+/// ("must be owner of table _migrations" failed every action before).
+#[tokio::test]
+async fn a_role_that_does_not_own_the_tracking_table_runs_migrations() {
+    let (mut client, db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "0001_a.sql", "CREATE TABLE a (id INT);");
+    let config = MigrationsConfig::default();
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    migrate::run(&mut client, &source, &config).await.unwrap();
+
+    let role = format!("{db}_deployer");
+    client
+        .batch_execute(&format!(
+            "CREATE ROLE \"{role}\";
+             GRANT CREATE ON SCHEMA public TO \"{role}\";
+             GRANT ALL ON public._migrations TO \"{role}\";
+             SET ROLE \"{role}\";"
+        ))
+        .await
+        .unwrap();
+    write(dir.path(), "0002_b.sql", "CREATE TABLE b (id INT);");
+    write(dir.path(), "0002_b.down.sql", "DROP TABLE b;");
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    assert_eq!(
+        migrate::run(&mut client, &source, &config).await.unwrap(),
+        ["0002_b"]
+    );
+    migrate::accept(&mut client, &source, &config, "0002_b")
+        .await
+        .unwrap();
+    assert_eq!(
+        migrate::revert_last(&mut client, &source, false, &config)
+            .await
+            .unwrap(),
+        "0002_b"
+    );
+    assert_eq!(recorded(&client, "public._migrations").await, ["0001_a"]);
+}
+
+/// A failure inside a `DO` block (or a function, a trigger) says where, as
+/// psql's CONTEXT line does: the message alone did not tell which line of
+/// the body raised it.
+#[tokio::test]
+async fn a_failure_inside_a_do_block_reports_its_context() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_do.sql",
+        "DO $$\nBEGIN\n  PERFORM 1;\n  RAISE EXCEPTION 'boom';\nEND $$;",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+    let err = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.ends_with(
+            "failed to apply migration 0001_do: ERROR:  boom\n\
+             CONTEXT:  PL/pgSQL function inline_code_block line 4 at RAISE"
+        ),
+        "{err}"
+    );
+}
+
+/// A failed migration reports PG's error exactly as psql 19 prints it at
+/// its default verbosity: each expected text below is `psql -f` of the
+/// same file, its `psql:<file>:<line>: ` prefix left out.
+#[tokio::test]
+async fn errors_are_reported_as_psql_reports_them() {
+    let (mut client, _db) = fresh_db().await;
+    let config = MigrationsConfig::default();
+    let setup = "CREATE TABLE t (ab int);\n\
+                 CREATE TABLE t2 (a int);\n\
+                 CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$\n\
+                 BEGIN\n  RETURN (SELECT nosuch FROM t2);\nEND\n$$;";
+    migrate::run(
+        &mut client,
+        &MigrationSource::from_embedded([("0001_setup", setup, None)]).unwrap(),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    let cases = [
+        // A position and a DETAIL.
+        (
+            "SELECT '{1,2'::int[];",
+            "ERROR:  malformed array literal: \"{1,2\"\n\
+             LINE 1: SELECT '{1,2'::int[];\n               ^\n\
+             DETAIL:  Unexpected end of input.",
+        ),
+        // A position and a HINT.
+        (
+            "SELECT aa FROM t;",
+            "ERROR:  column \"aa\" does not exist\n\
+             LINE 1: SELECT aa FROM t;\n               ^\n\
+             HINT:  Perhaps you meant to reference the column \"t.ab\".",
+        ),
+        // A syntax error.
+        (
+            "CREATE TABL b (id int);",
+            "ERROR:  syntax error at or near \"TABL\"\n\
+             LINE 1: CREATE TABL b (id int);\n               ^",
+        ),
+        // A position, a DETAIL and a CONTEXT.
+        (
+            "SELECT jsonb '{\"a\":}';",
+            "ERROR:  invalid input syntax for type json\n\
+             LINE 1: SELECT jsonb '{\"a\":}';\n                     ^\n\
+             DETAIL:  Expected JSON value, but found \"}\".\n\
+             CONTEXT:  JSON data, line 1: {\"a\":}",
+        ),
+        // An internal query: its caret, QUERY and CONTEXT.
+        (
+            "SELECT f();",
+            "ERROR:  column \"nosuch\" does not exist\n\
+             LINE 1: (SELECT nosuch FROM t2)\n                ^\n\
+             QUERY:  (SELECT nosuch FROM t2)\n\
+             CONTEXT:  PL/pgSQL function f() line 3 at RETURN",
+        ),
+        // RAISE with a DETAIL and a HINT.
+        (
+            "DO $$\nBEGIN\n  RAISE EXCEPTION 'boom %', 42\n    \
+             USING DETAIL = 'the detail', HINT = 'the hint';\nEND\n$$;",
+            "ERROR:  boom 42\n\
+             DETAIL:  the detail\n\
+             HINT:  the hint\n\
+             CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE",
+        ),
+    ];
+    for (sql, psql) in cases {
+        let source =
+            MigrationSource::from_embedded([("0001_setup", setup, None), ("0002_bad", sql, None)])
+                .unwrap();
+        let err = migrate::run(&mut client, &source, &config)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.ends_with(&format!("failed to apply migration 0002_bad: {psql}")),
+            "{sql}:\n{err}"
+        );
+    }
+}
+
+/// An unterminated dollar quote swallows the rest of the file, as psql
+/// sends it: PG rejects that text whole, and the `DROP TABLE` inside it
+/// never runs (split at its `;`, it ran before the error).
+#[tokio::test]
+async fn an_unterminated_dollar_quote_runs_nothing_after_it() {
+    let (mut client, _db) = fresh_db().await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "0001_typo.sql",
+        "-- no-transaction\n\
+         CREATE TABLE keep (id INT);\n\
+         SELECT $body$ oops;\n\
+         DROP TABLE keep;\n",
+    );
+    let source = MigrationSource::from_dir(dir.path()).unwrap();
+
+    let err = migrate::run(&mut client, &source, &MigrationsConfig::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("(statement 2): ERROR:  unterminated dollar-quoted string"),
+        "{err}"
+    );
+    assert!(table_exists(&client, "keep").await);
+}
+
 /// With `use_transaction = false` every migration runs outside a
 /// transaction: statements PG refuses in a transaction block work, and a
 /// failure keeps what the statements before it did.
@@ -706,7 +884,7 @@ async fn accept_records_the_edited_file_without_running_it() {
     assert_eq!(row.get::<_, String>(1), edited.migrations()[0].sql);
     let stored_hash: String = row.get(2);
     assert_eq!(stored_hash.len(), 32, "not an MD5 hex digest");
-    assert_eq!(row.get::<_, i32>(3), 1);
+    assert_eq!(row.get::<_, i32>(3), HASH_VERSION);
 }
 
 /// A tracking table from before the hash columns: a run adds them, fills
@@ -756,7 +934,7 @@ async fn run_upgrades_a_table_from_before_the_hash_columns() {
         row.get::<_, Option<String>>(0).is_some(),
         "the old row was not hashed"
     );
-    assert_eq!(row.get::<_, i32>(1), 1);
+    assert_eq!(row.get::<_, i32>(1), HASH_VERSION);
 
     let statuses = migrate::status(&client, &source, &config).await.unwrap();
     assert!(!statuses[0].drifted);
@@ -805,6 +983,174 @@ async fn status_on_an_old_table_writes_nothing_and_sees_drift() {
         !column_exists(&client, "public._migrations", "hash_version").await,
         "status wrote the hash_version column"
     );
+}
+
+const LF_FUNCTION: &str =
+    "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
+
+/// A tracking table as typedpg 0.6 to 0.8 wrote it (`hash_version` 1, the
+/// hashes that release computed): `0001_f`, an LF function whose body and
+/// string hold line breaks; `0002_b`, applied as `id INT`; `0003_c`, a row
+/// without its text (its version-1 hash only).
+async fn version_1_table(client: &Client) {
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE public._migrations (
+                 name         TEXT PRIMARY KEY,
+                 applied_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                 sql_source   TEXT,
+                 hash         TEXT,
+                 hash_version INTEGER
+             );
+             {LF_FUNCTION}
+             CREATE TABLE b (id INT);
+             CREATE TABLE c (id INT);"
+        ))
+        .await
+        .unwrap();
+    let rows: [(&str, Option<&str>, String); 3] = [
+        (
+            "0001_f",
+            Some(LF_FUNCTION),
+            // What typedpg 0.8's `hash` returned for this text.
+            "36008b21f609949ea9d09c40c9aad1d0".to_string(),
+        ),
+        (
+            "0002_b",
+            Some("CREATE TABLE b (id INT);"),
+            hash_with_version("CREATE TABLE b (id INT);", 1).unwrap(),
+        ),
+        (
+            "0003_c",
+            None,
+            hash_with_version("CREATE TABLE c (id INT);\n", 1).unwrap(),
+        ),
+    ];
+    for (name, sql, stored) in rows {
+        client
+            .execute(
+                "INSERT INTO public._migrations (name, sql_source, hash, hash_version) \
+                 VALUES ($1, $2, $3, 1)",
+                &[&name, &sql, &stored],
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Upgrading typedpg reports no false drift on a table the previous hash
+/// version wrote, even for a checkout whose line endings changed (git
+/// `autocrlf`), and still reports a real edit under either version.
+#[tokio::test]
+async fn hashes_of_the_previous_version_report_no_false_drift() {
+    let (mut client, _db) = fresh_db().await;
+    version_1_table(&client).await;
+    let config = MigrationsConfig::default();
+    let crlf = |sql: &str| sql.replace('\n', "\r\n");
+    let function = crlf(LF_FUNCTION);
+    let checkout = |b: &str| {
+        let b = crlf(b);
+        MigrationSource::from_embedded([
+            ("0001_f", function.as_str(), None),
+            ("0002_b", b.as_str(), None),
+            ("0003_c", "CREATE TABLE c (id INT);\n", None),
+            ("0004_d", "CREATE TABLE d (id INT);", None),
+        ])
+        .unwrap()
+    };
+
+    // `status` reads the old rows without writing: the CRLF checkout is no
+    // drift, the edit of `0002_b` is.
+    let edited = checkout("CREATE TABLE b (id BIGINT);");
+    let drifted: Vec<_> = migrate::status(&client, &edited, &config)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| (s.name.clone(), s.drifted))
+        .collect();
+    assert_eq!(
+        drifted,
+        [
+            ("0001_f".to_string(), false),
+            ("0002_b".to_string(), true),
+            ("0003_c".to_string(), false),
+            ("0004_d".to_string(), false),
+        ]
+    );
+    let err = migrate::run(&mut client, &edited, &config)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("migration '0002_b' has been modified since it was applied"),
+        "unexpected error: {err}"
+    );
+    assert!(!err.contains("0001_f"), "false drift: {err}");
+    assert!(!table_exists(&client, "d").await);
+
+    // The file restored (with CRLF line endings): the run goes ahead, and
+    // the rows with their text now carry the current version's hash.
+    let restored = checkout("CREATE TABLE b (id INT);");
+    let applied = migrate::run(&mut client, &restored, &config).await.unwrap();
+    assert_eq!(applied, ["0004_d"]);
+    let rows = client
+        .query(
+            "SELECT name, hash, hash_version FROM public._migrations ORDER BY name",
+            &[],
+        )
+        .await
+        .unwrap();
+    let stored: Vec<(String, String, i32)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        stored,
+        [
+            ("0001_f".to_string(), hash(LF_FUNCTION), HASH_VERSION),
+            (
+                "0002_b".to_string(),
+                hash("CREATE TABLE b (id INT);"),
+                HASH_VERSION
+            ),
+            // No text to re-hash: it keeps its version-1 hash.
+            (
+                "0003_c".to_string(),
+                hash_with_version("CREATE TABLE c (id INT);\n", 1).unwrap(),
+                1
+            ),
+            (
+                "0004_d".to_string(),
+                hash("CREATE TABLE d (id INT);"),
+                HASH_VERSION
+            ),
+        ]
+    );
+    assert!(
+        migrate::status(&client, &restored, &config)
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| !s.drifted)
+    );
+
+    // After the upgrade, real drift is still drift: an edit inside the
+    // function's body, and an edit of the row only version 1 can check.
+    let edited_function = crlf(&LF_FUNCTION.replace("'a", "'z"));
+    let body_edit = MigrationSource::from_embedded([
+        ("0001_f", edited_function.as_str(), None),
+        ("0002_b", "CREATE TABLE b (id INT);", None),
+        ("0003_c", "CREATE TABLE c (id BIGINT);\n", None),
+        ("0004_d", "CREATE TABLE d (id INT);", None),
+    ])
+    .unwrap();
+    let drifted: Vec<_> = migrate::status(&client, &body_edit, &config)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.drifted)
+        .collect();
+    assert_eq!(drifted, [true, false, true, false]);
 }
 
 /// `accept` only accepts a known, applied migration.

@@ -3,9 +3,9 @@
 An implicit conversion between `timestamp` (or `date`) and `timestamptz`,
 whose result depends on the session's `TimeZone`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -19,21 +19,21 @@ SELECT id FROM users WHERE created_at >= current_date;
 ```
 
 ```
-warning[timestamp_timezone_mix]: `>` compares timestamp without time zone with timestamp with time zone, converting the timestamp in the session's TimeZone setting
+warning[suspicious/timestamp_timezone_mix]: `>` compares timestamp without time zone with timestamp with time zone, converting the timestamp in the session's TimeZone setting
    ╭─[queries.sql:2:28]
  2 │ SELECT id FROM posts WHERE published_at > now() - interval '1 day';
    ·                            ────────────
    ╰────
   help: convert it in an explicit time zone: `value AT TIME ZONE 'UTC'`
 
-warning[timestamp_timezone_mix]: timestamp with time zone value implicitly converted to timestamp without time zone: the result depends on the session's TimeZone setting
+warning[suspicious/timestamp_timezone_mix]: timestamp with time zone value implicitly converted to timestamp without time zone: the result depends on the session's TimeZone setting
    ╭─[queries.sql:4:33]
  4 │ UPDATE posts SET published_at = now() WHERE id = $id;
    ·                                 ─────
    ╰────
   help: convert it in an explicit time zone: `value AT TIME ZONE 'UTC'`
 
-warning[timestamp_timezone_mix]: `>=` compares date with timestamp with time zone, converting the date in the session's TimeZone setting
+warning[suspicious/timestamp_timezone_mix]: `>=` compares date with timestamp with time zone, converting the date in the session's TimeZone setting
    ╭─[queries.sql:6:42]
  6 │ SELECT id FROM users WHERE created_at >= current_date;
    ·                                          ────────────

@@ -5,6 +5,9 @@ import { createCopyIn, createSql, embedMigrations } from "@cubos/typedpg";
 import type * as typedpg from "@cubos/typedpg";
 import type { Point2, UserPrefs } from "./domains.ts";
 
+export type Color = "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL";
+export type Mood = "happy" | "sad" | "neutral";
+
 // Each type in `types` must fit what its PostgreSQL type is read as.
 export type TypeMappingChecks = [
   typedpg.Fits<Point2, { readonly x: number | null; readonly y: number | null }>, // public.point2
@@ -18,10 +21,10 @@ export interface Queries {
       email: string | null;
       qty: number | null;
       tags: readonly (string | null)[] | null;
-      colors: readonly ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
-      shapes: readonly ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null)[] | null;
+      colors: readonly (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      shape_d: { name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
+      shapes: readonly ({ name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: readonly typedpg.Range<Temporal.Instant | Temporal.ZonedDateTime | Date>[] | null;
       amounts: typedpg.Range<string | number> | null;
@@ -34,7 +37,7 @@ export interface Queries {
       flags: readonly (boolean | null)[] | null;
       blobs: readonly (Uint8Array | null)[] | null;
       stamps: readonly (Temporal.Instant | Temporal.ZonedDateTime | Date | null)[] | null;
-      docs: readonly (unknown | null)[] | null;
+      docs: readonly ({} | null)[] | null;
       day: Temporal.PlainDate | null;
       at_local: Temporal.PlainDateTime | null;
       clock: string | null;
@@ -52,11 +55,39 @@ export interface Queries {
   };
   "\n  INSERT INTO users (name, email, mood, tags, prefs, visits, avatar)\n  VALUES $..users { name, email, mood, tags, prefs, visits, avatar }\n  RETURNING id, name\n": {
     params: {
-      users: readonly { name: string; email: string | null; mood: "happy" | "sad" | "neutral" | null; tags: readonly (string | null)[]; prefs: UserPrefs | null; visits: bigint | number | string; avatar: Uint8Array | null }[];
+      users: readonly { name: string; email: string | null; mood: Mood | null; tags: readonly (string | null)[]; prefs: UserPrefs | null; visits: bigint | number | string; avatar: Uint8Array | null }[];
     };
     row: {
       id: number;
       name: string;
+    };
+  };
+  "\n  SELECT $boxes::box[] AS boxes,\n         ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,\n         $frames::frame[] AS frames,\n         '1 2 -3'::int2vector AS vec,\n         ''::int2vector AS empty_vec,\n         $vec::int2vector AS vec_param,\n         $oids::oidvector AS oids,\n         ARRAY[$vec::int2vector, ''::int2vector] AS vecs\n": {
+    params: {
+      boxes: readonly (string | null)[];
+      frames: readonly (string | null)[];
+      vec: readonly number[];
+      oids: readonly number[];
+    };
+    row: {
+      boxes: (string | null)[];
+      built: (string | null)[];
+      frames: (string | null)[];
+      vec: number[];
+      empty_vec: number[];
+      vec_param: number[];
+      oids: number[];
+      vecs: number[][];
+    };
+  };
+  "\n  SELECT ARRAY[ROW(1, 'a\"b,(c)'::text, 'quo\"te'::color), ROW(2, NULL::text, 'with space'::color)] AS pairs,\n         ARRAY(SELECT ROW(n, ROW(n * 1.5::float8, n)::point2) FROM generate_series(1, 2) AS n) AS points,\n         (SELECT ROW(ARRAY[ROW('x,y'::text, ARRAY['{}'::text, NULL])], 'NULL'::color)) AS nested,\n         CASE WHEN random() >= 0 THEN ROW(1, 'yes'::text) ELSE ROW(0, 'no'::text) END AS picked,\n         (SELECT array_agg(ROW(n, n % 2 = 0) ORDER BY n) FROM generate_series(1, 3) AS n) AS agg\n": {
+    params: {};
+    row: {
+      pairs: ({ f1: 1 | 2; f2: string | null; f3: "quo\"te" | "with space" })[];
+      points: { f1: number; f2: Point2 }[];
+      nested: { f1: ({ f1: "x,y"; f2: ("{}" | null)[] })[]; f2: "NULL" };
+      picked: { f1: 0 | 1; f2: "no" | "yes" };
+      agg: { f1: number; f2: boolean }[];
     };
   };
   "\n  SELECT CASE WHEN visits > 10 THEN 'regular' ELSE 'new' END AS kind, mood, 2::int8 AS two\n  FROM users WHERE mood <> 'neutral'\n": {
@@ -101,6 +132,16 @@ export interface Queries {
       titles: (string | null)[];
     };
   };
+  "\n  SELECT v.indkey = $key AS same, v.indkey[0] AS first, array_length(v.indkey, 1) AS len\n  FROM (SELECT '3 1'::int2vector AS indkey) v\n": {
+    params: {
+      key: readonly number[];
+    };
+    row: {
+      same: boolean;
+      first: number | null;
+      len: number | null;
+    };
+  };
   "\n  WITH a AS (INSERT INTO posts (author_id, title) VALUES $..first { author, title } RETURNING id),\n       b AS (INSERT INTO posts (author_id, title) VALUES $..second { author, title } RETURNING id)\n  SELECT (SELECT count(*) FROM a) AS \"a!\", (SELECT count(*) FROM b) AS \"b!\"\n": {
     params: {
       first: readonly { author: number; title: string }[];
@@ -134,7 +175,7 @@ export interface Queries {
   };
   "SELECT $doc::jsonb AS doc": {
     params: {
-      doc: unknown;
+      doc: {};
     };
     row: {
       doc: typedpg.JsonValue;
@@ -151,10 +192,10 @@ export interface Queries {
       email: string | null;
       qty: number | null;
       tags: (string | null)[] | null;
-      colors: ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shapes: ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
+      colors: (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shape_d: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shapes: ({ name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: typedpg.Range<Temporal.Instant>[] | null;
       amounts: typedpg.Range<string> | null;
@@ -165,7 +206,7 @@ export interface Queries {
       bigs: (bigint | null)[] | null;
       nums: (string | null)[] | null;
       flags: (boolean | null)[] | null;
-      blobs: (Uint8Array | null)[] | null;
+      blobs: (Buffer | null)[] | null;
       stamps: (Temporal.Instant | null)[] | null;
       docs: (typedpg.JsonValue | null)[] | null;
       day: Temporal.PlainDate | null;
@@ -187,12 +228,12 @@ export interface Queries {
       id: number;
       name: string;
       email: string | null;
-      mood: "happy" | "sad" | "neutral" | null;
+      mood: Mood | null;
       tags: (string | null)[];
       prefs: UserPrefs | null;
       balance: string;
       visits: bigint;
-      avatar: Uint8Array | null;
+      avatar: Buffer | null;
       home: { street: string | null; number: number | null } | null;
       created_at: Temporal.Instant;
     };
@@ -203,9 +244,19 @@ export interface Queries {
       f: number;
       nan: number;
       now: Temporal.Instant;
-      b: Uint8Array;
+      b: Buffer;
       nothing: string | null;
     };
+  };
+  "SELECT b::text AS b FROM unnest($boxes::box[]) AS b WHERE b IN $..wanted": {
+    params: {
+      boxes: readonly (string | null)[];
+      wanted: readonly string[];
+    };
+    row: {
+      b: string;
+    };
+    value: string;
   };
   "SELECT count(*) AS n FROM users": {
     params: {};
@@ -241,12 +292,12 @@ export interface Queries {
   };
   "SELECT id, name, mood FROM users WHERE mood = $mood ORDER BY id": {
     params: {
-      mood: "happy" | "sad" | "neutral";
+      mood: Mood;
     };
     row: {
       id: number;
       name: string;
-      mood: "happy" | "sad" | "neutral";
+      mood: Mood;
     };
   };
   "SELECT interval '1 mon -1 days' AS iv": {
@@ -256,9 +307,27 @@ export interface Queries {
     };
     value: Temporal.Duration;
   };
+  "SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text": {
+    params: {
+      doc: {} | null;
+    };
+    row: {
+      kind: string | null;
+      text: string | null;
+    };
+  };
   "SELECT label FROM things WHERE $color = ANY (colors) ORDER BY id": {
     params: {
-      color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL";
+      color: Color;
+    };
+    row: {
+      label: string;
+    };
+    value: string;
+  };
+  "SELECT label FROM things WHERE (shape).meta @> $sub ORDER BY id": {
+    params: {
+      sub: {};
     };
     row: {
       label: string;
@@ -293,7 +362,7 @@ export interface Queries {
   "SELECT name FROM users WHERE mood IN $..moods AND id > $after ORDER BY id": {
     params: {
       after: number;
-      moods: readonly ("happy" | "sad" | "neutral")[];
+      moods: readonly Mood[];
     };
     row: {
       name: string;
@@ -317,10 +386,10 @@ export interface Queries {
       email: string | null;
       qty: number | null;
       tags: (string | null)[] | null;
-      colors: ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shape_d: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
-      shapes: ({ name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
+      colors: (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shape_d: { name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null;
+      shapes: ({ name: string | null; color: Color | null; points: (Point2 | null)[] | null; tags: (string | null)[] | null; meta: typedpg.JsonValue | null } | null)[] | null;
       span: typedpg.Range<number> | null;
       periods: typedpg.Range<Temporal.Instant>[] | null;
       amounts: typedpg.Range<string> | null;
@@ -331,7 +400,7 @@ export interface Queries {
       bigs: (bigint | null)[] | null;
       nums: (string | null)[] | null;
       flags: (boolean | null)[] | null;
-      blobs: (Uint8Array | null)[] | null;
+      blobs: (Buffer | null)[] | null;
       stamps: (Temporal.Instant | null)[] | null;
       docs: (typedpg.JsonValue | null)[] | null;
       day: Temporal.PlainDate | null;
@@ -386,8 +455,8 @@ export interface CopyTargets {
     row: {
       label: string;
       tags: readonly (string | null)[] | null;
-      colors: readonly ("red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null)[] | null;
-      shape: { name: string | null; color: "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL" | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: unknown | null } | null;
+      colors: readonly (Color | null)[] | null;
+      shape: { name: string | null; color: Color | null; points: readonly (Point2 | null)[] | null; tags: readonly (string | null)[] | null; meta: {} | null } | null;
       span: typedpg.Range<number> | null;
       attrs: Readonly<Record<string, string | null>> | null;
       big: bigint | number | string | null;
@@ -399,10 +468,13 @@ export interface CopyTargets {
 export const sql = createSql<Queries>({
   "\n  INSERT INTO things (label, email, qty, tags, colors, shape, shape_d, shapes, span, periods,\n                      amounts, dates, dur, attrs, big, bigs, nums, flags, blobs, stamps, docs,\n                      day, at_local, clock, wall, id_uuid, addr, money_v, bits, ch)\n  VALUES ($label, $email, $qty, $tags, $colors, $shape, $shape_d, $shapes, $span, $periods,\n          $amounts, $dates, $dur, $attrs, $big, $bigs, $nums, $flags, $blobs, $stamps, $docs,\n          $day, $at_local, $clock, $wall, $id_uuid, $addr, $money_v, $bits, $ch)\n  RETURNING id\n": "{\"sql\":[\"\\n  INSERT INTO things (label, email, qty, tags, colors, shape, shape_d, shapes, span, periods,\\n                      amounts, dates, dur, attrs, big, bigs, nums, flags, blobs, stamps, docs,\\n                      day, at_local, clock, wall, id_uuid, addr, money_v, bits, ch)\\n  VALUES (($1::pg_catalog.text), ($2::pg_catalog.text), ($3::pg_catalog.int4), ($4::pg_catalog.text[]), ($5::public.color[]), ($6::public.shape), ($7::public.shape), ($8::public.shape[]), ($9::pg_catalog.int4range), ($10::pg_catalog.tstzmultirange),\\n          ($11::pg_catalog.numrange), ($12::pg_catalog.daterange), ($13::pg_catalog.\\\"interval\\\"), ($14::public.hstore), ($15::pg_catalog.int8), ($16::pg_catalog.int8[]), ($17::pg_catalog.\\\"numeric\\\"[]), ($18::pg_catalog.bool[]), ($19::pg_catalog.bytea[]), ($20::pg_catalog.timestamptz[]), ($21::pg_catalog.jsonb[]),\\n          ($22::pg_catalog.date), ($23::pg_catalog.\\\"timestamp\\\"), ($24::pg_catalog.timetz), ($25::pg_catalog.\\\"time\\\"), ($26::pg_catalog.uuid), ($27::pg_catalog.inet), ($28::pg_catalog.money), ($29::pg_catalog.varbit), ($30::pg_catalog.\\\"char\\\"))\\n  RETURNING id\\n\"],\"params\":[[\"label\",\"text\"],[\"email\",\"text\"],[\"qty\",\"number\"],[\"tags\",[\"array\",\"text\"]],[\"colors\",[\"array\",\"text\"]],[\"shape\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]],[\"shape_d\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]],[\"shapes\",[\"array\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]]],[\"span\",[\"range\",\"number\"]],[\"periods\",[\"multirange\",\"timestamptz\"]],[\"amounts\",[\"range\",\"text\"]],[\"dates\",[\"range\",\"date\"]],[\"dur\",\"interval\"],[\"attrs\",\"hstore\"],[\"big\",\"bigint\"],[\"bigs\",[\"array\",\"bigint\"]],[\"nums\",[\"array\",\"text\"]],[\"flags\",[\"array\",\"bool\"]],[\"blobs\",[\"array\",\"bytea\"]],[\"stamps\",[\"array\",\"timestamptz\"]],[\"docs\",[\"array\",\"json\"]],[\"day\",\"date\"],[\"at_local\",\"timestamp\"],[\"clock\",\"text\"],[\"wall\",\"time\"],[\"id_uuid\",\"text\"],[\"addr\",\"text\"],[\"money_v\",\"text\"],[\"bits\",\"text\"],[\"ch\",\"text\"]],\"columns\":[[\"id\",\"number\"]]}",
   "\n  INSERT INTO users (name, email, mood, tags, prefs, visits, avatar)\n  VALUES $..users { name, email, mood, tags, prefs, visits, avatar }\n  RETURNING id, name\n": "{\"sql\":[\"\\n  INSERT INTO users (name, email, mood, tags, prefs, visits, avatar)\\n  \",[\"values\",[[\"rows\",0]],\"SELECT * FROM (VALUES (NULL::pg_catalog.text, NULL::pg_catalog.text, NULL::public.mood, NULL::pg_catalog.text[], NULL::pg_catalog.jsonb, NULL::pg_catalog.int8, NULL::pg_catalog.bytea)) AS __typedpg_empty WHERE false\"],\"\\n  RETURNING id, name\\n\"],\"params\":[],\"spreads\":[[\"users\",[[\"name\",\"text\",\"::pg_catalog.text\"],[\"email\",\"text\",\"::pg_catalog.text\"],[\"mood\",\"text\",\"::public.mood\"],[\"tags\",[\"array\",\"text\"],\"::pg_catalog.text[]\"],[\"prefs\",\"json\",\"::pg_catalog.jsonb\"],[\"visits\",\"bigint\",\"::pg_catalog.int8\"],[\"avatar\",\"bytea\",\"::pg_catalog.bytea\"]],\"rows\"]],\"columns\":[[\"id\",\"number\"],[\"name\",\"text\"]]}",
+  "\n  SELECT $boxes::box[] AS boxes,\n         ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,\n         $frames::frame[] AS frames,\n         '1 2 -3'::int2vector AS vec,\n         ''::int2vector AS empty_vec,\n         $vec::int2vector AS vec_param,\n         $oids::oidvector AS oids,\n         ARRAY[$vec::int2vector, ''::int2vector] AS vecs\n": "{\"sql\":[\"\\n  SELECT ($1::pg_catalog.box[])::box[] AS boxes,\\n         ARRAY[box '(1,1),(0,0)', NULL, box '(3,3),(2,2)'] AS built,\\n         ($2::pg_catalog.box[])::frame[] AS frames,\\n         '1 2 -3'::int2vector AS vec,\\n         ''::int2vector AS empty_vec,\\n         ($3::pg_catalog.int2vector)::int2vector AS vec_param,\\n         ($4::pg_catalog.oidvector)::oidvector AS oids,\\n         ARRAY[($3::pg_catalog.int2vector)::int2vector, ''::int2vector] AS vecs\\n\"],\"params\":[[\"boxes\",[\"array\",\"text\",\";\"]],[\"frames\",[\"array\",\"text\",\";\"]],[\"vec\",[\"spaced\",\"number\"]],[\"oids\",[\"spaced\",\"number\"]]],\"columns\":[[\"boxes\",[\"array\",\"text\",\";\"]],[\"built\",[\"array\",\"text\",\";\"]],[\"frames\",[\"array\",\"text\",\";\"]],[\"vec\",[\"spaced\",\"number\"]],[\"empty_vec\",[\"spaced\",\"number\"]],[\"vec_param\",[\"spaced\",\"number\"]],[\"oids\",[\"spaced\",\"number\"]],[\"vecs\",[\"array\",[\"spaced\",\"number\"]]]],\"subquery\":true}",
+  "\n  SELECT ARRAY[ROW(1, 'a\"b,(c)'::text, 'quo\"te'::color), ROW(2, NULL::text, 'with space'::color)] AS pairs,\n         ARRAY(SELECT ROW(n, ROW(n * 1.5::float8, n)::point2) FROM generate_series(1, 2) AS n) AS points,\n         (SELECT ROW(ARRAY[ROW('x,y'::text, ARRAY['{}'::text, NULL])], 'NULL'::color)) AS nested,\n         CASE WHEN random() >= 0 THEN ROW(1, 'yes'::text) ELSE ROW(0, 'no'::text) END AS picked,\n         (SELECT array_agg(ROW(n, n % 2 = 0) ORDER BY n) FROM generate_series(1, 3) AS n) AS agg\n": "{\"sql\":[\"\\n  SELECT ARRAY[ROW(1, 'a\\\"b,(c)'::text, 'quo\\\"te'::color), ROW(2, NULL::text, 'with space'::color)] AS pairs,\\n         ARRAY(SELECT ROW(n, ROW(n * 1.5::float8, n)::point2) FROM generate_series(1, 2) AS n) AS points,\\n         (SELECT ROW(ARRAY[ROW('x,y'::text, ARRAY['{}'::text, NULL])], 'NULL'::color)) AS nested,\\n         CASE WHEN random() >= 0 THEN ROW(1, 'yes'::text) ELSE ROW(0, 'no'::text) END AS picked,\\n         (SELECT array_agg(ROW(n, n % 2 = 0) ORDER BY n) FROM generate_series(1, 3) AS n) AS agg\\n\"],\"params\":[],\"columns\":[[\"pairs\",[\"array\",[\"record\",[[\"f1\",\"number\"],[\"f2\",\"text\"],[\"f3\",\"text\"]]]]],[\"points\",[\"array\",[\"record\",[[\"f1\",\"number\"],[\"f2\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]]]]],[\"nested\",[\"record\",[[\"f1\",[\"array\",[\"record\",[[\"f1\",\"text\"],[\"f2\",[\"array\",\"text\"]]]]]],[\"f2\",\"text\"]]]],[\"picked\",[\"record\",[[\"f1\",\"number\"],[\"f2\",\"text\"]]]],[\"agg\",[\"array\",[\"record\",[[\"f1\",\"number\"],[\"f2\",\"bool\"]]]]]],\"subquery\":true}",
   "\n  SELECT CASE WHEN visits > 10 THEN 'regular' ELSE 'new' END AS kind, mood, 2::int8 AS two\n  FROM users WHERE mood <> 'neutral'\n": "{\"sql\":[\"\\n  SELECT CASE WHEN visits > 10 THEN 'regular' ELSE 'new' END AS kind, mood, 2::int8 AS two\\n  FROM users WHERE mood <> 'neutral'\\n\"],\"params\":[],\"columns\":[[\"kind\",\"text\"],[\"mood\",\"text\"],[\"two\",\"bigint\"]],\"subquery\":true}",
   "\n  SELECT ROW(1, 'a', NULL::text) AS r,\n         ARRAY[ROW(1, 2.5)::point2] AS arr_of_row,\n         ARRAY['', NULL, 'NULL', '\"', '\\', ',', '{}', ' a ', 'é'] AS strings,\n         int4range(1, 10, '[]') AS discrete,\n         '(,5]'::numrange AS unbounded,\n         'empty'::int4range AS nothing,\n         '{[1,3), [5,7)}'::int4multirange AS multi,\n         interval '1 year 2 mons 3 days 04:05:06.789' AS iv,\n         '\"a\"=>\"1\", \"b c\"=>NULL'::hstore AS h,\n         'infinity'::date AS forever,\n         '-infinity'::timestamp AS dawn,\n         '23:59:59.999999'::time AS last\n": "{\"sql\":[\"\\n  SELECT ROW(1, 'a', NULL::text) AS r,\\n         ARRAY[ROW(1, 2.5)::point2] AS arr_of_row,\\n         ARRAY['', NULL, 'NULL', '\\\"', '\\\\', ',', '{}', ' a ', 'é'] AS strings,\\n         int4range(1, 10, '[]') AS discrete,\\n         '(,5]'::numrange AS unbounded,\\n         'empty'::int4range AS nothing,\\n         '{[1,3), [5,7)}'::int4multirange AS multi,\\n         interval '1 year 2 mons 3 days 04:05:06.789' AS iv,\\n         '\\\"a\\\"=>\\\"1\\\", \\\"b c\\\"=>NULL'::hstore AS h,\\n         'infinity'::date AS forever,\\n         '-infinity'::timestamp AS dawn,\\n         '23:59:59.999999'::time AS last\\n\"],\"params\":[],\"columns\":[[\"r\",[\"record\",[[\"f1\",\"number\"],[\"f2\",\"text\"],[\"f3\",\"text\"]]]],[\"arr_of_row\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"strings\",[\"array\",\"text\"]],[\"discrete\",[\"range\",\"number\"]],[\"unbounded\",[\"range\",\"text\"]],[\"nothing\",[\"range\",\"number\"]],[\"multi\",[\"multirange\",\"number\"]],[\"iv\",\"interval\"],[\"h\",\"hstore\"],[\"forever\",\"date\"],[\"dawn\",\"timestamp\"],[\"last\",\"time\"]],\"subquery\":true}",
   "\n  SELECT p.title, u.name AS author, p.body, ROW(u.id, u.email) AS who\n  FROM posts p JOIN users u ON u.id = p.author_id\n  ORDER BY p.id\n": "{\"sql\":[\"\\n  SELECT p.title, u.name AS author, p.body, ROW(u.id, u.email) AS who\\n  FROM posts p JOIN users u ON u.id = p.author_id\\n  ORDER BY p.id\\n\"],\"params\":[],\"columns\":[[\"title\",\"text\"],[\"author\",\"text\"],[\"body\",\"text\"],[\"who\",[\"record\",[[\"f1\",\"number\"],[\"f2\",\"text\"]]]]],\"subquery\":true}",
   "\n  SELECT u.name, count(p.id) AS posts, array_agg(p.title ORDER BY p.id) AS titles\n  FROM users u LEFT JOIN posts p ON p.author_id = u.id\n  GROUP BY u.id\n  ORDER BY u.id\n": "{\"sql\":[\"\\n  SELECT u.name, count(p.id) AS posts, array_agg(p.title ORDER BY p.id) AS titles\\n  FROM users u LEFT JOIN posts p ON p.author_id = u.id\\n  GROUP BY u.id\\n  ORDER BY u.id\\n\"],\"params\":[],\"columns\":[[\"name\",\"text\"],[\"posts\",\"bigint\"],[\"titles\",[\"array\",\"text\"]]],\"subquery\":true}",
+  "\n  SELECT v.indkey = $key AS same, v.indkey[0] AS first, array_length(v.indkey, 1) AS len\n  FROM (SELECT '3 1'::int2vector AS indkey) v\n": "{\"sql\":[\"\\n  SELECT v.indkey = ($1::pg_catalog.int2vector) AS same, v.indkey[0] AS first, array_length(v.indkey, 1) AS len\\n  FROM (SELECT '3 1'::int2vector AS indkey) v\\n\"],\"params\":[[\"key\",[\"spaced\",\"number\"]]],\"columns\":[[\"same\",\"bool\"],[\"first\",\"number\"],[\"len\",\"number\"]],\"subquery\":true}",
   "\n  WITH a AS (INSERT INTO posts (author_id, title) VALUES $..first { author, title } RETURNING id),\n       b AS (INSERT INTO posts (author_id, title) VALUES $..second { author, title } RETURNING id)\n  SELECT (SELECT count(*) FROM a) AS \"a!\", (SELECT count(*) FROM b) AS \"b!\"\n": "{\"sql\":[\"\\n  WITH a AS (INSERT INTO posts (author_id, title) \",[\"values\",[[\"rows\",0]],\"SELECT * FROM (VALUES (NULL::pg_catalog.int4, NULL::pg_catalog.text)) AS __typedpg_empty WHERE false\",[\"::pg_catalog.int4[]\",\"::pg_catalog.text[]\"]],\" RETURNING id),\\n       b AS (INSERT INTO posts (author_id, title) \",[\"values\",[[\"rows\",1]],\"SELECT * FROM (VALUES (NULL::pg_catalog.int4, NULL::pg_catalog.text)) AS __typedpg_empty WHERE false\",[\"::pg_catalog.int4[]\",\"::pg_catalog.text[]\"]],\" RETURNING id)\\n  SELECT (SELECT count(*) FROM a) AS \\\"a!\\\", (SELECT count(*) FROM b) AS \\\"b!\\\"\\n\"],\"params\":[],\"spreads\":[[\"first\",[[\"author\",\"number\",\"::pg_catalog.int4\"],[\"title\",\"text\",\"::pg_catalog.text\"]],\"rows\"],[\"second\",[[\"author\",\"number\",\"::pg_catalog.int4\"],[\"title\",\"text\",\"::pg_catalog.text\"]],\"rows\"]],\"columns\":[[\"a\",\"bigint\"],[\"b\",\"bigint\"]]}",
   "INSERT INTO posts (author_id, title) VALUES ($author, 'first'), $..more { author, title } RETURNING title": "{\"sql\":[\"INSERT INTO posts (author_id, title) \",[\"values\",[[\"row\",[\"(($1::pg_catalog.int4), 'first')\"]],[\"rows\",0]],\"SELECT * FROM (VALUES (NULL::pg_catalog.int4, NULL::pg_catalog.text)) AS __typedpg_empty WHERE false\"],\" RETURNING title\"],\"params\":[[\"author\",\"number\"]],\"spreads\":[[\"more\",[[\"author\",\"number\",\"::pg_catalog.int4\"],[\"title\",\"text\",\"::pg_catalog.text\"]],\"rows\"]],\"columns\":[[\"title\",\"text\"]]}",
   "INSERT INTO posts (author_id, title, body) VALUES ($author, $title, $body?) RETURNING id": "{\"sql\":[\"INSERT INTO posts (author_id, title, body) VALUES (($1::pg_catalog.int4), ($2::pg_catalog.text), ($3::pg_catalog.text)) RETURNING id\"],\"params\":[[\"author\",\"number\"],[\"title\",\"text\"],[\"body\",\"text\"]],\"columns\":[[\"id\",\"number\"]]}",
@@ -410,13 +482,16 @@ export const sql = createSql<Queries>({
   "SELECT * FROM things WHERE id = $id": "{\"sql\":[\"SELECT * FROM things WHERE id = ($1::pg_catalog.int4)\"],\"params\":[[\"id\",\"number\"]],\"columns\":[[\"id\",\"number\"],[\"label\",\"text\"],[\"email\",\"text\"],[\"qty\",\"number\"],[\"tags\",[\"array\",\"text\"]],[\"colors\",[\"array\",\"text\"]],[\"shape\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]],[\"shape_d\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]],[\"shapes\",[\"array\",[\"record\",[[\"name\",\"text\"],[\"color\",\"text\"],[\"points\",[\"array\",[\"record\",[[\"x\",\"number\"],[\"y\",\"number\"]]]]],[\"tags\",[\"array\",\"text\"]],[\"meta\",\"json\"]]]]],[\"span\",[\"range\",\"number\"]],[\"periods\",[\"multirange\",\"timestamptz\"]],[\"amounts\",[\"range\",\"text\"]],[\"dates\",[\"range\",\"date\"]],[\"dur\",\"interval\"],[\"attrs\",\"hstore\"],[\"big\",\"bigint\"],[\"bigs\",[\"array\",\"bigint\"]],[\"nums\",[\"array\",\"text\"]],[\"flags\",[\"array\",\"bool\"]],[\"blobs\",[\"array\",\"bytea\"]],[\"stamps\",[\"array\",\"timestamptz\"]],[\"docs\",[\"array\",\"json\"]],[\"day\",\"date\"],[\"at_local\",\"timestamp\"],[\"clock\",\"text\"],[\"wall\",\"time\"],[\"id_uuid\",\"text\"],[\"addr\",\"text\"],[\"money_v\",\"text\"],[\"bits\",\"text\"],[\"ch\",\"text\"]],\"subquery\":true}",
   "SELECT * FROM users WHERE id = $id": "{\"sql\":[\"SELECT * FROM users WHERE id = ($1::pg_catalog.int4)\"],\"params\":[[\"id\",\"number\"]],\"columns\":[[\"id\",\"number\"],[\"name\",\"text\"],[\"email\",\"text\"],[\"mood\",\"text\"],[\"tags\",[\"array\",\"text\"]],[\"prefs\",\"json\"],[\"balance\",\"text\"],[\"visits\",\"bigint\"],[\"avatar\",\"bytea\"],[\"home\",[\"record\",[[\"street\",\"text\"],[\"number\",\"number\"]]]],[\"created_at\",\"timestamptz\"]],\"subquery\":true}",
   "SELECT 1.5::float8 AS f, 'NaN'::float8 AS nan, now() AS now, '\\x00ff'::bytea AS b, NULL::text AS nothing": "{\"sql\":[\"SELECT 1.5::float8 AS f, 'NaN'::float8 AS nan, now() AS now, '\\\\x00ff'::bytea AS b, NULL::text AS nothing\"],\"params\":[],\"columns\":[[\"f\",\"number\"],[\"nan\",\"number\"],[\"now\",\"timestamptz\"],[\"b\",\"bytea\"],[\"nothing\",\"text\"]],\"subquery\":true}",
+  "SELECT b::text AS b FROM unnest($boxes::box[]) AS b WHERE b IN $..wanted": "{\"sql\":[\"SELECT b::text AS b FROM unnest(($1::pg_catalog.box[])::box[]) AS b WHERE \",[\"list\",0,\"::pg_catalog.box\",\"(SELECT NULL::pg_catalog.box WHERE false)\",\"b \",\"IN \",\"= ANY\",\"::pg_catalog.box[]\"],\"\"],\"params\":[[\"boxes\",[\"array\",\"text\",\";\"]]],\"spreads\":[[\"wanted\",[[\"wanted\",\"text\",\"::pg_catalog.box\",\";\"]],\"list\"]],\"columns\":[[\"b\",\"text\"]]}",
   "SELECT count(*) AS n FROM users": "{\"sql\":[\"SELECT count(*) AS n FROM users\"],\"params\":[],\"columns\":[[\"n\",\"bigint\"]],\"subquery\":true}",
   "SELECT email FROM users WHERE id = $id": "{\"sql\":[\"SELECT email FROM users WHERE id = ($1::pg_catalog.int4)\"],\"params\":[[\"id\",\"number\"]],\"columns\":[[\"email\",\"text\"]],\"subquery\":true}",
   "SELECT home, (home).street FROM users WHERE id = $id": "{\"sql\":[\"SELECT home, (home).street FROM users WHERE id = ($1::pg_catalog.int4)\"],\"params\":[[\"id\",\"number\"]],\"columns\":[[\"home\",[\"record\",[[\"street\",\"text\"],[\"number\",\"number\"]]]],[\"street\",\"text\"]],\"subquery\":true}",
   "SELECT id, label FROM things ORDER BY id": "{\"sql\":[\"SELECT id, label FROM things ORDER BY id\"],\"params\":[],\"columns\":[[\"id\",\"number\"],[\"label\",\"text\"]],\"subquery\":true}",
   "SELECT id, name, mood FROM users WHERE mood = $mood ORDER BY id": "{\"sql\":[\"SELECT id, name, mood FROM users WHERE mood = ($1::public.mood) ORDER BY id\"],\"params\":[[\"mood\",\"text\"]],\"columns\":[[\"id\",\"number\"],[\"name\",\"text\"],[\"mood\",\"text\"]],\"subquery\":true}",
   "SELECT interval '1 mon -1 days' AS iv": "{\"sql\":[\"SELECT interval '1 mon -1 days' AS iv\"],\"params\":[],\"columns\":[[\"iv\",\"interval\"]],\"subquery\":true}",
+  "SELECT jsonb_typeof($doc?::jsonb) AS kind, $doc?::jsonb::text AS text": "{\"sql\":[\"SELECT jsonb_typeof(($1::pg_catalog.jsonb)::jsonb) AS kind, ($1::pg_catalog.jsonb)::jsonb::text AS text\"],\"params\":[[\"doc\",\"json\"]],\"columns\":[[\"kind\",\"text\"],[\"text\",\"text\"]],\"subquery\":true}",
   "SELECT label FROM things WHERE $color = ANY (colors) ORDER BY id": "{\"sql\":[\"SELECT label FROM things WHERE ($1::public.color) = ANY (colors) ORDER BY id\"],\"params\":[[\"color\",\"text\"]],\"columns\":[[\"label\",\"text\"]],\"subquery\":true}",
+  "SELECT label FROM things WHERE (shape).meta @> $sub ORDER BY id": "{\"sql\":[\"SELECT label FROM things WHERE (shape).meta @> ($1::pg_catalog.jsonb) ORDER BY id\"],\"params\":[[\"sub\",\"json\"]],\"columns\":[[\"label\",\"text\"]],\"subquery\":true}",
   "SELECT name FROM users ORDER BY id": "{\"sql\":[\"SELECT name FROM users ORDER BY id\"],\"params\":[],\"columns\":[[\"name\",\"text\"]],\"subquery\":true}",
   "SELECT name FROM users WHERE id IN $..ids ORDER BY id": "{\"sql\":[\"SELECT name FROM users WHERE \",[\"list\",0,\"::pg_catalog.int4\",\"(SELECT NULL::pg_catalog.int4 WHERE false)\",\"id \",\"IN \",\"= ANY\",\"::pg_catalog.int4[]\"],\" ORDER BY id\"],\"params\":[],\"spreads\":[[\"ids\",[[\"ids\",\"number\",\"::pg_catalog.int4\"]],\"list\"]],\"columns\":[[\"name\",\"text\"]]}",
   "SELECT name FROM users WHERE id NOT IN $..ids ORDER BY id": "{\"sql\":[\"SELECT name FROM users WHERE \",[\"list\",0,\"::pg_catalog.int4\",\"(SELECT NULL::pg_catalog.int4 WHERE false)\",\"id \",\"NOT IN \",\"<> ALL\",\"::pg_catalog.int4[]\"],\" ORDER BY id\"],\"params\":[],\"spreads\":[[\"ids\",[[\"ids\",\"number\",\"::pg_catalog.int4\"]],\"list\"]],\"columns\":[[\"name\",\"text\"]]}",
@@ -433,6 +508,6 @@ export const copyIn = createCopyIn<CopyTargets>({
 });
 export const migrations = embedMigrations([
   ["0001_init", "CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral');\nCREATE DOMAIN user_prefs AS jsonb;\nCREATE TYPE address AS (street text, number int4);\n\nCREATE TABLE users (\n    id int4 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    name text NOT NULL,\n    email text,\n    mood mood,\n    tags text[] NOT NULL DEFAULT '{}',\n    prefs user_prefs,\n    balance numeric(12, 2) NOT NULL DEFAULT 0,\n    visits int8 NOT NULL DEFAULT 0,\n    avatar bytea,\n    home address,\n    created_at timestamptz NOT NULL DEFAULT now()\n);\n\nCREATE TABLE posts (\n    id int4 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    author_id int4 NOT NULL REFERENCES users (id),\n    title text NOT NULL,\n    body text\n);\n", "DROP TABLE posts;\nDROP TABLE users;\nDROP TYPE address;\nDROP DOMAIN user_prefs;\nDROP TYPE mood;\n"],
-  ["0002_types", "CREATE EXTENSION IF NOT EXISTS hstore;\n\nCREATE DOMAIN email AS text CHECK (VALUE LIKE '%@%');\nCREATE DOMAIN positive AS int4 CHECK (VALUE > 0);\nCREATE DOMAIN tag_list AS text[];\nCREATE TYPE color AS ENUM ('red', 'green', 'with space', 'quo\"te', 'back\\slash', 'NULL');\nCREATE TYPE point2 AS (x float8, y float8);\nCREATE TYPE shape AS (\n    name text,\n    color color,\n    points point2[],\n    tags text[],\n    meta jsonb\n);\nCREATE DOMAIN shape_d AS shape;\n\nCREATE TABLE things (\n    id int4 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    label text NOT NULL,\n    email email,\n    qty positive,\n    tags tag_list,\n    colors color[],\n    shape shape,\n    shape_d shape_d,\n    shapes shape[],\n    span int4range,\n    periods tstzmultirange,\n    amounts numrange,\n    dates daterange,\n    dur interval,\n    attrs hstore,\n    big int8,\n    bigs int8[],\n    nums numeric[],\n    flags bool[],\n    blobs bytea[],\n    stamps timestamptz[],\n    docs jsonb[],\n    day date,\n    at_local timestamp,\n    clock timetz,\n    wall time,\n    id_uuid uuid,\n    addr inet,\n    money_v money,\n    bits varbit,\n    ch \"char\"\n);\n", "DROP TABLE things;\nDROP DOMAIN shape_d;\nDROP TYPE shape;\nDROP TYPE point2;\nDROP TYPE color;\nDROP DOMAIN tag_list;\nDROP DOMAIN positive;\nDROP DOMAIN email;\n"],
+  ["0002_types", "CREATE EXTENSION IF NOT EXISTS hstore;\n\nCREATE DOMAIN email AS text CHECK (VALUE LIKE '%@%');\nCREATE DOMAIN positive AS int4 CHECK (VALUE > 0);\nCREATE DOMAIN tag_list AS text[];\nCREATE TYPE color AS ENUM ('red', 'green', 'with space', 'quo\"te', 'back\\slash', 'NULL');\nCREATE TYPE point2 AS (x float8, y float8);\nCREATE TYPE shape AS (\n    name text,\n    color color,\n    points point2[],\n    tags text[],\n    meta jsonb\n);\nCREATE DOMAIN shape_d AS shape;\n-- Separated by `;` in an array, as a box is.\nCREATE DOMAIN frame AS box;\n\nCREATE TABLE things (\n    id int4 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    label text NOT NULL,\n    email email,\n    qty positive,\n    tags tag_list,\n    colors color[],\n    shape shape,\n    shape_d shape_d,\n    shapes shape[],\n    span int4range,\n    periods tstzmultirange,\n    amounts numrange,\n    dates daterange,\n    dur interval,\n    attrs hstore,\n    big int8,\n    bigs int8[],\n    nums numeric[],\n    flags bool[],\n    blobs bytea[],\n    stamps timestamptz[],\n    docs jsonb[],\n    day date,\n    at_local timestamp,\n    clock timetz,\n    wall time,\n    id_uuid uuid,\n    addr inet,\n    money_v money,\n    bits varbit,\n    ch \"char\"\n);\n", "DROP TABLE things;\nDROP DOMAIN frame;\nDROP DOMAIN shape_d;\nDROP TYPE shape;\nDROP TYPE point2;\nDROP TYPE color;\nDROP DOMAIN tag_list;\nDROP DOMAIN positive;\nDROP DOMAIN email;\n"],
   ["0003_things_index", "-- no-transaction\nCREATE INDEX CONCURRENTLY things_label ON things (label);\nCREATE INDEX CONCURRENTLY things_big ON things (big);\n", "-- no-transaction\nDROP INDEX CONCURRENTLY things_big;\nDROP INDEX CONCURRENTLY things_label;\n"],
 ], { table: "public._migrations", lockId: 713705, useTransaction: true, failOnDrift: true });

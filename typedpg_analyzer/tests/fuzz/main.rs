@@ -23,7 +23,12 @@
 //!      SELECTs (with joins, subquery predicates, scalar subqueries, GROUP BY,
 //!      DISTINCT [ON], …), set operations, CTEs, and DML
 //!      (INSERT/UPDATE/DELETE with RETURNING) — mistypes deliberately allowed,
-//!      and `$pN` parameters threaded through typed contexts;
+//!      and `$pN` parameters threaded through typed contexts — next to a
+//!      **feature generator** (`gen_feature_statement`, `features.rs`) for
+//!      the surface the templates don't reach: row values, SRFs in FROM,
+//!      SQL/JSON and `JSON_TABLE`, window frames, ranges, domains over
+//!      arrays and composites, inheritance and partitions, `RETURNING
+//!      old/new`, schema-qualified references, …;
 //!   2. an **AST mutator** that parses a seed with `typedpg_pg_query`, tweaks leaf
 //!      nodes in the AST (constants, column refs, operators,
 //!      function names, cast targets), and prints the tree back to SQL with a
@@ -80,6 +85,7 @@ use typedpg_analyzer::{
 };
 use typedpg_pg_query::ast::Node;
 
+mod features;
 mod generators;
 mod minimize;
 mod mutate;
@@ -89,6 +95,7 @@ mod report;
 mod schema;
 mod typed;
 
+use features::*;
 use generators::*;
 use minimize::*;
 use mutate::*;
@@ -117,9 +124,17 @@ fn fuzz_analyze_against_pg() {
     // actually produce. Returns before any Postgres connection is needed.
     if let Ok(n) = std::env::var("FUZZ_DUMP").map(|s| s.parse::<u32>().unwrap_or(20)) {
         let mut shapes: BTreeMap<&str, u32> = BTreeMap::new();
-        for _ in 0..n {
-            let sql = gen_statement(&mut rng);
-            let shape = if sql.starts_with("INSERT") {
+        for k in 0..n {
+            // Every fifth statement comes from the feature generator.
+            let feature = k % 5 == 4;
+            let sql = if feature {
+                gen_feature_statement(&mut rng)
+            } else {
+                gen_statement(&mut rng)
+            };
+            let shape = if feature {
+                "FEATURE"
+            } else if sql.starts_with("INSERT") {
                 "INSERT"
             } else if sql.starts_with("UPDATE") {
                 "UPDATE"
@@ -260,6 +275,15 @@ fn fuzz_analyze_against_pg() {
                 Some(q) => q,
                 None => gen_statement(&mut rng),
             }
+        } else if roll < 22 {
+            // Feature generator: the SQL surface the templates don't reach
+            // (row values, SRFs in FROM, SQL/JSON, frames, ranges, …).
+            let q = gen_feature_statement(&mut rng);
+            let positional = named_to_positional(&q);
+            if typedpg_pg_query::parse(&positional).is_ok() && live_seeds.len() < 400 {
+                live_seeds.push(positional);
+            }
+            q
         } else if roll < 32 {
             // Template generator (SELECT / set-op / CTE / VALUES / DML).
             // Pool the *positional* form (`$N`) — typedpg_pg_query can parse it, so
@@ -491,10 +515,11 @@ fn printer_round_trips_trees() {
 ///   in UPDATE and MERGE too, although PG fails only the executions that
 ///   touch a row — and the execute fallback runs against empty tables (see
 ///   CLAUDE.md, "Errors that every execution raises");
-/// - a role name (`'x'::regrole`, an `aclitem` grantee) is accepted: roles
-///   live in the cluster, not in the migrations (see `reg_input`), so the
-///   scratch database's `role "x" does not exist` says nothing about the
-///   one the application runs against.
+/// - a role name (`'x'::regrole`, an `aclitem` grantee) or a database name
+///   (`'x'::regdatabase`) is accepted: roles and databases live in the
+///   cluster, not in the migrations (see `reg_input`), so the scratch
+///   database's `role "x" does not exist` says nothing about the one the
+///   application runs against.
 fn deliberate_divergence(div: &Divergence) -> bool {
     let line = |prefix: &str| {
         div.message
@@ -506,8 +531,10 @@ fn deliberate_divergence(div: &Divergence) -> bool {
             e.starts_with("null value in column ")
                 || (e.starts_with("domain ") && e.contains("does not allow null values"))
         }),
-        DivergenceKind::AnalyzePgRejected => line("PG error: ")
-            .is_some_and(|e| e.starts_with("role \"") && e.contains("\" does not exist")),
+        DivergenceKind::AnalyzePgRejected => line("PG error: ").is_some_and(|e| {
+            (e.starts_with("role \"") || e.starts_with("database \""))
+                && e.contains("\" does not exist")
+        }),
         _ => false,
     }
 }

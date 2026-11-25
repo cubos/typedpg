@@ -131,27 +131,32 @@ pub(crate) fn analyze_merge_with_outer_ctes(
         ..Scope::default()
     };
     target_scope.add_dml_target(snapshot, &target_alias, target_qn.clone(), &table_attrs);
+    let events: Vec<DmlEvent> = merge
+        .merge_when_clauses
+        .iter()
+        .filter_map(|n| match n.as_ref() {
+            Some(ast::Node::MergeWhenClause(w)) => match w.command_type {
+                CmdType::CmdInsert => Some(DmlEvent::Insert),
+                CmdType::CmdUpdate => Some(DmlEvent::Update),
+                CmdType::CmdDelete => Some(DmlEvent::Delete),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
     // The values its actions write, until it is analyzed.
     let _write = crate::pg_catalog::note_write_statement(
         crate::condition::WriteCommand::Merge,
         table_oid,
-        || {
-            let events: Vec<DmlEvent> = merge
-                .merge_when_clauses
-                .iter()
-                .filter_map(|n| match n.as_ref() {
-                    Some(ast::Node::MergeWhenClause(w)) => match w.command_type {
-                        CmdType::CmdInsert => Some(DmlEvent::Insert),
-                        CmdType::CmdUpdate => Some(DmlEvent::Update),
-                        CmdType::CmdDelete => Some(DmlEvent::Delete),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-                .collect();
-            super::dml::write_base(snapshot, table_oid, &events, true)
-        },
+        || super::dml::write_base(snapshot, table_oid, &events, true),
     );
+    // A DELETE action through an automatically updatable view deletes the
+    // base table's rows.
+    if events.contains(&DmlEvent::Delete) {
+        crate::pg_catalog::note_delete_base(table_oid, || {
+            super::dml::write_base(snapshot, table_oid, &events, true).map(|b| b.relid)
+        });
+    }
     note_merge_privileges(merge, table_oid, &table_attrs);
     let mut source_scope = Scope {
         ctes: cte_scopes.clone(),

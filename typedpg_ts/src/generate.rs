@@ -250,11 +250,18 @@ fn generate_query(a: &AnalyzedQuery, mapper: &TypeMapper) -> Result<Generated, G
                         .fields
                         .iter()
                         .map(|f| {
-                            json!([
-                                f.name,
+                            let mut field = vec![
+                                json!(f.name),
                                 mapper.map(&f.pg_type).codec.to_json(),
-                                cast_suffix(&f.pg_type)
-                            ])
+                                json!(cast_suffix(&f.pg_type)),
+                            ];
+                            // What separates the values in the spread's
+                            // array form, when it isn't `,`.
+                            let delimiter = mapper.delimiter(&f.pg_type);
+                            if delimiter != ',' {
+                                field.push(json!(delimiter.to_string()));
+                            }
+                            Value::Array(field)
                         })
                         .collect();
                     let kind = match s.kind {
@@ -559,8 +566,18 @@ mod tests {
         let mapper = TypeMapper {
             overrides: &overrides,
             used: Default::default(),
+            catalog: &c,
         };
-        generate(&c, &mapper, kind, sql, roles)
+        // As a module prints them: each enum by its name.
+        let names = crate::typemap::Enums::new(&c, &overrides).names([]);
+        let render = |s: &str| names.render(s).into_owned();
+        generate(&c, &mapper, kind, sql, roles).map(|g| Generated {
+            types: render(&g.types),
+            params: g.params.iter().map(|m| render(m)).collect(),
+            row: g.row.iter().map(|m| render(m)).collect(),
+            value: g.value.as_deref().map(render),
+            ..g
+        })
     }
 
     fn ok(sql: &str) -> Generated {
@@ -598,7 +615,7 @@ mod tests {
       id: number;
       name: string | null;
       big: bigint;
-      m: "happy" | "sad" | null;
+      m: Mood | null;
       tags: (string | null)[];
       prefs: typedpg.JsonValue | null;
     };
@@ -610,12 +627,50 @@ mod tests {
         );
     }
 
+    /// An enum is its name where any of its labels can be: a column, a
+    /// parameter, an array, a record's field; a value narrowed to some of
+    /// them is their literal union.
+    #[test]
+    fn enums_are_named_unless_narrowed() {
+        let g = ok("SELECT m, moods, home FROM users WHERE m = $m");
+        assert!(g.types.contains("m: Mood;"), "{}", g.types);
+        let g = ok("SELECT m, moods FROM users WHERE m <> 'sad' AND moods = $moods");
+        assert!(g.types.contains(r#"m: "happy";"#), "{}", g.types);
+        assert!(
+            g.types.contains("moods: readonly (Mood | null)[];"),
+            "{}",
+            g.types
+        );
+        assert!(g.types.contains("moods: (Mood | null)[];"), "{}", g.types);
+        let g = ok("SELECT name FROM users WHERE m IN $..ms");
+        assert!(g.types.contains("ms: readonly Mood[];"), "{}", g.types);
+        let g = ok("SELECT ROW(m, 1) AS r, ROW('sad'::mood, 2) AS s FROM users");
+        assert!(
+            g.types.contains("r: { f1: Mood | null; f2: 1 };"),
+            "{}",
+            g.types
+        );
+        assert!(
+            g.types.contains(r#"s: { f1: "sad"; f2: 2 };"#),
+            "{}",
+            g.types
+        );
+        assert_eq!(
+            ok("SELECT 'sad'::mood AS v").value.as_deref(),
+            Some(r#""sad""#)
+        );
+        assert_eq!(
+            ok("SELECT m AS v FROM users").value.as_deref(),
+            Some("Mood | null")
+        );
+    }
+
     #[test]
     fn hard_types() {
         let g = ok("SELECT home, moods, span, period, t2, homes FROM users");
         for expected in [
             "home: { street: string | null; num: number | null } | null;",
-            r#"moods: ("happy" | "sad" | null)[] | null;"#,
+            "moods: (Mood | null)[] | null;",
             "span: typedpg.Range<number> | null;",
             "period: typedpg.Range<Temporal.Instant>[] | null;",
             "t2: (string | null)[];",
@@ -649,6 +704,44 @@ mod tests {
     }
 
     #[test]
+    fn int2vector_parameters_are_cast_to_int2vector() {
+        // Not `int2[]`, which has no cast to `int2vector`; written `1 2 3`.
+        let g = ok("SELECT $v::int2vector AS v, $o::oidvector AS o");
+        assert!(
+            g.runtime.contains(
+                "SELECT ($1::pg_catalog.int2vector)::int2vector AS v, \
+                 ($2::pg_catalog.oidvector)::oidvector AS o"
+            ),
+            "{}",
+            g.runtime
+        );
+        assert!(
+            g.runtime
+                .contains(r#""params":[["v",["spaced","number"]],["o",["spaced","number"]]]"#),
+            "{}",
+            g.runtime
+        );
+        assert!(g.types.contains("v: readonly number[];"), "{}", g.types);
+        assert!(g.types.contains("v: number[];"), "{}", g.types);
+    }
+
+    #[test]
+    fn a_box_spread_carries_its_delimiter() {
+        let g = ok("SELECT b FROM unnest($bs::box[]) AS b WHERE b IN $..wanted");
+        assert!(
+            g.runtime
+                .contains(r#"["wanted",[["wanted","text","::pg_catalog.box",";"]],"list"]"#),
+            "{}",
+            g.runtime
+        );
+        assert!(
+            g.runtime.contains(r#"["bs",["array","text",";"]]"#),
+            "{}",
+            g.runtime
+        );
+    }
+
+    #[test]
     fn nullability_annotations() {
         let g = ok(r#"SELECT name AS "name!", id AS "id?" FROM users WHERE name = $n?"#);
         assert!(g.types.contains("name: string;"), "{}", g.types);
@@ -674,6 +767,35 @@ mod tests {
             "{}",
             g.types
         );
+    }
+
+    /// An array cast element by element, and an aggregate of values proven
+    /// non-NULL, have non-NULL elements.
+    #[test]
+    fn proven_elements_are_not_nullable() {
+        let ddl = "CREATE TABLE cl (id int4 PRIMARY KEY, tz text NOT NULL);
+            CREATE TABLE ev (id uuid PRIMARY KEY, cid int4 NOT NULL REFERENCES cl,
+                             dates date[] NOT NULL CHECK (array_position(dates, NULL) IS NULL),
+                             fin timestamptz NOT NULL CHECK (isfinite(fin)));";
+        let g = run_with_ddl(
+            ddl,
+            Kind::Query,
+            r#"SELECT dates::text[] AS "dates!" FROM ev"#,
+            &[],
+        )
+        .unwrap();
+        assert!(g.types.contains("value: string[];"), "{}", g.types);
+        let g = run_with_ddl(
+            ddl,
+            Kind::Query,
+            r#"SELECT array_agg(DISTINCT extract(isodow FROM s.fin AT TIME ZONE c.tz)::int) AS "days!",
+                      array_agg(s.id) AS "ids!"
+               FROM ev s JOIN cl c ON c.id = s.cid"#,
+            &[],
+        )
+        .unwrap();
+        assert!(g.types.contains("days: number[];"), "{}", g.types);
+        assert!(g.types.contains("ids: string[];"), "{}", g.types);
     }
 
     #[test]

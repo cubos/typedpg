@@ -39,6 +39,12 @@ export type Fits<T extends U, U> = T;
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
+/**
+ * The JSON `null`, for a `json`/`jsonb` parameter: a plain `null` there is
+ * SQL NULL. Anywhere inside a value, `null` already is the JSON one.
+ */
+export const jsonNull: { readonly toJSON: () => null } = Object.freeze({ toJSON: () => null });
+
 /** A query's types, as the generated `Queries` interface describes it. */
 export interface QueryTypes {
   params: object;
@@ -171,9 +177,13 @@ export type ValuesItem = readonly ["row", readonly SqlPiece[]] | readonly ["rows
  * one rows spread) is written in it — `(x = ANY($1::type[]))`, `SELECT *
  * FROM unnest($1::type[], …) AS __typedpg_rows (column1, …)`: a parameter
  * per field, whatever the number of items. The analysis offers the form
- * only where it is the same query.
+ * only where it is the same query. At or below it too when its
+ * placeholders would pass the spread's share of {@link MAX_PARAMS}.
  */
 const ARRAY_THRESHOLD = 1000;
+
+/** The most parameters a query can bind: the Bind message counts them in 16 bits. */
+const MAX_PARAMS = 65535;
 
 /** What the generator writes for each query: the SQL to run and the codecs. */
 export interface QuerySpec {
@@ -183,13 +193,22 @@ export interface QuerySpec {
   params: readonly (readonly [string, Codec])[];
   /**
    * Each spread's name, fields (name, codec, the cast after its
-   * placeholder) and kind: `rows` of VALUES (`VALUES $..rows { a, b }`), or
-   * the `list` of an IN (`x IN $..ids`), whose one field is the element.
+   * placeholder and, when it isn't `,`, what separates its values in an
+   * array) and kind: `rows` of VALUES (`VALUES $..rows { a, b }`), or the
+   * `list` of an IN (`x IN $..ids`), whose one field is the element.
    */
-  spreads?: readonly (readonly [string, readonly (readonly [string, Codec, string])[], "rows" | "list"])[];
+  spreads?: readonly (readonly [string, readonly SpreadField[], "rows" | "list"])[];
   columns: readonly (readonly [string, Codec])[];
   /** Whether `fetchOne` / `fetchOptional` can wrap the SQL in `LIMIT 2`. */
   subquery?: boolean;
+}
+
+/** A spread's field: its name, codec, cast and array delimiter (when not `,`). */
+type SpreadField = readonly [string, Codec, string] | readonly [string, Codec, string, string];
+
+/** The codec of an array of `field`'s values. */
+function arrayOf(field: SpreadField): Codec {
+  return field[3] === undefined ? ["array", field[1]] : ["array", field[1], field[3]];
 }
 
 export class TypedpgError extends Error {
@@ -323,45 +342,59 @@ class QueryImpl {
    */
   private build(params: Record<string, unknown> = {}): Built {
     const { spec } = this;
-    const values = spec.params.map(([name, codec]) => {
+    // The codec knows the value, not the parameter it belongs to.
+    const encodeFor = (where: () => string, codec: Codec, value: unknown) => {
       try {
-        return encode(codec, params[name]);
+        return encode(codec, value);
       } catch (e) {
-        // The codec knows the value, not the parameter it belongs to.
-        if (e instanceof TypeError) {
-          throw new TypeError(`the parameter \`${name}\`: ${e.message}`);
-        }
+        if (e instanceof TypeError) throw new TypeError(`${where()}: ${e.message}`);
         throw e;
       }
-    });
+    };
+    const values = spec.params.map(([name, codec]) => encodeFor(() => `the parameter \`${name}\``, codec, params[name]));
     let n = values.length;
-    const placeholder = (codec: Codec, value: unknown, cast: string) => {
-      values.push(encode(codec, value));
+    const placeholder = (where: () => string, codec: Codec, value: unknown, cast: string) => {
+      values.push(encodeFor(where, codec, value));
       return `$${++n}${cast}`;
     };
-    const items = (i: number) => params[spec.spreads![i]![0]] as readonly unknown[];
+    const spread = (i: number) => `the spread \`${spec.spreads![i]![0]}\``;
+    const items = (i: number) => {
+      const list = params[spec.spreads![i]![0]];
+      if (!Array.isArray(list)) {
+        throw new TypeError(`${spread(i)} must be an array, not ${list === null ? "null" : typeof list}`);
+      }
+      return list as readonly unknown[];
+    };
+    // Each spread's share of the parameters: within it, the spreads with an
+    // array form never make the query pass the limit (the Rust runtime's
+    // `spread_budget`).
+    const budget = Math.floor(Math.max(0, MAX_PARAMS - spec.params.length) / Math.max(1, spec.spreads?.length ?? 0));
+    const asArrays = (length: number, width: number) => length > ARRAY_THRESHOLD || length * width > budget;
     const write = (pieces: readonly SqlPiece[]): string =>
       pieces
         .map((piece) => {
           if (typeof piece === "string") return piece;
           if (piece[0] === "list") {
             const [, i, cast, empty, lead = "", keyword = "", op, arrayCast] = piece;
-            const codec = spec.spreads![i]![1][0]![1];
+            const field = spec.spreads![i]![1][0]!;
+            const codec = field[1];
             const list = items(i);
-            if (op !== undefined && arrayCast !== undefined && list.length > ARRAY_THRESHOLD) {
-              return `(${lead}${op}(${placeholder(["array", codec], list, arrayCast)}))`;
+            if (op !== undefined && arrayCast !== undefined && asArrays(list.length, 1)) {
+              return `(${lead}${op}(${placeholder(() => spread(i), arrayOf(field), list, arrayCast)}))`;
             }
-            const written = list.length === 0 ? empty : `(${list.map((v) => placeholder(codec, v, cast)).join(", ")})`;
+            const written =
+              list.length === 0 ? empty : `(${list.map((v) => placeholder(() => spread(i), codec, v, cast)).join(", ")})`;
             return lead + keyword + written;
           }
           const [, rows, empty, unnest] = piece;
           const only = rows.length === 1 && rows[0]![0] === "rows" ? rows[0]![1] : undefined;
-          if (unnest !== undefined && only !== undefined && items(only).length > ARRAY_THRESHOLD) {
+          if (unnest !== undefined && only !== undefined && asArrays(items(only).length, unnest.length)) {
             const values = items(only) as readonly Record<string, unknown>[];
-            const arrays = spec.spreads![only]![1].map(([field, codec], c) =>
+            const arrays = spec.spreads![only]![1].map((field, c) =>
               placeholder(
-                ["array", codec],
-                values.map((r) => r[field]),
+                () => `${spread(only)}, field \`${field[0]}\``,
+                arrayOf(field),
+                values.map((r) => r[field[0]]),
                 unnest[c]!,
               ),
             );
@@ -373,8 +406,12 @@ class QueryImpl {
             .map((item) => {
               if (item[0] === "row") return write(item[1]);
               const fields = spec.spreads![item[1]]![1];
-              const row = (r: Record<string, unknown>) =>
-                `(${fields.map(([field, codec, cast]) => placeholder(codec, r[field], cast)).join(", ")})`;
+              const row = (r: Record<string, unknown>, at: number) =>
+                `(${fields
+                  .map(([field, codec, cast]) =>
+                    placeholder(() => `${spread(item[1])}, item ${at}, field \`${field}\``, codec, r[field], cast),
+                  )
+                  .join(", ")})`;
               return (items(item[1]) as readonly Record<string, unknown>[]).map(row).join(", ");
             });
           return written.length === 0 ? empty : `VALUES ${written.join(", ")}`;
@@ -523,14 +560,23 @@ async function* copyText(
   rows: Iterable<Record<string, unknown>> | AsyncIterable<Record<string, unknown>>,
 ): AsyncIterable<string> {
   let chunk = "";
+  let at = 0;
   for await (const row of rows) {
     for (let i = 0; i < spec.columns.length; i++) {
       const [name, codec] = spec.columns[i]!;
-      const text = encode(codec, row[name]);
+      let text: string | null;
+      try {
+        text = encode(codec, row[name]);
+      } catch (e) {
+        // The codec knows the value, not the row and column it belongs to.
+        if (e instanceof TypeError) throw new TypeError(`row ${at}, column \`${name}\`: ${e.message}`);
+        throw e;
+      }
       if (i > 0) chunk += "\t";
       chunk += text === null ? "\\N" : copyEscape(text);
     }
     chunk += "\n";
+    at++;
     if (chunk.length >= COPY_CHUNK) {
       yield chunk;
       chunk = "";

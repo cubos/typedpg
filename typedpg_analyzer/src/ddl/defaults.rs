@@ -192,7 +192,8 @@ fn check_default_kind(
 ) -> Result<(), DdlError> {
     check_default_kind_node(interp, expr, column_default)?;
     crate::resolve::check_no_srf_in_clause(expr, interp, "DEFAULT expressions")
-        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))
+        .map_err(|e| DdlError::UnsupportedDdl(e.to_string()))?;
+    super::expr_kind::reject_parameters(expr)
 }
 
 fn check_default_kind_node(
@@ -331,8 +332,14 @@ pub(crate) fn record_default_dependencies(
             .iter()
             .find(|a| a.attnum == attnum)
             .map(|a| a.atttypid);
-        let refs =
+        let mut refs =
             super::depend::coerced_expression_references(interp, Some(expr), Some(relid), target);
+        // recordDependencyOnSingleRelExpr: and on the type it produces, the
+        // column's.
+        refs.extend(
+            target
+                .map(|t| super::depend::Reference::Object(super::depend::ObjectAddress::type_(t))),
+        );
         super::depend::record_references(
             interp,
             super::depend::ObjectAddress::column(relid, attnum),

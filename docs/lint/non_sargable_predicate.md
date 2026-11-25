@@ -3,9 +3,9 @@
 A comparison that wraps an indexed column in a cast, function or arithmetic,
 so the column's index can't serve it.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| performance | warning | queries | — |
 
 ## Example
 
@@ -24,21 +24,21 @@ SELECT sku FROM products WHERE id = 1.5;
 ```
 
 ```
-info[non_sargable_predicate]: this comparison can't use the index users_created_at_idx on created_at: the column is cast to date
+warning[performance/non_sargable_predicate]: this comparison can't use the index users_created_at_idx on created_at: the column is cast to date
    ╭─[queries.sql:2:28]
  2 │ SELECT id FROM users WHERE created_at::date = $day;
    ·                            ───────────────────────
    ╰────
   help: compare a range on the column itself: `created_at >= $day::date::timestamptz AND created_at < ($day::date + 1)::timestamptz` reads days in the session's TimeZone as the cast does, and selects the same rows but around a daylight-saving change at midnight; for days of a fixed zone instead (other rows, unless the session is in that zone), convert each bound with `::timestamp AT TIME ZONE 'UTC'`
 
-info[non_sargable_predicate]: this comparison can't use the index products_sku_idx on sku: the column is an argument of lower()
+warning[performance/non_sargable_predicate]: this comparison can't use the index products_sku_idx on sku: the column is an argument of lower()
    ╭─[queries.sql:6:31]
  6 │ SELECT id FROM products WHERE lower(sku) = $sku;
    ·                               ─────────────────
    ╰────
   help: compare the column itself, or create an expression index on (lower(sku))
 
-info[non_sargable_predicate]: this comparison can't use the index products_pkey on id: the column is converted from int4 to numeric to match the other side's type
+warning[performance/non_sargable_predicate]: this comparison can't use the index products_pkey on id: the column is converted from int4 to numeric to match the other side's type
     ╭─[queries.sql:12:32]
  12 │ SELECT sku FROM products WHERE id = 1.5;
     ·                                ────────

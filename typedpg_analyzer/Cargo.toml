@@ -9,6 +9,9 @@ authors.workspace = true
 description = "Static SQL type and nullability analyzer for typedpg"
 keywords = ["postgres", "postgresql", "sql", "static-analysis", "types"]
 categories = ["database"]
+# The extension scripts are embedded from their zstd compressions
+# (`<file>.sql.zst`); the readable `.sql` files stay in the repository.
+exclude = ["src/extensions/*.sql"]
 
 [features]
 internal = []
@@ -38,6 +41,9 @@ serde_tuple = "1"
 thiserror = "2"
 postgres = { version = "0.19", optional = true }
 bytes = { version = "1", optional = true }
+# Decompresses the bundled extension scripts (`src/extensions/*.sql.zst`):
+# pure Rust, so no C library is linked into the targets the analyzer runs on.
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

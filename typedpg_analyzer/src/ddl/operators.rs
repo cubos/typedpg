@@ -161,7 +161,7 @@ fn validate_restriction_estimator(
     names: &[String],
 ) -> Result<PgProcOid, DdlError> {
     let args = [INTERNAL, builtin::OID, INTERNAL, builtin::INT4];
-    let oid = lookup_func_name(interp, names, Some(&args))?.ok_or_else(|| {
+    let oid = lookup_func_name(interp, names, Some(&args), false)?.ok_or_else(|| {
         DdlError::TypeNotFound(format!(
             "function {} does not exist",
             func_signature_string(interp, names, &args)
@@ -181,8 +181,8 @@ fn validate_restriction_estimator(
 fn validate_join_estimator(interp: &PgCatalog, names: &[String]) -> Result<PgProcOid, DdlError> {
     let args5 = [INTERNAL, builtin::OID, INTERNAL, builtin::INT2, INTERNAL];
     let args4 = [INTERNAL, builtin::OID, INTERNAL, builtin::INT2];
-    let five = lookup_func_name(interp, names, Some(&args5))?;
-    let four = lookup_func_name(interp, names, Some(&args4))?;
+    let five = lookup_func_name(interp, names, Some(&args5), false)?;
+    let four = lookup_func_name(interp, names, Some(&args4), false)?;
     let oid = match (five, four) {
         (Some(_), Some(_)) => {
             return Err(DdlError::Parse(format!(
@@ -418,7 +418,7 @@ pub fn define_operator(interp: &mut PgCatalog, stmt: &DefineStmt) -> Result<(), 
         }));
     };
     let args: Vec<PgTypeOid> = left.into_iter().chain([right]).collect();
-    let Some(proc_oid) = lookup_func_name(interp, &function, Some(&args))? else {
+    let Some(proc_oid) = lookup_func_name(interp, &function, Some(&args), false)? else {
         return Err(DdlError::TypeNotFound(format!(
             "function {} does not exist",
             func_signature_string(interp, &function, &args)
@@ -616,6 +616,8 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         return Ok(());
     };
     let (mut restrict, mut join, mut commutator, mut negator) = (None, None, None, None);
+    // Whether RESTRICT / JOIN are given (with a value, or NONE).
+    let (mut restrict_given, mut join_given) = (false, false);
     let (mut can_merge, mut can_hash) = (false, false);
     let (mut update_merges, mut update_hashes) = (false, false);
     for opt in &stmt.options {
@@ -625,8 +627,14 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         // An option without a value (NONE) resets it.
         let value = de.arg.is_some().then(|| def_qualified_name(de));
         match de.defname.as_str() {
-            "restrict" => restrict = value,
-            "join" => join = value,
+            "restrict" => {
+                restrict = value;
+                restrict_given = true;
+            }
+            "join" => {
+                join = value;
+                join_given = true;
+            }
             "commutator" => commutator = value,
             "negator" => negator = value,
             "merges" => {
@@ -650,12 +658,14 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
             }
         }
     }
-    if let Some(names) = restrict.as_deref() {
-        validate_restriction_estimator(interp, names)?;
-    }
-    if let Some(names) = join.as_deref() {
-        validate_join_estimator(interp, names)?;
-    }
+    let restrict_fn = match restrict.as_deref() {
+        Some(names) => Some(validate_restriction_estimator(interp, names)?),
+        None => None,
+    };
+    let join_fn = match join.as_deref() {
+        Some(names) => Some(validate_join_estimator(interp, names)?),
+        None => None,
+    };
     // ValidateOperatorReference: the linked operators must exist, defined.
     let validate_reference =
         |names: &[String], l: Option<PgTypeOid>, r: PgTypeOid| match operator_lookup(
@@ -736,6 +746,49 @@ pub fn alter_operator(interp: &mut PgCatalog, stmt: &AlterOperatorStmt) -> Resul
         if update_hashes {
             row.oprcanhash = can_hash;
         }
+    }
+    // makeOperatorDependencies(isUpdate): the operator depends on its
+    // estimators as they are now — an estimator replaced (or reset) is no
+    // longer one.
+    if restrict_given || join_given {
+        let estimator = |p: &crate::pg_catalog::PgProc| {
+            let restriction = p.proargtypes == [INTERNAL, builtin::OID, INTERNAL, builtin::INT4];
+            let join_fn =
+                p.proargtypes
+                    .starts_with(&[INTERNAL, builtin::OID, INTERNAL, builtin::INT2]);
+            (restrict_given && restriction) || (join_given && join_fn)
+        };
+        let me = ObjectAddress::operator(oid);
+        let replaced: Vec<crate::oid::PgGenericOid> = interp
+            .pg_depend
+            .iter()
+            .filter(|d| {
+                d.classid == me.classid
+                    && d.objid == me.objid
+                    && d.refclassid == crate::pg_catalog::PG_PROC_RELID
+                    && d.deptype == DepType::Normal
+                    && PgProcOid::new(d.refobjid.get())
+                        .and_then(|f| interp.pg_proc.get(&f))
+                        .is_some_and(estimator)
+            })
+            .map(|d| d.refobjid)
+            .collect();
+        interp.pg_depend.retain(|d| {
+            !(d.classid == me.classid
+                && d.objid == me.objid
+                && d.refclassid == crate::pg_catalog::PG_PROC_RELID
+                && d.deptype == DepType::Normal
+                && replaced.contains(&d.refobjid))
+        });
+        super::depend::record(
+            interp,
+            me,
+            restrict_fn
+                .into_iter()
+                .chain(join_fn)
+                .map(ObjectAddress::proc),
+            DepType::Normal,
+        );
     }
     operator_upd(
         interp,

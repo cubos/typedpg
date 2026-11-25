@@ -3,9 +3,9 @@
 `GROUP BY` keys that can't split a group: the other keys determine them, or
 `WHERE` pins them to one value.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the keys |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the keys |
 
 ## Example
 
@@ -19,7 +19,7 @@ SELECT user_id, count(*) AS n FROM posts WHERE status = $status GROUP BY status,
 ```
 
 ```
-info[redundant_group_by]: the GROUP BY key name can't split a group: the other keys determine it, or WHERE pins it to one value
+info[redundant/redundant_group_by]: the GROUP BY key name can't split a group: the other keys determine it, or WHERE pins it to one value
    ╭─[queries.sql:4:56]
  4 │ SELECT email, count(*) AS n FROM users GROUP BY email, name;
    ·                                                        ────

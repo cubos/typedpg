@@ -131,3 +131,33 @@ async fn a_date_or_timestamp_parameter_is_finite() {
         ("2024-02-29", Decimal::from(2), "12:34")
     );
 }
+
+#[tokio::test]
+async fn int2vector_and_oidvector_parameters_and_columns() {
+    let pool = common::setup().await;
+
+    // Typed as themselves (not `int2[]` / `oid[]`, which have no cast to
+    // them), read as `Vec`s of their elements; an empty one too, which is
+    // bound in text (PostgreSQL refuses an empty one in binary).
+    for (key, oids) in [(vec![3i16, -1], vec![26u32, 1259]), (vec![], vec![])] {
+        let row = sql!(
+            &pool,
+            "SELECT $key::int2vector AS k, $key::int2vector = '3 -1'::int2vector AS same,
+                    $oids::oidvector AS o, '1 2'::oidvector AS lit, ''::int2vector AS empty,
+                    ARRAY[$key::int2vector] AS ks",
+            key = key.clone(),
+            oids = oids.clone()
+        )
+        .fetch_one()
+        .await
+        .expect("select");
+        let (k, o, lit, empty): (Vec<i16>, Vec<u32>, Vec<u32>, Vec<i16>) =
+            (row.k, row.o, row.lit, row.empty);
+        assert_eq!(k, key);
+        assert_eq!(row.same, key == [3, -1]);
+        assert_eq!(o, oids);
+        assert_eq!(lit, [1, 2]);
+        assert!(empty.is_empty());
+        assert_eq!(row.ks.len(), 1);
+    }
+}

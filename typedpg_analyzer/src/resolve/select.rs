@@ -448,6 +448,21 @@ fn analyze_select_here(
                 null_ctx.note_nullified_joins(where_clause, &scope, &log, snapshot);
             }
             null_ctx.add_where_facts(facts.restricted_to(&own));
+            let plan_rels = crate::nonnull::plan_strict::qual_rels(
+                Some(where_clause),
+                &crate::nonnull::plan_strict::ScopeVars {
+                    scope: &scope,
+                    from: sel.from_clause.iter().flatten().collect(),
+                    null_ctx: &null_ctx,
+                    log: &log,
+                    snapshot,
+                },
+                &crate::nonnull::plan_strict::Strictness {
+                    log: Some(&log),
+                    snapshot,
+                },
+            );
+            null_ctx.add_plan_quals(plan_rels);
             Ok(())
         })?;
     }
@@ -506,7 +521,32 @@ fn analyze_select_here(
         if let Some(qual) = having.as_ref() {
             crate::nonnull::note_settled_null_tests(qual, &scope, &log, snapshot);
         }
+        // The planner moves a HAVING conjunct without aggregates into WHERE
+        // before reducing the outer joins.
+        let mut conjuncts = Vec::new();
+        super::row_guarantees::conjuncts(having.as_ref(), &mut conjuncts);
+        let plan_rels: std::collections::HashSet<String> = conjuncts
+            .into_iter()
+            .filter(|c| !has_aggregate_call(*c, snapshot))
+            .flat_map(|c| {
+                crate::nonnull::plan_strict::qual_rels(
+                    c,
+                    &crate::nonnull::plan_strict::ScopeVars {
+                        scope: &scope,
+                        from: sel.from_clause.iter().flatten().collect(),
+                        null_ctx: &null_ctx,
+                        log: &log,
+                        snapshot,
+                    },
+                    &crate::nonnull::plan_strict::Strictness {
+                        log: Some(&log),
+                        snapshot,
+                    },
+                )
+            })
+            .collect();
         null_ctx.add_having_facts(facts);
+        null_ctx.add_plan_quals(plan_rels);
         // What the groups left must hold: rows, non-NULL aggregated values.
         let facts = crate::having::having_facts(having.as_ref(), &scope, snapshot);
         null_ctx.input_not_empty |= facts.input_not_empty;
@@ -2844,22 +2884,6 @@ pub(crate) fn subquery_lock_blocker(
     })
 }
 
-/// The WHERE and every join's ON of query level `sel`.
-fn level_quals(sel: &ast::SelectStmt) -> Vec<&ast::Node> {
-    fn joins<'a>(n: Option<&'a ast::Node>, out: &mut Vec<&'a ast::Node>) {
-        if let Some(ast::Node::JoinExpr(j)) = n {
-            out.extend(j.quals.as_ref());
-            joins(j.larg.as_ref(), out);
-            joins(j.rarg.as_ref(), out);
-        }
-    }
-    let mut out: Vec<&ast::Node> = sel.where_clause.iter().collect();
-    for item in &sel.from_clause {
-        joins(item.as_ref(), &mut out);
-    }
-    out
-}
-
 /// The query of FROM subquery `alias` in `from` (joins searched).
 fn from_subselect<'a>(from: &'a [Option<ast::Node>], alias: &str) -> Option<&'a ast::SelectStmt> {
     fn find<'a>(n: Option<&'a ast::Node>, alias: &str) -> Option<&'a ast::SelectStmt> {
@@ -2907,7 +2931,7 @@ pub(crate) fn check_full_joins(
     });
     // A qual of the level around may reduce the join first.
     if expr::plan_time_checks()
-        && !expr::plan_fold::outer_quals_may_reduce()
+        && !expr::plan_fold::outer_quals_may_reduce(snapshot)
         && let Some(location) = null_ctx.unplannable_full_join(gated)
         && let Some(e) = expr::plan_time_error(location, full_join_unplannable_error())
     {
@@ -2930,6 +2954,62 @@ pub(crate) fn full_join_unplannable_error() -> AnalyzeError {
     .finalize_implicit()
 }
 
+/// Whether FROM entry `source` is on the nullable side of an outer join
+/// the plan keeps: its own, or — an entry an aliased join hides — one the
+/// hiding join (and the one hiding that, …) is on the nullable side of.
+fn plan_nullable_entry(
+    source: &crate::scope::TableSource,
+    scope: &Scope,
+    null_ctx: &NullabilityContext,
+) -> bool {
+    if null_ctx.plan_nullable(&source.alias) {
+        return true;
+    }
+    let Some(h) = &source.hidden else {
+        return false;
+    };
+    scope
+        .sources
+        .iter()
+        .chain(scope.shadowed_sources.iter())
+        .find(|s| s.alias == h.join)
+        .is_some_and(|join| plan_nullable_entry(join, scope, null_ctx))
+}
+
+/// The range-table entries of `scope`'s own level, in range-table order
+/// ([`crate::scope::TableSource::seq`]): its visible FROM entries and those
+/// its aliased joins hide — not an enclosing level's, which a LATERAL item
+/// or a sublink also keeps among its hidden entries.
+fn level_range_table(scope: &Scope) -> Vec<&crate::scope::TableSource> {
+    use crate::scope::SourceKind;
+    fn own(s: &crate::scope::TableSource, scope: &Scope) -> bool {
+        let Some(h) = &s.hidden else {
+            return true;
+        };
+        scope
+            .sources
+            .iter()
+            .any(|v| v.alias == h.join && matches!(v.kind, SourceKind::Join { .. }))
+            || scope
+                .shadowed_sources
+                .iter()
+                .any(|p| p.hidden.is_some() && p.alias == h.join && own(p, scope))
+    }
+    let mut entries: Vec<&crate::scope::TableSource> = scope
+        .sources
+        .iter()
+        .filter(|s| !s.table_only && !s.shares_rte)
+        .chain(
+            scope
+                .shadowed_sources
+                .iter()
+                .filter(|s| s.hidden.is_some() && own(s, scope)),
+        )
+        .collect();
+    entries.sort_by_key(|s| s.seq);
+    entries
+}
+
 /// Validate a SELECT's locking clauses like PG: `CheckSelectLocking` (the
 /// query may not use DISTINCT / GROUP BY / HAVING / aggregates / window
 /// functions / target-list SRFs), then `transformLockingClause` — each
@@ -2950,6 +3030,8 @@ fn check_locking_clause(
         crate::error::RawError::new(AnalyzeError::FeatureNotSupported(msg), None, None)
             .finalize_implicit()
     };
+    // The parser's errors, clause after clause (`transformLockingClause`).
+    let mut clauses: Vec<(&str, Vec<&crate::scope::TableSource>)> = Vec::new();
     for node in &sel.locking_clause {
         let Some(ast::Node::LockingClause(lc)) = node.as_ref() else {
             continue;
@@ -2961,9 +3043,14 @@ fn check_locking_clause(
             )));
         }
         let mut locked: Vec<&crate::scope::TableSource> = Vec::new();
+        // The level's range table, in order: the visible entries and those
+        // an aliased join hides (`(t JOIN u) j`), which
+        // `transformLockingClause` finds by their names all the same — the
+        // first one named wins, wherever it is.
+        let range_table = level_range_table(scope);
         if lc.locked_rels.is_empty() {
             locked.extend(
-                scope.sources.iter().filter(|s| {
+                range_table.iter().copied().filter(|s| {
                     matches!(s.kind, SourceKind::Relation | SourceKind::Subquery { .. })
                 }),
             );
@@ -2982,7 +3069,11 @@ fn check_locking_clause(
                 )
                 .finalize_implicit());
             }
-            let Some(source) = scope.sources.iter().find(|s| s.alias == rv.relname) else {
+            let Some(source) = range_table
+                .iter()
+                .copied()
+                .find(|s| query_name(s) == rv.relname)
+            else {
                 return Err(crate::error::RawError::new(
                     AnalyzeError::UndefinedTable(format!(
                         "relation \"{}\" in {clause} clause not found in FROM clause",
@@ -2996,6 +3087,7 @@ fn check_locking_clause(
             let what = match source.kind {
                 SourceKind::Cte => Some("a WITH query"),
                 SourceKind::Function => Some("a function"),
+                SourceKind::TableFunc => Some("a table function"),
                 SourceKind::Join { .. } => Some("a join"),
                 _ => None,
             };
@@ -3017,7 +3109,12 @@ fn check_locking_clause(
                 // subquery: its relations are locked too.
                 SourceKind::Subquery { .. } => {
                     for item in &sel.from_clause {
-                        note_subquery_locks(item.as_ref(), Some(&source.alias), scope, snapshot);
+                        note_subquery_locks(
+                            item.as_ref(),
+                            Some(query_name(source)),
+                            scope,
+                            snapshot,
+                        );
                     }
                 }
                 _ => {}
@@ -3034,10 +3131,33 @@ fn check_locking_clause(
                 )));
             }
         }
+        // A FROM subquery's own subqueries take the clause as the parser
+        // pushes it down (`transformLockingClause`): their blockers are the
+        // parser's too.
         for source in &locked {
+            if let Some(crate::scope::LockBlock::NotAllowedWith(blocker, false)) = source.lock_error
+            {
+                return Err(unsupported(format!(
+                    "{clause} is not allowed with {blocker}"
+                )));
+            }
+        }
+        clauses.push((clause, locked));
+    }
+    // The planner's errors come after every clause's parser errors: first
+    // `make_outerjoininfo` over the level's joins (a view or subquery pulled
+    // up has its own joins among them), then each view or subquery planned
+    // on its own, as `set_base_rel_pathlists` plans it.
+    let nullable_side = |clause: &str| {
+        unsupported(format!(
+            "{clause} cannot be applied to the nullable side of an outer join"
+        ))
+    };
+    for (clause, locked) in &clauses {
+        for source in locked {
             let marks_rows = match source.kind {
                 SourceKind::Relation => true,
-                SourceKind::Subquery { .. } => from_subselect(&sel.from_clause, &source.alias)
+                SourceKind::Subquery { .. } => from_subselect(&sel.from_clause, query_name(source))
                     .is_none_or(|s| super::from::pushed_lock_marks_rows(s, snapshot)),
                 _ => false,
             };
@@ -3046,60 +3166,130 @@ fn check_locking_clause(
             // reduces the join (`COALESCE($1, t.x) = 1` with `$1` NULL).
             if marks_rows
                 && expr::plan_time_checks()
-                && null_ctx.is_nullable(&source.alias, "", true)
-                && !level_quals(sel)
-                    .iter()
-                    .any(|q| param_fold_may_name(q, &source.alias))
-                && let Some(e) = expr::plan_time_error(
-                    first_from_location(sel),
-                    unsupported(format!(
-                        "{clause} cannot be applied to the nullable side of an outer join"
-                    )),
-                )
+                && plan_nullable_entry(source, scope, null_ctx)
+                && let Some(e) =
+                    expr::plan_time_error(first_from_location(sel), nullable_side(clause))
             {
                 return Err(e);
             }
         }
-        // Below a locked view or subquery: its own query's blockers and
-        // nullable sides (the rewriter / planner's errors).
-        for source in &locked {
+    }
+    // Pulled up (or with quals pushed down into it), the view or subquery's
+    // outer joins are reduced by what this level hands down to it.
+    for (clause, locked) in &clauses {
+        for source in locked {
+            if source.lock_error == Some(crate::scope::LockBlock::NullableSide)
+                && expr::plan_time_checks()
+                && !planned_alone(sel, source, snapshot)
+                && !reduced_from_above(sel, source, null_ctx, snapshot)
+                && let Some(e) =
+                    expr::plan_time_error(first_from_location(sel), nullable_side(clause))
+            {
+                return Err(e);
+            }
+        }
+    }
+    for (clause, locked) in &clauses {
+        for source in locked {
             match source.lock_error {
-                Some(crate::scope::LockBlock::NotAllowedWith(blocker)) => {
+                // A view's query only appears after the rewriter: the
+                // planner checks it (`preprocess_rowmarks`).
+                Some(crate::scope::LockBlock::NotAllowedWith(blocker, true)) => {
                     return Err(unsupported(format!(
                         "{clause} is not allowed with {blocker}"
                     )));
                 }
-                // Pulled up, the view or subquery's outer joins are this
-                // level's: a qual here naming it may reduce them.
-                Some(crate::scope::LockBlock::NullableSide)
-                    if level_quals(sel)
-                        .iter()
-                        .any(|q| super::from::qual_may_name(q, &source.alias)) => {}
                 // Planned on its own, the view or subquery is never planned
                 // when the planner proves it empty first
                 // (`relation_excluded_by_constraints`: `WHERE false`, or a
                 // custom plan's `WHERE $1` with `$1` NULL); nor is a query
                 // only stored (a view's).
                 Some(crate::scope::LockBlock::NullableSide)
-                    if !expr::plan_time_checks()
-                        || (planned_alone(sel, source, snapshot)
-                            && (expr::plan_fold::level_may_exclude(&source.alias)
-                                || params_may_exclude(sel))) => {}
-                Some(crate::scope::LockBlock::NullableSide) => {
-                    if let Some(e) = expr::plan_time_error(
-                        first_from_location(sel),
-                        unsupported(format!(
-                            "{clause} cannot be applied to the nullable side of an outer join"
-                        )),
-                    ) {
+                    if expr::plan_time_checks()
+                        && planned_alone(sel, source, snapshot)
+                        && !reduced_from_above(sel, source, null_ctx, snapshot)
+                        && !(expr::plan_fold::level_may_exclude(&source.alias)
+                            || params_may_exclude(sel)) =>
+                {
+                    if let Some(e) =
+                        expr::plan_time_error(first_from_location(sel), nullable_side(clause))
+                    {
                         return Err(e);
                     }
                 }
-                None => {}
+                _ => {}
             }
         }
     }
     Ok(())
+}
+
+/// Whether what this level hands down to FROM entry `source` (a view or
+/// subquery whose own query locks a relation on an outer join's nullable
+/// side) may reduce that join: the forced output columns' Vars, as
+/// [`crate::nonnull::plan_strict::forced_by_outputs`] finds them, leave no
+/// such relation in the query's reduction.
+fn reduced_from_above(
+    sel: &ast::SelectStmt,
+    source: &crate::scope::TableSource,
+    null_ctx: &NullabilityContext,
+    snapshot: &PgCatalog,
+) -> bool {
+    use crate::nonnull::plan_strict::Reach;
+    let reach = null_ctx.plan_reach(&source.alias);
+    if reach == Reach::Nothing {
+        return false;
+    }
+    let under_outer = null_ctx.syntactically_nulled(&source.alias);
+    let block = if let crate::scope::SourceKind::Subquery { .. } = source.kind {
+        let Some(sub) = from_subselect(&sel.from_clause, query_name(source)) else {
+            return true;
+        };
+        let names = from_subselect_colnames(&sel.from_clause, query_name(source));
+        let forced = crate::nonnull::plan_strict::forced_by_outputs(
+            sub,
+            &names,
+            &reach,
+            under_outer,
+            snapshot,
+        );
+        super::from::pushed_lock_error_with(sub, &forced, snapshot)
+    } else {
+        match source.relid.and_then(|r| snapshot.pg_class.get(&r)) {
+            Some(class) => super::from::view_lock_error_with(class, &reach, under_outer, snapshot),
+            None => return true,
+        }
+    };
+    block != Some(crate::scope::LockBlock::NullableSide)
+}
+
+/// The column names the alias of FROM subquery `alias` in `from` gives.
+fn from_subselect_colnames(from: &[Option<ast::Node>], alias: &str) -> Vec<String> {
+    fn find(n: Option<&ast::Node>, alias: &str) -> Option<Vec<String>> {
+        match n? {
+            ast::Node::RangeSubselect(rs)
+                if rs.alias.as_ref().is_some_and(|a| a.aliasname == alias) =>
+            {
+                Some(super::from::alias_colnames(rs.alias.as_deref()))
+            }
+            ast::Node::JoinExpr(j) => {
+                find(j.larg.as_ref(), alias).or_else(|| find(j.rarg.as_ref(), alias))
+            }
+            _ => None,
+        }
+    }
+    from.iter()
+        .find_map(|n| find(n.as_ref(), alias))
+        .unwrap_or_default()
+}
+
+/// The name FROM entry `source` has in the query: an entry an aliased
+/// join hides is known by a key from then on.
+fn query_name(source: &crate::scope::TableSource) -> &str {
+    source
+        .hidden
+        .as_ref()
+        .map_or(source.alias.as_str(), |h| h.name.as_str())
 }
 
 /// A location in `sel`'s FROM clause: where a planner error about its
@@ -3113,27 +3303,17 @@ fn first_from_location(sel: &ast::SelectStmt) -> Option<i32> {
     })
 }
 
-/// Whether qual `q` holds a CASE, COALESCE or AND / OR over a parameter
-/// that reads FROM entry `alias`: a custom plan may fold it into a qual
-/// strict in `alias` (`CASE WHEN $1 THEN t.x END = 1`), which reduces an
-/// outer join `alias` is on the nullable side of.
-fn param_fold_may_name(q: &ast::Node, alias: &str) -> bool {
-    use typedpg_pg_query::NodeRef;
-    fn has(n: NodeRef<'_>, pred: &dyn Fn(NodeRef<'_>) -> bool) -> bool {
-        pred(n) || n.children().any(|c| has(c, pred))
-    }
-    q.nodes().any(|(n, _)| {
-        matches!(
-            n,
-            NodeRef::CaseExpr(_) | NodeRef::CoalesceExpr(_) | NodeRef::BoolExpr(_)
-        ) && has(n, &|m| matches!(m, NodeRef::ParamRef(_)))
-            && has(n, &|m| match m {
-                NodeRef::ColumnRef(c) => {
-                    let fields = expr::extract_string_fields(&c.fields);
-                    fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
-                }
-                _ => false,
-            })
+/// Whether `n` calls an aggregate or a window function of its own level
+/// (`contain_agg_clause`): such a HAVING conjunct stays in HAVING.
+pub(crate) fn has_aggregate_call(n: Option<&ast::Node>, snapshot: &PgCatalog) -> bool {
+    n.is_some_and(|n| {
+        n.nodes().any(|(r, _)| match r {
+            typedpg_pg_query::NodeRef::FuncCall(fc) => {
+                fc.over.is_some() || fc.agg_star || super::walk::is_aggregate_call(fc, snapshot)
+            }
+            typedpg_pg_query::NodeRef::GroupingFunc(_) => true,
+            _ => false,
+        })
     })
 }
 
@@ -3146,7 +3326,7 @@ fn planned_alone(
     snapshot: &PgCatalog,
 ) -> bool {
     if let crate::scope::SourceKind::Subquery { .. } = source.kind {
-        return from_subselect(&sel.from_clause, &source.alias)
+        return from_subselect(&sel.from_clause, query_name(source))
             .is_none_or(|s| !super::deferred::pulled_up_in(s, snapshot));
     }
     match source
@@ -3386,7 +3566,10 @@ fn sort_target_key(
     if !has_star
         && let Some(i) = target_list.iter().position(|t| {
             matches!(t.as_ref(), Some(ast::Node::ResTarget(rt))
-                if rt.val.as_ref().is_some_and(|v| grouping::typed_fingerprint(v, scope, snapshot) == fp))
+            if rt.val.as_ref().is_some_and(|v| {
+                grouping::typed_fingerprint(v, scope, snapshot) == fp
+                    || grouping::same_level_exprs_equal(Some(v), Some(inner), scope, snapshot)
+            }))
         })
     {
         return SortKey::Target(i);

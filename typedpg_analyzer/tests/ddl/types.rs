@@ -445,6 +445,44 @@ fn alter_domain_errors() {
 }
 
 #[test]
+fn alter_domain_validate_not_null_constraint() {
+    // PG 19: 42809 AlterDomainValidateConstraint validates only CHECKs.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE DOMAIN d AS int CONSTRAINT nn NOT NULL;
+             ALTER DOMAIN d VALIDATE CONSTRAINT nn;",
+        )]),
+        DdlError::Parse(_),
+        "constraint \"nn\" of domain \"d\" is not a check constraint",
+    );
+    // Both, and DROP CONSTRAINT's, name the domain as written.
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE SCHEMA s; CREATE DOMAIN s.d AS int;
+             ALTER DOMAIN s.d VALIDATE CONSTRAINT nope;",
+        )]),
+        DdlError::TypeNotFound(_),
+        "constraint \"nope\" of domain \"s.d\" does not exist",
+    );
+    assert_ddl_err!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE SCHEMA s; CREATE DOMAIN s.d AS int;
+             ALTER DOMAIN s.d DROP CONSTRAINT nope;",
+        )]),
+        DdlError::TypeNotFound(_),
+        "constraint \"nope\" of domain \"s.d\" does not exist",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE DOMAIN d AS int CONSTRAINT c CHECK (VALUE > 0);
+         ALTER DOMAIN d VALIDATE CONSTRAINT c;",
+    )]);
+}
+
+#[test]
 fn create_domain_check_must_be_boolean() {
     // PG 18: 42804 argument of CHECK must be type boolean, not type integer.
     assert_ddl_err!(

@@ -2718,6 +2718,10 @@ enum FrameKind {
         event: i32,
         /// The relation written, as `schema.name`.
         relation: String,
+        /// The trigger's name.
+        name: String,
+        /// The relation whose trigger fires.
+        relid: PgClassOid,
     },
 }
 
@@ -2800,6 +2804,198 @@ impl Drop for TransitionGuard {
     }
 }
 
+/// What a statement reaches a body through: a routine it calls, or a
+/// trigger one of its writes fires (see [`BodyDiagnostics`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyReach {
+    /// A routine the statement calls (or whose default it runs).
+    Function {
+        /// Its signature, `name(argument types)`.
+        signature: String,
+    },
+    /// A trigger a write of the statement fires.
+    Trigger {
+        name: String,
+        /// The relation whose trigger it is.
+        relid: PgClassOid,
+        /// The event: `a` INSERT, `w` UPDATE, `d` DELETE.
+        event: char,
+        /// Its function's signature.
+        signature: String,
+    },
+}
+
+/// A statement of a body a statement runs that doesn't analyze (a table it
+/// reads is gone, a column renamed): PostgreSQL fails it when it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyFailure {
+    /// What the statement reaches the body through: the outermost routine
+    /// or trigger.
+    pub reach: BodyReach,
+    /// The routine whose statement fails, when it is another one than
+    /// `reach`'s (a function `reach`'s body calls).
+    pub inner: Option<String>,
+    /// The analysis error's first line.
+    pub message: String,
+}
+
+/// A trigger a statement's writes fire (see [`BodyDiagnostics`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FiredTrigger {
+    pub name: String,
+    /// The relation whose trigger it is.
+    pub relid: PgClassOid,
+    /// Its function.
+    pub function: PgProcOid,
+    /// Its function's signature.
+    pub signature: String,
+    /// The event: `a` INSERT, `w` UPDATE, `d` DELETE.
+    pub event: char,
+    /// `FOR EACH ROW`.
+    pub row: bool,
+    /// It has a `WHEN` condition: it may not fire for a row.
+    pub conditional: bool,
+    /// Fired by a statement of a body (another trigger's, a routine's),
+    /// not by the statement itself.
+    pub nested: bool,
+}
+
+/// What the bodies a statement runs do, as the privilege walk reaches them
+/// ([`collect_body_diagnostics`]): the statements of theirs that don't
+/// analyze, and the triggers the statement's writes fire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyDiagnostics {
+    pub failures: Vec<BodyFailure>,
+    pub triggers: Vec<FiredTrigger>,
+}
+
+thread_local! {
+    /// The diagnostics being collected, while [`collect_body_diagnostics`]
+    /// runs.
+    static BODY_DIAGNOSTICS: RefCell<Option<BodyDiagnostics>> = const { RefCell::new(None) };
+}
+
+/// Run `f` (an analysis as a role, which walks the bodies the statement
+/// runs) collecting what those bodies do: see [`BodyDiagnostics`].
+pub(crate) fn collect_body_diagnostics<R>(f: impl FnOnce() -> R) -> (R, BodyDiagnostics) {
+    /// Puts the enclosing collection back, however `f` ends.
+    struct Restore(Option<BodyDiagnostics>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let outer = self.0.take();
+            BODY_DIAGNOSTICS.with(|d| *d.borrow_mut() = outer);
+        }
+    }
+    let outer = BODY_DIAGNOSTICS.with(|d| d.borrow_mut().replace(BodyDiagnostics::default()));
+    let restore = Restore(outer);
+    let result = f();
+    let collected = BODY_DIAGNOSTICS
+        .with(|d| d.borrow_mut().take())
+        .unwrap_or_default();
+    drop(restore);
+    (result, collected)
+}
+
+/// The event letter of a `TRIGGER_TYPE_*` bit.
+fn event_letter(event: i32) -> char {
+    match event {
+        TRIGGER_TYPE_INSERT => 'a',
+        TRIGGER_TYPE_UPDATE => 'w',
+        TRIGGER_TYPE_DELETE => 'd',
+        _ => 't',
+    }
+}
+
+/// Note a body statement that doesn't analyze, while diagnostics are
+/// collected. An error the analyzer raises for what it doesn't model says
+/// nothing of the body.
+fn note_body_failure(error: &AnalyzeError) {
+    if matches!(
+        error,
+        AnalyzeError::Unsupported(_)
+            | AnalyzeError::UnsupportedJoinType(_)
+            | AnalyzeError::Internal(_)
+    ) {
+        return;
+    }
+    BODY_DIAGNOSTICS.with(|d| {
+        let mut d = d.borrow_mut();
+        let Some(diagnostics) = d.as_mut() else {
+            return;
+        };
+        let failure = RUN_FRAMES.with(|frames| {
+            let frames = frames.borrow();
+            let outer = frames.first()?;
+            let signature = |frame: &RunFrame| match &frame.kind {
+                FrameKind::Function { signature, .. } | FrameKind::Trigger { signature, .. } => {
+                    signature.clone()
+                }
+            };
+            let reach = match &outer.kind {
+                FrameKind::Function { signature, .. } => BodyReach::Function {
+                    signature: signature.clone(),
+                },
+                FrameKind::Trigger {
+                    signature,
+                    event,
+                    name,
+                    relid,
+                    ..
+                } => BodyReach::Trigger {
+                    name: name.clone(),
+                    relid: *relid,
+                    event: event_letter(*event),
+                    signature: signature.clone(),
+                },
+            };
+            let inner = frames
+                .last()
+                .map(signature)
+                .filter(|inner| *inner != signature(outer));
+            let message = error.to_string();
+            let message = message.lines().next().unwrap_or_default().trim().to_owned();
+            Some(BodyFailure {
+                reach,
+                inner,
+                message,
+            })
+        });
+        if let Some(failure) = failure
+            && !diagnostics.failures.contains(&failure)
+        {
+            diagnostics.failures.push(failure);
+        }
+    });
+}
+
+/// Note a trigger a write fires, while diagnostics are collected.
+fn note_fired_trigger(catalog: &PgCatalog, relid: PgClassOid, trigger: &Trigger, event: i32) {
+    BODY_DIAGNOSTICS.with(|d| {
+        let mut d = d.borrow_mut();
+        let Some(diagnostics) = d.as_mut() else {
+            return;
+        };
+        let signature = catalog
+            .pg_proc
+            .get(&trigger.function)
+            .map(|proc| catalog.routine_signature(proc))
+            .unwrap_or_default();
+        let fired = FiredTrigger {
+            name: trigger.name.clone(),
+            relid,
+            function: trigger.function,
+            signature,
+            event: event_letter(event),
+            row: trigger.row,
+            conditional: trigger.when.is_some(),
+            nested: RUN_FRAMES.with(|frames| !frames.borrow().is_empty()),
+        };
+        if !diagnostics.triggers.contains(&fired) {
+            diagnostics.triggers.push(fired);
+        }
+    });
+}
+
 /// The note locating a body failure: which routine ran, why, and as whom.
 fn frames_note() -> Option<String> {
     RUN_FRAMES.with(|frames| {
@@ -2818,6 +3014,7 @@ fn frames_note() -> Option<String> {
                     signature,
                     event,
                     relation,
+                    ..
                 } => {
                     parts.push(format!("{lead} trigger function {signature}"));
                     parts.push(format!(
@@ -4904,6 +5101,8 @@ impl PgCatalog {
                 signature,
                 event: f.event,
                 relation: self.relation_display_name(f.relid),
+                name: f.trigger.name.clone(),
+                relid: f.relid,
             },
             None => FrameKind::Function {
                 signature,
@@ -5035,7 +5234,8 @@ impl PgCatalog {
                 })
             })
         });
-        if result.is_err() {
+        if let Err(error) = &result {
+            note_body_failure(error);
             return Ok(());
         }
         self.check_requirements_in(role, &requirements, ctx)
@@ -5505,6 +5705,7 @@ impl PgCatalog {
         if trigger_when_never_fires(trigger, self) {
             return Ok(());
         }
+        note_fired_trigger(self, relid, trigger, event);
         self.check_routine_body(
             trigger.function,
             Some(TriggerFiring {
@@ -6147,7 +6348,7 @@ impl PgCatalog {
                 .any(|policy| clause(policy).is_some_and(|c| never_true(&c)))
     }
 
-    /// For the lint (`breaks_deployed_queries`): what row-level security
+    /// For the lint (`deployed_query_breakage`): what row-level security
     /// checks a row against when role `role` writes it into relation
     /// `relid` by command `cmd` — `a` INSERT: the new row against the INSERT
     /// policies' WITH CHECK (their USING without one); `w` UPDATE: the new
@@ -7059,7 +7260,7 @@ fn walk_plpgsql_stmts<'a>(stmts: &'a [PlStmt], f: &mut impl FnMut(&'a PlStmt)) {
 }
 
 /// [`walk_plpgsql_stmts`] over a block's body and its exception handlers.
-fn walk_plpgsql_block<'a>(block: &'a PlBlock, f: &mut impl FnMut(&'a PlStmt)) {
+pub(crate) fn walk_plpgsql_block<'a>(block: &'a PlBlock, f: &mut impl FnMut(&'a PlStmt)) {
     walk_plpgsql_stmts(&block.body, f);
     for exception in block.exceptions.iter().flat_map(|e| &e.exc_list) {
         walk_plpgsql_stmts(&exception.action, f);

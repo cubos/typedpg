@@ -47,6 +47,26 @@ CREATE TABLE payments (
         OR method NOT IN ('a', 'b')),
     CHECK (num_nonnulls(card_last4, iban) <= 1)
 );
+-- Queried only by the feature generator (`features.rs`).
+CREATE TYPE money_pair AS (amount NUMERIC, cur TEXT);
+CREATE DOMAIN tag_list AS TEXT[] CHECK (array_position(VALUE, NULL) IS NULL);
+CREATE DOMAIN pos_pair AS money_pair CHECK ((VALUE).amount > 0);
+CREATE TABLE events (
+    id     BIGINT PRIMARY KEY,
+    during TSTZRANGE,
+    slots  INT4MULTIRANGE,
+    span   DATERANGE NOT NULL,
+    labels tag_list,
+    pair   money_pair,
+    ppair  pos_pair,
+    kind   TEXT,
+    n      INT GENERATED ALWAYS AS (length(kind)) STORED
+);
+CREATE TABLE logs (id BIGINT NOT NULL, msg TEXT, at TIMESTAMPTZ NOT NULL) PARTITION BY RANGE (at);
+CREATE TABLE logs_2024 PARTITION OF logs FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+CREATE TABLE logs_default PARTITION OF logs DEFAULT;
+CREATE TABLE base_items (id BIGINT NOT NULL, label TEXT);
+CREATE TABLE special_items (extra INT NOT NULL) INHERITS (base_items);
 ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]

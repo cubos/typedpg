@@ -13,6 +13,8 @@ CREATE TYPE shape AS (
     meta jsonb
 );
 CREATE DOMAIN shape_d AS shape;
+-- Separated by `;` in an array, as a box is.
+CREATE DOMAIN frame AS box;
 
 CREATE TABLE things (
     id int4 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

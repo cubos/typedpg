@@ -125,6 +125,7 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Reply, String> {
             position: reader.optional_u32()?,
             internal_position: reader.optional_u32()?,
             internal_query: reader.optional_string()?,
+            context: reader.optional_string()?,
         }),
         tag => return Err(format!("typedpg_wasm: unknown migration reply tag {tag}")),
     };
@@ -406,6 +407,7 @@ mod tests {
         writer.u32(34);
         writer.optional_string(None);
         writer.optional_string(None);
+        writer.optional_string(Some("PL/pgSQL function inline_code_block line 1 at RAISE"));
         let DbError {
             code,
             message,
@@ -413,6 +415,7 @@ mod tests {
             hint,
             position,
             internal_position,
+            context,
             ..
         } = match decode_reply(&writer.bytes).unwrap() {
             Reply::DbError(error) => error,
@@ -424,6 +427,10 @@ mod tests {
         assert_eq!(hint.as_deref(), Some("a hint"));
         assert_eq!(position, Some(34));
         assert_eq!(internal_position, None);
+        assert_eq!(
+            context.as_deref(),
+            Some("PL/pgSQL function inline_code_block line 1 at RAISE")
+        );
     }
 
     #[test]

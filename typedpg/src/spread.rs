@@ -4,16 +4,34 @@
 /// Above this many items, a spread offered an array form is written in it:
 /// one parameter per field, whatever the number of items (and no
 /// 65535-parameter limit). At or below it, a placeholder per value, as
-/// written.
+/// written — unless those would pass the spread's share of
+/// [`MAX_PARAMS`].
 #[doc(hidden)]
 pub const ARRAY_THRESHOLD: usize = 1000;
 
-/// Whether a spread of `len` items is bound as arrays — when its pieces
-/// offer an array form (`capable`) and it has more than [`ARRAY_THRESHOLD`]
-/// items. `sql!` binds the values and [`spread_sql`] writes the SQL by it.
+/// The most parameters a query can bind: the Bind message counts them in
+/// 16 bits.
 #[doc(hidden)]
-pub fn uses_arrays(len: usize, capable: bool) -> bool {
-    capable && len > ARRAY_THRESHOLD
+pub const MAX_PARAMS: usize = 65535;
+
+/// The placeholders each spread of a query may take, whatever the others
+/// take: [`MAX_PARAMS`] less the `regular` parameters, shared by the
+/// `spreads`. Within it, spreads that offer an array form never make the
+/// query pass the limit.
+#[doc(hidden)]
+pub const fn spread_budget(regular: usize, spreads: usize) -> usize {
+    let spreads = if spreads == 0 { 1 } else { spreads };
+    MAX_PARAMS.saturating_sub(regular) / spreads
+}
+
+/// Whether a spread of `len` items of `width` fields each is bound as
+/// arrays — when its pieces offer an array form (`capable`), and it has
+/// more than [`ARRAY_THRESHOLD`] items or its placeholders would pass its
+/// `budget` ([`spread_budget`]). `sql!` binds the values and
+/// [`spread_sql`] writes the SQL by it.
+#[doc(hidden)]
+pub fn uses_arrays(len: usize, width: usize, budget: usize, capable: bool) -> bool {
+    capable && (len > ARRAY_THRESHOLD || len.saturating_mul(width) > budget)
 }
 
 /// A part of a spread query's SQL.
@@ -62,16 +80,23 @@ pub enum ValuesItem {
 
 /// The SQL of `pieces` for spreads of `sizes[i]` items, their placeholders
 /// numbered from `first`, in the order they are written — the order
-/// `sql!` binds their values in.
+/// `sql!` binds their values in. `budget` is each spread's share of the
+/// parameters ([`spread_budget`]), for [`uses_arrays`].
 #[doc(hidden)]
-pub fn spread_sql(pieces: &[SqlPiece], sizes: &[usize], first: usize) -> String {
+pub fn spread_sql(pieces: &[SqlPiece], sizes: &[usize], first: usize, budget: usize) -> String {
     let mut sql = String::new();
     let mut next = first;
-    write_pieces(&mut sql, pieces, sizes, &mut next);
+    write_pieces(&mut sql, pieces, sizes, budget, &mut next);
     sql
 }
 
-fn write_pieces(sql: &mut String, pieces: &[SqlPiece], sizes: &[usize], next: &mut usize) {
+fn write_pieces(
+    sql: &mut String,
+    pieces: &[SqlPiece],
+    sizes: &[usize],
+    budget: usize,
+    next: &mut usize,
+) {
     for piece in pieces {
         match piece {
             SqlPiece::Text(text) => sql.push_str(text),
@@ -84,7 +109,7 @@ fn write_pieces(sql: &mut String, pieces: &[SqlPiece], sizes: &[usize], next: &m
                 array,
             } => {
                 if let Some((op, array_cast)) = array
-                    && uses_arrays(sizes[*spread], true)
+                    && uses_arrays(sizes[*spread], 1, budget, true)
                 {
                     sql.push('(');
                     sql.push_str(lead);
@@ -115,7 +140,7 @@ fn write_pieces(sql: &mut String, pieces: &[SqlPiece], sizes: &[usize], next: &m
                 unnest,
             } => {
                 if let (Some(casts), [ValuesItem::Rows { spread, .. }]) = (unnest, items)
-                    && uses_arrays(sizes[*spread], true)
+                    && uses_arrays(sizes[*spread], casts.len(), budget, true)
                 {
                     sql.push_str("SELECT * FROM unnest(");
                     for (c, cast) in casts.iter().enumerate() {
@@ -151,7 +176,7 @@ fn write_pieces(sql: &mut String, pieces: &[SqlPiece], sizes: &[usize], next: &m
                     }
                     first = false;
                     match item {
-                        ValuesItem::Row(row) => write_pieces(sql, row, sizes, next),
+                        ValuesItem::Row(row) => write_pieces(sql, row, sizes, budget, next),
                         ValuesItem::Rows { spread, casts } => {
                             for r in 0..sizes[*spread] {
                                 if r > 0 {
@@ -218,13 +243,13 @@ mod tests {
     #[test]
     fn writes_the_items_that_have_rows() {
         assert_eq!(
-            spread_sql(PIECES, &[2, 1, 2], 2),
+            spread_sql(PIECES, &[2, 1, 2], 2, MAX_PARAMS),
             "INSERT INTO t VALUES ($1::int4), ($2::int4), ($3::int4), ($4::int4) \
              RETURNING x IN ($5::int4, $6::int4)"
         );
         // An empty spread leaves no comma; an empty list is a subquery.
         assert_eq!(
-            spread_sql(PIECES, &[0, 1, 0], 2),
+            spread_sql(PIECES, &[0, 1, 0], 2, MAX_PARAMS),
             "INSERT INTO t VALUES ($1::int4), ($2::int4) RETURNING x IN (SELECT NULL::int4 WHERE false)"
         );
     }
@@ -249,11 +274,11 @@ mod tests {
             },
         ];
         assert_eq!(
-            spread_sql(ONLY_SPREADS, &[0, 0], 1),
+            spread_sql(ONLY_SPREADS, &[0, 0], 1, MAX_PARAMS),
             format!("INSERT INTO t {EMPTY}")
         );
         assert_eq!(
-            spread_sql(ONLY_SPREADS, &[0, 1], 1),
+            spread_sql(ONLY_SPREADS, &[0, 1], 1, MAX_PARAMS),
             "INSERT INTO t VALUES ($1::int4)"
         );
     }
@@ -286,24 +311,48 @@ mod tests {
     #[test]
     fn above_the_threshold_a_spread_offered_one_is_written_in_its_array_form() {
         assert_eq!(
-            spread_sql(LIST, &[2], 1),
+            spread_sql(LIST, &[2], 1, MAX_PARAMS),
             "SELECT … WHERE x IN ($1::int4, $2::int4) AND y"
         );
         assert_eq!(
-            spread_sql(LIST, &[ARRAY_THRESHOLD], 1).matches('$').count(),
+            spread_sql(LIST, &[ARRAY_THRESHOLD], 1, MAX_PARAMS)
+                .matches('$')
+                .count(),
             ARRAY_THRESHOLD
         );
         assert_eq!(
-            spread_sql(LIST, &[ARRAY_THRESHOLD + 1], 3),
+            spread_sql(LIST, &[ARRAY_THRESHOLD + 1], 3, MAX_PARAMS),
             "SELECT … WHERE (x = ANY($3::int4[])) AND y"
         );
         assert_eq!(
-            spread_sql(ROWS, &[ARRAY_THRESHOLD + 1], 1),
+            spread_sql(ROWS, &[ARRAY_THRESHOLD + 1], 1, MAX_PARAMS),
             "INSERT INTO t SELECT * FROM unnest($1::int4[], $2::text[]) AS __typedpg_rows (column1, column2)"
         );
         assert!(
-            spread_sql(ROWS, &[ARRAY_THRESHOLD], 1)
+            spread_sql(ROWS, &[ARRAY_THRESHOLD], 1, MAX_PARAMS)
                 .starts_with("INSERT INTO t VALUES ($1::int4, $2::text), ")
         );
+    }
+
+    /// Below the threshold, a spread whose placeholders would pass its
+    /// share of the 65535 parameters is written in its array form too:
+    /// 1 000 rows of 70 fields could not be sent.
+    #[test]
+    fn a_spread_past_its_parameter_budget_is_written_in_its_array_form() {
+        assert_eq!(
+            spread_sql(ROWS, &[10], 1, 19),
+            "INSERT INTO t SELECT * FROM unnest($1::int4[], $2::text[]) AS __typedpg_rows (column1, column2)"
+        );
+        assert!(spread_sql(ROWS, &[10], 1, 20).starts_with("INSERT INTO t VALUES "));
+        assert_eq!(
+            spread_sql(LIST, &[10], 1, 9),
+            "SELECT … WHERE (x = ANY($1::int4[])) AND y"
+        );
+        assert_eq!(spread_budget(0, 1), MAX_PARAMS);
+        assert_eq!(spread_budget(35, 2), 32750);
+        assert_eq!(spread_budget(0, 0), MAX_PARAMS);
+        assert!(uses_arrays(1_000, 70, spread_budget(0, 1), true));
+        assert!(!uses_arrays(1_000, 70, spread_budget(0, 1), false));
+        assert!(!uses_arrays(1_000, 65, spread_budget(0, 1), true));
     }
 }

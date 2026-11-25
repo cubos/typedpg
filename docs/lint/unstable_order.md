@@ -3,9 +3,9 @@
 An `ORDER BY` under `LIMIT`, `OFFSET`, `FETCH` or `DISTINCT ON` whose keys
 can tie, so which tied rows come back is arbitrary.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -24,7 +24,7 @@ SELECT DISTINCT ON (user_id) user_id, title FROM posts ORDER BY user_id, created
 ```
 
 ```
-warning[unstable_order]: the ORDER BY keys can tie: they don't determine a unique row of posts — under LIMIT, rows that tie come back in an arbitrary order, so pages may skip or repeat rows
+error[correctness/unstable_order]: the ORDER BY keys can tie: they don't determine a unique row of posts — under LIMIT, rows that tie come back in an arbitrary order, so pages may skip or repeat rows
    ╭─[queries.sql:2:29]
  2 │ SELECT id, title FROM posts ORDER BY created_at DESC LIMIT 20 OFFSET $offset;
    ·                             ────────────────────────
@@ -42,10 +42,10 @@ the data, so tests rarely catch it. End the `ORDER BY` with a unique column.
 
 ## Reported when
 
-The `ORDER BY` keys, together with the columns `WHERE` equates to constants,
-parameters or columns of an enclosing query (one value per evaluation of a
-correlated or `LATERAL` subquery), don't cover a unique key of every table in
-`FROM`:
+The `ORDER BY` keys, together with the columns `WHERE` (or an inner join's
+`ON`) equates to constants, parameters, columns of an enclosing query (one
+value per evaluation of a correlated or `LATERAL` subquery) or columns of a
+table the keys determine, don't cover a unique key of every table in `FROM`:
 
 - a table joined on its primary key needs no key of its own;
 - in a grouped query, the `GROUP BY` columns count;
@@ -56,7 +56,8 @@ correlated or `LATERAL` subquery), don't cover a unique key of every table in
   nondeterministic one, distinct values can compare equal.
 
 A `DISTINCT ON` whose keys `WHERE` fixes returns one row, still picked
-among ties. The help names each undetermined table's primary key.
+among ties. The help names each undetermined table's primary key columns
+that nothing above fixes.
 
 ## Not reported
 
@@ -102,5 +103,5 @@ See [Configuring rules](README.md#configuring-rules).
   `ORDER BY`.
 - [`redundant_order_by`](redundant_order_by.md): `ORDER BY` keys after keys
   that already determine a unique row.
-- [`scalar_subquery_may_return_many`](scalar_subquery_may_return_many.md):
+- [`scalar_subquery_multiple_rows`](scalar_subquery_multiple_rows.md):
   suggests `ORDER BY … LIMIT 1`, which this rule then checks.

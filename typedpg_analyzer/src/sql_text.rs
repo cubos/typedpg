@@ -27,6 +27,15 @@ pub fn strip_trailing_junk(sql: &str) -> &str {
             b'"' => (skip_quoted_identifier(sql, i), true),
             b'-' if bytes.get(i + 1) == Some(&b'-') => (skip_line_comment(bytes, i), false),
             b'/' if bytes.get(i + 1) == Some(&b'*') => (skip_block_comment(bytes, i), false),
+            // An identifier or keyword, its `$`s included (`a$x$`, as
+            // scan.l's `ident_cont`): a `$` inside one opens no dollar quote.
+            c if is_ident_start_byte(c) => {
+                let mut end = i + 1;
+                while end < bytes.len() && (is_ident_char_byte(bytes[end]) || bytes[end] == b'$') {
+                    end += 1;
+                }
+                (end, true)
+            }
             b'$' => match dollar_quote_end(sql, i) {
                 Some(end) => (end, true),
                 None => (next_char(sql, i), true),
@@ -230,6 +239,29 @@ mod tests {
         assert_eq!(
             strip_trailing_junk("SELECT 1; SELECT 2"),
             "SELECT 1; SELECT 2"
+        );
+    }
+
+    /// A `$` inside an identifier opens no dollar quote: what follows is
+    /// still a trailing comment.
+    #[test]
+    fn a_dollar_inside_an_identifier_quotes_nothing() {
+        assert_eq!(
+            strip_trailing_junk("SELECT 1 AS a$x$ -- note $x$"),
+            "SELECT 1 AS a$x$"
+        );
+        assert_eq!(
+            strip_trailing_junk("SELECT 1 AS a$x$; /* $x$ */"),
+            "SELECT 1 AS a$x$"
+        );
+        assert_eq!(
+            strip_trailing_junk("SELECT é$x$ FROM t; -- $x$"),
+            "SELECT é$x$ FROM t"
+        );
+        // A dollar quote still starts a token.
+        assert_eq!(
+            strip_trailing_junk("SELECT $x$ -- $x$ AS a"),
+            "SELECT $x$ -- $x$ AS a"
         );
     }
 

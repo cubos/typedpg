@@ -791,3 +791,94 @@ fn reserved_keyword_names_are_quoted_in_messages_like_pg() {
         "{err}"
     );
 }
+
+#[test]
+fn qualified_names_report_a_missing_schema_then_the_name_as_written() {
+    // PG 19: LookupExplicitNamespace (3F000) before the object's own lookup,
+    // whose message names it as written (NameListToString).
+    assert_ddl_rejections(&[
+        (
+            "",
+            "ALTER TYPE nos.e ADD VALUE 'x';",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "ALTER TYPE public.e ADD VALUE 'x';",
+            "type \"public.e\" does not exist",
+        ),
+        (
+            "",
+            "REFRESH MATERIALIZED VIEW nos.mv;",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "CREATE TABLE t (c text COLLATE nos.c);",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "CREATE TABLE t (c text COLLATE public.c);",
+            "collation \"public.c\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "CREATE DOMAIN d AS text COLLATE nope;",
+            "collation \"nope\" for encoding \"UTF8\" does not exist",
+        ),
+        (
+            "",
+            "CREATE TYPE r AS RANGE (subtype = text, collation = nos.c);",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "CREATE TABLE a (x int);",
+            "CREATE INDEX ON a (x nos.c);",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "CREATE TABLE a (x int);",
+            "CREATE INDEX ON a (x public.c);",
+            "operator class \"public.c\" does not exist for access method \"btree\"",
+        ),
+        (
+            "",
+            "CREATE EVENT TRIGGER e ON ddl_command_start EXECUTE FUNCTION nos.f();",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "CREATE EVENT TRIGGER e ON ddl_command_start EXECUTE FUNCTION public.f();",
+            "function public.f() does not exist",
+        ),
+        (
+            "",
+            "CREATE AGGREGATE agg(int) (sfunc = nos.f, stype = int);",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "CREATE OPERATOR ## (leftarg = int, rightarg = int, function = nos.f);",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "CREATE OPERATOR ## (leftarg = int, rightarg = int, function = int4pl, \
+             restrict = nos.sel);",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "DROP TABLE a.b.c.d;",
+            "improper relation name (too many dotted names): a.b.c.d",
+        ),
+    ]);
+    // A type support function looked up with missing_ok reports itself
+    // missing (findTypeInputFunction).
+    assert_ddl_rejections(&[(
+        "CREATE TYPE bt;",
+        "CREATE TYPE bt (input = nos.f, output = nos.g);",
+        "function nos.f(cstring) does not exist",
+    )]);
+}

@@ -11,7 +11,7 @@
 //!   contents as the original, or fail with the same SQLSTATE;
 //! - a claim that a value or condition is something wherever it is
 //!   evaluated (`redundant_null_check`, `constant_condition`,
-//!   `unreachable_case_branch`, `count_not_null`, `null_comparison`): the
+//!   `unreachable_case_branch`, `redundant_count_argument`, `null_comparison`): the
 //!   expression is wrapped in a `pg_temp.typedpg_lint_*` assertion that
 //!   raises when the claim is broken;
 //! - a claim that a clause changes nothing (`redundant_distinct`,
@@ -29,10 +29,12 @@
 //! appends per-rule counters to a file (`scripts/run-lint-oracle.sh`
 //! prints their totals).
 //!
-//! What is not checked: `scalar_subquery_may_return_many`,
+//! What is not checked: `scalar_subquery_multiple_rows`,
 //! `case_without_else`'s reachability and `not_in_nullable` only say a
 //! thing *may* happen, which no execution refutes; the advisory rules
-//! (`cartesian_join`, `float_equality`, …) claim nothing about results.
+//! (`cartesian_join`, `float_equality`, …) claim nothing about results;
+//! `json_stringify_param` judges the TypeScript call's values, not the SQL,
+//! and has neither a fix nor a claim a query's execution could break.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -413,13 +415,16 @@ fn claims(ctx: &Ctx<'_>, record: &Record) -> Vec<LintProbe> {
         Rule::RedundantOrderBy | Rule::RedundantGroupBy if record.fix.is_empty() => {
             list_removals(ctx, span)
         }
-        Rule::CountNotNull => count_not_null(ctx, record),
+        Rule::RedundantCountArgument => redundant_count_argument(ctx, record),
         Rule::CheckViolation => check_violation(ctx, span),
         Rule::LeftJoinNullified => left_join_nullified(ctx, record),
         Rule::SimplifiableCase if record.fix.is_empty() => simplifiable_case(ctx, span),
         Rule::FetchAllSingleRow => vec![LintProbe::AtMostOneRow {
             sql: ctx.sql.to_owned(),
         }],
+        // About the caller's values (a `JSON.stringify(…)` passed to a
+        // `json` / `jsonb` parameter), not the rows: nothing to probe.
+        Rule::JsonStringifyParam => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -628,7 +633,7 @@ fn list_removals(ctx: &Ctx<'_>, span: &Range<usize>) -> Vec<LintProbe> {
         .collect()
 }
 
-fn count_not_null(ctx: &Ctx<'_>, record: &Record) -> Vec<LintProbe> {
+fn redundant_count_argument(ctx: &Ctx<'_>, record: &Record) -> Vec<LintProbe> {
     let Some(call) = ctx.tree.nodes().find_map(|(n, _)| match n {
         NodeRef::FuncCall(c) if usize::try_from(c.location).ok() == Some(record.span.start) => {
             Some(c)

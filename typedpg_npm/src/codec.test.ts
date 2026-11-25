@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { type Range, decode, encode } from "./codec.js";
+import { jsonNull } from "./index.js";
 
 test("scalars", () => {
   assert.equal(decode("bool", "t"), true);
@@ -11,7 +12,11 @@ test("scalars", () => {
   assert.ok(Number.isNaN(decode("number", "NaN")));
   assert.equal(decode("bigint", "9223372036854775807"), 9223372036854775807n);
   assert.deepEqual(decode("json", '{"a":[1,null]}'), { a: [1, null] });
-  assert.deepEqual(decode("bytea", "\\x00ff10"), new Uint8Array([0, 255, 16]));
+  assert.deepEqual(decode("bytea", "\\x00ff10"), Buffer.from([0, 255, 16]));
+  assert.ok(Buffer.isBuffer(decode("bytea", "\\x00ff10")));
+  // `bytea_output = escape`.
+  assert.ok(Buffer.isBuffer(decode("bytea", "a\\\\\\001")));
+  assert.deepEqual(decode("bytea", "a\\\\\\001"), Buffer.from([0x61, 0x5c, 1]));
 });
 
 test("timestamptz", () => {
@@ -87,6 +92,40 @@ test("arrays", () => {
   assert.throws(() => decode(["array", "number"], "{{1},{2}}"), /multidimensional/);
 });
 
+test("an array codec carries its elements' delimiter when it isn't a comma", () => {
+  // `box`'s typdelim is `;`: its own text holds commas.
+  const boxes = ["array", "text", ";"] as const;
+  assert.deepEqual(decode(boxes, "{(1,1),(0,0);(3,3),(2,2);NULL}"), ["(1,1),(0,0)", "(3,3),(2,2)", null]);
+  assert.equal(encode(boxes, ["(1,1),(0,0)", null, "(3,3),(2,2)"]), '{"(1,1),(0,0)";NULL;"(3,3),(2,2)"}');
+  // Any delimiter a type was created with.
+  assert.deepEqual(decode(["array", "number", "|"], "{1|2|NULL}"), [1, 2, null]);
+  assert.equal(encode(["array", "number", "|"], [1, null]), '{"1"|NULL}');
+});
+
+test("older modules' box codec still reads and writes box arrays", () => {
+  assert.deepEqual(decode(["array", "box"], "{(1,1),(0,0);(3,3),(2,2);NULL}"), [
+    "(1,1),(0,0)",
+    "(3,3),(2,2)",
+    null,
+  ]);
+  assert.equal(encode(["array", "box"], ["(1,1),(0,0)", null, "(3,3),(2,2)"]), '{"(1,1),(0,0)";NULL;"(3,3),(2,2)"}');
+  assert.equal(decode("box", "(1,1),(0,0)"), "(1,1),(0,0)");
+});
+
+test("int2vector and oidvector are spaced arrays", () => {
+  assert.deepEqual(decode(["spaced", "number"], "1 2 -3"), [1, 2, -3]);
+  assert.deepEqual(decode(["spaced", "number"], ""), []);
+  assert.equal(encode(["spaced", "number"], [1, 2, -3]), "1 2 -3");
+  assert.equal(encode(["spaced", "number"], []), "");
+  assert.throws(() => encode(["spaced", "number"], [1, null]), /cannot be null/);
+  // An array of them: each element quoted, as `array_in` reads it.
+  assert.deepEqual(decode(["array", ["spaced", "number"]], '{"1 2",3,""}'), [[1, 2], [3], []]);
+  assert.equal(encode(["array", ["spaced", "number"]], [[1, 2], []]), '{"1 2",""}');
+  // As older modules describe them: an array of numbers.
+  assert.deepEqual(decode(["array", "number"], "1 2 -3"), [1, 2, -3]);
+  assert.deepEqual(decode(["array", "number"], ""), []);
+});
+
 test("records", () => {
   const codec = ["record", [["a", "number"], ["b", "text"], ["c", "text"], ["d", ["array", "number"]]]] as const;
   assert.deepEqual(decode(codec, '(1,"x ""y"" \\\\z",,"{1,2}")'), {
@@ -115,10 +154,22 @@ test("encode", () => {
   assert.equal(encode("bigint", 12n), "12");
   assert.equal(encode("json", { a: "x" }), '{"a":"x"}');
   assert.equal(encode("json", "x"), '"x"');
+  // `null` is SQL NULL; `jsonNull` the JSON null, at the top or nested.
+  assert.equal(encode("json", null), null);
+  assert.equal(encode("json", jsonNull), "null");
+  assert.equal(encode("json", { a: jsonNull, b: [jsonNull, null] }), '{"a":null,"b":[null,null]}');
+  assert.equal(encode(["array", "json"], [jsonNull, null]), '{"null",NULL}');
   assert.equal(encode("bytea", new Uint8Array([1, 255])), "\\x01ff");
-  assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Uint8Array, not a string/);
+  assert.throws(() => encode("bytea", "00ff"), /a bytea parameter must be a Buffer or a Uint8Array, not a string/);
   assert.equal(encode(["array", "text"], ["a", null, 'q"\\']), '{"a",NULL,"q\\"\\\\"}');
   assert.equal(encode("text", null), null);
+});
+
+test("a float's negative zero is encoded as one", () => {
+  assert.equal(encode("number", -0), "-0");
+  assert.equal(encode("number", 0), "0");
+  assert.equal(encode(["array", "number"], [-0, 1.5]), '{"-0","1.5"}');
+  assert.ok(Object.is(decode("number", encode("number", -0)!), -0));
 });
 
 test("encode dates and times", () => {

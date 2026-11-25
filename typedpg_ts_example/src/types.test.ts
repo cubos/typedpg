@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
 
-import { type CopyRow, DecodeError, NoRowsError, type Params, range, emptyRange } from "@cubos/typedpg";
+import { type CopyRow, DecodeError, NoRowsError, type Params, jsonNull, range, emptyRange } from "@cubos/typedpg";
 
 import { type Connection, baseUrl, drivers, freshDatabase, plain, prng } from "./testdb.ts";
 import * as t from "./things.ts";
@@ -64,7 +64,7 @@ const fixed: ThingParams = {
   bigs: [-9223372036854775808n, null, 0n],
   nums: ["1.50", null, "-0.000001", "NaN"],
   flags: [true, false, null],
-  blobs: [new Uint8Array([0, 255, 92, 34]), null, new Uint8Array([])],
+  blobs: [Buffer.from([0, 255, 92, 34]), null, Buffer.from([])],
   // Microseconds, a year before 1 (PG's BC) and after 9999.
   stamps: [
     instant("2024-02-29T12:34:56.789012Z"),
@@ -164,6 +164,59 @@ for (const [name, connect] of drivers) {
       }));
     });
 
+    test("anonymous records in arrays, sublinks and CASE decode", async () => {
+      assert.deepEqual(plain(await t.nestedRecords.fetchOne(c.db)), plain({
+        pairs: [
+          { f1: 1, f2: 'a"b,(c)', f3: 'quo"te' },
+          { f1: 2, f2: null, f3: "with space" },
+        ],
+        points: [
+          { f1: 1, f2: { x: 1.5, y: 1 } },
+          { f1: 2, f2: { x: 3, y: 2 } },
+        ],
+        nested: { f1: [{ f1: "x,y", f2: ["{}", null] }], f2: "NULL" },
+        picked: { f1: 1, f2: "yes" },
+        agg: [
+          { f1: 1, f2: false },
+          { f1: 2, f2: true },
+          { f1: 3, f2: false },
+        ],
+      }));
+    });
+
+    test("box arrays and int2vectors decode, and both encode", async () => {
+      const boxes = ["(1,1),(0,0)", null, "(3,3),(2,2)"];
+      assert.deepEqual(await t.oddArrays.fetchOne(c.db, { boxes, frames: boxes, vec: [4, -5], oids: [26, 1259] }), {
+        boxes,
+        built: boxes,
+        frames: boxes,
+        vec: [1, 2, -3],
+        empty_vec: [],
+        vec_param: [4, -5],
+        oids: [26, 1259],
+        vecs: [[4, -5], []],
+      });
+      const empty = await t.oddArrays.fetchOne(c.db, { boxes: [], frames: [], vec: [], oids: [] });
+      assert.deepEqual([empty.vec_param, empty.oids, empty.vecs], [[], [], [[], []]]);
+      assert.deepEqual(await t.vectorMatches.fetchOne(c.db, { key: [3, 1] }), { same: true, first: 3, len: 2 });
+      assert.equal((await t.vectorMatches.fetchOne(c.db, { key: [1, 3] })).same, false);
+    });
+
+    test("a box spread, item by item and as an array", async () => {
+      const boxes = Array.from({ length: 1001 }, (_, i) => `(${i + 1},${i + 1}),(0,0)`);
+      const wanted = ["(2,2),(0,0)", "(5,5),(0,0)"];
+      assert.deepEqual(await t.boxSpread.fetchAll(c.db, { boxes, wanted }), wanted.map((b) => ({ b })));
+      // Above the threshold, the spread is bound as one `box[]`.
+      assert.equal((await t.boxSpread.fetchAll(c.db, { boxes, wanted: boxes })).length, 1001);
+    });
+
+    test("a JSON parameter's null is SQL NULL, jsonNull the JSON null", async () => {
+      assert.deepEqual(await t.jsonKind.fetchOne(c.db, { doc: null }), { kind: null, text: null });
+      assert.deepEqual(await t.jsonKind.fetchOne(c.db, { doc: jsonNull }), { kind: "null", text: "null" });
+      assert.deepEqual(await t.jsonKind.fetchOne(c.db, { doc: { a: jsonNull, b: null } }), { kind: "object", text: '{"a": null, "b": null}' });
+      assert.deepEqual(await t.thingsWithMeta.fetchAll(c.db, { sub: { never: jsonNull } }), []);
+    });
+
     test("an interval mixing signs is a DecodeError", async () => {
       await assert.rejects(t.mixedInterval.fetchOne(c.db), (e) => e instanceof DecodeError && /justify_interval/.test(e.message));
     });
@@ -176,7 +229,7 @@ for (const [name, connect] of drivers) {
       const maybe = <T>(f: () => T): T | null => (random() < 0.2 ? null : f());
       const arr = <T>(f: () => T, n = 4) => Array.from({ length: Math.floor(random() * n) }, f);
       const labels = ["red", "green", "with space", 'quo"te', "back\\slash", "NULL"] as const;
-      const json = (depth = 0): unknown =>
+      const json = (depth = 0): {} =>
         depth > 2 || random() < 0.4
           ? pick([str(), Math.round(random() * 1000) / 8, true, false])
           : random() < 0.5
@@ -205,7 +258,7 @@ for (const [name, connect] of drivers) {
             Math.floor(random() * 1e12),
           ),
           bigs: arr(() => maybe(() => BigInt.asIntN(64, BigInt(Math.floor(random() * 2 ** 53)) * 1031n))),
-          blobs: arr(() => maybe(() => Uint8Array.from(arr(() => Math.floor(random() * 256), 8)))),
+          blobs: arr(() => maybe(() => Buffer.from(arr(() => Math.floor(random() * 256), 8)))),
         };
         const id = await t.insertThing.fetchValue(c.db, params);
         const { j, ...row } = await t.thingWithJson.fetchOne(c.db, { id });

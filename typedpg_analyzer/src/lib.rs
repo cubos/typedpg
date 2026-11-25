@@ -94,6 +94,7 @@ mod tsearch_input;
 mod type_facts;
 mod types;
 mod typmod;
+mod tz;
 mod xml_input;
 
 /// Re-exports of types defined in `typedpg_core` but used pervasively by
@@ -125,13 +126,15 @@ pub use condition::{
     WriteBase, WriteCommand, WriteConstraint, WriteStatement, WrittenColumn, WrittenValue,
 };
 pub use ddl::DdlError;
+#[cfg(feature = "pg_sanity")]
+pub use ddl::extensions::{ExtensionInfo, extension_registry};
 pub use error::AnalyzeError;
 pub use pg_catalog::{
-    CoalesceFact, ColumnRefBinding, LocatedError, MigrationObserver, MigrationStatement,
-    NullifiedJoin, PgCatalog, QueryView, RelationRef, SublinkNullability, UserObjectCounts,
-    ValueLimit,
+    CoalesceFact, ColumnRefBinding, LintForeignKey, LocatedError, MigrationObserver,
+    MigrationStatement, NullifiedJoin, PgCatalog, QueryView, RelationRef, SublinkNullability,
+    UserObjectCounts, ValueLimit,
 };
-pub use privileges::RowSecurityChecks;
+pub use privileges::{BodyDiagnostics, BodyFailure, BodyReach, FiredTrigger, RowSecurityChecks};
 pub use refine::{IntRange, Refinement, Widenings};
 pub use refine_bounds::{Num, OrdBound, OrdKind, OrdPoint, OrdRange};
 pub use resolve::{

@@ -505,6 +505,20 @@ fn insert_null_into_not_null_column_rejected() {
 }
 
 #[test]
+fn insert_null_after_a_parameter_for_an_earlier_not_null_column() {
+    // A parameter feeds a NOT NULL column PG checks before the literal
+    // NULL's: the error is the literal's whatever non-NULL value is passed.
+    // (The pg_sanity fallback's all-NULL execution fails on the parameter's
+    // column first; it compares against an execution with non-NULL ones.)
+    let db = setup();
+    assert_analyze_err!(
+        db.analyze("INSERT INTO posts (user_id, title) VALUES ($uid, NULL)"),
+        AnalyzeError::Invalid(_),
+        "null value in column \"title\" of relation \"posts\" violates not-null constraint (cannot insert NULL into NOT NULL column `posts.title`)",
+    );
+}
+
+#[test]
 fn insert_null_reports_the_first_null_column_in_table_order() {
     // PG checks a row's NOT NULL columns in attnum order once the row is
     // built: an omitted column with no default (posts.user_id) comes

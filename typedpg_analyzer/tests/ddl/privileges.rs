@@ -1489,6 +1489,49 @@ fn default_privileges_are_role_dependencies() {
 }
 
 #[test]
+fn grant_option_to_public_is_checked_per_object() {
+    // PG 19 merge_acl_with_grant: `ALL … IN SCHEMA` naming no object
+    // grants nothing, and checks nothing.
+    build_db(&[(
+        "0001.sql",
+        "GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO PUBLIC WITH GRANT OPTION;",
+    )]);
+    assert_err_prefix!(
+        try_apply(&[(
+            "0001.sql",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+             GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO PUBLIC WITH GRANT OPTION;",
+        )]),
+        DdlError::Parse(_),
+        "grant options can only be granted to roles"
+    );
+}
+
+#[test]
+fn default_privileges_on_large_objects() {
+    // PG 19: ALTER DEFAULT PRIVILEGES ... ON LARGE OBJECTS stores a
+    // `pg_default_acl` row (defaclobjtype 'L') its role depends on.
+    let result = try_apply(&[(
+        "0001.sql",
+        "CREATE ROLE acl_dp_lo;
+         ALTER DEFAULT PRIVILEGES FOR ROLE acl_dp_lo
+             GRANT SELECT ON LARGE OBJECTS TO PUBLIC;
+         DROP ROLE acl_dp_lo;",
+    )]);
+    assert_err_prefix!(
+        result,
+        DdlError::DependencyError(_),
+        "role \"acl_dp_lo\" cannot be dropped because some objects depend on it (owner of \
+         default privileges on new large objects belonging to role acl_dp_lo)"
+    );
+    build_db(&[(
+        "0001.sql",
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT, UPDATE ON LARGE OBJECTS TO PUBLIC;
+         ALTER DEFAULT PRIVILEGES REVOKE UPDATE ON LARGE OBJECTS FROM PUBLIC;",
+    )]);
+}
+
+#[test]
 fn a_rolled_back_create_role_disappears() {
     let db = build_db(&[
         ("0001.sql", "CREATE TABLE acl_tx_role_t (id int);"),
@@ -2395,8 +2438,9 @@ fn create_schema_authorization_current_user_uses_its_name() {
     )]);
     assert!(db.namespace_oid("acl_cs_owner").is_some());
 
-    // The migrations' own user is unnamed: the schema's name is unknowable,
-    // and the statement is accepted without creating anything (as before).
+    // The migrations' own user's schema is named after the connecting user
+    // (see `a_schema_named_after_the_connecting_user`), never after the
+    // model's pseudo-role.
     let mut db = PgCatalog::new().unwrap();
     db.skip_pg_sanity();
     db.apply_sql("CREATE SCHEMA AUTHORIZATION CURRENT_USER;")
@@ -2741,6 +2785,41 @@ fn do_block_role_existence_branch_runs_other_statements() {
 }
 
 #[test]
+fn do_block_if_a_role_exists_runs_the_branch_its_existence_selects() {
+    // The converse idiom: a grant to a role that may not exist yet.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE acl2_do5_here;
+         CREATE TABLE acl2_do5_t (id int);
+         DO $$ BEGIN
+             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'acl2_do5_here') THEN
+                 GRANT SELECT ON acl2_do5_t TO acl2_do5_here;
+             END IF;
+             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'acl2_do5_missing') THEN
+                 GRANT SELECT ON acl2_do5_t TO acl2_do5_missing;
+             ELSE
+                 GRANT INSERT ON acl2_do5_t TO acl2_do5_here;
+             END IF;
+         END $$;",
+    )]);
+    assert!(table_has(
+        &db,
+        "acl2_do5_here",
+        "public",
+        "acl2_do5_t",
+        Privilege::Select
+    ));
+    assert!(table_has(
+        &db,
+        "acl2_do5_here",
+        "public",
+        "acl2_do5_t",
+        Privilege::Insert
+    ));
+    assert!(!db.role_exists("acl2_do5_missing"));
+}
+
+#[test]
 fn do_block_role_existence_branch_can_create_a_role_in_role() {
     let db = build_db(&[(
         "0001.sql",
@@ -2903,4 +2982,346 @@ fn parameter_privileges_hold_their_grantees() {
             "DROP OWNED BY dp_param_role2; DROP ROLE dp_param_role2;",
         ),
     ]);
+}
+
+// ── DDL privilege checks as the current role ────────────────────────────────
+
+/// Apply `setup`, then `stmt`, which must fail with a message starting with
+/// `msg` (PostgreSQL's, checked by the `pg_sanity` mirror).
+#[track_caller]
+fn ddl_denied(setup: &str, stmt: &str, msg: &str) {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(setup).unwrap();
+    let err = db.apply_sql(stmt).expect_err(stmt);
+    assert!(err.to_string().starts_with(msg), "{stmt}\n  got: {err}");
+}
+
+#[test]
+fn creating_needs_create_on_the_schema() {
+    // PostgreSQL 15+: PUBLIC has no CREATE on `public`.
+    let setup = "CREATE ROLE ddl_perm_create; CREATE SCHEMA ddl_perm_create_s;
+                 SET ROLE ddl_perm_create;";
+    for stmt in [
+        "CREATE TABLE t (id int);",
+        "CREATE TABLE public.t (id int);",
+        "CREATE SEQUENCE seq;",
+        "CREATE VIEW v AS SELECT 1 AS x;",
+        "CREATE TYPE e AS ENUM ('a');",
+        "CREATE DOMAIN d AS int;",
+        "CREATE TYPE c AS (x int);",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';",
+        "CREATE TABLE ta AS SELECT 1 AS x;",
+    ] {
+        ddl_denied(setup, stmt, "permission denied for schema public");
+    }
+    ddl_denied(
+        setup,
+        "CREATE TABLE ddl_perm_create_s.t (id int);",
+        "permission denied for schema ddl_perm_create_s",
+    );
+    // Granted CREATE, the role creates and owns the objects; a temporary
+    // table needs nothing of a schema.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE ddl_perm_create2;
+         GRANT CREATE ON SCHEMA public TO ddl_perm_create2;
+         SET ROLE ddl_perm_create2;
+         CREATE TABLE t (id int);
+         CREATE TEMP TABLE tt (id int);
+         CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+         RESET ROLE;",
+    )]);
+    assert!(db.has_table_privilege(
+        "ddl_perm_create2",
+        relation(&db, "public", "t"),
+        Privilege::Insert
+    ));
+    // CREATE OR REPLACE checks the schema before the view's owner; a
+    // partition needs its parent's owner (also with CREATE on a schema
+    // without USAGE).
+    ddl_denied(
+        "CREATE ROLE ddl_perm_create4; CREATE VIEW v AS SELECT 1 AS x;
+         SET ROLE ddl_perm_create4;",
+        "CREATE OR REPLACE VIEW v AS SELECT 1 AS x;",
+        "permission denied for schema public",
+    );
+    ddl_denied(
+        "CREATE ROLE ddl_perm_create5; CREATE TABLE c (id int) PARTITION BY RANGE (id);
+         CREATE SCHEMA ddl_perm_create5_s;
+         GRANT CREATE ON SCHEMA ddl_perm_create5_s TO ddl_perm_create5;
+         SET ROLE ddl_perm_create5;",
+        "CREATE TABLE ddl_perm_create5_s.c1 PARTITION OF public.c FOR VALUES FROM (1) TO (2);",
+        "must be owner of table c",
+    );
+    // An untrusted language is a superuser's.
+    ddl_denied(
+        "CREATE ROLE ddl_perm_create3; GRANT CREATE ON SCHEMA public TO ddl_perm_create3;
+         SET ROLE ddl_perm_create3;",
+        "CREATE FUNCTION f() RETURNS int LANGUAGE internal AS 'int4in';",
+        "permission denied for language internal",
+    );
+}
+
+#[test]
+fn altering_dropping_and_commenting_need_ownership() {
+    let setup = "CREATE ROLE ddl_perm_owner;
+                 CREATE TABLE t (id int PRIMARY KEY);
+                 CREATE VIEW v AS SELECT id FROM t;
+                 CREATE TYPE e AS ENUM ('a');
+                 CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';
+                 CREATE SCHEMA ddl_perm_owner_s;
+                 GRANT ALL ON t, v TO ddl_perm_owner;
+                 GRANT ALL ON SCHEMA public, ddl_perm_owner_s TO ddl_perm_owner;
+                 SET ROLE ddl_perm_owner;";
+    for (stmt, msg) in [
+        (
+            "ALTER TABLE t ADD COLUMN c int;",
+            "must be owner of table t",
+        ),
+        (
+            "ALTER TABLE public.t RENAME TO t2;",
+            "must be owner of table t",
+        ),
+        (
+            "ALTER TABLE t RENAME COLUMN id TO id2;",
+            "must be owner of table t",
+        ),
+        ("ALTER VIEW v RENAME TO v2;", "must be owner of view v"),
+        ("DROP TABLE t CASCADE;", "must be owner of table t"),
+        ("DROP VIEW v;", "must be owner of view v"),
+        ("DROP TYPE e;", "must be owner of type e"),
+        ("DROP FUNCTION f();", "must be owner of function f"),
+        (
+            "DROP SCHEMA ddl_perm_owner_s;",
+            "must be owner of schema ddl_perm_owner_s",
+        ),
+        ("COMMENT ON TABLE t IS 'x';", "must be owner of table t"),
+        (
+            "COMMENT ON COLUMN t.id IS 'x';",
+            "must be owner of relation t",
+        ),
+        ("COMMENT ON TYPE e IS 'x';", "must be owner of type e"),
+        (
+            "COMMENT ON FUNCTION f() IS 'x';",
+            "must be owner of function f",
+        ),
+        (
+            "COMMENT ON SCHEMA ddl_perm_owner_s IS 'x';",
+            "must be owner of schema ddl_perm_owner_s",
+        ),
+        ("CREATE INDEX ON t (id);", "must be owner of table t"),
+        (
+            "CREATE OR REPLACE VIEW v AS SELECT id FROM t;",
+            "must be owner of view v",
+        ),
+        (
+            "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 2';",
+            "must be owner of function f",
+        ),
+    ] {
+        ddl_denied(setup, stmt, msg);
+    }
+    // The owner of the schema may drop what is in it.
+    build_db(&[(
+        "0001.sql",
+        "CREATE ROLE ddl_perm_owner2;
+         CREATE SCHEMA ddl_perm_owner2_s AUTHORIZATION ddl_perm_owner2;
+         CREATE TABLE ddl_perm_owner2_s.t (id int);
+         SET ROLE ddl_perm_owner2;
+         DROP TABLE ddl_perm_owner2_s.t;
+         RESET ROLE;",
+    )]);
+}
+
+#[test]
+fn names_need_usage_on_their_schema() {
+    let setup = "CREATE ROLE ddl_perm_usage;
+                 CREATE SCHEMA ddl_perm_usage_s;
+                 CREATE TABLE ddl_perm_usage_s.t (id int);
+                 GRANT SELECT ON ddl_perm_usage_s.t TO ddl_perm_usage;
+                 GRANT CREATE ON SCHEMA public TO ddl_perm_usage;
+                 SET ROLE ddl_perm_usage;";
+    ddl_denied(
+        setup,
+        "CREATE VIEW v AS SELECT id FROM ddl_perm_usage_s.t;",
+        "permission denied for schema ddl_perm_usage_s",
+    );
+    ddl_denied(
+        setup,
+        "CREATE TABLE t (x ddl_perm_usage_s.t);",
+        "permission denied for schema ddl_perm_usage_s",
+    );
+    // A schema without USAGE is left out of the search path: the table
+    // goes to the next one.
+    let db = build_db(&[(
+        "0001.sql",
+        "CREATE ROLE ddl_perm_usage2;
+         CREATE SCHEMA ddl_perm_usage2_s;
+         GRANT CREATE ON SCHEMA public TO ddl_perm_usage2;
+         SET search_path = ddl_perm_usage2_s, public;
+         SET ROLE ddl_perm_usage2;
+         CREATE TABLE t (id int);
+         RESET ROLE;",
+    )]);
+    assert!(db.resolve_table(Some("public"), "t").is_some());
+    assert!(db.resolve_table(Some("ddl_perm_usage2_s"), "t").is_none());
+}
+
+#[test]
+fn column_types_need_usage() {
+    let setup = "CREATE ROLE ddl_perm_type;
+                 CREATE TYPE e AS ENUM ('a');
+                 REVOKE USAGE ON TYPE e FROM PUBLIC;
+                 CREATE DOMAIN d AS int;
+                 REVOKE USAGE ON DOMAIN d FROM PUBLIC;
+                 GRANT CREATE ON SCHEMA public TO ddl_perm_type;
+                 SET ROLE ddl_perm_type;";
+    ddl_denied(
+        setup,
+        "CREATE TABLE t (x e);",
+        "permission denied for type e",
+    );
+    ddl_denied(
+        setup,
+        "CREATE TABLE t (x e[]);",
+        "permission denied for type e",
+    );
+    ddl_denied(
+        setup,
+        "CREATE TABLE t (x d);",
+        "permission denied for type d",
+    );
+    ddl_denied(
+        setup,
+        "CREATE DOMAIN d2 AS d;",
+        "permission denied for type d",
+    );
+}
+
+#[test]
+fn foreign_keys_need_references() {
+    let setup = "CREATE ROLE ddl_perm_fk;
+                 CREATE TABLE p (id int PRIMARY KEY, code int UNIQUE);
+                 GRANT CREATE ON SCHEMA public TO ddl_perm_fk;
+                 SET ROLE ddl_perm_fk;";
+    ddl_denied(
+        setup,
+        "CREATE TABLE c (pid int REFERENCES p);",
+        "permission denied for table p",
+    );
+    ddl_denied(
+        setup,
+        "CREATE TABLE c (pid int, FOREIGN KEY (pid) REFERENCES p (code));",
+        "permission denied for table p",
+    );
+    // REFERENCES on the table, or on the referenced columns.
+    build_db(&[(
+        "0001.sql",
+        "CREATE ROLE ddl_perm_fk2;
+         CREATE TABLE p (id int PRIMARY KEY, code int UNIQUE);
+         GRANT CREATE ON SCHEMA public TO ddl_perm_fk2;
+         GRANT REFERENCES (id) ON p TO ddl_perm_fk2;
+         SET ROLE ddl_perm_fk2;
+         CREATE TABLE c (pid int REFERENCES p);
+         CREATE TABLE c2 (id int PRIMARY KEY, parent int REFERENCES c2);
+         RESET ROLE;",
+    )]);
+    ddl_denied(
+        "CREATE ROLE ddl_perm_fk3;
+         CREATE TABLE p (id int PRIMARY KEY, code int UNIQUE);
+         GRANT CREATE ON SCHEMA public TO ddl_perm_fk3;
+         GRANT REFERENCES (id) ON p TO ddl_perm_fk3;
+         SET ROLE ddl_perm_fk3;
+         CREATE TABLE c (pid int);",
+        "ALTER TABLE c ADD FOREIGN KEY (pid) REFERENCES p (code);",
+        "permission denied for table p",
+    );
+}
+
+#[test]
+fn owner_to_needs_the_new_owner() {
+    let setup = "CREATE ROLE ddl_perm_give; CREATE ROLE ddl_perm_take;
+                 GRANT CREATE ON SCHEMA public TO ddl_perm_give;
+                 SET ROLE ddl_perm_give;
+                 CREATE TABLE t (id int);
+                 CREATE TYPE e AS ENUM ('a');
+                 CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1';";
+    for stmt in [
+        "ALTER TABLE t OWNER TO ddl_perm_take;",
+        "ALTER TYPE e OWNER TO ddl_perm_take;",
+        "ALTER FUNCTION f() OWNER TO ddl_perm_take;",
+    ] {
+        ddl_denied(setup, stmt, "must be able to SET ROLE \"ddl_perm_take\"");
+    }
+    // A member of the new owner: it still needs CREATE on the schema.
+    let setup = "CREATE ROLE ddl_perm_give2; CREATE ROLE ddl_perm_take2;
+                 GRANT ddl_perm_take2 TO ddl_perm_give2;
+                 GRANT CREATE ON SCHEMA public TO ddl_perm_give2;
+                 SET ROLE ddl_perm_give2;
+                 CREATE TABLE t (id int);";
+    ddl_denied(
+        setup,
+        "ALTER TABLE t OWNER TO ddl_perm_take2;",
+        "permission denied for schema public",
+    );
+    build_db(&[(
+        "0001.sql",
+        "CREATE ROLE ddl_perm_give3; CREATE ROLE ddl_perm_take3;
+         GRANT ddl_perm_take3 TO ddl_perm_give3;
+         GRANT CREATE ON SCHEMA public TO ddl_perm_give3, ddl_perm_take3;
+         SET ROLE ddl_perm_give3;
+         CREATE TABLE t (id int);
+         ALTER TABLE t OWNER TO ddl_perm_take3;
+         RESET ROLE;",
+    )]);
+}
+
+#[test]
+fn creating_a_schema_needs_create_on_the_database() {
+    ddl_denied(
+        "CREATE ROLE ddl_perm_schema; SET ROLE ddl_perm_schema;",
+        "CREATE SCHEMA ddl_perm_schema_s;",
+        "permission denied for database ",
+    );
+}
+
+#[test]
+fn privileges_a_do_block_may_have_granted_pass() {
+    // The GRANT runs from a string the analyzer doesn't follow: the role
+    // may hold CREATE on public, so its CREATE TABLE is not an error.
+    build_db(&[(
+        "0001.sql",
+        "CREATE ROLE ddl_perm_maybe;
+         DO $$ BEGIN EXECUTE 'GRANT CREATE ON SCHEMA public TO ' || 'ddl_perm_maybe'; END $$;
+         SET ROLE ddl_perm_maybe;
+         CREATE TABLE t (id int);
+         RESET ROLE;",
+    )]);
+}
+
+#[test]
+fn a_schema_named_after_the_connecting_user() {
+    // `CREATE SCHEMA AUTHORIZATION CURRENT_USER` names the schema after the
+    // connecting user (the mirror's), and `$user` then finds it first.
+    let mut db = PgCatalog::new().unwrap();
+    db.set_connecting_user("postgres");
+    db.apply_sql(
+        "CREATE SCHEMA AUTHORIZATION CURRENT_USER;
+         CREATE TABLE postgres.a (id int);
+         CREATE TABLE b (id int);
+         CREATE SCHEMA IF NOT EXISTS AUTHORIZATION SESSION_USER;",
+    )
+    .unwrap();
+    assert!(db.resolve_table(Some("postgres"), "a").is_some());
+    assert!(db.resolve_table(Some("postgres"), "b").is_some());
+    // The application's queries, analyzed as the connecting user (as the
+    // mirror's query session connects), find it unqualified too.
+    db.analyze("SELECT a.id FROM a JOIN b USING (id)").unwrap();
+    // SESSION_USER under SET ROLE is still the connecting user, whom the
+    // role can't become; but CREATE on the database comes first.
+    ddl_denied(
+        "CREATE ROLE ddl_perm_session;",
+        "SET ROLE ddl_perm_session; CREATE SCHEMA s AUTHORIZATION SESSION_USER;",
+        "permission denied for database ",
+    );
 }

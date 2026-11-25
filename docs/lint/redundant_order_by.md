@@ -3,9 +3,9 @@
 `ORDER BY` keys that can't change the order, and whole `ORDER BY` clauses
 whose order nothing observes.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the keys, or the whole `ORDER BY` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the keys, or the whole `ORDER BY` |
 
 ## Example
 
@@ -22,14 +22,14 @@ SELECT id FROM users ORDER BY id, lower(name);
 ```
 
 ```
-info[redundant_order_by]: the ORDER BY key created_at can't change the order: the keys before it already determine a unique row, so it never breaks a tie
+info[redundant/redundant_order_by]: the ORDER BY key created_at can't change the order: the keys before it already determine a unique row, so it never breaks a tie
    ╭─[queries.sql:2:45]
  2 │ SELECT id, email FROM users ORDER BY email, created_at;
    ·                                             ──────────
    ╰────
   help: remove it
 
-info[redundant_order_by]: ORDER BY has no effect: a subquery that only tests membership never observes its rows' order
+info[redundant/redundant_order_by]: ORDER BY has no effect: a subquery that only tests membership never observes its rows' order
    ╭─[queries.sql:8:61]
  8 │ SELECT id FROM users WHERE id IN (SELECT user_id FROM posts ORDER BY created_at);
    ·                                                             ───────────────────
@@ -88,7 +88,11 @@ at most one row before it), when it belongs to an `EXISTS`, `IN`/`= ANY` or
 For a key that is not a plain column, an output column's alias or an ordinal
 (`ORDER BY 1`): `lower(name)`, `1 / (tenant - 1)` and `random()` may raise
 an error or have side effects. A whole-clause finding is fixed only when
-every key in it is removable.
+every key in it is removable, and not under `FETCH … WITH TIES`, which
+needs an `ORDER BY`. Nor is a key the clause sorts an untyped literal by
+removed in a set operation's branch or an `INSERT`'s `SELECT`
+(`(SELECT 'y' AS c ORDER BY 1) UNION …`): the `ORDER BY` types the literal
+`text` there.
 
 ## Configuration
 

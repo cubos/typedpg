@@ -4316,3 +4316,23 @@ fn an_unqualified_conversion_is_never_looked_up_in_the_temporary_schema() {
         "conversion \"cv\" does not exist",
     );
 }
+
+#[test]
+fn a_policy_depends_on_the_types_it_names() {
+    // recordDependencyOnExpr records the type a policy expression casts
+    // to: DROP TYPE needs CASCADE, which drops the policy.
+    let mut db = build_db(&[(
+        "0001.sql",
+        "CREATE TYPE e AS ENUM ('x', 'y');
+         CREATE TABLE t (c text);
+         CREATE POLICY p ON t USING (c::e IS NOT NULL);",
+    )]);
+    let err = db.apply_sql("DROP TYPE e;").unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("cannot drop type e because other objects depend on it"),
+        "got: {err}"
+    );
+    db.apply_sql("DROP TYPE e CASCADE; CREATE POLICY p ON t USING (true);")
+        .unwrap();
+}

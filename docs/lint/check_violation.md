@@ -3,9 +3,9 @@
 An `INSERT` or `UPDATE` that stores a constant a `CHECK` constraint or the
 column's domain rejects, so it fails for every row it writes.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| correctness | error | queries | — |
 
 ## Example
 
@@ -24,14 +24,14 @@ UPDATE posts SET score = 9 WHERE id = $id;
 ```
 
 ```
-warning[check_violation]: storing this value in status violates CHECK constraint "posts_status_check": the statement fails as soon as it updates a row
+error[correctness/check_violation]: storing this value in status violates CHECK constraint "posts_status_check": the statement fails as soon as it updates a row
    ╭─[queries.sql:2:27]
  2 │ UPDATE posts SET status = 'publshed' WHERE id = $id;
    ·                           ──────────
    ╰────
   help: the constraint allows one of 'archived', 'draft', 'published'
 
-warning[check_violation]: storing this value in score fails: value for domain rating violates check constraint "rating_check"
+error[correctness/check_violation]: storing this value in score fails: value for domain rating violates check constraint "rating_check"
    ╭─[queries.sql:6:26]
  6 │ UPDATE posts SET score = 9 WHERE id = $id;
    ·                          ─

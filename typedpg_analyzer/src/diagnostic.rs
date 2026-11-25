@@ -125,7 +125,8 @@ pub(crate) fn render(
         }
         prev_line = Some(*line_no);
 
-        let line_text = nth_line(sql_original, *line_no);
+        // Tabs expanded, as the columns count them.
+        let line_text = nth_line(sql_original, *line_no).replace('\t', &" ".repeat(TAB_WIDTH));
         out.push_str(&format!(
             "{:>width$} │ {}\n",
             line_no,
@@ -313,7 +314,39 @@ fn translate(span: SourceSpan, lex_output: &LexOutput) -> SourceSpan {
     SourceSpan::new(s, e)
 }
 
-/// Convert a byte span in the original SQL into a 1-based (line, col_start, col_end).
+/// The columns a tab of the snippet's source lines is shown as.
+const TAB_WIDTH: usize = 4;
+
+/// The columns `c` takes in a terminal: none for a combining mark, two for
+/// a wide character (CJK, emoji), [`TAB_WIDTH`] for a tab, else one —
+/// PostgreSQL's own widths (`ucs_wcwidth`), a control character counting
+/// as one.
+fn char_width(c: char) -> usize {
+    if c == '\t' {
+        return TAB_WIDTH;
+    }
+    match typedpg_core::display_width::pg_wcwidth(c) {
+        width if width < 0 => 1,
+        width => width.unsigned_abs() as usize,
+    }
+}
+
+/// The columns `s` takes in a terminal (see [`char_width`]).
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// The smallest char boundary of `s` at or after `i`.
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Convert a byte span in the original SQL into a 1-based (line, col_start,
+/// col_end), in the columns the snippet's line takes on screen — not
+/// bytes: `é` is two bytes and one column.
 ///
 /// If the span crosses multiple lines, the position covers from `col_start`
 /// on the start line to the end of that line — multi-line underlines aren't
@@ -322,8 +355,8 @@ fn span_to_position(span: SourceSpan, sql: &str) -> Option<Position> {
     if span.start > sql.len() {
         return None;
     }
-    let start = span.start;
-    let end = span.end.min(sql.len()).max(start + 1);
+    let start = floor_char_boundary(sql, span.start);
+    let end = ceil_char_boundary(sql, span.end.min(sql.len()).max(start + 1));
 
     let bytes = sql.as_bytes();
     let mut line = 1usize;
@@ -343,12 +376,14 @@ fn span_to_position(span: SourceSpan, sql: &str) -> Option<Position> {
         .unwrap_or(bytes.len());
     // At least one column wide: a span at the end of a line (`syntax error
     // at end of input`) still gets its marker, just past the last character.
-    let end_on_line = end.min(line_end).max(start + 1);
+    let end_on_line = end.min(line_end);
 
+    let col_start = 1 + display_width(&sql[line_start..start]);
+    let col_end = (1 + display_width(&sql[line_start..end_on_line])).max(col_start + 1);
     Some(Position {
         line,
-        col_start: 1 + (start - line_start),
-        col_end: 1 + (end_on_line - line_start),
+        col_start,
+        col_end,
     })
 }
 
@@ -406,6 +441,28 @@ function f(integer) does not exist
   note: candidates are:
           f(text)
           f(bytea)
+";
+        assert_eq!(rendered, expected);
+    }
+
+    /// The marker sits under the token on screen: a column per character
+    /// (two for a wide one), not per byte, and a tab as the line shows it.
+    #[test]
+    fn markers_count_columns_not_bytes() {
+        let sql = "SELECT 'ação', '😀',\t'中' AS x FROM userz";
+        let lex_output = lex(sql).unwrap();
+        let start = sql.find("userz").unwrap();
+        let span = SourceSpan::new(start, start + "userz".len());
+        let raw = RawError::undefined_table("userz", Some(span), None);
+        let rendered = render(&raw.pg_message(), &raw, sql, &lex_output);
+
+        let expected = "\
+relation \"userz\" does not exist
+  ╭────
+1 │ SELECT 'ação', '😀',    '中' AS x FROM userz
+  ·                                        ──┬──
+  ·                                          ╰─ relation does not exist
+  ╰────
 ";
         assert_eq!(rendered, expected);
     }

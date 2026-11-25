@@ -9,19 +9,49 @@
 //! Shared with `typedpg_wasm`, which the npm runtime calls: a database
 //! looks drifted to one runner exactly when it does to the other.
 
+use std::borrow::Cow;
+
 use super::split::{
-    is_ident_cont, is_ident_start, skip_block_comment, skip_line_comment, skip_quoted,
+    is_ident_cont, is_ident_start, is_space, skip_block_comment, skip_line_comment, skip_quoted,
 };
 use crate::migration_marker::has_no_transaction_marker;
 
 /// Which normalization the stored hashes use. A row's `hash_version` names
 /// the algorithm that computed its `hash`; `run` re-hashes rows of another
-/// version from their `sql_source`.
-pub const HASH_VERSION: i32 = 1;
+/// version from their `sql_source`, and a row of an older version without
+/// one is compared with that version's algorithm ([`hash_with_version`]).
+///
+/// - 1: typedpg 0.6 to 0.8. Line breaks were content inside literals (a
+///   CRLF checkout of an LF file drifted), and `\v` was not whitespace.
+/// - 2: every line break is one LF, and whitespace is PostgreSQL's.
+pub const HASH_VERSION: i32 = 2;
 
 /// The MD5 hex digest of [`normalize`]'s UTF-8 bytes.
 pub fn hash(sql: &str) -> String {
-    format!("{:x}", md5::compute(normalize(sql).as_bytes()))
+    digest(&normalize(sql))
+}
+
+/// The hash of `sql` under the algorithm `version` names, as rows of that
+/// version store it: `None` for a version this release does not know.
+pub fn hash_with_version(sql: &str, version: i32) -> Option<String> {
+    match version {
+        1 => Some(digest(&normalize_as(sql, Version::V1))),
+        HASH_VERSION => Some(hash(sql)),
+        _ => None,
+    }
+}
+
+fn digest(normalized: &str) -> String {
+    format!("{:x}", md5::compute(normalized.as_bytes()))
+}
+
+/// The hashing algorithms [`hash_with_version`] knows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Version {
+    /// `hash_version` 1: line breaks kept as written, `\v` not whitespace.
+    V1,
+    /// The current one, [`HASH_VERSION`].
+    Current,
 }
 
 /// `sql` normalized so that comments, whitespace and the case of unquoted
@@ -29,6 +59,13 @@ pub fn hash(sql: &str) -> String {
 /// Unquoted ASCII letters are lowercased, as PostgreSQL folds them; strings,
 /// quoted identifiers and dollar-quoted bodies are content and copied
 /// verbatim.
+///
+/// A CRLF or a lone CR is the same line break as an LF everywhere in the
+/// file, inside literals and dollar-quoted bodies too: checking a migration
+/// out with other line endings (git's `autocrlf`) is no edit by its author.
+/// The statements run are the file as it is; only the comparison ignores
+/// the difference. Whitespace is what PostgreSQL's lexer skips: space,
+/// `\t`, `\n`, `\r`, `\v` and `\f`.
 ///
 /// A maximal run of whitespace and/or comments becomes one ASCII space only
 /// when the character just before it and the character just after it would
@@ -60,6 +97,18 @@ pub fn hash(sql: &str) -> String {
 /// The `-- no-transaction` marker decides how the migration runs, so it is
 /// part of the normalized text (the comment scan drops it otherwise).
 pub fn normalize(sql: &str) -> String {
+    normalize_as(sql, Version::Current)
+}
+
+fn normalize_as(sql: &str, version: Version) -> String {
+    let unified;
+    let (sql, is_space): (&str, fn(u8) -> bool) = match version {
+        Version::V1 => (sql, |b| b.is_ascii_whitespace()),
+        Version::Current => {
+            unified = unify_line_breaks(sql);
+            (&unified, is_space)
+        }
+    };
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut last: Option<Class> = None;
@@ -81,7 +130,7 @@ pub fn normalize(sql: &str) -> String {
                 i = skip_block_comment(bytes, i);
                 pending_run = true;
             }
-            b if b.is_ascii_whitespace() => {
+            b if is_space(b) => {
                 pending_run = true;
                 i += 1;
             }
@@ -163,6 +212,15 @@ pub fn normalize(sql: &str) -> String {
         format!("no-transaction\n{out}")
     } else {
         out
+    }
+}
+
+/// `sql` with every CRLF and lone CR written as an LF.
+fn unify_line_breaks(sql: &str) -> Cow<'_, str> {
+    if sql.contains('\r') {
+        Cow::Owned(sql.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(sql)
     }
 }
 
@@ -288,7 +346,7 @@ fn dollar_quote_span(bytes: &[u8], open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hash, normalize};
+    use super::{HASH_VERSION, hash, hash_with_version, normalize};
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -372,5 +430,52 @@ mod tests {
             hash("SELECT Café FROM t;"),
             "5a3c8a972c93614feb3618f2e3ce47b1"
         );
+    }
+
+    const LF_FUNCTION: &str = "CREATE FUNCTION f() RETURNS text AS $$\nBEGIN\n  RETURN 'a\nb';\nEND\n$$ LANGUAGE plpgsql;\n";
+    const CRLF_FUNCTION: &str = "CREATE FUNCTION f() RETURNS text AS $$\r\nBEGIN\r\n  RETURN 'a\r\nb';\r\nEND\r\n$$ LANGUAGE plpgsql;\r\n";
+
+    /// Version 1 is what typedpg 0.6 to 0.8 stored: the digests below were
+    /// computed by that release's `hash`, and must not change, or rows it
+    /// wrote without their text would read as drifted.
+    #[test]
+    fn version_1_hashes_are_the_released_ones() {
+        assert_eq!(
+            hash_with_version(LF_FUNCTION, 1).as_deref(),
+            Some("36008b21f609949ea9d09c40c9aad1d0")
+        );
+        assert_eq!(
+            hash_with_version(CRLF_FUNCTION, 1).as_deref(),
+            Some("7bfec4f9fc4133c7e9feb3b6344748eb")
+        );
+        assert_eq!(
+            hash_with_version("SELECT\x0b1;", 1).as_deref(),
+            Some("c36edb0c2f8e8be0f92c9a21f50d831e")
+        );
+        assert_eq!(
+            hash_with_version("SELECT 'x\ry';", 1).as_deref(),
+            Some("d27130028390f98d57d559243b9074fc")
+        );
+        assert_eq!(hash_with_version("SELECT 1;", 0), None);
+        assert_eq!(hash_with_version("SELECT 1;", HASH_VERSION + 1), None);
+    }
+
+    /// The current version: line endings and PostgreSQL's whitespace are no
+    /// edit, and a file with neither hashes as it did under version 1.
+    #[test]
+    fn line_endings_and_vertical_tabs_are_not_drift() {
+        assert_eq!(hash(CRLF_FUNCTION), hash(LF_FUNCTION));
+        assert_eq!(
+            hash(&CRLF_FUNCTION.replace("\r\n", "\r")),
+            hash(LF_FUNCTION)
+        );
+        assert_eq!(hash(LF_FUNCTION), "36008b21f609949ea9d09c40c9aad1d0");
+        assert_eq!(
+            hash_with_version(CRLF_FUNCTION, HASH_VERSION),
+            Some(hash(LF_FUNCTION))
+        );
+        assert_eq!(normalize("SELECT\x0b1\x0bFROM\x0ct;"), "select 1 from t;");
+        // A line break is still content: removing one is an edit.
+        assert_ne!(hash("SELECT 'x\r\ny';"), hash("SELECT 'xy';"));
     }
 }

@@ -19,12 +19,28 @@
 # only pass filters / extra nextest flags, never the boilerplate.
 # `PG_SANITY_PACKAGE=typedpg_lint` runs the lint crate's suite instead, with
 # the lint oracle on (`scripts/run-lint-oracle.sh` does).
+#
+# `PG_IMAGE` picks the server (the official `postgres` image of the release
+# typedpg targets by default). The third-party extensions the analyzer
+# bundles (PostGIS, pgvector, pg_cron, pgmq, pg_jsonschema) are compared only
+# on a server that has them: `scripts/build-extensions-image.sh` builds one,
+# then `PG_IMAGE=typedpg-extensions:pg19 scripts/run-pg-sanity.sh` runs on it
+# (`third_party` selects their tests). Elsewhere a test stops comparing once
+# the server reports the extension as not available.
 
 set -euo pipefail
 
 # The release typedpg targets: the parser's and the seed's.
 PG_VERSION=$(tr -d '[:space:]' < "$(dirname "$0")/../typedpg_pg_query/POSTGRES_VERSION")
 PG_IMAGE="${PG_IMAGE:-postgres:$PG_VERSION}"
+# typedpg-pg-pl:<version> is that release's image with PL/Perl and
+# PL/Python (scripts/pg-pl/Dockerfile), for the extension oracle: built
+# here, cached by Docker afterwards.
+if [[ "$PG_IMAGE" == typedpg-pg-pl:* ]]; then
+    echo "pg_sanity: building $PG_IMAGE..."
+    docker build -q -t "$PG_IMAGE" --build-arg "PG_VERSION=${PG_IMAGE#typedpg-pg-pl:}" \
+        "$(dirname "$0")/pg-pl" >/dev/null
+fi
 CONTAINER_NAME="typedpg-pg-sanity-$$"
 PG_USER="postgres"
 PG_PASS="postgres"

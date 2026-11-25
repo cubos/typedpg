@@ -82,8 +82,28 @@ fn dotenv_vars(
 /// returns the two paths.
 ///
 /// Neither file is overwritten: a migration written by hand, or one created
-/// a moment ago, is never silently emptied.
+/// a moment ago, is never silently emptied. A name the runner would not
+/// read back as this migration is refused before anything is written.
 pub fn create_migration(dir: &Path, name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+    let invalid = |reason: &str| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid migration name {name:?}: {reason}"),
+        ))
+    };
+    if name.is_empty() {
+        // `<timestamp>_.sql`, which the runner rejects for its missing
+        // description.
+        return invalid("it is empty");
+    }
+    if name.contains(['/', '\\']) {
+        return invalid("it is a file name, not a path");
+    }
+    if name.ends_with(".down") {
+        // `<timestamp>_x.down.sql` would read as the down file of
+        // `<timestamp>_x`, and the migration itself would not exist.
+        return invalid("a name ending in `.down` makes its file read as a down file");
+    }
     let timestamp = Utc::now().format("%Y%m%d%H%M%S");
     fs::create_dir_all(dir)?;
     let up_file = dir.join(format!("{timestamp}_{name}.sql"));
@@ -261,7 +281,7 @@ fn resolve_commit(top: &Path, reference: &str) -> Result<String, String> {
 
 /// The tree of a git ref, checked out in a temporary directory that is
 /// removed when the snapshot is dropped: the code `--previous-deployment`
-/// names, whose queries `breaks_deployed_queries` checks.
+/// names, whose queries `deployed_query_breakage` checks.
 pub struct Snapshot {
     dir: tempfile::TempDir,
     /// The root of the work tree the snapshot's paths map from.
@@ -387,10 +407,10 @@ fn git_error(command: &str, stderr: &[u8]) -> String {
 }
 
 /// Connect honoring the URL's `sslmode` as libpq does: `disable` is plain,
-/// `require` is TLS or nothing, and `prefer` (the default) tries TLS and
-/// falls back to a plain connection when that attempt fails — for instance
-/// on a server that does not offer TLS, or when the TLS handshake itself
-/// fails.
+/// `require` is TLS or nothing, `prefer` (the default) tries TLS and falls
+/// back to a plain connection when that attempt fails — for instance on a
+/// server that does not offer TLS, or when the TLS handshake itself fails —
+/// and `allow` tries a plain connection first, then TLS.
 ///
 /// libpq does not verify the certificate for `require` and `prefer`: it only
 /// checks that the server presents one. Verifying would make a server with
@@ -406,9 +426,31 @@ pub async fn connect(
     use tokio_postgres::config::SslMode;
 
     check_sslmode(database_url)?;
-    let config: tokio_postgres::Config = database_url
+    // The connection library has no `allow`: parse the URL as `disable`, and
+    // try TLS only when the plain connection fails, as libpq does.
+    let allow = parameter(database_url, "sslmode").as_deref() == Some("allow");
+    let parsed = if allow {
+        database_url
+            .replacen("sslmode='allow'", "sslmode=disable", 1)
+            .replacen("sslmode=allow", "sslmode=disable", 1)
+    } else {
+        database_url.to_owned()
+    };
+    let config: tokio_postgres::Config = parsed
         .parse()
         .map_err(|e| format!("invalid DATABASE_URL: {e}"))?;
+    if allow {
+        return match connect_plain(&config).await {
+            Ok(client) => Ok(client),
+            Err(plain_err) => {
+                let mut tls = config.clone();
+                tls.ssl_mode(SslMode::Require);
+                connect_tls(&tls).await.map_err(|e| {
+                    format!("{e} (after a plain connection attempt failed: {plain_err})").into()
+                })
+            }
+        };
+    }
     match config.get_ssl_mode() {
         SslMode::Disable => connect_plain(&config).await,
         SslMode::Require => connect_tls(&config).await,
@@ -443,7 +485,7 @@ fn check_sslmode(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     match value.as_str() {
         "disable" | "prefer" | "require" | "allow" => Ok(()),
         other => Err(format!(
-            "unsupported sslmode `{other}`: this CLI connects with `disable`, `prefer` or \
+            "unsupported sslmode `{other}`: this CLI connects with `disable`, `allow`, `prefer` or \
              `require`, and never verifies the server's certificate"
         )
         .into()),
@@ -535,19 +577,13 @@ pub async fn run_migrate_action(
         }
         MigrateAction::Down { name, force } => {
             let revert_name = match name {
-                Some(n) => n,
-                None => {
-                    // Find the last applied migration
-                    let statuses = migrate::status(client, source, config).await?;
-                    statuses
-                        .iter()
-                        .rev()
-                        .find(|s| s.applied)
-                        .map(|s| s.name.clone())
-                        .ok_or("No applied migrations to revert")?
+                Some(name) => {
+                    migrate::revert(client, source, &name, force, config).await?;
+                    name
                 }
+                // The last applied one, chosen under the runner's lock.
+                None => migrate::revert_last(client, source, force, config).await?,
             };
-            migrate::revert(client, source, &revert_name, force, config).await?;
             println!("Reverting {revert_name}... done");
         }
         MigrateAction::Accept { name } => {

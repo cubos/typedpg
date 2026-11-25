@@ -1,4 +1,5 @@
 DROP TABLE things;
+DROP DOMAIN frame;
 DROP DOMAIN shape_d;
 DROP TYPE shape;
 DROP TYPE point2;

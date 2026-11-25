@@ -55,6 +55,13 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 };
                 continue;
             }
+            // A number, with an identifier touching it: psql lexes the two
+            // as one (erroneous) token, `integer_junk` & co.
+            b'0'..=b'9' => {
+                state.has_token = true;
+                i = skip_number(bytes, i);
+                continue;
+            }
             b'(' => state.paren_depth += 1,
             b')' => state.paren_depth = state.paren_depth.saturating_sub(1),
             b';' if state.paren_depth == 0 && state.begin_depth == 0 => {
@@ -72,16 +79,25 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                     i += 1;
                 }
                 let word = &sql[begin..i];
-                // `E'…'`: a string where backslash escapes.
-                if word.eq_ignore_ascii_case("e") && bytes.get(i) == Some(&b'\'') {
-                    i = skip_quoted(bytes, i, b'\'', true);
+                state.has_token = true;
+                let prefix = match word.as_bytes() {
+                    [letter] => Some(letter.to_ascii_lowercase()),
+                    _ => None,
+                };
+                match (prefix, bytes.get(i)) {
+                    // `E'…'`: a string where backslash escapes.
+                    (Some(b'e'), Some(b'\'')) => i = skip_quoted(bytes, i, b'\'', true),
+                    // `B'…'`, `X'…'`, `N'…'`, and `U&'…'` / `U&"…"` (or the
+                    // error token `U&`): the letter prefixes a literal, and
+                    // is no identifier to psql.
+                    (Some(b'b' | b'x' | b'n'), Some(b'\'')) | (Some(b'u'), Some(b'&')) => {}
+                    _ => state.identifier(word),
                 }
-                state.identifier(word);
                 continue;
             }
             _ => {}
         }
-        if !b.is_ascii_whitespace() {
+        if !is_space(b) {
             state.has_token = true;
         }
         i += 1;
@@ -98,15 +114,19 @@ struct StatementState {
     paren_depth: usize,
     begin_depth: usize,
     identifier_count: usize,
-    /// psql's `identifiers[4]`: the first letter of each of the first four
-    /// identifiers when it is one of CREATE / OR / REPLACE / FUNCTION /
-    /// PROCEDURE, `0` otherwise.
+    /// psql's `init_idents`, as far as routines go: the first letter of
+    /// each of the first four identifiers outside parentheses when it is
+    /// one of CREATE / OR / REPLACE / FUNCTION / PROCEDURE, `0` otherwise.
     identifiers: [u8; 4],
 }
 
 impl StatementState {
+    /// psql's `psqlscan_track_identifier`: an unquoted identifier or
+    /// keyword, which only counts outside parentheses.
     fn identifier(&mut self, word: &str) {
-        self.has_token = true;
+        if self.paren_depth != 0 {
+            return;
+        }
         let is = |kw: &str| word.eq_ignore_ascii_case(kw);
         if ["create", "function", "procedure", "or", "replace"]
             .iter()
@@ -122,7 +142,7 @@ impl StatementState {
             && (ids[1] == b'f'
                 || ids[1] == b'p'
                 || (ids[1] == b'o' && ids[2] == b'r' && (ids[3] == b'f' || ids[3] == b'p')));
-        if creates_routine && self.paren_depth == 0 {
+        if creates_routine {
             if is("begin") {
                 self.begin_depth += 1;
             } else if is("case") {
@@ -135,6 +155,12 @@ impl StatementState {
             }
         }
     }
+}
+
+/// Whitespace as PostgreSQL's lexer skips it (scan.l's `space`, which
+/// `scanner_isspace` mirrors): Rust's `is_ascii_whitespace` leaves out `\v`.
+pub(crate) fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
 }
 
 pub(crate) fn is_ident_start(b: u8) -> bool {
@@ -196,8 +222,40 @@ pub(crate) fn skip_block_comment(bytes: &[u8], open: usize) -> usize {
     bytes.len()
 }
 
+/// The index past the number starting at `open` (a digit): digits and `_`,
+/// a fraction, an exponent, and an identifier touching it, which psql lexes
+/// into the same token (`integer_junk`, `real_junk`, …): `1end` is no `END`.
+fn skip_number(bytes: &[u8], open: usize) -> usize {
+    let digits = |mut i: usize| {
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = digits(open);
+    // `1.5`, `1.`, but not `1..5` (psql's `numericfail`).
+    if bytes.get(i) == Some(&b'.') && bytes.get(i + 1) != Some(&b'.') {
+        i = digits(i + 1);
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        let sign = usize::from(matches!(bytes.get(i + 1), Some(b'+' | b'-')));
+        if bytes.get(i + 1 + sign).is_some_and(u8::is_ascii_digit) {
+            i = digits(i + 1 + sign);
+        }
+    }
+    if i < bytes.len() && is_ident_start(bytes[i]) {
+        while i < bytes.len() && is_ident_cont(bytes[i]) {
+            i += 1;
+        }
+    }
+    i
+}
+
 /// If `open` starts a dollar-quote delimiter (`$$`, `$tag$`), the index past
-/// its closing delimiter; `None` for any other `$` (a `$1` placeholder).
+/// its closing delimiter — or the end of `bytes` when the body is
+/// unterminated: psql sends the rest of the input as one statement, which
+/// PG rejects whole, instead of running the statements the body swallowed.
+/// `None` for any other `$` (a `$1` placeholder).
 fn dollar_quote_end(bytes: &[u8], open: usize) -> Option<usize> {
     let mut i = open + 1;
     if i < bytes.len() && is_ident_start(bytes[i]) {
@@ -210,10 +268,15 @@ fn dollar_quote_end(bytes: &[u8], open: usize) -> Option<usize> {
     }
     let delimiter = &bytes[open..=i];
     let body = i + 1;
-    let close = bytes[body..]
-        .windows(delimiter.len())
-        .position(|w| w == delimiter)?;
-    Some(body + close + delimiter.len())
+    Some(
+        match bytes[body..]
+            .windows(delimiter.len())
+            .position(|w| w == delimiter)
+        {
+            Some(close) => body + close + delimiter.len(),
+            None => bytes.len(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -244,6 +307,13 @@ mod tests {
             ["SELECT 1;"]
         );
         assert!(split("  -- only a comment\n").is_empty());
+    }
+
+    // scan.l's `space` is `[ \t\n\r\f\v]`: a vertical tab after the last
+    // statement is no statement of its own.
+    #[test]
+    fn a_vertical_tab_is_whitespace() {
+        assert_eq!(split_statements("SELECT 1;\x0b\x0c\n"), ["SELECT 1;"]);
     }
 
     #[test]
@@ -300,6 +370,53 @@ mod tests {
             split(&format!("{f}\n{p}\nBEGIN; COMMIT;")),
             [f, p, "BEGIN;", "COMMIT;"]
         );
+    }
+
+    // psql 19 (`psql -e -f`) sends everything after an unterminated
+    // dollar quote as one statement, which PG rejects ("unterminated
+    // dollar-quoted string"); splitting it would run the `DROP TABLE`.
+    #[test]
+    fn an_unterminated_dollar_quote_runs_to_the_end() {
+        assert_eq!(
+            split("CREATE TABLE t (x int); SELECT $a$ x; DROP TABLE t; SELECT 1;"),
+            [
+                "CREATE TABLE t (x int);",
+                "SELECT $a$ x; DROP TABLE t; SELECT 1;"
+            ]
+        );
+        // A `$` that opens no quote still splits.
+        assert_eq!(split("SELECT $a x; SELECT 1"), ["SELECT $a x;", "SELECT 1"]);
+    }
+
+    // psql lexes a number and the identifier touching it as one token
+    // (`integer_junk`, `real_junk`): `1end` ends no `BEGIN ATOMIC` block,
+    // and psql 19 sends the function whole.
+    #[test]
+    fn an_identifier_touching_a_number_is_no_keyword() {
+        let f = "CREATE FUNCTION f() RETURNS int LANGUAGE sql \
+                 BEGIN ATOMIC SELECT 1e5; SELECT 1end; END;";
+        assert_eq!(split(&format!("{f} SELECT 3;")), [f, "SELECT 3;"]);
+        let g = "CREATE FUNCTION g() RETURNS int LANGUAGE sql \
+                 BEGIN ATOMIC SELECT 0x1F, 1_000.5e-3, $1end; END;";
+        assert_eq!(split(&format!("{g} SELECT 4;")), [g, "SELECT 4;"]);
+    }
+
+    // What psql 19 sends for each (`psql -e -f`): a literal's prefix
+    // letter (`x'…'`, `u&'…'`, `e'…'`) and an identifier inside
+    // parentheses are no identifier to its CREATE FUNCTION heuristic.
+    #[test]
+    fn literal_prefixes_and_parenthesized_words_are_not_counted() {
+        for (head, n) in [
+            ("CREATE x'1' FUNCTION", 2),
+            ("CREATE (a) FUNCTION", 3),
+            ("CREATE u&'a' FUNCTION", 4),
+            ("CREATE e'\\'' FUNCTION", 5),
+            ("CREATE n'a' FUNCTION", 6),
+        ] {
+            let f = format!("{head} f() BEGIN ATOMIC SELECT 1; END;");
+            let tail = format!("SELECT {n};");
+            assert_eq!(split(&format!("{f} {tail}")), [f.as_str(), tail.as_str()]);
+        }
     }
 
     #[test]

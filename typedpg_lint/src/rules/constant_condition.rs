@@ -37,8 +37,9 @@
 //! whole input, which removing it would change). Nothing else has a fix —
 //! an always-true `AND` argument, a `WHERE` of an `UPDATE` or `DELETE`
 //! (without it, `unbounded_write` reports the statement), a condition that
-//! is never true (what the query meant is not what it does), and what only
-//! the analyzer's facts decide.
+//! is never true (what the query meant is not what it does), what only
+//! the analyzer's facts decide, and a condition reading a parameter (its
+//! removal would change the statement's parameters).
 
 use std::collections::HashSet;
 
@@ -212,7 +213,10 @@ fn condition(ctx: &Ctx<'_>, qual: Option<&Node>, clause: Clause, out: &mut Vec<R
     let from = keyword.map_or(start, |(_, token)| token.end);
     let (end, _) = scan_until(ctx, from, ends_condition);
     let span = keyword.map_or(start, |(_, token)| token.start)..end.max(start + 1);
+    // A parameter only the condition reads (in a branch the folding drops)
+    // would leave the statement's parameters.
     let removable = value
+        && !reads_parameter(qual.to_ref())
         && match clause {
             Clause::Where => true,
             Clause::Having { grouped } => grouped,
@@ -228,6 +232,11 @@ fn condition(ctx: &Ctx<'_>, qual: Option<&Node>, clause: Clause, out: &mut Vec<R
         _ => Vec::new(),
     };
     out.push(finding(span, value, clause, fix));
+}
+
+/// Whether `node` reads a parameter anywhere.
+fn reads_parameter(node: NodeRef<'_>) -> bool {
+    matches!(node, NodeRef::ParamRef(_)) || node.children().into_iter().any(reads_parameter)
 }
 
 /// What the analyzer's proof says of the parts of `qual`: each
@@ -645,6 +654,8 @@ mod tests {
             "DELETE FROM users WHERE 1 = 1",
             // A JOIN's ON.
             "SELECT u.id FROM users u JOIN users v ON 1 = 1",
+            // The folded-away branch reads the statement's only parameter.
+            "SELECT id FROM users WHERE CASE WHEN 1 = 1 THEN true ELSE name = $1 END",
         ] {
             let findings = lint_rule(&db, sql, RULE);
             assert_eq!(findings.len(), 1, "{sql}: {findings:?}");

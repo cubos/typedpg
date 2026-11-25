@@ -2021,6 +2021,28 @@ fn add_index_constraint(
                 .find(|a| a.attnum == attnum)
                 .map(|a| a.attname.clone())
                 .unwrap_or_default();
+            // The columns' not-null constraints are set as SET NOT NULL
+            // sets them: an incompatible existing one is reported as it
+            // reports it (set_attnotnull), not as ADD PRIMARY KEY (cols)
+            // does (PostgreSQL 19).
+            if let Some(con) = super::inherit::not_null_constraint(interp, relid, attnum) {
+                let relname = relname_of(interp, relid);
+                if con.connoinherit {
+                    return Err(DdlError::Parse(format!(
+                        "cannot change NO INHERIT status of NOT NULL constraint \"{}\" on \
+                         relation \"{relname}\" (You might need to make the existing constraint \
+                         inheritable using ALTER TABLE ... ALTER CONSTRAINT ... INHERIT.)",
+                        con.conname
+                    )));
+                }
+                if !con.convalidated {
+                    return Err(DdlError::Parse(format!(
+                        "incompatible NOT VALID constraint \"{}\" on relation \"{relname}\" (You \
+                         might need to validate it using ALTER TABLE ... VALIDATE CONSTRAINT.)",
+                        con.conname
+                    )));
+                }
+            }
             super::inherit::require_pk_not_null(interp, relid, &colname, true)?;
         }
     }
@@ -2224,10 +2246,14 @@ pub(crate) fn copy_like_constraints(
                 conislocal: true,
                 coninhcount: 0,
                 conenforced: c.conenforced,
-                convalidated: c.convalidated,
+                // expandTableLikeClause: valid if enforced, its validation
+                // skipped (the new table is empty) — NOT VALID or not.
+                convalidated: c.conenforced,
                 connoinherit: c.connoinherit,
                 conperiod: false,
             });
+            // StoreRelCheck → recordDependencyOnExpr, over the new table.
+            crate::ddl::depend::record_check_constraint(interp, oid);
         }
     }
 
@@ -2273,10 +2299,17 @@ pub(crate) fn copy_like_constraints(
                         ConType::PrimaryKey => crate::ddl::util::choose_constraint_index_name(
                             interp, nsoid, relname, "", "pkey",
                         ),
-                        // ChooseIndexName: an exclusion constraint's index.
-                        ConType::Exclusion => crate::ddl::util::choose_constraint_index_name(
-                            interp, nsoid, relname, &addition, "excl",
-                        ),
+                        // ChooseIndexName: an index with exclusion operators —
+                        // an exclusion constraint's, or a temporal UNIQUE's
+                        // (WITHOUT OVERLAPS), whose operators
+                        // generateClonedIndexStmt copies.
+                        ConType::Exclusion | ConType::Unique
+                            if contype == ConType::Exclusion || period =>
+                        {
+                            crate::ddl::util::choose_constraint_index_name(
+                                interp, nsoid, relname, &addition, "excl",
+                            )
+                        }
                         _ => crate::ddl::util::choose_constraint_index_name(
                             interp, nsoid, relname, &addition, "key",
                         ),
@@ -2347,6 +2380,7 @@ fn copy_index_details_to(interp: &mut PgCatalog, source: PgClassOid, index: PgCl
         copy.indcollation = src.indcollation;
     }
     crate::ddl::depend::record_index_opclasses(interp, index);
+    crate::ddl::depend::record_index_expressions(interp, index);
     if let Some(am) = interp.index_access_methods.get(&source).cloned() {
         interp.index_access_methods.insert(index, am);
     }

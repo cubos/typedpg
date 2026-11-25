@@ -1582,11 +1582,33 @@ fn validate_on_conflict_target(
                 .min(idx.indkey.len())];
             let cols: std::collections::BTreeSet<i16> =
                 key.iter().copied().filter(|&a| a != 0).collect();
-            let idx_exprs: Vec<Option<&ast::Node>> = idx.indexprs.iter().map(decode).collect();
+            // Compared as written: the index's expressions as ruleutils
+            // prints them under the current search path.
+            let rendered: Vec<Option<ast::Node>> = idx
+                .indexprs
+                .iter()
+                .map(|e| crate::ddl::stored_exprs::render(snapshot, decode(e)))
+                .collect();
+            let idx_exprs: Vec<Option<&ast::Node>> = rendered.iter().map(Option::as_ref).collect();
             let mut exprs: Vec<String> = idx_exprs.iter().map(|n| node_fingerprint(*n)).collect();
             exprs.sort();
             exprs.dedup();
-            if cols != target_cols || exprs != target_exprs {
+            // PG compares the transformed trees (infer_arbiter_indexes):
+            // each inference expression must be one of the index's, and
+            // the index have no other — `lower(c)` is the index's
+            // `lower((c)::text)` over a varchar column.
+            let cooked_match = || {
+                let same = |a: Option<&ast::Node>, b: Option<&ast::Node>| {
+                    crate::ddl::cooked::same_index_expr(snapshot, (table_oid, a), (table_oid, b))
+                };
+                target_expr_nodes
+                    .iter()
+                    .all(|t| idx_exprs.iter().any(|&e| same(e, t.as_ref())))
+                    && idx_exprs
+                        .iter()
+                        .all(|&e| target_expr_nodes.iter().any(|t| same(e, t.as_ref())))
+            };
+            if cols != target_cols || (exprs != target_exprs && !cooked_match()) {
                 return false;
             }
             if !qualified
@@ -1595,8 +1617,20 @@ fn validate_on_conflict_target(
             {
                 return false;
             }
-            let pred = idx.indpred.as_ref().and_then(decode);
-            predtest::predicate_implied_by(pred, where_clause.as_ref(), &types)
+            let pred = idx
+                .indpred
+                .as_ref()
+                .and_then(|p| crate::ddl::stored_exprs::render(snapshot, decode(p)));
+            // As written, else as both print once transformed (a
+            // predicate rebuilt by ALTER COLUMN TYPE shows its coercions).
+            predtest::predicate_implied_by(pred.as_ref(), where_clause.as_ref(), &types)
+                || pred.is_some()
+                    && predtest::predicate_implied_by(
+                        crate::ddl::cooked::deparse(snapshot, table_oid, pred.as_ref()).as_ref(),
+                        crate::ddl::cooked::deparse(snapshot, table_oid, where_clause.as_ref())
+                            .as_ref(),
+                        &types,
+                    )
         })
         .map(|idx| idx.indexrelid)
         .collect();
@@ -1901,7 +1935,7 @@ mod call;
 pub(crate) use call::call_target;
 mod copy_in;
 mod cte;
-mod deferred;
+pub(crate) mod deferred;
 mod dml;
 pub(crate) use dml::assignment_violation;
 mod failing_rows;

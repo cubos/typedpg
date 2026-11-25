@@ -393,7 +393,7 @@ pub(super) fn add_foreign_key(
     }
     // The equality (or, for the PERIOD column, overlaps) operators: a
     // temporal key's index is a GiST one.
-    for (i, ((_, fktype), (_, pktype))) in fk.iter().zip(&pk).enumerate() {
+    for (i, ((fkattnum, fktype), (pkattnum, pktype))) in fk.iter().zip(&pk).enumerate() {
         if !fk_types_compatible(interp, *pktype, *fktype, pk_has_without_overlaps) {
             return Err(DdlError::DependencyError(format!(
                 "foreign key constraint \"{conname}\" cannot be implemented (Key columns \
@@ -403,6 +403,29 @@ pub(super) fn add_foreign_key(
                 pk_names[i],
                 format_type_for_message(interp, *fktype),
                 format_type_for_message(interp, *pktype)
+            )));
+        }
+        // Different collations need both to be deterministic: equality
+        // must mean the same on both sides.
+        let collation = |rel: PgClassOid, attnum: i16| {
+            interp
+                .attributes_of(rel)
+                .iter()
+                .find(|a| a.attnum == attnum)
+                .and_then(|a| a.attcollation)
+                .and_then(|c| interp.pg_collation.get(&c))
+        };
+        if let (Some(fkcoll), Some(pkcoll)) =
+            (collation(relid, *fkattnum), collation(target, *pkattnum))
+            && fkcoll.oid != pkcoll.oid
+            && (!fkcoll.collisdeterministic || !pkcoll.collisdeterministic)
+        {
+            return Err(DdlError::DependencyError(format!(
+                "foreign key constraint \"{conname}\" cannot be implemented (Key columns \
+                 \"{}\" of the referencing table and \"{}\" of the referenced table have \
+                 incompatible collations: \"{}\" and \"{}\".  If either collation is \
+                 nondeterministic, then both collations have to be the same.)",
+                fk_names[i], pk_names[i], fkcoll.collname, pkcoll.collname
             )));
         }
     }
@@ -711,9 +734,7 @@ impl FkDetails {
         self.initdeferred = initdeferred;
     }
 
-    /// `confupdtype`, `confdeltype` and `confmatchtype` (for the catalog
-    /// oracle).
-    #[cfg(feature = "pg_sanity")]
+    /// `confupdtype`, `confdeltype` and `confmatchtype`.
     pub(crate) fn catalog_codes(&self) -> (char, char, char) {
         let code = |s: &str| s.chars().next().unwrap_or(' ');
         (

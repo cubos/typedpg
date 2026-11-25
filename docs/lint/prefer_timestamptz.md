@@ -2,9 +2,9 @@
 
 A `timestamp` (without time zone) column instead of `timestamptz`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| off | the final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| pedantic | off | the final schema | — |
 
 ## Example
 
@@ -18,7 +18,7 @@ CREATE TABLE logs (
 ```
 
 ```
-info[prefer_timestamptz]: public.logs.happened_at is timestamp without time zone: it stores no offset, so the same instant reads differently per session TimeZone
+info[pedantic/prefer_timestamptz]: public.logs.happened_at is timestamp without time zone: it stores no offset, so the same instant reads differently per session TimeZone
    ╭─[migrations/004_logs.sql:1:1]
  1 │ CREATE TABLE logs (
    · ───────────────────
@@ -60,7 +60,7 @@ it.
   `pg_*` schemas or `information_schema`, columns from `extra_migrations`.
 
 Converting a column with `ALTER COLUMN … TYPE timestamptz` rewrites the
-table ([`table_rewrite`](table_rewrite.md)) and reads the old values in the
+table ([`alter_table_rewrite`](alter_table_rewrite.md)) and reads the old values in the
 migration session's `TimeZone`, or in the one
 `USING happened_at AT TIME ZONE 'UTC'` names.
 

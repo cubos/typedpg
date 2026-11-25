@@ -15,17 +15,7 @@ pub(crate) fn build_column(
         rc.record_fields.as_deref(),
         snapshot,
     )?;
-    // A domain over an array has its elements too.
-    let mut array = &mut pg_type;
-    while let Type::Domain { base, .. } = array {
-        array = base;
-    }
-    if let Type::Array {
-        element_nullable, ..
-    } = array
-    {
-        *element_nullable = rc.elem_nullable;
-    }
+    set_elem_nullable(&mut pg_type, rc.elem_nullable);
 
     // The `!` / `?` nullability annotation belongs to the alias the user
     // wrote, not to the column's real name: a column named `col!` in the
@@ -41,6 +31,29 @@ pub(crate) fn build_column(
         refinement: enumerated(rc.refine).normalized(rc.type_oid, snapshot),
         elem_refinement: elems_normalized(enumerated(rc.elem_refine), rc.type_oid, snapshot),
     })
+}
+
+/// Record in `ty`, an array (or a domain over one, which has its elements
+/// too), whether its elements can be NULL.
+fn set_elem_nullable(ty: &mut Type, elem_nullable: Option<bool>) {
+    let mut array = ty;
+    while let Type::Domain { base, .. } = array {
+        array = base;
+    }
+    if let Type::Array {
+        element_nullable,
+        name,
+        ..
+    } = array
+    {
+        // An `int2vector` / `oidvector` never holds a NULL: neither its
+        // input nor its receive function takes one, and nothing makes one
+        // of an array that has (a slice or `||` of one is an `int2[]`).
+        let vector = name.as_ref().is_some_and(|n| {
+            n.schema == "pg_catalog" && matches!(n.name.as_str(), "int2vector" | "oidvector")
+        });
+        *element_nullable = if vector { Some(false) } else { elem_nullable };
+    }
 }
 
 /// `refine`, a range of a few integers listing them.
@@ -67,7 +80,8 @@ fn elems_normalized(
 /// Like [`resolve_type`] but lets the caller override the structural shape
 /// when the OID is the pseudo `record` type (typmod -1 in PG terms). When
 /// `shape` is `Some` and the OID is `record`, we build a `Type::AnonymousRecord`
-/// from the shape recursively. Otherwise falls through to the OID-only path.
+/// from the shape recursively (for `record[]`, an array of one). Otherwise
+/// falls through to the OID-only path.
 fn resolve_type_with_shape(
     type_oid: PgTypeOid,
     typmod: Option<i32>,
@@ -80,15 +94,18 @@ fn resolve_type_with_shape(
     {
         let mut out = Vec::with_capacity(fields.len());
         for f in fields {
+            let mut ty = resolve_type_with_shape(
+                f.ty.type_oid,
+                f.ty.typmod,
+                f.ty.collation,
+                f.ty.record_fields.as_deref(),
+                snapshot,
+            )?;
+            // A field's elements are known as a column's are.
+            set_elem_nullable(&mut ty, f.ty.elem_nullable);
             out.push(crate::types::RecordField {
                 name: f.name.clone(),
-                ty: resolve_type_with_shape(
-                    f.ty.type_oid,
-                    f.ty.typmod,
-                    f.ty.collation,
-                    f.ty.record_fields.as_deref(),
-                    snapshot,
-                )?,
+                ty,
                 nullable: f.ty.nullable,
                 refinement: enumerated(f.ty.refine.clone()).normalized(f.ty.type_oid, snapshot),
                 elem_refinement: elems_normalized(
@@ -100,6 +117,18 @@ fn resolve_type_with_shape(
         }
         return Ok(Type::AnonymousRecord { fields: out });
     }
+    // A `record[]` carrying a shape: its elements' (an array of `ROW(…)`s,
+    // `array_agg` of one, an ARRAY sublink over one).
+    if type_oid == oid::RECORD_ARRAY
+        && let Some(fields) = shape
+    {
+        let element = resolve_type_with_shape(oid::RECORD, None, None, Some(fields), snapshot)?;
+        return Ok(Type::Array {
+            element: Box::new(element),
+            element_nullable: None,
+            name: None,
+        });
+    }
     let mut ty = resolve_type(type_oid, typmod, collation, snapshot)?;
     // A composite carrying a shape is a row read from a relation: its
     // fields are NULL only where the relation's columns may be, and are
@@ -109,6 +138,7 @@ fn resolve_type_with_shape(
             let known = shape.iter().find(|f| f.name == field.name);
             field.nullable = known.is_none_or(|f| f.ty.nullable);
             if let Some(f) = known {
+                set_elem_nullable(&mut field.ty, f.ty.elem_nullable);
                 field.refinement = enumerated(field.refinement.and(&f.ty.refine));
                 field.elem_refinement = enumerated(field.elem_refinement.and(&f.ty.elem_refine));
             }
@@ -200,9 +230,13 @@ fn resolve_type(
             // Collation propagates through to the element — PG attaches it
             // to the element type, not the array wrapper.
             let element = resolve_type(elem, typmod, collation, snapshot)?;
+            // `int2vector` / `oidvector`: arrays, but not their element's.
+            let name = (snapshot.array_type_of(elem) != Some(type_oid))
+                .then(|| QualifiedName::new(schema, name));
             return Ok(Type::Array {
                 element: Box::new(element),
                 element_nullable: None,
+                name,
             });
         }
 

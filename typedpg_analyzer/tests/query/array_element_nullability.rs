@@ -240,3 +240,139 @@ fn a_domain_keeping_null_elements_out() {
         &[("d", Some(false)), ("e", Some(false)), ("g", Some(false))],
     );
 }
+
+#[test]
+fn an_element_by_element_cast_keeps_known_elements() {
+    let mut db = PgCatalog::new().unwrap();
+    // `int4(jsonb)` maps a JSON null to NULL; `to_big` is a cast function
+    // between the array types themselves, which may return any elements.
+    db.apply_sql(
+        "CREATE TABLE ev (id int PRIMARY KEY,
+                          dates date[] NOT NULL CHECK (array_position(dates, NULL) IS NULL),
+                          js jsonb[] NOT NULL CHECK (array_position(js, NULL) IS NULL),
+                          raw date[] NOT NULL, loose int[] NOT NULL,
+                          ints int[] NOT NULL CHECK (array_position(ints, NULL) IS NULL));
+         CREATE TYPE big AS (v bigint);
+         CREATE FUNCTION to_big(int[]) RETURNS big[] LANGUAGE sql
+             AS 'SELECT ARRAY[NULL::big]';
+         CREATE CAST (int[] AS big[]) WITH FUNCTION to_big(int[]);",
+    )
+    .unwrap();
+    assert_elements(
+        &db,
+        "SELECT dates::text[] AS a, dates::timestamp[] AS b, dates::varchar(3)[] AS c,
+                raw::text[] AS d, js::int[] AS e, js::text[] AS f
+         FROM ev",
+        &[
+            ("a", Some(false)),
+            ("b", Some(false)),
+            ("c", Some(false)),
+            ("d", None),
+            ("e", None),
+            ("f", Some(false)),
+        ],
+    );
+    assert_elements(
+        &db,
+        "SELECT ints::big[] AS a, array_agg(id)::text[] AS b FROM ev GROUP BY id",
+        &[("a", None), ("b", Some(false))],
+    );
+    // A CASE / COALESCE branch converted to the result's type the same way.
+    assert_elements(
+        &db,
+        "SELECT CASE WHEN id > 0 THEN ARRAY[id] ELSE ARRAY[1::bigint] END AS a,
+                COALESCE(js::int[], ARRAY[1]) AS b, GREATEST(ints, ARRAY[1::bigint]) AS c,
+                LEAST(ints, loose) AS d
+         FROM ev",
+        &[
+            ("a", Some(false)),
+            ("b", None),
+            ("c", Some(false)),
+            ("d", None),
+        ],
+    );
+}
+
+#[test]
+fn aggregated_values_proven_non_null_make_non_null_elements() {
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE TABLE cl (id int PRIMARY KEY, tz text NOT NULL);
+         CREATE TABLE ev (id uuid PRIMARY KEY, cid int NOT NULL REFERENCES cl,
+                          \"startsAt\" timestamptz NOT NULL,
+                          fin timestamptz NOT NULL CHECK (isfinite(fin)));",
+    )
+    .unwrap();
+    // `extract` of an infinite timestamp is NULL for `isodow`: only a
+    // finite one makes a non-NULL element.
+    assert_elements(
+        &db,
+        "SELECT array_agg(DISTINCT extract(isodow FROM s.fin AT TIME ZONE c.tz)::int) AS a,
+                array_agg(DISTINCT extract(isodow FROM s.\"startsAt\" AT TIME ZONE c.tz)::int) AS b,
+                array_agg(s.id ORDER BY s.id) AS c, array_agg(lower(c.tz) || 'x') AS d
+         FROM ev s JOIN cl c ON c.id = s.cid",
+        &[
+            ("a", Some(false)),
+            ("b", Some(true)),
+            ("c", Some(false)),
+            ("d", Some(false)),
+        ],
+    );
+    // A primary key on the nullable side of an outer join may be NULL,
+    // unless the FILTER or the WHERE clause keeps those rows out.
+    assert_elements(
+        &db,
+        "SELECT array_agg(e.id) AS a, array_agg(e.id) FILTER (WHERE e.id IS NOT NULL) AS b,
+                COALESCE(array_agg(e.id) FILTER (WHERE e.id IS NOT NULL), '{}') AS c
+         FROM cl c LEFT JOIN ev e ON e.cid = c.id GROUP BY c.id",
+        &[("a", Some(true)), ("b", Some(false)), ("c", Some(false))],
+    );
+    assert_elements(
+        &db,
+        "SELECT array_agg(e.id) AS a FROM ev e RIGHT JOIN cl c ON e.cid = c.id
+         WHERE e.id IS NOT NULL GROUP BY c.id",
+        &[("a", Some(false))],
+    );
+    assert_elements(
+        &db,
+        "SELECT (SELECT array_agg(e.id) FROM ev e WHERE e.cid = c.id) AS a,
+                ARRAY(SELECT e.id FROM ev e WHERE e.cid = c.id) AS b,
+                x.a AS c
+         FROM cl c CROSS JOIN LATERAL (SELECT array_agg(e.id) AS a FROM ev e
+                                       WHERE e.cid = c.id) x",
+        &[("a", Some(false)), ("b", Some(false)), ("c", Some(false))],
+    );
+}
+
+#[test]
+fn multidimensional_arrays_and_slices_keep_their_elements() {
+    let db = setup();
+    // A multidimensional array's elements are its sub-arrays' (a NULL
+    // sub-array fails the query); a slice is some of the array's elements.
+    assert_elements(
+        &db,
+        "SELECT array_agg(ARRAY[n]) AS a, array_agg(ARRAY[age]) AS b, array_agg(tags) AS c,
+                ARRAY(SELECT ARRAY[n] FROM t) AS d, ARRAY(SELECT ARRAY[age] FROM t) AS e,
+                ARRAY[ARRAY[1], ARRAY[2]] AS f, ARRAY[ARRAY[1], ARRAY[NULL::int]] AS g,
+                (array_agg(n))[1:2] AS h, (array_agg(age))[1:2] AS i,
+                ARRAY[array_agg(n), array_agg(n)] AS j
+         FROM t",
+        &[
+            ("a", Some(false)),
+            ("b", Some(true)),
+            ("c", None),
+            ("d", Some(false)),
+            ("e", Some(true)),
+            ("f", Some(false)),
+            ("g", Some(true)),
+            ("h", Some(false)),
+            ("i", Some(true)),
+            ("j", Some(false)),
+        ],
+    );
+    assert_elements(
+        &db,
+        "SELECT array_agg(x) AS a FROM unnest(ARRAY(SELECT ARRAY[n] FROM t)) x",
+        &[("a", Some(false))],
+    );
+}

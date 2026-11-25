@@ -53,15 +53,25 @@ pub(crate) fn infer_sublink(
                 // value is NULL only when the column is.
                 let nullable = if min_one_row { first.nullable } else { true };
                 // The sublink carries its column's collation, implicitly,
-                // and its value — an array's elements included (no row is
-                // NULL, not an array with other elements).
+                // and its value — what is known of it, an array's elements
+                // included (no row is NULL, not an array with other
+                // elements).
                 // Planned, it is a Param collated like the planned
                 // subquery's column (make_subplan).
                 let mut t = ExprType::scalar_with_typmod(first.type_oid, nullable, first.typmod)
                     .with_collation(first.sublink_collation())
                     .with_elem_nullable(first.elem_nullable)
-                    .with_elem_refine(first.elem_refine.clone());
+                    .with_elem_refine(first.elem_refine.clone())
+                    .with_refine(first.refine.clone());
                 t.planned = first.planned;
+                // A record (or records) keeps its column's row shape, which
+                // PG doesn't see: the SubLink is typed plain `record`.
+                if matches!(first.type_oid, oid::RECORD | oid::RECORD_ARRAY) {
+                    t.record_fields = first
+                        .record_fields
+                        .as_ref()
+                        .map(|s| super::RecordShape::hidden(s.fields.clone()));
+                }
                 return Ok(t);
             }
             Ok(ExprType::scalar(oid::UNKNOWN, true))
@@ -272,8 +282,17 @@ pub(crate) fn infer_sublink(
             let mut elem_nullable = None;
             let mut elem_refine = crate::refine::Refinement::NONE;
             let mut planned = super::Planned::AsParsed;
+            let mut record_fields = None;
             if let Some(ast::Node::SelectStmt(sel)) = &sub.subselect {
                 let (first, _) = single_sublink_column(sub, sel, ctx, params)?;
+                // The column's records are the array's elements (or its
+                // sub-arrays'), with their row shape.
+                if matches!(first.type_oid, oid::RECORD | oid::RECORD_ARRAY) {
+                    record_fields = first
+                        .record_fields
+                        .as_ref()
+                        .map(|s| super::RecordShape::hidden(s.fields.clone()));
+                }
                 // The array carries the column's typmod (exprTypmod of an
                 // ARRAY sublink is its subquery column's) and, implicitly,
                 // its collation.
@@ -283,8 +302,13 @@ pub(crate) fn infer_sublink(
                 let elem = first.type_oid;
                 let elem_array = snapshot.array_type_of(elem);
                 // The elements are the column's values (or, for an array
-                // column, the multidimensional result's sub-arrays').
-                elem_nullable = elem_array.is_some().then_some(first.nullable);
+                // column, the multidimensional result's sub-arrays' elements:
+                // a NULL sub-array fails, "cannot accumulate null arrays").
+                elem_nullable = if elem_array.is_some() {
+                    Some(first.nullable)
+                } else {
+                    first.elem_nullable
+                };
                 elem_refine = if elem_array.is_some() {
                     first.refine.clone()
                 } else {
@@ -305,6 +329,7 @@ pub(crate) fn infer_sublink(
                 .with_elem_nullable(elem_nullable)
                 .with_elem_refine(elem_refine);
             t.planned = planned;
+            t.record_fields = record_fields;
             Ok(t)
         }
         _ => Err(crate::error::RawError::unsupported(

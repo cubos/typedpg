@@ -3,9 +3,9 @@
 An `=`, `<>`, `IN` or `NOT IN` comparison of `real` or `double precision`
 values.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| suspicious | warning | queries | — |
 
 ## Example
 
@@ -19,14 +19,14 @@ SELECT id FROM products WHERE price = $price;
 ```
 
 ```
-warning[float_equality]: = compares double precision values exactly: a floating-point value rarely equals the decimal it is written as (0.1 + 0.2 = 0.3 is false), so rows may be missed
+warning[suspicious/float_equality]: = compares double precision values exactly: a floating-point value rarely equals the decimal it is written as (0.1 + 0.2 = 0.3 is false), so rows may be missed
    ╭─[queries.sql:2:31]
  2 │ SELECT id FROM products WHERE price = 19.99;
    ·                               ─────────────
    ╰────
   help: compare within a tolerance (abs(a - b) < 1e-9) or a range, or store exact values as numeric
 
-warning[float_equality]: = compares real values exactly: a floating-point value rarely equals the decimal it is written as (0.1 + 0.2 = 0.3 is false), so rows may be missed
+warning[suspicious/float_equality]: = compares real values exactly: a floating-point value rarely equals the decimal it is written as (0.1 + 0.2 = 0.3 is false), so rows may be missed
    ╭─[queries.sql:4:31]
  4 │ SELECT id FROM products WHERE weight = 16777217;
    ·                               ─────────────────

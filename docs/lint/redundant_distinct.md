@@ -2,9 +2,9 @@
 
 A plain `DISTINCT` on rows that are already distinct.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes `DISTINCT` |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes `DISTINCT` |
 
 ## Example
 
@@ -18,7 +18,7 @@ SELECT DISTINCT id, 100 / views AS ratio FROM posts;
 ```
 
 ```
-info[redundant_distinct]: DISTINCT has no effect: the rows are already distinct
+info[redundant/redundant_distinct]: DISTINCT has no effect: the rows are already distinct
    ╭─[queries.sql:2:8]
  2 │ SELECT DISTINCT id, name FROM users;
    ·        ─────────
@@ -67,6 +67,10 @@ When an output expression can raise an error on some rows, e.g.
 `100 / views`: with `DISTINCT` every row is evaluated before any is
 returned, without it a `LIMIT` or a client that stops fetching may skip the
 row that would divide by zero.
+
+Nor when the output has an untyped literal in a set operation's branch or an
+`INSERT`'s `SELECT`: `(SELECT DISTINCT 'y' AS c) UNION (SELECT 'a'::varchar)`
+is `text` because `DISTINCT` types `'y'`, `varchar` without it.
 
 ## Configuration
 

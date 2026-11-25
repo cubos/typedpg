@@ -2,9 +2,9 @@
 
 A foreign key whose referencing columns no index can look up.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| performance | warning | final schema | — |
 
 ## Example
 
@@ -16,7 +16,7 @@ CREATE TABLE memberships (org_id bigint NOT NULL, user_id bigint NOT NULL REFERE
 ```
 
 ```
-warning[fk_without_index]: foreign key posts_author_id_fkey on public.posts (author_id) has no index
+warning[performance/fk_without_index]: foreign key posts_author_id_fkey on public.posts (author_id) has no index
    ╭─[migrations/0001_init.sql:2:1]
  2 │ CREATE TABLE posts (id bigint PRIMARY KEY, author_id bigint NOT NULL REFERENCES users (id), title text NOT NULL);
    · ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -40,9 +40,10 @@ index.
 No index on the referencing table serves `col1 = $1 AND col2 = $2 …` for the
 key's columns. An index serves it when:
 
-- it is a btree, or a hash index for a single-column key;
-- its leading columns are exactly the key's columns, in any order; more
-  columns, expressions or `INCLUDE` columns may follow;
+- it is a btree or a hash index;
+- its leading columns are exactly the key's columns, in any order, or some
+  of them that reference columns unique by themselves in the referenced
+  table; more columns, expressions or `INCLUDE` columns may follow;
 - it is not partial, or its predicate only requires key columns to be
   `IS NOT NULL`.
 
@@ -53,6 +54,11 @@ CREATE INDEX ON posts (author_id) WHERE title <> '';   -- other predicate
 CREATE INDEX ON posts (id, author_id);                 -- key not leading
 CREATE INDEX ON posts USING brin (author_id);          -- not btree/hash
 ```
+
+In a multi-tenant schema, a key `(exercise_id, tenant_id)` referencing
+`exercises (id, tenant_id)` is served by an index on `exercise_id` when
+`exercises.id` is the primary key: every row with that `exercise_id` belongs
+to one exercise. An index leading with `tenant_id` doesn't serve it.
 
 The finding is placed on the statement that created the foreign key; an
 index added by any later migration resolves it. When that statement's file

@@ -1866,10 +1866,43 @@ fn domain_check_violation(
         return super::failing_rows::array_elements_domain_error(arr, tc.atttypid, snapshot)
             .map(AnalyzeError::Invalid);
     }
-    let literal = crate::nonnull::literal(v)?;
+    let literal = crate::nonnull::literal(constant_value(v, snapshot))?;
     snapshot
         .domain_value_violation_at_execution(tc.atttypid, &literal)
         .map(AnalyzeError::CheckViolation)
+}
+
+/// The literal `v` is, seen through what leaves it as it is: a cast to the
+/// type it already has (`100::integer`, which adds no node) and a
+/// `COALESCE` whose first argument is such a non-NULL constant (the result,
+/// `COALESCE(-1, 0)`). Anything else is `v` itself.
+fn constant_value<'a>(v: Option<&'a ast::Node>, snapshot: &PgCatalog) -> Option<&'a ast::Node> {
+    match v? {
+        ast::Node::TypeCast(tc) => {
+            let inner = constant_value(tc.arg.as_ref(), snapshot);
+            let same_type = match (inner, tc.type_name.as_ref()) {
+                (Some(ast::Node::AConst(c)), Some(name)) if !c.isnull => {
+                    crate::expr::literals::infer_a_const(c).is_ok_and(|t| {
+                        t.type_oid != crate::pg_catalog::oid::UNKNOWN
+                            && name.typmods.is_empty()
+                            && crate::ddl::util::resolve_type_name(name, snapshot)
+                                == Some(t.type_oid)
+                    })
+                }
+                _ => false,
+            };
+            if same_type { inner } else { v }
+        }
+        ast::Node::CoalesceExpr(c) => match c
+            .args
+            .first()
+            .and_then(|a| constant_value(a.as_ref(), snapshot))
+        {
+            first @ Some(ast::Node::AConst(a)) if !a.isnull => first,
+            _ => v,
+        },
+        _ => v,
+    }
 }
 
 /// The partition constraint the row `items` of `tgt` surely fails when
@@ -3190,9 +3223,32 @@ fn analyze_update_here(
         // between WHERE and RETURNING. The old row keeps all of it.
         // Only the assigned columns' names are read: the SET list's row
         // expansion ([`analyze_set_clause`], after WHERE) leaves them as is.
+        // (`SET c = c` writes the value WHERE saw: no rewrite of it.)
+        let self_assigned: std::collections::HashSet<&str> = upd
+            .target_list
+            .iter()
+            .filter_map(|t| match t {
+                Some(ast::Node::ResTarget(rt)) if rt.indirection.is_empty() => {
+                    match rt.val.as_ref() {
+                        Some(ast::Node::ColumnRef(c)) => {
+                            let fields = expr::extract_string_fields(&c.fields);
+                            let names_it = match fields.as_slice() {
+                                [col] => col == &rt.name,
+                                [qualifier, col] => qualifier == alias && col == &rt.name,
+                                _ => false,
+                            };
+                            names_it.then_some(rt.name.as_str())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
         let assigned: std::collections::HashSet<String> = set_list_assigns(&upd.target_list)
             .into_iter()
             .map(|a| a.column)
+            .filter(|c| !self_assigned.contains(c.as_str()))
             .collect();
         let keeps = update_keeps_values(snapshot, table_oid);
         let old_as_is = rows_returned_as_is(snapshot, table_oid);
@@ -3212,11 +3268,27 @@ fn analyze_update_here(
             },
         );
         null_ctx.add_where_facts(facts);
+        let plan_rels = crate::nonnull::plan_strict::qual_rels(
+            where_clause.as_ref(),
+            &crate::nonnull::plan_strict::ScopeVars {
+                scope: &scope,
+                from: upd.from_clause.iter().flatten().collect(),
+                null_ctx: &null_ctx,
+                log: &log,
+                snapshot,
+            },
+            &crate::nonnull::plan_strict::Strictness {
+                log: Some(&log),
+                snapshot,
+            },
+        );
+        null_ctx.add_plan_quals(plan_rels);
         old_facts = Some(all);
     }
     // The planner's: a FULL JOIN in FROM / USING no merge or hash join
-    // implements.
-    super::select::check_full_joins(&null_ctx, None, snapshot)?;
+    // implements — raised once the statement is parsed and rewritten (and
+    // its constants folded), so after those errors.
+    let full_joins = super::select::check_full_joins(&null_ctx, None, snapshot);
 
     let ret_scope = with_written_target(
         &scope,
@@ -3234,14 +3306,34 @@ fn analyze_update_here(
     )?;
 
     // SET col = expr / (a, b) = (…) / col[i] = expr — assignment context.
-    let set_list = analyze_set_clause(
+    let set_list = match analyze_set_clause(
         &upd.target_list,
         &table_attrs,
         &table_relname,
         expr::Ctx::new(&scope, &set_null_ctx, snapshot),
         params,
         true,
-    )?;
+    ) {
+        Ok(set_list) => set_list,
+        Err(e) => {
+            // A NULL literal written into a NOT NULL column is the error
+            // its execution raises: the planner's come first.
+            let mut scratch = params.clone();
+            if analyze_set_clause(
+                &upd.target_list,
+                &table_attrs,
+                &table_relname,
+                expr::Ctx::new(&scope, &set_null_ctx, snapshot),
+                &mut scratch,
+                false,
+            )
+            .is_ok()
+            {
+                full_joins?;
+            }
+            return Err(e);
+        }
+    };
 
     // The old row is a stored row past WHERE; the new one, with no BEFORE
     // ROW trigger or row movement, that row with the SET values (computed
@@ -3298,6 +3390,7 @@ fn analyze_update_here(
     );
     rw.returning = has_returning(upd.returning_clause.as_deref());
     check_rewrite(snapshot, table_oid, &rw)?;
+    full_joins?;
     Ok((columns, None))
 }
 
@@ -3374,6 +3467,9 @@ fn analyze_delete_here(
     let table_oid = table.oid;
     // transformDeleteStmt: the target requires DELETE.
     crate::pg_catalog::note_relation_use(table_oid, 'd');
+    crate::pg_catalog::note_delete_base(table_oid, || {
+        write_base(snapshot, table_oid, &[DmlEvent::Delete], false).map(|b| b.relid)
+    });
     crate::pg_catalog::note_target_relation(relation, table_oid);
     crate::privileges::note_relation(table_oid, crate::ddl::acl::bits::DELETE);
     crate::privileges::note_write(
@@ -3469,11 +3565,27 @@ fn analyze_delete_here(
             |_| keeps,
         );
         null_ctx.add_where_facts(facts);
+        let plan_rels = crate::nonnull::plan_strict::qual_rels(
+            where_clause.as_ref(),
+            &crate::nonnull::plan_strict::ScopeVars {
+                scope: &scope,
+                from: del.using_clause.iter().flatten().collect(),
+                null_ctx: &null_ctx,
+                log: &log,
+                snapshot,
+            },
+            &crate::nonnull::plan_strict::Strictness {
+                log: Some(&log),
+                snapshot,
+            },
+        );
+        null_ctx.add_plan_quals(plan_rels);
         old_facts = Some(all);
     }
     // The planner's: a FULL JOIN in FROM / USING no merge or hash join
-    // implements.
-    super::select::check_full_joins(&null_ctx, None, snapshot)?;
+    // implements — raised once the statement is parsed and rewritten (and
+    // its constants folded), so after those errors.
+    let full_joins = super::select::check_full_joins(&null_ctx, None, snapshot);
     // A deleted row is a stored row past WHERE: its CHECK constraints and
     // generated columns hold too.
     if has_returning(del.returning_clause.as_deref())
@@ -3503,6 +3615,7 @@ fn analyze_delete_here(
     let mut rw = Rewrite::single(DmlEvent::Delete, Vec::new(), Overriding::NotSet);
     rw.returning = has_returning(del.returning_clause.as_deref());
     check_rewrite(snapshot, table_oid, &rw)?;
+    full_joins?;
     Ok((columns, None))
 }
 

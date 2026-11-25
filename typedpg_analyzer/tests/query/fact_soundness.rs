@@ -329,9 +329,10 @@ fn a_renamed_enum_label_renames_it_in_constraints() {
     );
     assert_nullable(&db, "SELECT v FROM u WHERE k = 'z'", &[("v", false)]);
     assert_nullable(&db, "SELECT v FROM u WHERE k = 'b'", &[("v", true)]);
-    // An array of labels isn't rewritten: the CHECK's comparisons go.
+    // An array of labels is rewritten too: the CHECK says `k <> ALL
+    // ('{z}')`.
     assert_nullable(&db, "SELECT v FROM w WHERE k = 'b'", &[("v", true)]);
-    assert_nullable(&db, "SELECT v FROM w WHERE k = 'z'", &[("v", true)]);
+    assert_nullable(&db, "SELECT v FROM w WHERE k = 'z'", &[("v", false)]);
 }
 
 #[test]

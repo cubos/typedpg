@@ -1,4 +1,4 @@
-//! The `breaks_deployed_queries` oracle (the `pg_sanity` feature): what the
+//! The `deployed_query_breakage` oracle (the `pg_sanity` feature): what the
 //! rule says of the deployed queries, checked by running them on a real
 //! PostgreSQL before and after the new migrations.
 //!
@@ -29,10 +29,12 @@
 //! A deployed query breaks when a call that ran before fails after on the
 //! migrated rows — or, where those couldn't be kept, on the reseeded ones
 //! when it reached a row before (others than the deployed schema's rows
-//! may fail it for their own reasons) — other than by data (a unique,
-//! exclusion or foreign key violation, a serialization failure, a timeout,
-//! a subquery returning more rows) or inside a function's or trigger's
-//! body (what a body does isn't the rule's), when its parameter or result types or
+//! may fail it for their own reasons) — other than by data (a unique or
+//! exclusion violation, a serialization failure, a timeout, a subquery
+//! returning more rows; a foreign key violation too, except on the
+//! migrated rows, the same rows as before: there a new foreign key made
+//! it), inside a function's or trigger's body included (a body a migration
+//! broke, a new trigger raising), when its parameter or result types or
 //! result column names change (the deployed code binds and decodes them),
 //! or when a result value is one its deployed analysis said it couldn't
 //! be: NULL in a column analyzed NOT NULL, a value outside the column's
@@ -42,8 +44,10 @@
 //!
 //! A finding claiming the query "no longer runs" (as a role, or for
 //! anyone), that an INSERT or COPY leaving out a column "fails" for any
-//! row, or that an INSERT "fails as role", is **false** when a call it
-//! covers runs after the migrations (and, for a write, writes a row). Any
+//! row, that an INSERT "fails as role", or that a trigger it fires "fails
+//! for every row it writes", is **false** when a call it covers runs after
+//! the migrations (and, for a write, writes a row); one claiming a trigger
+//! "fails every time it runs", when a call runs at all. Any
 //! other finding ("may now be NULL", "a longer value fails", "may reject")
 //! says a value may break the query; when no call broke it (nor, for row
 //! security, saw or changed rows before and none after), it is
@@ -51,7 +55,7 @@
 //! not reach the value that breaks it. A query no call ran before bears
 //! nothing out.
 //!
-//! [`assert_agrees`] runs from `breaks_deployed_queries`' own tests (with
+//! [`assert_agrees`] runs from `deployed_query_breakage`' own tests (with
 //! the feature on, as `scripts/run-lint-oracle.sh` runs them) and panics on
 //! a missed break or a false claim; `tests/deployed_oracle.rs` runs a
 //! generated corpus. `TYPEDPG_DEPLOYED_ORACLE_VERBOSE=1` prints every
@@ -110,16 +114,20 @@ pub struct Report {
 
 /// SQLSTATEs that depend on the rows, not the schema: a unique, exclusion
 /// or foreign key violation, a serialization failure or deadlock, a
-/// timeout, a lock not available. A new UNIQUE or foreign key is no
-/// break the rule reports (whether a row breaks it depends on the data).
+/// timeout, a lock not available. A new UNIQUE is no break the rule
+/// reports (whether a row breaks it depends on the data); a foreign key
+/// violation on the migrated rows is ([`FOREIGN_KEY_VIOLATION`]).
 const DATA_DEPENDENT: &[&str] = &[
     "23505", "23P01", "23503", "40001", "40P01", "57014", "55P03",
 ];
 
+/// A foreign key violation: on the rows a call ran over before, only a
+/// foreign key the migrations added (or enforced, or whose action they
+/// changed) raises it, which the rule reports as "may fail".
+const FOREIGN_KEY_VIOLATION: &str = "23503";
+
 /// Marks a failure raised inside a function's or trigger's body (its
-/// context names the function): what a body does — a new trigger raising,
-/// a string body a migration broke (it isn't checked again) — is not what
-/// the rule checks, so such a failure is no break.
+/// context names the function), for the report.
 const IN_FUNCTION: &str = "[in a function: ";
 
 /// Marks a COPY that failed before its data was sent.
@@ -322,8 +330,13 @@ impl Scratch {
     /// Connect (again) and install the helpers in the session.
     fn connect(&mut self) -> Result<(), String> {
         let mut client = Client::connect(&self.url, NoTls).map_err(|e| e.to_string())?;
+        // Roles are the cluster's: a migration another oracle replays
+        // (`ALTER ROLE postgres SET session_replication_role = replica`)
+        // reaches this session too, and would keep every trigger from
+        // firing.
         client
-            .batch_execute(support::SEED_SQL)
+            .batch_execute("SET session_replication_role = origin")
+            .and_then(|()| client.batch_execute(support::SEED_SQL))
             .and_then(|()| client.batch_execute(CANDIDATES_SQL))
             .map_err(|e| format!("installing the helpers: {e}"))?;
         self.client = Some(client);
@@ -585,13 +598,16 @@ fn execute(client: &mut Client, target: &Target<'_>, call: &Call) -> Outcome {
         return failed(&e);
     }
     // A role's own settings (`ALTER ROLE … SET search_path`) apply to
-    // the sessions it logs in, which `SET ROLE` doesn't: they are set too.
+    // the sessions it logs in, which `SET ROLE` doesn't: they are set too —
+    // but `session_replication_role`, which another oracle's migrations
+    // leave on the cluster's roles (see `Scratch::connect`).
     if let Some(role) = &call.role
         && let Err(e) = tx
             .query(
                 "SELECT pg_catalog.set_config(split_part(c, '=', 1), substr(c, strpos(c, '=') + 1), true)
                  FROM pg_catalog.pg_db_role_setting s, unnest(s.setconfig) AS c
                  WHERE s.setrole = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1)
+                   AND split_part(c, '=', 1) <> 'session_replication_role'
                    AND s.setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database
                                              WHERE datname = current_database()))
                  ORDER BY s.setdatabase",
@@ -940,10 +956,10 @@ pub fn run(case: &Case<'_>) -> Report {
                     // the schema only where the migrated rows couldn't be
                     // run and the call reached rows before.
                     (Outcome::Ran { count, .. }, Outcome::Failed { code, message })
-                        if !DATA_DEPENDENT.contains(&code.as_str())
+                        if (!DATA_DEPENDENT.contains(&code.as_str())
+                            || code == FOREIGN_KEY_VIOLATION && phase == "migrated")
                             && code != "(role)"
                             && code != "(client)"
-                            && !message.contains(IN_FUNCTION)
                             && (phase == "migrated"
                                 || migrated.is_none() && *count > 0 && code != "21000") =>
                     {
@@ -1009,15 +1025,15 @@ pub fn run(case: &Case<'_>) -> Report {
         let header = || case_header(case, target);
         // An allow comment, in the query or a new migration, accepts it.
         let allowed = crate::allowed_rules(&target.query.sql)
-            .contains(&crate::Rule::BreaksDeployedQueries)
+            .contains(&crate::Rule::DeployedQueryBreakage)
             || case
                 .new
                 .iter()
-                .any(|m| crate::allowed_rules(m).contains(&crate::Rule::BreaksDeployedQueries));
+                .any(|m| crate::allowed_rules(m).contains(&crate::Rule::DeployedQueryBreakage));
         if texts.is_empty() {
             if !breaks[index].is_empty() && !allowed {
                 report.missed.push(format!(
-                    "deployed oracle: breaks_deployed_queries misses a break: {}\n{}",
+                    "deployed oracle: deployed_query_breakage misses a break: {}\n{}",
                     breaks[index]
                         .iter()
                         .take(4)
@@ -1044,29 +1060,40 @@ pub fn run(case: &Case<'_>) -> Report {
         let plain_insert = (sql.starts_with("INSERT") && !sql.contains("ON CONFLICT"))
             || target.describe.is_some();
         for text in &texts {
-            // The calls the claim says fail, and whether one must write a
-            // row to contradict it.
-            let claim: Option<(Option<&str>, bool)> = if text.starts_with("it no longer runs: ") {
-                Some((None, false))
-            } else if let Some(rest) = text.strip_prefix("it no longer runs as role \"") {
-                rest.split_once("\":").map(|(role, _)| (Some(role), false))
-            } else if text.contains("so inserting any row fails") && plain_insert {
-                Some((None, true))
-            } else if let Some((_, rest)) = text.split_once(" fails as role \"")
-                && text.starts_with("its INSERT into ")
-                && plain_insert
-            {
-                rest.split_once('"').map(|(role, _)| (Some(role), true))
-            } else {
-                None
-            };
-            if let Some((role, writes)) = claim {
+            // The calls the claim says fail, and what a call that runs must
+            // have done to contradict it.
+            let claim: Option<(Option<&str>, Contradicted)> =
+                if text.starts_with("it no longer runs: ") {
+                    Some((None, Contradicted::Ran))
+                } else if let Some(rest) = text.strip_prefix("it no longer runs as role \"") {
+                    rest.split_once("\":")
+                        .map(|(role, _)| (Some(role), Contradicted::Ran))
+                } else if text.contains("so inserting any row fails") && plain_insert {
+                    Some((None, Contradicted::Wrote))
+                } else if let Some((_, rest)) = text.split_once(" fails as role \"")
+                    && text.starts_with("its INSERT into ")
+                    && plain_insert
+                {
+                    rest.split_once('"')
+                        .map(|(role, _)| (Some(role), Contradicted::Wrote))
+                } else if text.contains(", which now fails for every row it writes: ") {
+                    Some((None, Contradicted::Wrote))
+                } else if text.contains(", which now fails every time it runs: ") {
+                    Some((None, Contradicted::Always))
+                } else {
+                    None
+                };
+            if let Some((role, contradicted)) = claim {
                 let ran = outcomes.iter().find(|(call, outcome, _)| {
                     role.is_none_or(|r| call.role.as_deref() == Some(r))
                         && match outcome {
-                            Outcome::Ran { count, .. } => {
-                                !writes && !is_write_without_rows(&sql, *count) || *count > 0
-                            }
+                            Outcome::Ran { count, .. } => match contradicted {
+                                Contradicted::Ran => {
+                                    !is_write_without_rows(&sql, *count) || *count > 0
+                                }
+                                Contradicted::Wrote => *count > 0,
+                                Contradicted::Always => true,
+                            },
                             Outcome::Failed { .. } => false,
                         }
                 });
@@ -1076,7 +1103,7 @@ pub fn run(case: &Case<'_>) -> Report {
                         Outcome::Failed { .. } => 0,
                     };
                     report.false_claims.push(format!(
-                        "deployed oracle: breaks_deployed_queries claims \"{text}\", but {} runs \
+                        "deployed oracle: deployed_query_breakage claims \"{text}\", but {} runs \
                          after the migrations ({phase}, {count} rows)\n{}",
                         describe_call(call),
                         header()
@@ -1138,6 +1165,19 @@ pub fn run(case: &Case<'_>) -> Report {
         eprint!("{out}");
     }
     report
+}
+
+/// What a call that runs after the migrations must have done to
+/// contradict a finding claiming it fails.
+#[derive(Clone, Copy)]
+enum Contradicted {
+    /// Run, and returned rows or wrote some (a write changing no row runs
+    /// whatever its writes would have broken).
+    Ran,
+    /// Written a row.
+    Wrote,
+    /// Run at all.
+    Always,
 }
 
 /// An UPDATE, DELETE or MERGE that changed no row: it runs whatever its

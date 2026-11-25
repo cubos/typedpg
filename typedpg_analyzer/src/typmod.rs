@@ -12,6 +12,7 @@
 //! | `interval`                                    | `(fields << 16) \| p` (`p` = 0xFFFF: none) |
 //! | `bit`, `varbit`                               | `n`                                       |
 //! | `vector` (pgvector)                           | `n` (dimension)                           |
+//! | `geometry`, `geography` (PostGIS)             | `srid << 8 \| type << 2 \| z << 1 \| m`    |
 //!
 //! `None` represents PG's `-1` sentinel ("no typmod").
 //!
@@ -57,6 +58,14 @@ pub enum DecodedTypmod {
     Precision(i32),
     /// pgvector dimension count.
     VectorDim(i32),
+    /// PostGIS's `geometry` / `geography` modifier: the geometry type
+    /// (`TYPMOD_GET_TYPE`, 0 for any), dimensions and SRID (0 for unknown).
+    Spatial {
+        geometry_type: i32,
+        z: bool,
+        m: bool,
+        srid: i32,
+    },
     /// Recognised type whose typmod we don't decode further (or one whose
     /// shape isn't in the table above).
     Other(i32),
@@ -110,6 +119,9 @@ pub fn encode(
 
     if let Some(max) = pgvector_max_dimensions(snapshot, type_oid) {
         return encode_vector(&raw()?, &t.typname, max).map(Some);
+    }
+    if let Some(geography) = postgis_type(snapshot, type_oid) {
+        return encode_spatial(&typmod_strings(typmods)?, geography).map(Some);
     }
 
     let in_pg_catalog = snapshot.namespace_name(t.typnamespace) == Some("pg_catalog");
@@ -167,6 +179,16 @@ pub fn decode(snapshot: &PgCatalog, type_oid: PgTypeOid, typmod: Option<i32>) ->
             .is_some_and(|t| t.typname == "vector")
     {
         return DecodedTypmod::VectorDim(t);
+    }
+
+    if postgis_type(snapshot, type_oid).is_some() {
+        return DecodedTypmod::Spatial {
+            geometry_type: (t & 0xFC) >> 2,
+            z: t & 0x02 != 0,
+            m: t & 0x01 != 0,
+            // TYPMOD_GET_SRID: the 21-bit field, sign-extended.
+            srid: ((t & 0x0FFF_FF00) - (t & 0x1000_0000)) >> 8,
+        };
     }
 
     let typname = snapshot.get_type(type_oid).map(|x| x.typname.as_str());
@@ -340,6 +362,194 @@ fn encode_vector(raw: &[i32], typname: &str, max: i32) -> Result<i32, DdlError> 
         )));
     }
     Ok(*n)
+}
+
+/// liblwgeom's geometry type names (`geomtype_struct_array`, matched
+/// upper-cased) and their numbers (`POINTTYPE` …), `GEOMETRY` being 0; each
+/// takes a `Z`, `M` or `ZM` suffix.
+const POSTGIS_GEOMETRY_TYPES: &[(&str, i32)] = &[
+    ("GEOMETRY", 0),
+    ("POINT", 1),
+    ("LINESTRING", 2),
+    ("POLYGON", 3),
+    ("MULTIPOINT", 4),
+    ("MULTILINESTRING", 5),
+    ("MULTIPOLYGON", 6),
+    ("GEOMETRYCOLLECTION", 7),
+    ("CIRCULARSTRING", 8),
+    ("COMPOUNDCURVE", 9),
+    ("CURVEPOLYGON", 10),
+    ("MULTICURVE", 11),
+    ("MULTISURFACE", 12),
+    ("POLYHEDRALSURFACE", 13),
+    ("TRIANGLE", 14),
+    ("TIN", 15),
+];
+
+/// `lwtype_name`: how `postgis_typmod_out` names a geometry type.
+const POSTGIS_TYPE_NAMES: &[&str] = &[
+    "Unknown",
+    "Point",
+    "LineString",
+    "Polygon",
+    "MultiPoint",
+    "MultiLineString",
+    "MultiPolygon",
+    "GeometryCollection",
+    "CircularString",
+    "CompoundCurve",
+    "CurvePolygon",
+    "MultiCurve",
+    "MultiSurface",
+    "PolyhedralSurface",
+    "Triangle",
+    "Tin",
+];
+
+/// `SRID_DEFAULT`, the SRID a geography without one gets (WGS 84).
+const SRID_DEFAULT: i32 = 4326;
+/// `SRID_MAXIMUM` / `SRID_USER_MAXIMUM`.
+const SRID_MAXIMUM: i64 = 999_999;
+const SRID_USER_MAXIMUM: i64 = 998_999;
+
+/// `Some(is_geography)` when `oid` is PostGIS's `geometry` or `geography`
+/// (by name, with a `typmod_in`, as pgvector's types are found).
+fn postgis_type(snapshot: &PgCatalog, oid: PgTypeOid) -> Option<bool> {
+    if !snapshot.types_with_typmodin.contains(&oid) {
+        return None;
+    }
+    match snapshot.get_type(oid)?.typname.as_str() {
+        "geometry" => Some(false),
+        "geography" => Some(true),
+        _ => None,
+    }
+}
+
+/// PostGIS's `geometry_typmod_in` / `geography_typmod_in`
+/// (gserialized_typmod.c, `gserialized_typmod_in`): a geometry type name,
+/// then an SRID (clamped by `clamp_srid`); further modifiers are ignored.
+/// A geography's SRID defaults to 4326 and must be a lon/lat one
+/// (`srid_check_latlong`).
+fn encode_spatial(raw: &[String], geography: bool) -> Result<i32, DdlError> {
+    let mut srid: i64 = if geography { SRID_DEFAULT.into() } else { 0 };
+    let mut typmod: i32 = 0;
+    if let Some(name) = raw.first() {
+        // geometry_type_from_string: trimmed of spaces, upper-cased.
+        let upper = name.trim_matches(' ').to_ascii_uppercase();
+        let (base, z, m) = if let Some(b) = upper.strip_suffix("ZM") {
+            (b, true, true)
+        } else if let Some(b) = upper.strip_suffix('Z') {
+            (b, true, false)
+        } else if let Some(b) = upper.strip_suffix('M') {
+            (b, false, true)
+        } else {
+            (upper.as_str(), false, false)
+        };
+        // No base name ends in Z or M.
+        let Some(&(_, number)) = POSTGIS_GEOMETRY_TYPES.iter().find(|(n, _)| *n == base) else {
+            return Err(DdlError::UnsupportedDdl(format!(
+                "Invalid geometry type modifier: {name}"
+            )));
+        };
+        typmod = (number << 2) | (i32::from(z) << 1) | i32::from(m);
+    }
+    if let Some(text) = raw.get(1) {
+        // strtol: leading white space, a sign and digits, nothing after.
+        let digits = text.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+        let unsigned = digits.strip_prefix(['+', '-']).unwrap_or(digits);
+        let invalid =
+            || DdlError::Parse(format!("invalid input syntax for type integer: \"{text}\""));
+        if unsigned.is_empty() || !unsigned.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let value: i64 = digits
+            .parse::<i64>()
+            .ok()
+            .filter(|v| i32::try_from(*v).is_ok())
+            .ok_or_else(|| {
+                DdlError::Parse(format!("value \"{text}\" is out of range for type integer"))
+            })?;
+        // clamp_srid (the NOTICEs it raises aren't errors).
+        let clamped = if value <= 0 {
+            0
+        } else if value > SRID_MAXIMUM {
+            SRID_USER_MAXIMUM + 1 + value % (SRID_MAXIMUM - SRID_USER_MAXIMUM - 1)
+        } else {
+            value
+        };
+        if clamped != 0 {
+            srid = clamped;
+        }
+    }
+    if geography && srid != i64::from(SRID_DEFAULT) && srid != 0 {
+        check_latlong(srid)?;
+    }
+    // TYPMOD_SET_SRID: 21 bits from bit 8.
+    let srid = i32::try_from(srid).unwrap_or(0);
+    Ok(typmod | ((srid & 0x001F_FFFF) << 8))
+}
+
+/// `srid_check_latlong`: a geography's SRID must name a geographic
+/// (lon/lat) coordinate system in `spatial_ref_sys`. The analyzer knows the
+/// rows PostGIS installs: one there is geographic when PROJ reads it as
+/// angular, which for every bundled row is a `+proj=longlat` definition
+/// without vertical units (checked against PostGIS 3.7.0's 8500 rows). A
+/// SRID missing from them may be one the migrations inserted: accepted.
+///
+/// The SRIDs from 999000 are PostGIS's own (lwgeom_transform.c's
+/// `getProjDefinition`), never in the table: projected ones — world
+/// mercator, the UTM, Lambert, stereographic and LAEA zones — and the rest
+/// invalid (999283 is an LAEA zone of a band that doesn't exist).
+fn check_latlong(srid: i64) -> Result<(), DdlError> {
+    const RESERVE_OFFSET: i64 = 999_000;
+    if srid >= RESERVE_OFFSET {
+        return Err(DdlError::UnsupportedDdl(match srid {
+            999_000..=999_062 | 999_101..=999_282 => {
+                "Only lon/lat coordinate systems are supported in geography.".to_owned()
+            }
+            999_283 => "Unknown yzone encountered!".to_owned(),
+            _ => format!("Invalid reserved SRID ({srid})"),
+        }));
+    }
+    let Some(proj4text) = crate::ddl::extensions::postgis_proj4text(srid) else {
+        return Ok(());
+    };
+    if proj4text.contains("+proj=longlat") && !proj4text.contains("+vunits") {
+        return Ok(());
+    }
+    Err(DdlError::UnsupportedDdl(
+        "Only lon/lat coordinate systems are supported in geography.".into(),
+    ))
+}
+
+/// `postgis_typmod_out`: `(Type[Z][M][,srid])`, empty when the modifier
+/// says nothing.
+pub(crate) fn spatial_typmod_out(geometry_type: i32, z: bool, m: bool, srid: i32) -> String {
+    if geometry_type == 0 && !z && !m && srid == 0 {
+        return String::new();
+    }
+    let mut out = String::from("(");
+    if geometry_type != 0 {
+        out.push_str(
+            POSTGIS_TYPE_NAMES
+                .get(geometry_type as usize)
+                .copied()
+                .unwrap_or("Invalid type"),
+        );
+    } else {
+        out.push_str("Geometry");
+    }
+    if z {
+        out.push('Z');
+    }
+    if m {
+        out.push('M');
+    }
+    if srid > 0 {
+        out.push_str(&format!(",{srid}"));
+    }
+    out.push(')');
+    out
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

@@ -1322,6 +1322,9 @@ fn process_join_expr(
     // `ON` are never registered with the collector and `into_sorted`
     // reports a spurious "parameter gap".
     let mut on_facts = crate::nonnull::Facts::default();
+    // What the planner's strictness test may find the ON clause forcing
+    // (see `nonnull::plan_strict`).
+    let mut on_strict: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut equalities: Option<Vec<(crate::nonnull::Col, crate::nonnull::Col)>> = None;
     let side_aliases = |side: SourceSpan, scope: &Scope| -> std::collections::HashSet<String> {
         side.sources(scope)
@@ -1434,6 +1437,23 @@ fn process_join_expr(
         })?;
         check_no_srf_in_clause(quals.as_ref(), snapshot, "JOIN conditions")?;
         on_facts = crate::nonnull::nonnullable(quals.as_ref(), true, &on_scope, &log, snapshot);
+        on_strict = crate::nonnull::plan_strict::qual_rels(
+            quals.as_ref(),
+            &crate::nonnull::plan_strict::ScopeVars {
+                scope: &on_scope,
+                from: [join.larg.as_ref(), join.rarg.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                null_ctx,
+                log: &log,
+                snapshot,
+            },
+            &crate::nonnull::plan_strict::Strictness {
+                log: Some(&log),
+                snapshot,
+            },
+        );
         if let Some(qual) = quals.as_ref() {
             crate::nonnull::note_settled_null_tests(qual, &on_scope, &log, snapshot);
         }
@@ -1483,6 +1503,11 @@ fn process_join_expr(
             join_type,
         )?;
         on_facts = std::mem::take(&mut on_facts).union(facts);
+        // The merged columns' equalities `l = r`, strict in both.
+        for p in &parts {
+            on_strict.extend(null_ctx.plan_var_rels(&p.left.0));
+            on_strict.extend(null_ctx.plan_var_rels(&p.right.0));
+        }
         full_unplannable = join_type == JoinType::JoinFull
             && super::full_join::using_unplannable(
                 &parts.iter().map(|p| p.eq_op).collect::<Vec<_>>(),
@@ -1533,6 +1558,7 @@ fn process_join_expr(
         fk,
         always_matches,
         full_sides,
+        on_strict,
     );
     // `populate_joinrel_with_paths` skips a FULL JOIN of two relations
     // both proven empty (`is_dummy_rel`), or under a constant FALSE qual
@@ -2300,8 +2326,7 @@ pub(crate) fn srf_elements_nullable(
     if array_unnest {
         // What the argument's type says of its elements: `ARRAY[a, b]` over
         // NOT NULL values, `ARRAY(SELECT nn_col …)`, … (a multidimensional
-        // array's are unknown: its sub-arrays being there says nothing of
-        // their elements).
+        // array's are its sub-arrays' elements, every one unrolled).
         let elements_not_null = args
             .first()
             .map(|n| functions::call_arg_value(n.as_ref()))
@@ -2469,7 +2494,8 @@ pub(crate) fn srfs_have_equal_static_rows<'a>(
     rows.is_some()
 }
 
-/// Whether a SELECT's input always has a row, whatever the data: no WHERE,
+/// Whether a SELECT's input always has a row, whatever the data: no WHERE
+/// (or one folding to TRUE),
 /// and a FROM list (none at all is one row) of items that always do —
 /// a VALUES list, a FROM-less SELECT, a function of statically known
 /// non-zero length, or a join keeping such a side. What an aggregate
@@ -2479,7 +2505,10 @@ pub(crate) fn select_input_never_empty(
     ctx: Ctx<'_>,
     params: &ParamCollector,
 ) -> bool {
-    sel.where_clause.is_none()
+    // (A WHERE the planner folds to TRUE, `WHERE 1 = 1`, filters nothing.)
+    (sel.where_clause.is_none()
+        || crate::expr::plan_fold::certainly_true(sel.where_clause.as_ref(), ctx.snapshot)
+            == Some(true))
         && sel
             .from_clause
             .iter()
@@ -3356,7 +3385,7 @@ fn process_json_table(
     for (c, n) in cols.iter_mut().zip(col_aliases) {
         c.name = n;
     }
-    scope.add_derived(alias, cols, crate::scope::SourceKind::Other)
+    scope.add_derived(alias, cols, crate::scope::SourceKind::TableFunc)
 }
 
 /// A JSON_TABLE path (the row pattern, a column's `PATH` / `EXISTS PATH`,
@@ -3523,14 +3552,25 @@ fn json_table_query_type(t: PgTypeOid, snapshot: &PgCatalog) -> bool {
 /// `transformLockingClause` for subqueries, `grouping_planner` for views,
 /// whose queries only appear after the rewriter's `markQueryForLocking`),
 /// the same for the views it reads, and `make_outerjoininfo`'s refusal of
-/// a marked relation or subquery on an outer join's nullable side.
+/// a marked relation or subquery on an outer join's nullable side — as
+/// `reduce_outer_joins` leaves the joins (see [`StoredReduction`]).
 pub(crate) fn pushed_lock_error(
     sel: &ast::SelectStmt,
     snapshot: &PgCatalog,
 ) -> Option<crate::scope::LockBlock> {
+    pushed_lock_error_with(sel, &std::collections::HashSet::new(), snapshot)
+}
+
+/// [`pushed_lock_error`] with `forced` handed down from the level around
+/// too (see [`crate::nonnull::plan_strict::forced_by_outputs`]).
+pub(crate) fn pushed_lock_error_with(
+    sel: &ast::SelectStmt,
+    forced: &std::collections::HashSet<String>,
+    snapshot: &PgCatalog,
+) -> Option<crate::scope::LockBlock> {
     use crate::scope::LockBlock;
     if let Some(b) = subquery_lock_blocker(sel, snapshot) {
-        return Some(LockBlock::NotAllowedWith(b));
+        return Some(LockBlock::NotAllowedWith(b, false));
     }
     let ctes: Vec<String> = sel
         .with_clause
@@ -3545,20 +3585,14 @@ pub(crate) fn pushed_lock_error(
                 .collect()
         })
         .unwrap_or_default();
-    // A qual above an outer join may reduce it (`reduce_outer_joins`): a
-    // relation on its nullable side that one of them names may be no
-    // nullable side at all once planned, so only one no qual above names
-    // is refused (whether the qual is strict is the planner's to decide;
-    // the analyzer only rejects what fails every execution).
+    let reduction = StoredReduction::of(sel, forced, snapshot);
     fn item(
         n: Option<&ast::Node>,
-        nullable: bool,
-        above: &[&ast::Node],
+        reduction: &StoredReduction,
         ctes: &[String],
         snapshot: &PgCatalog,
     ) -> Option<crate::scope::LockBlock> {
         use crate::scope::LockBlock;
-        let refused = |alias: &str| nullable && !above.iter().any(|q| qual_may_name(q, alias));
         match n? {
             ast::Node::RangeVar(rv) => {
                 if rv.schemaname.is_empty() && ctes.contains(&rv.relname) {
@@ -3570,70 +3604,233 @@ pub(crate) fn pushed_lock_error(
                     .alias
                     .as_ref()
                     .map_or(rv.relname.as_str(), |a| a.aliasname.as_str());
-                if refused(alias) {
+                if reduction.nullable.contains(alias) {
                     return Some(LockBlock::NullableSide);
                 }
-                if nullable {
-                    return None;
-                }
-                view_lock_error(class, snapshot)
+                // A view pulled up here has its own outer joins reduced by
+                // what the quals hand down to it.
+                let (reach, under_outer) = reduction.reach(alias);
+                view_lock_error_with(class, &reach, under_outer, snapshot)
             }
             ast::Node::RangeSubselect(rs) => {
                 let alias = rs.alias.as_ref().map_or("", |a| a.aliasname.as_str());
+                let nullable = reduction.nullable.contains(alias);
                 match rs.subquery.as_ref()? {
-                    ast::Node::SelectStmt(s) if nullable => (refused(alias)
-                        && pushed_lock_marks_rows(s, snapshot))
-                    .then_some(LockBlock::NullableSide)
-                    .or_else(|| match pushed_lock_error(s, snapshot) {
-                        Some(LockBlock::NullableSide) => None,
-                        other => other,
-                    }),
-                    ast::Node::SelectStmt(s) => pushed_lock_error(s, snapshot),
-                    _ => refused(alias).then_some(LockBlock::NullableSide),
+                    ast::Node::SelectStmt(s) if nullable => (pushed_lock_marks_rows(s, snapshot))
+                        .then_some(LockBlock::NullableSide)
+                        .or_else(|| match pushed_lock_error(s, snapshot) {
+                            Some(LockBlock::NullableSide) => None,
+                            other => other,
+                        }),
+                    ast::Node::SelectStmt(s) => {
+                        let (reach, under_outer) = reduction.reach(alias);
+                        let names = alias_colnames(rs.alias.as_deref());
+                        let forced = crate::nonnull::plan_strict::forced_by_outputs(
+                            s,
+                            &names,
+                            &reach,
+                            under_outer,
+                            snapshot,
+                        );
+                        pushed_lock_error_with(s, &forced, snapshot)
+                    }
+                    _ => nullable.then_some(LockBlock::NullableSide),
                 }
             }
             ast::Node::RangeTableSample(ts) => {
-                item(ts.relation.as_ref(), nullable, above, ctes, snapshot)
+                item(ts.relation.as_ref(), reduction, ctes, snapshot)
             }
-            ast::Node::JoinExpr(j) => {
-                let (l, r) = match j.jointype {
-                    JoinType::JoinLeft => (nullable, true),
-                    JoinType::JoinRight => (true, nullable),
-                    JoinType::JoinFull => (true, true),
-                    _ => (nullable, nullable),
-                };
-                // The join's own ON is above the joins below it, not above
-                // its own sides.
-                let mut below: Vec<&ast::Node> = above.to_vec();
-                below.extend(j.quals.as_ref());
-                let side = |n: Option<&ast::Node>| match n {
-                    Some(ast::Node::JoinExpr(_)) => below.as_slice(),
-                    _ => above,
-                };
-                item(j.larg.as_ref(), l, side(j.larg.as_ref()), ctes, snapshot)
-                    .or_else(|| item(j.rarg.as_ref(), r, side(j.rarg.as_ref()), ctes, snapshot))
-            }
+            ast::Node::JoinExpr(j) => item(j.larg.as_ref(), reduction, ctes, snapshot)
+                .or_else(|| item(j.rarg.as_ref(), reduction, ctes, snapshot)),
             // Functions, VALUES, JSON_TABLE… are unaffected by FOR UPDATE.
             _ => None,
         }
     }
-    let above: Vec<&ast::Node> = sel.where_clause.iter().collect();
     sel.from_clause
         .iter()
-        .find_map(|n| item(n.as_ref(), false, &above, &ctes, snapshot))
+        .find_map(|n| item(n.as_ref(), &reduction, &ctes, snapshot))
 }
 
-/// Whether qual `q` may read a column of FROM entry `alias`: it names
-/// `alias`, or reads an unqualified column (which could be its).
-pub(crate) fn qual_may_name(q: &ast::Node, alias: &str) -> bool {
-    use typedpg_pg_query::NodeRef;
-    q.nodes().any(|(n, _)| match n {
-        NodeRef::ColumnRef(c) => {
-            let fields = crate::expr::extract_string_fields(&c.fields);
-            fields.len() < 2 || fields.first().is_some_and(|f| f == alias)
-        }
-        _ => false,
+/// The column names an alias gives (`AS s(a, b)`).
+pub(crate) fn alias_colnames(alias: Option<&ast::Alias>) -> Vec<String> {
+    alias.map_or_else(Vec::new, |a| {
+        crate::expr::extract_string_fields(&a.colnames)
     })
+}
+
+/// `reduce_outer_joins` over a stored query (a view's, a FROM subquery's)
+/// read from its text: the strictness of its quals judged without their
+/// types (every call taken to be strict, see
+/// [`crate::nonnull::plan_strict`]), so only the joins every plan leaves
+/// outer stay so.
+pub(crate) struct StoredReduction {
+    /// The FROM entries on the nullable side of an outer join left outer.
+    pub nullable: std::collections::HashSet<String>,
+    /// What the quals handed down to each FROM entry force (entries and
+    /// [`crate::nonnull::plan_strict::column_key`]s), and whether it is on
+    /// the nullable side of an outer join as written.
+    pub reached: std::collections::HashMap<String, (std::collections::HashSet<String>, bool)>,
+}
+
+impl StoredReduction {
+    /// What the quals handed down to entry `alias` force of its columns,
+    /// and whether it is on the nullable side of an outer join as written.
+    pub(crate) fn reach(&self, alias: &str) -> (crate::nonnull::plan_strict::Reach, bool) {
+        match self.reached.get(alias) {
+            Some((forced, under_outer)) => (
+                crate::nonnull::plan_strict::Reach::of(alias, forced),
+                *under_outer,
+            ),
+            None => (crate::nonnull::plan_strict::Reach::Nothing, false),
+        }
+    }
+
+    /// The reduction of `sel`'s joins, with `forced` handed down from the
+    /// level around on top of its own quals.
+    pub(crate) fn of(
+        sel: &ast::SelectStmt,
+        forced: &std::collections::HashSet<String>,
+        snapshot: &PgCatalog,
+    ) -> StoredReduction {
+        use crate::nonnull::plan_strict::{self, NamedVars, Strictness};
+        use std::collections::HashSet;
+        let vars = NamedVars::of_from(&sel.from_clause, snapshot);
+        let strict = Strictness {
+            log: None,
+            snapshot,
+        };
+        let rels = |q: Option<&ast::Node>| plan_strict::qual_rels(q, &vars, &strict);
+        let entries = |n: Option<&ast::Node>| -> HashSet<String> {
+            NamedVars::of_from(std::slice::from_ref(&n.cloned()), snapshot)
+                .entries
+                .into_iter()
+                .map(|(a, _)| a)
+                .collect()
+        };
+        // WHERE, and the HAVING conjuncts without aggregates the planner
+        // moves into it.
+        let mut upper = rels(sel.where_clause.as_ref());
+        upper.extend(forced.iter().cloned());
+        let mut conjuncts = Vec::new();
+        super::row_guarantees::conjuncts(sel.having_clause.as_ref(), &mut conjuncts);
+        for c in conjuncts {
+            if !super::select::has_aggregate_call(c, snapshot) {
+                upper.extend(rels(c));
+            }
+        }
+        let mut out = StoredReduction {
+            nullable: HashSet::new(),
+            reached: std::collections::HashMap::new(),
+        };
+        #[allow(clippy::too_many_arguments)]
+        fn walk(
+            n: Option<&ast::Node>,
+            upper: &HashSet<String>,
+            (nullable, written_nullable): (bool, bool),
+            rels: &dyn Fn(Option<&ast::Node>) -> HashSet<String>,
+            entries: &dyn Fn(Option<&ast::Node>) -> HashSet<String>,
+            out: &mut StoredReduction,
+        ) {
+            let Some(node) = n else {
+                return;
+            };
+            let ast::Node::JoinExpr(j) = node else {
+                for alias in entries(n) {
+                    if nullable {
+                        out.nullable.insert(alias.clone());
+                    }
+                    out.reached.insert(alias, (upper.clone(), written_nullable));
+                }
+                return;
+            };
+            let (le, re) = (entries(j.larg.as_ref()), entries(j.rarg.as_ref()));
+            let l = le.iter().any(|a| upper.contains(a));
+            let r = re.iter().any(|a| upper.contains(a));
+            // The kind once reduced: (left side nullable, right side nullable).
+            let (ln, rn) = match (j.jointype, l, r) {
+                (JoinType::JoinLeft, _, false) => (false, true),
+                (JoinType::JoinRight, false, _) => (true, false),
+                (JoinType::JoinFull, false, false) => (true, true),
+                (JoinType::JoinFull, true, false) => (false, true),
+                (JoinType::JoinFull, false, true) => (true, false),
+                _ => (false, false),
+            };
+            // The join's own constraints: its ON's, or a USING's equalities
+            // (strict in both sides' columns of the name).
+            let mut local = rels(j.quals.as_ref());
+            if j.is_natural || !j.using_clause.is_empty() {
+                local.extend(le.iter().cloned());
+                local.extend(re.iter().cloned());
+            }
+            let (to_left, to_right) = match (ln, rn) {
+                // Inner: both, to both sides.
+                (false, false) => {
+                    let mut both = local;
+                    both.extend(upper.iter().cloned());
+                    (both.clone(), both)
+                }
+                (false, true) => (upper.clone(), local),
+                (true, false) => (local, upper.clone()),
+                (true, true) => (HashSet::new(), HashSet::new()),
+            };
+            let (wl, wr) = match j.jointype {
+                JoinType::JoinLeft => (false, true),
+                JoinType::JoinRight => (true, false),
+                JoinType::JoinFull => (true, true),
+                _ => (false, false),
+            };
+            walk(
+                j.larg.as_ref(),
+                &to_left,
+                (nullable || ln, written_nullable || wl),
+                rels,
+                entries,
+                out,
+            );
+            walk(
+                j.rarg.as_ref(),
+                &to_right,
+                (nullable || rn, written_nullable || wr),
+                rels,
+                entries,
+                out,
+            );
+        }
+        // An aliased join's name forces what's inside it.
+        for item in &sel.from_clause {
+            expand_join_aliases(item.as_ref(), &mut upper, &entries);
+        }
+        for item in &sel.from_clause {
+            walk(
+                item.as_ref(),
+                &upper,
+                (false, false),
+                &rels,
+                &entries,
+                &mut out,
+            );
+        }
+        out
+    }
+}
+
+/// Add to `forced` the entries inside each aliased join of `n` whose
+/// name it holds (`(a JOIN b) AS j`: `j.x` is a column inside).
+fn expand_join_aliases(
+    n: Option<&ast::Node>,
+    forced: &mut std::collections::HashSet<String>,
+    entries: &dyn Fn(Option<&ast::Node>) -> std::collections::HashSet<String>,
+) {
+    if let Some(ast::Node::JoinExpr(j)) = n {
+        expand_join_aliases(j.larg.as_ref(), forced, entries);
+        expand_join_aliases(j.rarg.as_ref(), forced, entries);
+        if let Some(a) = j.alias.as_ref()
+            && forced.contains(&a.aliasname)
+        {
+            forced.extend(entries(j.larg.as_ref()));
+            forced.extend(entries(j.rarg.as_ref()));
+        }
+    }
 }
 
 /// Whether a locking clause pushed into FROM subquery `sel` marks a row
@@ -3717,6 +3914,23 @@ pub(crate) fn view_lock_error(
     class: &crate::pg_catalog::PgClass,
     snapshot: &PgCatalog,
 ) -> Option<crate::scope::LockBlock> {
+    view_lock_error_with(
+        class,
+        &crate::nonnull::plan_strict::Reach::Nothing,
+        false,
+        snapshot,
+    )
+}
+
+/// [`view_lock_error`], with what the quals of the level around hand down
+/// to the view forcing `reach` of its columns (see
+/// [`crate::nonnull::plan_strict::forced_by_outputs`]).
+pub(crate) fn view_lock_error_with(
+    class: &crate::pg_catalog::PgClass,
+    reach: &crate::nonnull::plan_strict::Reach,
+    under_outer: bool,
+    snapshot: &PgCatalog,
+) -> Option<crate::scope::LockBlock> {
     if class.relkind != crate::pg_catalog::RelKind::View {
         return None;
     }
@@ -3731,7 +3945,28 @@ pub(crate) fn view_lock_error(
         // analyzing it here is no statement's parse analysis, so it requires
         // no schema's USAGE (PG looks none up).
         ast::Node::SelectStmt(s) => crate::privileges::suspended(|| {
-            crate::ddl::views::expanding_view(class.oid, || pushed_lock_error(&s, snapshot))
+            crate::ddl::views::expanding_view(class.oid, || {
+                let names: Vec<String> = snapshot
+                    .attributes_of(class.oid)
+                    .iter()
+                    .filter(|a| a.attnum > 0)
+                    .map(|a| a.attname.clone())
+                    .collect();
+                let forced = crate::nonnull::plan_strict::forced_by_outputs(
+                    &s,
+                    &names,
+                    reach,
+                    under_outer,
+                    snapshot,
+                );
+                // Whatever the view's query runs into, the planner raises.
+                match pushed_lock_error_with(&s, &forced, snapshot) {
+                    Some(crate::scope::LockBlock::NotAllowedWith(b, _)) => {
+                        Some(crate::scope::LockBlock::NotAllowedWith(b, true))
+                    }
+                    other => other,
+                }
+            })
         })?,
         _ => None,
     }

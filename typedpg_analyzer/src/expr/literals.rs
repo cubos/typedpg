@@ -110,7 +110,11 @@ pub(crate) fn passthrough_cast_operand<'a>(
         if !tn.typmods.is_empty() || !tn.array_bounds.is_empty() {
             return None;
         }
-        let target = resolve_type_name(Some(&**tn), snapshot).ok()?;
+        // (A peek at the target: what the cast refers to is noted where
+        // it is analyzed.)
+        let (target, _) =
+            crate::ddl::depend::collect_defined(|| resolve_type_name(Some(&**tn), snapshot));
+        let target = target.ok()?;
         if !keeps_unknown_operand(target) {
             return None;
         }
@@ -157,7 +161,11 @@ pub(crate) fn bare_param<'a>(
                 let tn = cast.type_name.as_ref()?;
                 if !tn.typmods.is_empty()
                     || !tn.array_bounds.is_empty()
-                    || !resolve_type_name(Some(&**tn), snapshot).is_ok_and(keeps_unknown_operand)
+                    || !crate::ddl::depend::collect_defined(|| {
+                        resolve_type_name(Some(&**tn), snapshot)
+                    })
+                    .0
+                    .is_ok_and(keeps_unknown_operand)
                 {
                     return None;
                 }
@@ -183,7 +191,13 @@ pub(crate) fn infer_type_cast(
     let inner =
         passthrough_cast_operand(inner.as_ref(), snapshot, params).unwrap_or(inner.as_ref());
 
-    let target_oid = resolve_type_name(cast.type_name.as_deref(), snapshot)?;
+    // The target type is a dependency of a stored expression only through
+    // a node of it the cast builds (find_expr_references_walker): noted
+    // below, once the operand's type is known.
+    let (target_oid, _) = crate::ddl::depend::collect_defined(|| {
+        resolve_type_name(cast.type_name.as_deref(), snapshot)
+    });
+    let target_oid = target_oid?;
     // typenameTypeIdAndMod: the target's typmod is resolved (and validated)
     // before the operand is transformed.
     let written_typmod = match cast.type_name.as_ref() {
@@ -309,13 +323,42 @@ pub(crate) fn infer_type_cast(
     // coerce_type: any other `record` cast to a composite is rebuilt field
     // by field from the row it names (a whole-row reference to a subquery,
     // CTE, VALUES list, …) — or rejected when it names none.
-    let inner_type = if inner_type.type_oid == oid::RECORD
-        && coerce::is_complex(target_oid, snapshot)
-    {
-        super::coerce_record_to_complex(inner, target_oid, CoercionContext::Explicit, ctx, params)?
-    } else {
-        inner_type
+    // Such a cast is no relabeling: without it, the operand is a `record`.
+    let (inner_type, typed_alone) =
+        if inner_type.type_oid == oid::RECORD && coerce::is_complex(target_oid, snapshot) {
+            (
+                super::coerce_record_to_complex(
+                    inner,
+                    target_oid,
+                    CoercionContext::Explicit,
+                    ctx,
+                    params,
+                )?,
+                false,
+            )
+        } else {
+            (inner_type, typed_alone)
+        };
+    // What the cast builds: a constant of the target type (an untyped
+    // literal or parameter), a row of it, its cast function, or a
+    // relabeling / I/O conversion / domain coercion to it — nothing for a
+    // value already of the type.
+    let untyped = match inner {
+        Some(ast::Node::AConst(ac)) => {
+            ac.isnull || matches!(ac.val, Some(ast::AConstValue::String(_)))
+        }
+        Some(ast::Node::ParamRef(_) | ast::Node::RowExpr(_)) => true,
+        _ => inner_type.type_oid == oid::UNKNOWN,
     };
+    if untyped || built_for_target {
+        // (A domain's constant is its base type's, coerced to the domain.)
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(target_oid));
+        crate::ddl::depend::note(crate::ddl::depend::ObjectAddress::type_(
+            snapshot.unwrap_domain(target_oid),
+        ));
+    } else {
+        crate::ddl::depend::note_coercion(snapshot, inner_type.type_oid, target_oid);
+    }
 
     if let Some(ast::Node::ParamRef(p)) = inner
         && !pass_through
@@ -433,6 +476,9 @@ pub(crate) fn infer_type_cast(
         .and_then(|oid| snapshot.pg_cast.get(oid))
         .and_then(|c| c.castfunc);
     ctx.note_proc(cast_func);
+    if cast_func.is_none() {
+        ctx.note_io_coercion(inner_type.type_oid, target_oid);
+    }
     // A cast function is a FuncExpr in the plan: ExecInitFunc checks its
     // EXECUTE (`SELECT 1::mytype` fails when the cast's function is
     // revoked).
@@ -447,13 +493,17 @@ pub(crate) fn infer_type_cast(
         cast_func.is_none() || ctx.proc_is_strict(cast_func),
     );
     let state = cast_collation(&inner_type, target_oid, written_typmod, snapshot)?;
-    let nullable = inner_type.nullable
-        || cast_function_can_return_null(inner_type.type_oid, target_oid, snapshot);
+    let nullable =
+        inner_type.nullable || value_cast_can_return_null(&inner_type, target_oid, snapshot);
     // The elements of an array cast to an array type: an array literal
     // says (`'{1,2}'::int[]` has no NULL element), an `ARRAY[…]` built
     // for the target or an array of the same type keeps its own (a
     // relabeling or typmod coercion maps no element to NULL); an element
-    // conversion (`jsonb[]` → `int[]`, …) may.
+    // conversion (`date[]` → `text[]`, an `ArrayCoerceExpr`) maps a NULL
+    // element to NULL and a non-NULL one to NULL only through a cast
+    // function that can return NULL (`jsonb[]` → `int[]`: `'null'::jsonb`).
+    // A cast function between the array types themselves says nothing of
+    // the elements it returns.
     // A domain whose CHECK keeps NULL elements out checks the value.
     let elem_nullable = if array_element_type(snapshot, target_base).is_none() {
         None
@@ -466,7 +516,12 @@ pub(crate) fn infer_type_cast(
             ),
             _ => None,
         }
-    } else if built_for_target || snapshot.unwrap_domain(inner_type.type_oid) == target_base {
+    } else if built_for_target
+        || snapshot.unwrap_domain(inner_type.type_oid) == target_base
+        || (array_element_type(snapshot, snapshot.unwrap_domain(inner_type.type_oid)).is_some()
+            && !array_cast_runs_function(inner_type.type_oid, target_oid, snapshot)
+            && !coercion_can_null_elements(inner_type.type_oid, target_oid, snapshot))
+    {
         inner_type.elem_nullable
     } else {
         None
@@ -499,6 +554,7 @@ pub(crate) fn infer_type_cast(
     // `ROW(a, b)::pair` is the row built for `pair` (and a cast to the
     // composite a value already is changes nothing): its fields keep
     // their nullability.
+    let had_record_fields = inner_type.record_fields.is_some();
     let record_fields = inner_type.record_fields.filter(|_| {
         coerce::is_complex(target_oid, snapshot)
             && snapshot.unwrap_domain(inner_type.type_oid) == snapshot.unwrap_domain(target_oid)
@@ -522,7 +578,9 @@ pub(crate) fn infer_type_cast(
             && typmod_of(written_typmod) == typmod_of(inner_type.typmod)
             && !inner_type.unknown_value
             && typed_alone
-            && !matches!(inner, Some(ast::Node::ParamRef(_))),
+            && !matches!(inner, Some(ast::Node::ParamRef(_)))
+            // `x::record` of a row whose fields are known forgets them.
+            && !(target_oid == oid::RECORD && had_record_fields),
     );
     let planned = if inner_type.type_oid == target_oid
         && written_typmod.is_none()
@@ -583,7 +641,44 @@ pub(crate) fn assignment_nullable(t: &ExprType, target: PgTypeOid, snapshot: &Pg
     t.nullable
         || (t.type_oid != oid::UNKNOWN
             && snapshot.unwrap_domain(t.type_oid) != snapshot.unwrap_domain(target)
-            && cast_function_can_return_null(t.type_oid, target, snapshot))
+            && value_cast_can_return_null(t, target, snapshot))
+}
+
+/// [`cast_function_can_return_null`] for a value known as `t`: a built-in
+/// cast function that returns NULL only for an infinite input
+/// ([`crate::builtin_nullability::NULL_ONLY_ON_INFINITE`]: `time(timestamp)`
+/// & co.) never does for a finite one (`now()`, `LOCALTIMESTAMP`, a column
+/// CHECKed `isfinite`, … see [`crate::refine`]).
+pub(crate) fn value_cast_can_return_null(
+    t: &ExprType,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    cast_function_can_return_null(t.type_oid, target, snapshot)
+        && !(crate::refine::finite_value(t, snapshot)
+            && builtin_cast_signature(t.type_oid, target, snapshot).is_some_and(|sig| {
+                crate::builtin_nullability::NULL_ONLY_ON_INFINITE.contains(&sig.as_str())
+            }))
+}
+
+/// The signature (`time(timestamp)`) of the built-in function the cast from
+/// `source` to `target` runs: PG names a built-in cast function after its
+/// target type (`pg_cast.castfunc` isn't in the snapshot).
+fn builtin_cast_signature(
+    source: PgTypeOid,
+    target: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> Option<String> {
+    let (source, target) = (
+        snapshot.unwrap_domain(source),
+        snapshot.unwrap_domain(target),
+    );
+    let (src, tgt) = (snapshot.get_type(source)?, snapshot.get_type(target)?);
+    snapshot
+        .find_functions(Some("pg_catalog"), &tgt.typname)
+        .iter()
+        .find(|f| f.proargtypes.first() == Some(&source) && f.prorettype == target)
+        .map(|f| format!("{}({})", f.proname, src.typname))
 }
 
 /// Whether the cast from `source` to `target` runs a cast function that can
@@ -673,6 +768,21 @@ pub(crate) fn coercion_can_null_elements(
         (Some(fe), Some(te)) => coercion_can_return_null(fe, te, snapshot),
         _ => false,
     }
+}
+
+/// Whether coercing `from` to `to` runs a cast function between the two
+/// types themselves (a `pg_cast` row with a function), not a relabeling
+/// nor an element-by-element conversion.
+pub(crate) fn array_cast_runs_function(
+    from: PgTypeOid,
+    to: PgTypeOid,
+    snapshot: &PgCatalog,
+) -> bool {
+    snapshot
+        .cast_by_pair
+        .get(&(snapshot.unwrap_domain(from), snapshot.unwrap_domain(to)))
+        .and_then(|oid| snapshot.pg_cast.get(oid))
+        .is_some_and(|c| c.castmethod == crate::pg_catalog::CastMethod::Function)
 }
 
 /// A pseudo-type whose input function is PSEUDOTYPE_DUMMY_INPUT_FUNC

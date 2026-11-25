@@ -153,6 +153,28 @@ mod tests {
     }
 
     #[test]
+    fn a_distinct_typing_an_untyped_literal_keeps_it() {
+        let db = catalog();
+        // DISTINCT resolves `'y'` to text, and the UNION's column with it:
+        // without DISTINCT, the UNION resolves it to varchar.
+        let sql = "SELECT c FROM ((SELECT DISTINCT 'y' AS c) UNION (SELECT 'a'::varchar)) s";
+        let findings: Vec<_> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::RedundantDistinct)
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].fix.is_empty(), "{findings:?}");
+        // Typed outputs: removed as anywhere.
+        let sql = "SELECT c FROM ((SELECT DISTINCT 'y'::text AS c) UNION (SELECT 'a'::varchar)) s";
+        let findings: Vec<_> = lint(&db, sql)
+            .into_iter()
+            .filter(|finding| finding.rule == Rule::RedundantDistinct)
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(!findings[0].fix.is_empty(), "{findings:?}");
+    }
+
+    #[test]
     fn a_distinct_that_can_remove_rows_is_kept() {
         let db = catalog();
         for sql in [

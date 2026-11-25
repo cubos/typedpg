@@ -3,9 +3,9 @@
 `CREATE INDEX` without `CONCURRENTLY`, or a constraint that builds an index,
 on a table that already has rows.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -19,14 +19,14 @@ ALTER TABLE users ADD CONSTRAINT users_name_key UNIQUE (name);
 ```
 
 ```
-warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build
+warning[locking/create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build
    ╭─[migrations/0002_index_email.sql:1:1]
  1 │ CREATE INDEX users_email_idx ON users (email);
    · ─────────────────────────────────────────────
    ╰────
   help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
 
-warning[create_index_blocking]: adding the constraint builds its index under an ACCESS EXCLUSIVE lock, blocking reads and writes on public.users for the whole build
+warning[locking/create_index_blocking]: adding the constraint builds its index under an ACCESS EXCLUSIVE lock, blocking reads and writes on public.users for the whole build
    ╭─[migrations/0002_index_email.sql:2:1]
  2 │ ALTER TABLE users ADD CONSTRAINT users_name_key UNIQUE (name);
    · ─────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ warning[create_index_blocking]: adding the constraint builds its index under an 
 ```
 
 The `CREATE INDEX` also gets a
-[`missing_lock_timeout`](missing_lock_timeout.md) finding.
+[`lock_without_timeout`](lock_without_timeout.md) finding.
 
 ## Why
 
@@ -105,11 +105,11 @@ See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+- [`lock_without_timeout`](lock_without_timeout.md): the same statement
   waiting for its lock with no timeout.
 - [`drop_index_blocking`](drop_index_blocking.md): the `DROP INDEX`
   counterpart.
-- [`blocking_rebuild`](blocking_rebuild.md): `REINDEX` without
+- [`rebuild_blocking`](rebuild_blocking.md): `REINDEX` without
   `CONCURRENTLY`.
 - [`fk_without_index`](fk_without_index.md): the index you are probably
   adding.

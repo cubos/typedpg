@@ -46,6 +46,21 @@ struct JoinRecord {
     /// For a FULL join: per side, the columns non-NULL whenever that
     /// side's row is there. Each row has one side or the other.
     full_sides: Option<[Vec<Col>; 2]>,
+    /// The entries the planner's strictness test may find its ON clause
+    /// forcing non-NULL (see [`crate::nonnull::plan_strict`]).
+    on_strict: HashSet<String>,
+}
+
+/// This level's joins as the planner's `reduce_outer_joins` leaves them,
+/// judged only by the strictness of the quals (see
+/// [`NullabilityContext::plan_reduction`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlanReduction {
+    /// Each join's kind once reduced.
+    kinds: Vec<JoinKind>,
+    /// The entries forced non-NULL by the quals above each join, as
+    /// `reduce_outer_joins_pass2` hands them down to it.
+    upper: Vec<HashSet<String>>,
 }
 
 /// Where a column's value comes from, as far as this level's facts go:
@@ -144,6 +159,10 @@ pub(crate) struct NullabilityContext {
     /// This level's FULL JOINs no path can implement (by index into
     /// `joins`; see [`Self::unplannable_full_join`]).
     unplannable_full: Vec<(usize, Option<i32>)>,
+    /// The entries the planner's strictness test may find the level's
+    /// quals (WHERE, and HAVING conjuncts the planner moves there) forcing
+    /// non-NULL (see [`crate::nonnull::plan_strict`]).
+    plan_quals: HashSet<String>,
     /// Whether the current SELECT has a GROUP BY clause.
     /// When true, each group has ≥1 row, so aggregates with NOT NULL inputs
     /// produce NOT NULL results.
@@ -206,6 +225,7 @@ impl NullabilityContext {
         fk: Option<FkMatch>,
         always_matches: (bool, bool),
         full_sides: Option<[Vec<Col>; 2]>,
+        on_strict: HashSet<String>,
     ) -> usize {
         let left: HashSet<String> = left.iter().cloned().collect();
         let right: HashSet<String> = right.iter().cloned().collect();
@@ -218,6 +238,7 @@ impl NullabilityContext {
             fk,
             always_matches,
             full_sides,
+            on_strict,
         });
         self.recompute();
         self.joins.len() - 1
@@ -238,10 +259,193 @@ impl NullabilityContext {
     /// skipped (`restriction_is_constant_false`). `Some` of the location
     /// noted with the first one.
     pub fn unplannable_full_join(&self, except: Option<usize>) -> Option<Option<i32>> {
+        if self.unplannable_full.is_empty() {
+            return None;
+        }
+        let plan = self.plan_reduction();
         self.unplannable_full
             .iter()
-            .find(|&&(j, _)| Some(j) != except && self.final_kinds.get(j) == Some(&JoinKind::Full))
+            .find(|&&(j, _)| Some(j) != except && plan.kinds.get(j) == Some(&JoinKind::Full))
             .map(|&(_, location)| location)
+    }
+
+    /// Add what the planner's strictness test may find a qual of the level
+    /// (WHERE, a HAVING conjunct it moves there) forcing non-NULL.
+    pub fn add_plan_quals(&mut self, rels: HashSet<String>) {
+        self.plan_quals.extend(rels);
+    }
+
+    /// PG's `reduce_outer_joins` over this level's joins, with nothing but
+    /// what it reads: the entries the level's quals (`plan_quals`) and each
+    /// join's ON (`on_strict`) force non-NULL, handed down the join tree as
+    /// `reduce_outer_joins_pass2` does — the quals above an outer join to
+    /// its preserved side only, its ON to its nullable side only, nothing
+    /// through a FULL join. None of what the nullability inference adds
+    /// (foreign keys, CHECK constraints, a side always matching, the
+    /// non-strict reasoning of [`crate::nonnull::nonnullable`]) counts: the
+    /// planner reduces no join for it.
+    pub(crate) fn plan_reduction(&self) -> PlanReduction {
+        let n = self.joins.len();
+        // Each join's parent: the first join recorded after it whose side
+        // holds it (a join is recorded after both of its sides).
+        let parent: Vec<Option<(usize, bool)>> = (0..n)
+            .map(|i| {
+                let j = &self.joins[i];
+                let all: HashSet<&String> = j.left.iter().chain(&j.right).collect();
+                (i + 1..n).find_map(|p| {
+                    let pj = &self.joins[p];
+                    if all.iter().all(|a| pj.left.contains(*a)) {
+                        Some((p, true))
+                    } else if all.iter().all(|a| pj.right.contains(*a)) {
+                        Some((p, false))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let mut plan = PlanReduction {
+            kinds: vec![JoinKind::Inner; n],
+            upper: vec![HashSet::new(); n],
+        };
+        for i in (0..n).rev() {
+            let upper = match parent[i] {
+                None => self.plan_quals.clone(),
+                Some((p, left)) => self.plan_passed_down(&plan, p, left),
+            };
+            let j = &self.joins[i];
+            let l = j.left.iter().any(|a| upper.contains(a));
+            let r = j.right.iter().any(|a| upper.contains(a));
+            plan.kinds[i] = match (j.kind, l, r) {
+                (JoinKind::Left, _, true) | (JoinKind::Right, true, _) => JoinKind::Inner,
+                (JoinKind::Full, true, true) => JoinKind::Inner,
+                (JoinKind::Full, true, false) => JoinKind::Left,
+                (JoinKind::Full, false, true) => JoinKind::Right,
+                (k, _, _) => k,
+            };
+            plan.upper[i] = upper;
+        }
+        plan
+    }
+
+    /// What `reduce_outer_joins_pass2` hands down from join `p` (reduced
+    /// already) to its left (`left`) or right side: an inner join its ON's
+    /// constraints and those from above; an outer join those from above to
+    /// its preserved side, its ON's to its nullable side; a FULL join
+    /// nothing.
+    fn plan_passed_down(&self, plan: &PlanReduction, p: usize, left: bool) -> HashSet<String> {
+        let on = || self.joins[p].on_strict.clone();
+        let upper = || plan.upper[p].clone();
+        match (plan.kinds[p], left) {
+            (JoinKind::Inner, _) => {
+                let mut s = on();
+                s.extend(upper());
+                s
+            }
+            (JoinKind::Left, true) | (JoinKind::Right, false) => upper(),
+            (JoinKind::Left, false) | (JoinKind::Right, true) => on(),
+            (JoinKind::Full, _) => HashSet::new(),
+        }
+    }
+
+    /// Whether FROM entry `alias` is on the nullable side of an outer join
+    /// of this level the planner leaves outer (see
+    /// [`Self::plan_reduction`]): `make_outerjoininfo` refuses to lock its
+    /// rows.
+    pub fn plan_nullable(&self, alias: &str) -> bool {
+        let plan = self.plan_reduction();
+        self.joins
+            .iter()
+            .zip(&plan.kinds)
+            .any(|(j, kind)| match kind {
+                JoinKind::Inner => false,
+                JoinKind::Left => j.right.contains(alias),
+                JoinKind::Right => j.left.contains(alias),
+                JoinKind::Full => j.left.contains(alias) || j.right.contains(alias),
+            })
+    }
+
+    /// What the constraints `reduce_outer_joins_pass2` hands down to FROM
+    /// entry `alias` (a view or subquery the planner may pull up, whose own
+    /// outer joins they may then reduce) may force of its columns.
+    pub fn plan_reach(&self, alias: &str) -> crate::nonnull::plan_strict::Reach {
+        let plan = self.plan_reduction();
+        // The innermost join holding it: what that join hands its side.
+        let inner = self
+            .joins
+            .iter()
+            .enumerate()
+            .find(|(_, j)| j.left.contains(alias) || j.right.contains(alias));
+        let reaching = match inner {
+            None => self.plan_quals.clone(),
+            Some((i, j)) => self.plan_passed_down(&plan, i, j.left.contains(alias)),
+        };
+        crate::nonnull::plan_strict::Reach::of(alias, &reaching)
+    }
+
+    /// The FROM entries of this level a Var of column `col` belongs to
+    /// once the planner expanded the join aliases
+    /// (`flatten_join_alias_vars`): an aliased join's column is the
+    /// column inside; a `JOIN USING` merged column the left one of an inner
+    /// or LEFT join, the right one of a RIGHT join, and of a FULL join a
+    /// COALESCE of both (no Var).
+    pub(crate) fn plan_var_rels(&self, col: &Col) -> Vec<String> {
+        self.plan_var_rels_at(col, 0)
+    }
+
+    fn plan_var_rels_at(&self, col: &Col, depth: u32) -> Vec<String> {
+        if depth > 16 {
+            return vec![col.0.clone()];
+        }
+        if let Some(m) = self.merged.get(col) {
+            return match self.joins.get(m.join).map(|j| j.kind) {
+                Some(JoinKind::Inner | JoinKind::Left) => {
+                    self.plan_var_rels_at(&m.left.0, depth + 1)
+                }
+                Some(JoinKind::Right) => self.plan_var_rels_at(&m.right.0, depth + 1),
+                Some(JoinKind::Full) => Vec::new(),
+                None => vec![m.left.0.0.clone(), m.right.0.0.clone()],
+            };
+        }
+        if let Some((inner, _)) = self.aliased.get(col) {
+            return self.plan_var_rels_at(inner, depth + 1);
+        }
+        // The entry, and which of its columns (what a pulled-up subquery's
+        // column stands for is its own business).
+        vec![
+            col.0.clone(),
+            crate::nonnull::plan_strict::column_key(&col.0, &col.1),
+        ]
+    }
+
+    /// The FROM entries behind entry `alias`: itself, or for an aliased
+    /// join or a `JOIN USING`'s merged columns, the entries inside.
+    pub(crate) fn plan_entry_rels(&self, alias: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (k, (inner, _)) in &self.aliased {
+            if k.0 == alias && !out.contains(&inner.0) {
+                out.push(inner.0.clone());
+            }
+        }
+        for (k, m) in &self.merged {
+            if k.0 == alias {
+                for c in [&m.left.0, &m.right.0] {
+                    if !out.contains(&c.0) {
+                        out.push(c.0.clone());
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            out.push(alias.to_owned());
+        }
+        // The whole row: every column.
+        let rows: Vec<String> = out
+            .iter()
+            .map(|a| crate::nonnull::plan_strict::column_key(a, "*"))
+            .collect();
+        out.extend(rows);
+        out
     }
 
     /// The index the next join recorded gets.
@@ -282,10 +486,17 @@ impl NullabilityContext {
         let cols = |s: HashSet<Col>| s.into_iter().map(col).collect::<HashSet<_>>();
         self.nullable_aliases = set(std::mem::take(&mut self.nullable_aliases));
         self.forced_rels = set(std::mem::take(&mut self.forced_rels));
+        let plan_set = |s: HashSet<String>| -> HashSet<String> {
+            s.into_iter()
+                .map(|a| crate::nonnull::plan_strict::renamed_key(a, from, to))
+                .collect()
+        };
+        self.plan_quals = plan_set(std::mem::take(&mut self.plan_quals));
         for j in &mut self.joins {
             let keep = keep_exprs || !(j.left.contains(from) || j.right.contains(from));
             j.left = set(std::mem::take(&mut j.left));
             j.right = set(std::mem::take(&mut j.right));
+            j.on_strict = plan_set(std::mem::take(&mut j.on_strict));
             j.on = std::mem::take(&mut j.on).renamed(from, to, keep);
             if let Some(fk) = &mut j.fk {
                 for (c, _) in &mut fk.child_cols {

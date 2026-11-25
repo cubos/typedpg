@@ -13,6 +13,11 @@
 //! expression, on a local `const`/`let` binding of it, and on a `.sql` query
 //! or an exported `sql()` binding imported from another file. Those calls
 //! are placed at their method identifier, in the file that makes them.
+//! Each call also records the `JSON.stringify(…)` calls it passes, written
+//! directly, as a value (`json_stringify_param`): in the parameters object
+//! literal of a query's method, or in the rows array literal of a
+//! `copyIn()`'s `execute` (whose calls are recorded too, on the expression
+//! or a local binding of it).
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -22,9 +27,10 @@ use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, BindingPattern, CallExpression, Declaration, ExportSpecifier,
-    Expression, ImportDeclarationSpecifier, ModuleExportName, Program, SimpleAssignmentTarget,
-    Statement, StaticMemberExpression, TaggedTemplateExpression, UpdateExpression,
-    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
+    Expression, ImportDeclarationSpecifier, ModuleExportName, ObjectExpression, ObjectPropertyKind,
+    Program, PropertyKind, SimpleAssignmentTarget, Statement, StaticMemberExpression,
+    TaggedTemplateExpression, UpdateExpression, VariableDeclaration, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -84,6 +90,19 @@ pub struct FoundCall {
     pub method: String,
     /// Byte range of the method identifier.
     pub span: Range<usize>,
+    /// The `JSON.stringify(…)` calls the call passes as values, in source
+    /// order.
+    pub stringified: Vec<Stringified>,
+}
+
+/// A `JSON.stringify(…)` call a method call passes, written directly as a
+/// value (through parentheses, `as`, `satisfies`, `!` and `<T>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stringified {
+    /// Which value it is.
+    pub value: typedpg_lint::StringifiedValue,
+    /// Byte range of the `JSON.stringify(…)` call.
+    pub span: Range<usize>,
 }
 
 /// A call on a query another module declares.
@@ -92,6 +111,7 @@ pub struct RemoteCall {
     pub query: QueryExport,
     pub method: String,
     pub span: Range<usize>,
+    pub stringified: Vec<Stringified>,
 }
 
 /// A query found in a source.
@@ -543,6 +563,25 @@ fn member_call<'a>(
     Some((member.property.name.as_str(), member))
 }
 
+/// The `key: value` properties of an object literal whose key is a static
+/// name (`a`, `"a"`, `["a"]`): what a property of that name is passed as.
+/// Shorthand properties (`{ a }`) name a variable, never a call; spreads,
+/// methods and accessors are skipped.
+fn object_values<'o, 'a>(
+    object: &'o ObjectExpression<'a>,
+) -> impl Iterator<Item = (String, &'o Expression<'a>)> {
+    object.properties.iter().filter_map(|property| {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+        if property.kind != PropertyKind::Init || property.method || property.shorthand {
+            return None;
+        }
+        let name = property.key.static_name()?;
+        Some((name.as_str()?.to_owned(), &property.value))
+    })
+}
+
 /// Whether `name` is a method the call-site rules map to a [`CallMethod`].
 fn mapped_method(name: &str) -> Option<()> {
     matches!(
@@ -605,7 +644,7 @@ struct Finder<'s, 'r> {
     diagnostics: Vec<ScanDiagnostic>,
 }
 
-impl Finder<'_, '_> {
+impl<'s> Finder<'s, '_> {
     fn resolve(&mut self, spec: &str, name: &str) -> Option<Export> {
         let key = (spec.to_owned(), name.to_owned());
         if let Some(r) = self.cache.get(&key) {
@@ -707,15 +746,14 @@ impl Finder<'_, '_> {
         }
     }
 
-    /// The generated `sql()` call `expr` is, when it is the receiver of a
-    /// method call: `sql("…").fetchOne(…)`.
+    /// The generated `sql()` (or `copyIn()`) call `expr` is, when it is the
+    /// receiver of a method call: `sql("…").fetchOne(…)`.
     fn query_call(&mut self, expr: &Expression) -> Option<(usize, Kind)> {
         let Expression::CallExpression(call) = expr.without_parentheses() else {
             return None;
         };
         let (binding, member) = self.callee_binding(&call.callee)?;
-        let (db, kind) = self.target(&binding, member)?;
-        (kind == Kind::Query).then_some((db, kind))
+        self.target(&binding, member)
     }
 
     /// Record `call` as the query it is, once: the walk visits a receiver
@@ -747,11 +785,13 @@ impl Finder<'_, '_> {
     }
 
     /// Attach a method call to query `index`.
-    fn attach(&mut self, index: usize, method: &str, span: Span) {
+    fn attach(&mut self, index: usize, method: &str, span: Span, call: &CallExpression) {
+        let stringified = self.stringified(self.queries[index].kind, method, call);
         let query = &mut self.queries[index];
         query.calls.push(FoundCall {
             method: method.to_owned(),
             span: span.start as usize..span.end as usize,
+            stringified,
         });
         query.uses += 1;
         // A method not mapped to a rule is still a use: `unused_returning`
@@ -761,8 +801,9 @@ impl Finder<'_, '_> {
         }
     }
 
-    /// The local `const q = sql(…)` a declarator is, recorded and mapped to
-    /// its symbol so the semantic references can be classified later.
+    /// The local `const q = sql(…)` (or `copyIn(…)`) a declarator is,
+    /// recorded and mapped to its symbol so the semantic references can be
+    /// classified later.
     fn local_query(&mut self, declarator: &VariableDeclarator) -> Option<usize> {
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
             return None;
@@ -773,9 +814,6 @@ impl Finder<'_, '_> {
         };
         let (binding, member) = self.callee_binding(&call.callee)?;
         let (db, kind) = self.target(&binding, member)?;
-        if kind != Kind::Query {
-            return None;
-        }
         let index = self.record_once(call, db, kind)?;
         let symbol = id.symbol_id.get()?;
         self.query_bindings.insert(symbol, index);
@@ -820,11 +858,13 @@ impl Finder<'_, '_> {
                     escapes = true;
                     continue;
                 }
-                if let Some((method, span)) = self.method_call_at(node) {
+                if let Some((method, span, call)) = self.method_call_at(node) {
                     uses += 1;
+                    let stringified = self.stringified(self.queries[index].kind, &method, call);
                     self.queries[index].calls.push(FoundCall {
                         method: method.clone(),
                         span: span.start as usize..span.end as usize,
+                        stringified,
                     });
                     if mapped_method(&method).is_none() {
                         escapes = true;
@@ -840,8 +880,11 @@ impl Finder<'_, '_> {
     }
 
     /// The `name` of the `X.name(…)` call `node` is the receiver of, when
-    /// `node` is an identifier reference directly.
-    fn method_call_at(&self, node: &oxc_semantic::AstNode<'_>) -> Option<(String, Span)> {
+    /// `node` is an identifier reference directly, and the call.
+    fn method_call_at(
+        &self,
+        node: &oxc_semantic::AstNode<'s>,
+    ) -> Option<(String, Span, &'s CallExpression<'s>)> {
         if !matches!(node.kind(), AstKind::IdentifierReference(_)) {
             return None;
         }
@@ -859,7 +902,7 @@ impl Finder<'_, '_> {
         if call.callee.without_parentheses().span() != member.span {
             return None;
         }
-        Some((member.property.name.to_string(), member.property.span))
+        Some((member.property.name.to_string(), member.property.span, call))
     }
 
     /// A local query exported by `export { q as name }`.
@@ -902,6 +945,106 @@ impl Finder<'_, '_> {
                 self.queries[index].escapes = true;
             }
         }
+    }
+
+    /// The `JSON.stringify(…)` calls the method call `call` (`method` on a
+    /// query of `kind`) passes as values: in a query method's parameters
+    /// object literal (its second argument), a property's value, an element
+    /// of an array literal it is, or a field of an object literal in that
+    /// array (a rows spread's item); in a `copyIn()`'s `execute` rows
+    /// array literal, a field of an object literal in it. Only what is
+    /// written there: a value from a variable or a helper is not seen.
+    fn stringified(&self, kind: Kind, method: &str, call: &CallExpression) -> Vec<Stringified> {
+        use typedpg_lint::StringifiedValue;
+        let mut out = Vec::new();
+        if mapped_method(method).is_none() {
+            return out;
+        }
+        let Some(argument) = call.arguments.get(1).and_then(Argument::as_expression) else {
+            return out;
+        };
+        let stringified = |value, span| Stringified { value, span };
+        match kind {
+            Kind::Query => {
+                let Expression::ObjectExpression(params) = argument.get_inner_expression() else {
+                    return out;
+                };
+                for (name, value) in object_values(params) {
+                    if let Some(span) = self.json_stringify(value) {
+                        out.push(stringified(StringifiedValue::Param(name), span));
+                        continue;
+                    }
+                    let Expression::ArrayExpression(items) = value.get_inner_expression() else {
+                        continue;
+                    };
+                    for item in items.elements.iter().filter_map(|e| e.as_expression()) {
+                        if let Some(span) = self.json_stringify(item) {
+                            out.push(stringified(StringifiedValue::Element(name.clone()), span));
+                        } else if let Expression::ObjectExpression(row) =
+                            item.get_inner_expression()
+                        {
+                            for (field, value) in object_values(row) {
+                                if let Some(span) = self.json_stringify(value) {
+                                    let value = StringifiedValue::Field {
+                                        spread: name.clone(),
+                                        field,
+                                    };
+                                    out.push(stringified(value, span));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Kind::CopyIn => {
+                if method != "execute" {
+                    return out;
+                }
+                let Expression::ArrayExpression(rows) = argument.get_inner_expression() else {
+                    return out;
+                };
+                for row in rows.elements.iter().filter_map(|e| e.as_expression()) {
+                    let Expression::ObjectExpression(row) = row.get_inner_expression() else {
+                        continue;
+                    };
+                    for (column, value) in object_values(row) {
+                        if let Some(span) = self.json_stringify(value) {
+                            out.push(stringified(StringifiedValue::Column(column), span));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The span of `expr` when it is a call to the global
+    /// `JSON.stringify` (through parentheses and type assertions): `JSON`
+    /// must not resolve to a binding of the file.
+    fn json_stringify(&self, expr: &Expression) -> Option<Range<usize>> {
+        let Expression::CallExpression(call) = expr.get_inner_expression() else {
+            return None;
+        };
+        if call.optional {
+            return None;
+        }
+        let Expression::StaticMemberExpression(member) = call.callee.get_inner_expression() else {
+            return None;
+        };
+        if member.optional || member.property.name != "stringify" {
+            return None;
+        }
+        let Expression::Identifier(json) = member.object.get_inner_expression() else {
+            return None;
+        };
+        if json.name != "JSON" {
+            return None;
+        }
+        let reference = json.reference_id.get()?;
+        if self.scoping.get_reference(reference).symbol_id().is_some() {
+            return None;
+        }
+        Some(call.span.start as usize..call.span.end as usize)
     }
 
     fn diagnostic(&mut self, offset: u32, message: impl Into<String>) {
@@ -994,13 +1137,15 @@ impl<'a> Visit<'a> for Finder<'_, '_> {
         if let Some((method, member)) = member_call(&call.callee) {
             if let Some((db, kind)) = self.query_call(&member.object) {
                 if let Some(index) = self.record_receiver(&member.object, db, kind) {
-                    self.attach(index, method, member.property.span);
+                    self.attach(index, method, member.property.span, call);
                 }
             } else if let Some(query) = self.imported_query(&member.object) {
+                let stringified = self.stringified(Kind::Query, method, call);
                 self.remote_calls.push(RemoteCall {
                     query,
                     method: method.to_owned(),
                     span: member.property.span.start as usize..member.property.span.end as usize,
+                    stringified,
                 });
             }
         }
@@ -1760,6 +1905,152 @@ export const local = 1;
         check(r"\x41é\\z", false, "Aé\\z");
         assert_eq!(cooked_to_raw(r"a\tb", false, 2), 3);
         assert_eq!(cooked_to_raw("abc", false, 10), 3);
+    }
+
+    /// The values a call passes as `JSON.stringify(…)`, with their text.
+    fn stringified<'s>(src: &'s str, call: &FoundCall) -> Vec<(StringifiedValue, &'s str)> {
+        call.stringified
+            .iter()
+            .map(|s| (s.value.clone(), &src[s.span.clone()]))
+            .collect()
+    }
+
+    use typedpg_lint::StringifiedValue;
+
+    fn param(name: &str) -> StringifiedValue {
+        StringifiedValue::Param(name.to_owned())
+    }
+
+    #[test]
+    fn json_stringify_values_of_a_call_are_recorded() {
+        let src = r#"
+import { sql } from './db';
+sql('UPDATE t SET a = $a').execute(pool, {
+  a: JSON.stringify(x),
+  b: (JSON.stringify(y) as string),
+  c: JSON.stringify(z)!,
+  d: <string>JSON.stringify(w),
+  e: JSON.stringify(v) satisfies string,
+  "f": JSON.stringify(u),
+  ["g"]: JSON.stringify(t),
+  h: [JSON.stringify(s), 1, ...rest],
+  i: [{ j: JSON.stringify(r), k: 1 }, ({ j: JSON.stringify(q) })],
+  l: JSON.stringify,
+  m: String(JSON.stringify(p)),
+  n,
+  ...spread,
+});
+"#;
+        let s = run(src);
+        let call = &s.queries[0].calls[0];
+        let field = |spread: &str, field: &str| StringifiedValue::Field {
+            spread: spread.to_owned(),
+            field: field.to_owned(),
+        };
+        assert_eq!(
+            stringified(src, call),
+            [
+                (param("a"), "JSON.stringify(x)"),
+                (param("b"), "JSON.stringify(y)"),
+                (param("c"), "JSON.stringify(z)"),
+                (param("d"), "JSON.stringify(w)"),
+                (param("e"), "JSON.stringify(v)"),
+                (param("f"), "JSON.stringify(u)"),
+                (param("g"), "JSON.stringify(t)"),
+                (
+                    StringifiedValue::Element("h".to_owned()),
+                    "JSON.stringify(s)"
+                ),
+                (field("i", "j"), "JSON.stringify(r)"),
+                (field("i", "j"), "JSON.stringify(q)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_stringify_is_recorded_on_every_kind_of_call() {
+        let src = r#"
+import { sql, copyIn } from './db';
+sql('SELECT $a').fetchOne(pool, { a: JSON.stringify(1) });
+const q = sql('SELECT $a');
+q.fetchStream(pool, { a: JSON.stringify(2) }, { batchSize: 10 });
+q.fetchAll(pool, { a: 3 });
+copyIn('t (a)').execute(pool, [{ a: JSON.stringify(4) }, { a: 5 }]);
+const c = copyIn('t (a)');
+c.execute(pool, [{ a: JSON.stringify(6) }]);
+"#;
+        let s = run(src);
+        assert_eq!(s.queries.len(), 4, "{:?}", s.queries);
+        let found: Vec<Vec<(StringifiedValue, &str)>> = s
+            .queries
+            .iter()
+            .flat_map(|q| q.calls.iter())
+            .map(|call| stringified(src, call))
+            .collect();
+        let column = |name: &str| StringifiedValue::Column(name.to_owned());
+        assert_eq!(
+            found,
+            [
+                vec![(param("a"), "JSON.stringify(1)")],
+                vec![(param("a"), "JSON.stringify(2)")],
+                vec![],
+                vec![(column("a"), "JSON.stringify(4)")],
+                vec![(column("a"), "JSON.stringify(6)")],
+            ]
+        );
+        // The `copyIn()` targets' calls are recorded without making the
+        // targets queries: they keep their kind.
+        assert_eq!(s.queries[2].kind, Kind::CopyIn);
+        assert_eq!(s.queries[3].kind, Kind::CopyIn);
+
+        // A call on another module's query.
+        let mut resolve = |spec: &str, name: &str| match (spec, name) {
+            ("./queries.sql", "save") => Some(Export::Query(QueryExport {
+                file: PathBuf::from("/p/queries.sql"),
+                name: "save".to_owned(),
+            })),
+            _ => None,
+        };
+        let src = r#"
+import { save } from './queries.sql';
+save.execute(pool, { doc: JSON.stringify(doc) });
+"#;
+        let s = scan(Path::new("a.ts"), src, &mut resolve).unwrap();
+        let call = &s.remote_calls[0];
+        assert_eq!(
+            call.stringified
+                .iter()
+                .map(|s| (s.value.clone(), &src[s.span.clone()]))
+                .collect::<Vec<_>>(),
+            [(param("doc"), "JSON.stringify(doc)")]
+        );
+    }
+
+    #[test]
+    fn only_the_global_json_stringify_written_as_a_value_is_recorded() {
+        let src = r#"
+import { sql } from './db';
+import * as JSONX from './json';
+function local(JSON: { stringify(v: unknown): string }) {
+  sql('SELECT $a').execute(pool, { a: JSON.stringify(1) });
+}
+const doc = JSON.stringify(2);
+sql('SELECT $a').execute(pool, { a: doc });
+sql('SELECT $a').execute(pool, { a: JSONX.stringify(3) });
+sql('SELECT $a').execute(pool, { a: JSON?.stringify(4) });
+sql('SELECT $a').execute(pool, { a: JSON.stringify?.(5) });
+sql('SELECT $a').execute(pool, { a: JSON.parse('6') });
+sql('SELECT $a').execute(pool, params(JSON.stringify(7)));
+sql('SELECT $a').execute({ a: JSON.stringify(8) });
+sql('SELECT $a').other(pool, { a: JSON.stringify(9) });
+"#;
+        let s = run(src);
+        for query in &s.queries {
+            for call in &query.calls {
+                assert!(call.stringified.is_empty(), "{call:?}");
+            }
+        }
+        assert_eq!(s.queries.len(), 9);
     }
 
     #[test]

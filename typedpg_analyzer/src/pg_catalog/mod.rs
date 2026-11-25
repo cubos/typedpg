@@ -40,12 +40,16 @@ pub(crate) mod oid {
     pub const NAME: PgTypeOid = PgTypeOid::from_raw(19);
     pub const INT8: PgTypeOid = PgTypeOid::from_raw(20);
     pub const INT2: PgTypeOid = PgTypeOid::from_raw(21);
+    pub const INT2VECTOR: PgTypeOid = PgTypeOid::from_raw(22);
     pub const INT4: PgTypeOid = PgTypeOid::from_raw(23);
     pub const TEXT: PgTypeOid = PgTypeOid::from_raw(25);
     pub const OID: PgTypeOid = PgTypeOid::from_raw(26);
     pub const TID: PgTypeOid = PgTypeOid::from_raw(27);
     pub const XID: PgTypeOid = PgTypeOid::from_raw(28);
     pub const CID: PgTypeOid = PgTypeOid::from_raw(29);
+    pub const OIDVECTOR: PgTypeOid = PgTypeOid::from_raw(30);
+    pub const INT2ARRAY: PgTypeOid = PgTypeOid::from_raw(1005);
+    pub const OIDARRAY: PgTypeOid = PgTypeOid::from_raw(1028);
     pub const FLOAT4: PgTypeOid = PgTypeOid::from_raw(700);
     pub const FLOAT8: PgTypeOid = PgTypeOid::from_raw(701);
     pub const UNKNOWN: PgTypeOid = PgTypeOid::from_raw(705);
@@ -57,8 +61,11 @@ pub(crate) mod oid {
     pub const TIMESTAMPTZ: PgTypeOid = PgTypeOid::from_raw(1184);
     pub const TIMETZ: PgTypeOid = PgTypeOid::from_raw(1266);
     pub const NUMERIC: PgTypeOid = PgTypeOid::from_raw(1700);
+    pub const UUID: PgTypeOid = PgTypeOid::from_raw(2950);
     pub const JSONB: PgTypeOid = PgTypeOid::from_raw(3802);
     pub const RECORD: PgTypeOid = PgTypeOid::from_raw(2249);
+    /// `record[]` (`_record`): an array of anonymous records.
+    pub const RECORD_ARRAY: PgTypeOid = PgTypeOid::from_raw(2287);
     pub const VOID: PgTypeOid = PgTypeOid::from_raw(2278);
 }
 
@@ -97,7 +104,7 @@ pub const C_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(13);
 pub const SQL_LANGUAGE: PgLanguageOid = PgLanguageOid::from_raw(14);
 
 mod lint_access;
-pub use lint_access::ValueLimit;
+pub use lint_access::{LintForeignKey, ValueLimit};
 mod shared;
 pub use shared::Shared;
 pub(crate) mod pg_query_catalog;
@@ -212,7 +219,7 @@ pub struct PgCatalog {
     pub(crate) pg_constraint: Shared<HashMap<PgConstraintOid, PgConstraint>>,
     /// Keyed by `indexrelid` (the index's `pg_class.oid`).
     pub(crate) pg_index: Shared<HashMap<PgClassOid, PgIndex>>,
-    pg_rewrite: HashMap<PgRewriteOid, PgRewrite>,
+    pg_rewrite: Shared<HashMap<PgRewriteOid, PgRewrite>>,
     pub(crate) pg_collation: Shared<HashMap<PgCollationOid, PgCollation>>,
     pub(crate) pg_am: Shared<Vec<PgAm>>,
     pub(crate) pg_opfamily: Shared<Vec<PgOpfamily>>,
@@ -230,7 +237,7 @@ pub struct PgCatalog {
     /// Tablespaces, subscriptions and large objects migrations create.
     pub(crate) cluster_objects: crate::ddl::cluster::ClusterObjects,
     /// Transforms (`pg_transform`) migrations create: `(type, language)`.
-    pub(crate) transforms: Shared<Vec<(PgTypeOid, String)>>,
+    pub(crate) transforms: Shared<Vec<(PgTypeOid, String, crate::oid::PgGenericOid)>>,
 
     // ── Name-keyed indexes (built by `from_seed`, maintained by DDL) ──
     pub(crate) namespace_by_name: Shared<HashMap<String, PgNamespaceOid>>,
@@ -286,7 +293,7 @@ pub struct PgCatalog {
     /// what MergeAttributes compares when several parents give a column a
     /// default (PG compares the cooked `pg_attrdef` trees).
     pub(crate) attr_default_exprs:
-        HashMap<(PgClassOid, i16), crate::ddl::tables::check_inherit::StoredExpr>,
+        Shared<HashMap<(PgClassOid, i16), crate::ddl::tables::check_inherit::StoredExpr>>,
     /// The columns each generation expression reads, by the generated
     /// column (PG records them as `pg_depend` rows of the column's
     /// `pg_attrdef` entry): DROP COLUMN of such a column needs CASCADE and
@@ -313,6 +320,19 @@ pub struct PgCatalog {
     /// servers, and the pg_sanity mirror's), until a `SET TIME ZONE` /
     /// `SET timezone` / `set_config('TimeZone', ...)` says otherwise.
     pub(crate) timezone_utc: crate::ddl::session::BoolGuc,
+    /// `TimeZone` as the migrations' session set it.
+    pub(crate) timezone: crate::ddl::session::Guc<crate::tz::TzSetting>,
+    /// `DateStyle`: how dates print, and the field order numeric dates
+    /// are read in (`ISO, MDY` is the server's default and the mirror's).
+    pub(crate) datestyle: crate::ddl::session::Guc<(
+        crate::ddl::session::DateStyle,
+        crate::datetime_input::DateOrder,
+    )>,
+    /// `IntervalStyle`.
+    pub(crate) intervalstyle: crate::ddl::session::Guc<crate::ddl::session::IntervalStyle>,
+    /// The custom (placeholder, `prefix.name`) settings the migrations'
+    /// session set, for `current_setting` in a body the analyzer runs.
+    pub(crate) custom_settings: crate::ddl::session::CustomSettings,
     /// The migration set `constraint_exclusion` or `plan_cache_mode`: the
     /// planner may then prove more relations empty, or plan an EXECUTE
     /// generically, than the defaults the plan-time checks assume.
@@ -368,7 +388,7 @@ pub struct PgCatalog {
         Shared<HashMap<crate::ddl::depend::ObjectAddress, crate::ddl::depend::ExprTypeUse>>,
     /// Seeded `pg_get_functiondef` sources behind `inline_sql_bodies`,
     /// kept so `to_seed` round-trips them.
-    sql_function_defs: HashMap<PgProcOid, String>,
+    sql_function_defs: Shared<HashMap<PgProcOid, String>>,
     /// `pg_partitioned_table.partattrs` of each partitioned table: the
     /// partition key's attnums, `0` for an expression.
     pub(crate) partition_keys: Shared<HashMap<PgClassOid, Vec<i16>>>,
@@ -561,6 +581,31 @@ pub struct PgCatalog {
     /// CHECK constraints' expressions and `connoinherit`.
     pub(crate) check_defs:
         Shared<HashMap<PgConstraintOid, crate::ddl::tables::check_inherit::CheckDef>>,
+    /// The stored expressions (by a hash of their tree) whose names are
+    /// bound to the objects they found (see
+    /// [`crate::ddl::stored_exprs::bind_stored_expressions`]): a later
+    /// statement's search path doesn't rebind them.
+    pub(crate) bound_stored_exprs: Shared<std::collections::HashSet<u64>>,
+    /// The stored expressions (by tree hash) whose datetime literals hold
+    /// their canonical text ([`crate::ddl::stored_exprs`]).
+    pub(crate) settled_stored_exprs: Shared<std::collections::HashSet<u64>>,
+    /// For each stored expression (by slot), the tree hash whose
+    /// `regrole` / `regdatabase` constants were refused or found harmless
+    /// ([`crate::ddl::stored_exprs::bind_stored_expressions`]). Cleared
+    /// when a statement changes a column's type, which changes what a
+    /// literal coerces to.
+    pub(crate) refused_stored_exprs: Shared<HashMap<crate::ddl::stored_exprs::Slot, u64>>,
+    /// The write counts of the catalog tables stored expressions live in
+    /// ([`Shared::version`]) as of the last pass over them
+    /// ([`crate::ddl::stored_exprs::bind_stored_expressions`]): when they
+    /// are unchanged, no stored expression was added, changed or removed
+    /// since, and there is nothing to do. `None` before the first pass.
+    pub(crate) stored_expr_versions: Option<[u64; crate::ddl::stored_exprs::STORED_EXPR_SOURCES]>,
+    /// The datetime literals of stored expressions whose value wasn't known
+    /// when they were written (a zone-less timestamptz in the server's
+    /// unknown zone, `today`): read again later, under other settings, they
+    /// would be taken for another value, so they never are.
+    pub(crate) unsettled_datetime_literals: Shared<std::collections::HashSet<String>>,
     /// Tables and materialized views with a TOAST table (`reltoastrelid`):
     /// the CREATE or ALTER that first left them with a column needing one
     /// (needs_toast_table) made it, and it stays.
@@ -602,7 +647,7 @@ pub struct PgCatalog {
     pub(crate) uncertain_collations: Shared<std::collections::HashSet<(PgClassOid, i16)>>,
     /// The column / relation dependencies of policies, triggers, rules and
     /// SQL-standard function bodies.
-    pub(crate) column_deps: crate::ddl::coldeps::ColumnDeps,
+    pub(crate) column_deps: Shared<crate::ddl::coldeps::ColumnDeps>,
     /// The migration session's prepared statements (PREPARE), by name.
     pub(crate) prepared_statements:
         Shared<HashMap<String, crate::ddl::prepared::PreparedStatement>>,
@@ -616,7 +661,7 @@ pub struct PgCatalog {
     /// The seed's `pg_acl` rows, kept verbatim so `to_seed` round-trips the
     /// seed exporter's output (the internal ACL state also holds ACLs
     /// migrations created, which the exporter never writes).
-    pub(crate) seed_acls: Vec<SeedAcl>,
+    pub(crate) seed_acls: Shared<Vec<SeedAcl>>,
     /// One past the largest OID the seed holds: anything below it is a
     /// built-in object, owned by the bootstrap superuser.
     pub(crate) seed_oid_end: u32,
@@ -651,6 +696,11 @@ pub struct PgCatalog {
     /// analyzer assertion.
     #[cfg(feature = "pg_sanity")]
     pg_sanity_skip: bool,
+
+    /// Set by [`Self::pg_sanity_database`]: the database the mirror runs
+    /// in, instead of a scratch one of its own.
+    #[cfg(feature = "pg_sanity")]
+    pg_sanity_database: Option<String>,
 
     /// Every migration applied so far, in order, for the corpus recorder
     /// (see [`crate::corpus`]).
@@ -735,6 +785,12 @@ impl PgCatalog {
             // instance.
             let mut cat = Self::from_seed(load_seed()?);
             cat.pg_sanity = Some(std::sync::Arc::new(std::sync::OnceLock::new()));
+            // The mirror's session: its user and its scratch database,
+            // which `CURRENT_USER` and privilege errors name.
+            if let Some(user) = crate::pg_sanity::connecting_user() {
+                cat.set_connecting_user(&user);
+            }
+            cat.set_database_name(&crate::pg_sanity::scratch_db_name());
             Ok(cat)
         }
     }
@@ -884,7 +940,7 @@ impl PgCatalog {
         for acl in &seed.pg_acl {
             cat.load_seed_acl(acl);
         }
-        cat.seed_acls = seed.pg_acl;
+        cat.seed_acls = Shared::new(seed.pg_acl);
         // initdb makes `pg_database_owner` the owner of the `public` schema;
         // every other built-in object belongs to the bootstrap superuser.
         if let (Some(public), Some(database_owner)) = (
@@ -918,7 +974,7 @@ impl PgCatalog {
             pg_inherits: Shared::default(),
             pg_constraint: Shared::default(),
             pg_index: Shared::default(),
-            pg_rewrite: HashMap::new(),
+            pg_rewrite: Shared::default(),
             pg_collation: Shared::default(),
             pg_am: Shared::default(),
             pg_opfamily: Shared::default(),
@@ -949,13 +1005,19 @@ impl PgCatalog {
             domain_default_exprs: Shared::default(),
             domain_default_sequence_perms: Shared::default(),
             attr_default_types: Shared::default(),
-            attr_default_exprs: HashMap::new(),
+            attr_default_exprs: Shared::default(),
             generated_refs: Shared::default(),
             check_function_bodies: crate::ddl::session::BoolGuc::new(true),
             allow_system_table_mods: crate::ddl::session::BoolGuc::new(false),
             row_security_guc: crate::ddl::session::BoolGuc::new(true),
             database_row_security: None,
             timezone_utc: crate::ddl::session::BoolGuc::new(true),
+            timezone: crate::ddl::session::Guc::new(crate::tz::TzSetting::Default),
+            datestyle: crate::ddl::session::Guc::new(crate::ddl::session::DEFAULT_DATESTYLE),
+            intervalstyle: crate::ddl::session::Guc::new(
+                crate::ddl::session::IntervalStyle::Postgres,
+            ),
+            custom_settings: Default::default(),
             planner_settings_changed: false,
             inline_sql_bodies: Shared::default(),
             procs_with_config: Shared::default(),
@@ -968,7 +1030,7 @@ impl PgCatalog {
             routine_defaults: Shared::default(),
             types_with_typmodin: Shared::default(),
             expr_type_uses: Shared::default(),
-            sql_function_defs: HashMap::new(),
+            sql_function_defs: Shared::default(),
             partition_keys: Shared::default(),
             partition_key_exprs: Shared::default(),
             triggers: Shared::default(),
@@ -1026,6 +1088,11 @@ impl PgCatalog {
             fk_details: Shared::default(),
             partition_bounds: Shared::default(),
             check_defs: Shared::default(),
+            bound_stored_exprs: Shared::default(),
+            settled_stored_exprs: Shared::default(),
+            refused_stored_exprs: Shared::default(),
+            stored_expr_versions: None,
+            unsettled_datetime_literals: Shared::default(),
             toast_tables: Shared::default(),
             toast_rewrites: Shared::default(),
             security_barrier_views: Shared::default(),
@@ -1035,10 +1102,10 @@ impl PgCatalog {
             attnum_high_water: Shared::default(),
             attr_compression: Shared::default(),
             uncertain_collations: Shared::default(),
-            column_deps: Default::default(),
+            column_deps: Shared::default(),
             roles: Shared::new(crate::ddl::roles::Roles::new()),
             acls: Shared::default(),
-            seed_acls: Vec::new(),
+            seed_acls: Shared::default(),
             seed_oid_end: 0,
             next_oid: USER_OID_START_NZ,
             #[cfg(feature = "pg_sanity")]
@@ -1047,6 +1114,8 @@ impl PgCatalog {
             pg_sanity_tainted: false,
             #[cfg(feature = "pg_sanity")]
             pg_sanity_skip: false,
+            #[cfg(feature = "pg_sanity")]
+            pg_sanity_database: None,
             #[cfg(feature = "record_corpus")]
             corpus_ddl: Vec::new(),
             #[cfg(feature = "record_corpus")]
@@ -1165,7 +1234,7 @@ impl PgCatalog {
             pg_ts_objects: Vec::clone(&self.pg_ts_objects),
             pg_ts_config_map: Vec::clone(&self.pg_ts_config_map),
             pg_conversion: Vec::clone(&self.conversions),
-            pg_acl: self.seed_acls.clone(),
+            pg_acl: self.seed_acls.to_vec(),
             pg_language: {
                 let mut rows: Vec<_> = self.pg_language.values().cloned().collect();
                 rows.sort_by_key(|l| l.oid);
@@ -1276,6 +1345,11 @@ impl PgCatalog {
         };
         #[cfg(feature = "pg_sanity")]
         {
+            // Code the analyzer couldn't follow may have changed anything:
+            // there is nothing left to compare.
+            if self.roles.uncertain.catalog {
+                self.pg_sanity_tainted = true;
+            }
             if !self.pg_sanity_tainted && !self.pg_sanity_skip {
                 if sql_touches_extension(stripped) {
                     self.run_pg_sanity_extension_apply_check(stripped, &result);
@@ -1631,6 +1705,23 @@ impl PgCatalog {
         crate::resolve::column_type(t.oid, None, None, self).ok()
     }
 
+    /// Every enum type, each a [`crate::Type::Enum`] as
+    /// [`Self::type_named`] describes it, sorted by schema and name.
+    pub fn enum_types(&self) -> Vec<crate::Type> {
+        let mut enums: Vec<(&str, &str, crate::Type)> = self
+            .pg_type
+            .values()
+            .filter(|t| t.typtype == TypType::Enum)
+            .filter_map(|t| {
+                let schema = self.namespace_name(t.typnamespace)?;
+                let ty = crate::resolve::column_type(t.oid, None, None, self).ok()?;
+                Some((schema, t.typname.as_str(), ty))
+            })
+            .collect();
+        enums.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        enums.into_iter().map(|(_, _, ty)| ty).collect()
+    }
+
     /// Analyze a SQL query template against this catalog.
     ///
     /// Lexes `sql` to extract named parameters (`$name`), spreads (`$..name`),
@@ -1665,11 +1756,34 @@ impl PgCatalog {
         let (_analysis_sql, result) = self.analyze_as_with_sql(sql, role);
 
         #[cfg(feature = "pg_sanity")]
-        if !self.pg_sanity_tainted && !self.pg_sanity_skip {
+        if !self.pg_sanity_tainted
+            && !self.pg_sanity_skip
+            && !self.role_outcome_uncertain(sql, role, &result)
+        {
             self.run_pg_sanity_role_check(&_analysis_sql, role, &result);
         }
 
         result
+    }
+
+    /// Whether the role may run `sql` only because of privileges code the
+    /// analyzer couldn't follow may have granted (see
+    /// [`crate::ddl::uncertain`]): denied at the catalog's lower bound,
+    /// either outcome agrees with it.
+    #[cfg(feature = "pg_sanity")]
+    fn role_outcome_uncertain(
+        &self,
+        sql: &str,
+        role: &str,
+        result: &Result<AnalyzedQuery, AnalyzeError>,
+    ) -> bool {
+        use crate::ddl::uncertain::{Bound, with_bound};
+        result.is_ok()
+            && self.roles.uncertain.privileges()
+            && matches!(
+                with_bound(Bound::Lower, || self.analyze_as_with_sql(sql, role).1),
+                Err(AnalyzeError::InsufficientPrivilege(_))
+            )
     }
 
     /// [`Self::analyze_as`], with an error's location (see
@@ -1823,6 +1937,7 @@ impl PgCatalog {
             null_test_settled: lint_facts.null_test_settled,
             writes: lint_facts.writes,
             relation_uses: lint_facts.relation_uses,
+            delete_bases: lint_facts.delete_bases,
             relations_at: lint_facts.relations_at,
         })
     }
@@ -2121,7 +2236,17 @@ impl PgCatalog {
     /// Errors with [`DdlError::Internal`] only when the OID space (`u32`) is
     /// exhausted — practically unreachable in a single analyzer run since
     /// allocation starts at [`USER_OID_START`] (100_000) and steps by one.
-    /// The OID the next object will get.
+    /// The OID the next object will get. Every object a statement creates
+    /// gets one at or above the value before it ran, and OIDs are never
+    /// reused: comparing an object's OID with that value tells whether the
+    /// statement created it.
+    #[cfg(any(test, feature = "internal"))]
+    pub fn next_oid_value(&self) -> u32 {
+        self.next_oid.get()
+    }
+
+    /// [`Self::next_oid_value`], for the crate itself.
+    #[cfg(not(any(test, feature = "internal")))]
     pub(crate) fn next_oid_value(&self) -> u32 {
         self.next_oid.get()
     }
@@ -2158,6 +2283,27 @@ impl PgCatalog {
                         && c.conkey == [attr.attnum]
                 })
                 .is_none_or(|c| c.convalidated)
+    }
+
+    /// Run the `pg_sanity` mirror in database `name` — created afresh,
+    /// dropped afterwards, used by one catalog at a time across the test
+    /// processes — instead of a scratch database of its own: for an
+    /// extension that installs in one database only (pg_cron, in
+    /// `cron.database_name`). Call it before the first migration. A no-op
+    /// without the `pg_sanity` feature.
+    pub fn pg_sanity_database(&mut self, name: &str) {
+        #[cfg(feature = "pg_sanity")]
+        {
+            assert!(
+                self.pg_sanity
+                    .as_ref()
+                    .is_none_or(|cell| cell.get().is_none()),
+                "pg_sanity_database must be called before the mirror starts"
+            );
+            self.pg_sanity_database = Some(name.to_owned());
+        }
+        #[cfg(not(feature = "pg_sanity"))]
+        let _ = name;
     }
 
     pub fn skip_pg_sanity(&mut self) {
@@ -2258,12 +2404,26 @@ impl PgCatalog {
     ) -> Option<R> {
         let cell = self.pg_sanity.as_ref()?;
         let mutex = cell.get_or_init(|| {
-            let server = crate::pg_sanity::PgSanityServer::spawn()
-                .unwrap_or_else(|e| panic!("pg_sanity: {e}"));
+            let server = crate::pg_sanity::PgSanityServer::spawn_in(
+                self.pg_sanity_database
+                    .as_deref()
+                    .or(self.session_identity.database()),
+            )
+            .unwrap_or_else(|e| panic!("pg_sanity: {e}"));
             std::sync::Mutex::new(server)
         });
         let mut guard = mutex.lock().expect("pg_sanity: pg sanity mutex poisoned");
         Some(f(&mut guard))
+    }
+
+    /// The mirror's server catalog — its user rows, normalized as the
+    /// catalog oracle compares them, one line each — or `None` without a
+    /// mirror (the extension oracle compares two server states with it).
+    pub fn pg_sanity_server_catalog(&self) -> Option<Vec<String>> {
+        if self.pg_sanity_tainted {
+            return None;
+        }
+        self.with_pg_sanity(|server| server.server_catalog_lines(self))
     }
 
     fn run_pg_sanity_apply_check(&self, sql: &str, result: &Result<(), DdlError>) {
@@ -2669,6 +2829,25 @@ impl PgCatalog {
         }
     }
 
+    /// The migrations' routines may have been redefined by code the
+    /// analyzer couldn't follow (see [`crate::ddl::uncertain`]): nothing is
+    /// inferred from their bodies any more — not inlined, not followed by
+    /// a `CALL`, not checked for the privileges they need — as for a
+    /// routine in a language the analyzer doesn't read.
+    pub(crate) fn forget_user_routine_bodies(&mut self) {
+        let end = self.seed_oid_end;
+        let user = |oid: &PgProcOid| oid.get() >= end;
+        if self.inline_sql_bodies.keys().any(user) {
+            self.inline_sql_bodies.retain(|oid, _| !user(oid));
+        }
+        if self.inline_body_trust.keys().any(user) {
+            self.inline_body_trust.retain(|oid, _| !user(oid));
+        }
+        if self.routine_bodies.keys().any(user) {
+            self.routine_bodies.retain(|oid, _| !user(oid));
+        }
+    }
+
     pub(crate) fn remove_pg_proc(&mut self, oid: PgProcOid) -> Option<PgProc> {
         self.acls
             .forget_object(crate::ddl::acl::AclObject::Function(oid));
@@ -2813,10 +2992,26 @@ impl PgCatalog {
         let index = row.indexrelid;
         self.pg_index.insert(index, row);
         crate::ddl::depend::record_index_opclasses(self, index);
+        // index_create: what its expressions and predicate refer to, for
+        // every index (a constraint's too).
+        crate::ddl::depend::record_index_expressions(self, index);
     }
 
     pub(crate) fn remove_pg_index(&mut self, indexrelid: PgClassOid) -> Option<PgIndex> {
         self.pg_index.remove(&indexrelid)
+    }
+
+    /// The `pg_rewrite` row whose OID is `oid` (for the catalog oracle).
+    #[cfg(feature = "pg_sanity")]
+    pub(crate) fn pg_rewrite_row(&self, oid: u32) -> Option<&PgRewrite> {
+        self.pg_rewrite.values().find(|r| r.oid.get() == oid)
+    }
+
+    /// The `pg_rewrite` row of relation `relid`'s rule `name`.
+    pub(crate) fn pg_rewrite_of(&self, relid: PgClassOid, name: &str) -> Option<&PgRewrite> {
+        self.pg_rewrite
+            .values()
+            .find(|r| r.ev_class == relid && r.rulename == name)
     }
 
     pub(crate) fn insert_pg_rewrite(&mut self, row: PgRewrite) {
@@ -3073,6 +3268,7 @@ struct LintFacts {
     /// last.
     open_writes: Vec<usize>,
     relation_uses: Vec<(PgClassOid, char)>,
+    delete_bases: Vec<(PgClassOid, PgClassOid)>,
     relations_at: HashMap<i32, RelationAt>,
 }
 
@@ -3203,6 +3399,27 @@ pub(crate) fn note_relation_use(relid: PgClassOid, cmd: char) {
             && !facts.relation_uses.contains(&(relid, cmd))
         {
             facts.relation_uses.push((relid, cmd));
+        }
+    });
+}
+
+/// Record that the query deletes rows of `relid` and, when it is a view
+/// automatically updatable down to a table for the delete, `base()`: that
+/// table (see [`QueryView::delete_base`]), computed only while the facts
+/// are collected.
+pub(crate) fn note_delete_base(relid: PgClassOid, base: impl FnOnce() -> Option<PgClassOid>) {
+    if !LINT_FACTS.with(|facts| facts.borrow().is_some()) {
+        return;
+    }
+    // (Before borrowing the facts: following the view may note some.)
+    let Some(base) = base() else {
+        return;
+    };
+    LINT_FACTS.with(|facts| {
+        if let Some(facts) = facts.borrow_mut().as_mut()
+            && !facts.delete_bases.iter().any(|(view, _)| *view == relid)
+        {
+            facts.delete_bases.push((relid, base));
         }
     });
 }
@@ -3679,6 +3896,9 @@ pub struct QueryView {
     writes: Vec<crate::condition::WriteStatement>,
     /// The relations whose rows the query reads or writes, with the command.
     relation_uses: Vec<(PgClassOid, char)>,
+    /// The views the query deletes from, each with the table the rows are
+    /// deleted from (see [`QueryView::delete_base`]).
+    delete_bases: Vec<(PgClassOid, PgClassOid)>,
     /// What each table reference resolved to, by its location in
     /// [`Self::sql`].
     relations_at: HashMap<i32, RelationAt>,
@@ -3710,6 +3930,20 @@ impl QueryView {
     /// each command it has an action of), as the analyzer resolved them.
     pub fn relation_uses(&self) -> &[(PgClassOid, char)] {
         &self.relation_uses
+    }
+
+    /// When the query deletes rows of view `relid` (a DELETE, a MERGE's
+    /// DELETE action: a `d` of [`Self::relation_uses`]) and the view is
+    /// automatically updatable down to a table for it — through a chain of
+    /// views, with no DO INSTEAD rule or INSTEAD OF trigger for the command
+    /// on the way, as PostgreSQL's rewriter follows it: that table, whose
+    /// rows are the ones deleted. `None` for a table, or a view whose
+    /// deletes are something else.
+    pub fn delete_base(&self, relid: PgClassOid) -> Option<PgClassOid> {
+        self.delete_bases
+            .iter()
+            .find(|(view, _)| *view == relid)
+            .map(|&(_, base)| base)
     }
 
     /// What the table reference `rv` — a `RangeVar` of [`Self::tree`] in a

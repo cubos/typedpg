@@ -3,7 +3,8 @@
 # End-to-end check of typedpg for TypeScript (typedpg_ts + the npm packages),
 # on the project in typedpg_ts_example:
 #
-#   1. the runtime and the CLI build and their unit tests pass;
+#   1. the runtime and the CLI build and their unit tests pass, and the
+#      editor grammars tokenize the SQL of their calls;
 #   2. the example's generated modules are up to date (`typedpg check`);
 #   3. the errors fixture reports exactly errors/expected.stderr;
 #   4. tsc (7 and 6.0) accepts the example: its type-level assertions, and
@@ -52,6 +53,8 @@ echo "ts-e2e: runtime"
 # (above) first.
 echo "ts-e2e: cli"
 (cd "$ROOT/typedpg_npm_cli" && npm ci --silent && npm test --silent)
+echo "ts-e2e: editor grammars"
+(cd "$ROOT/typedpg_vscode" && npm ci --silent && npm test --silent)
 # The example installs both as copies (`install-links`), as from the
 # registry: refresh them.
 (cd "$EXAMPLE" && npm ci --silent)

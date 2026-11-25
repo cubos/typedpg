@@ -77,6 +77,17 @@ struct Identity {
 pub(crate) struct SessionIdentity {
     session: Identity,
     local: Option<Identity>,
+    /// The connecting user's name — the migrations' user's — when the
+    /// caller told it ([`PgCatalog::set_connecting_user`]).
+    connecting_user: Option<String>,
+    /// The current database's name, when the caller told it
+    /// ([`PgCatalog::set_database_name`]).
+    database: Option<String>,
+    /// A schema named after the connecting user, whose name is unknown, was
+    /// created (`CREATE SCHEMA AUTHORIZATION CURRENT_USER`): the first
+    /// schema a statement names that doesn't exist is taken to be it
+    /// (see `schema_stmt::materialize_user_schema`).
+    pub(crate) pending_user_schema: bool,
 }
 
 impl SessionIdentity {
@@ -100,6 +111,23 @@ impl SessionIdentity {
     /// `session_user`, when the migrations named it.
     pub(crate) fn session_user(&self) -> Option<&str> {
         self.effective().session_user.as_deref()
+    }
+
+    /// The connecting user's name, when known.
+    pub(crate) fn connecting_user(&self) -> Option<&str> {
+        self.connecting_user.as_deref()
+    }
+
+    /// The current database's name, when known.
+    pub(crate) fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    /// Name the connecting user: a schema named after it is no longer
+    /// pending.
+    pub(crate) fn set_connecting_user(&mut self, name: String) {
+        self.connecting_user = Some(name);
+        self.pending_user_schema = false;
     }
 
     fn update(&mut self, is_local: bool, f: impl FnOnce(&mut Identity)) {
@@ -174,11 +202,65 @@ impl SearchPathGuc {
         self.database.as_deref().unwrap_or(&self.default)
     }
 
+    /// `current_setting('search_path')`: the setting in effect, as text.
+    pub(crate) fn effective_setting(&self) -> String {
+        if self.local.is_none() && self.session.is_none() {
+            return self.default_setting.clone();
+        }
+        self.effective()
+            .iter()
+            .map(|n| typedpg_core::quote_identifier(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub(crate) fn effective(&self) -> &[String] {
         self.local
             .as_deref()
             .or(self.session.as_deref())
             .unwrap_or(&self.default)
+    }
+}
+
+/// The custom settings (placeholder variables, `prefix.name`: no server
+/// parameter of their own, unless an extension's library defines one) the
+/// migrations' session set, with their session values and pending `SET
+/// LOCAL` ones. One the session never set is taken as unset — the server's
+/// configuration may define some the analyzer can't see.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CustomSettings {
+    session: std::collections::BTreeMap<String, String>,
+    local: std::collections::BTreeMap<String, Option<String>>,
+}
+
+impl CustomSettings {
+    /// Whether `name` is a custom setting's (a dotted name,
+    /// valid_custom_variable_name).
+    pub(crate) fn is_custom(name: &str) -> bool {
+        name.contains('.')
+    }
+
+    /// Its value now: `None` when unset.
+    pub(crate) fn get(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        match self.local.get(&name) {
+            Some(local) => local.as_deref(),
+            None => self.session.get(&name).map(String::as_str),
+        }
+    }
+
+    /// `SET [LOCAL]` (`Some`), or `RESET` / `SET ... TO DEFAULT` (`None`).
+    fn set(&mut self, name: &str, value: Option<String>, is_local: bool) {
+        let name = name.to_ascii_lowercase();
+        if is_local {
+            self.local.insert(name, value);
+        } else {
+            self.local.remove(&name);
+            match value {
+                Some(value) => self.session.insert(name, value),
+                None => self.session.remove(&name),
+            };
+        }
     }
 }
 
@@ -292,6 +374,21 @@ impl PgCatalog {
     /// or the database's (`ALTER DATABASE ... SET`): the application's
     /// queries run in sessions of their own, which a migration's `SET
     /// search_path` doesn't reach.
+    /// Tell the catalog the connecting user's name — the role the
+    /// migrations run as (see [`PgCatalog::MIGRATIONS_USER`]) — which
+    /// `CURRENT_USER` / `SESSION_USER` name in `CREATE SCHEMA AUTHORIZATION`
+    /// and `$user` names in the search path. Unknown by default.
+    pub fn set_connecting_user(&mut self, name: &str) {
+        self.session_identity.set_connecting_user(name.to_owned());
+        self.refresh_search_path();
+    }
+
+    /// Tell the catalog the name of the database the migrations run in,
+    /// which privilege errors on the database name. Unknown by default.
+    pub fn set_database_name(&mut self, name: &str) {
+        self.session_identity.database = Some(name.to_owned());
+    }
+
     pub(crate) fn refresh_search_path(&mut self) {
         let mut resolved = Vec::new();
         let setting = if self.in_migration {
@@ -304,9 +401,22 @@ impl PgCatalog {
         // where new objects go even before it exists (activeTempCreationPending
         // — the analyzer creates it right away).
         let mut temp_first = false;
+        // recomputeNamespacePath leaves out the schemas the current role
+        // has no USAGE on — known for a role the DDL privilege checks
+        // apply to (`permissions::restricted`).
+        let restricted = self
+            .session_identity
+            .current_user()
+            .filter(|_| self.in_migration)
+            .and_then(|name| self.roles.id(name))
+            .filter(|&role| super::permissions::restricted(self, role))
+            .map(|role| self.roles.name(role).to_owned());
         for name in setting {
-            // `$user` is the schema named after current_user — known only
-            // in the migrations' session, and once they name the role.
+            // `$user` is the schema named after current_user: in the
+            // migrations' session the role they named, else the connecting
+            // user; the application's queries are analyzed as the
+            // connecting user. While that user's name is unknown, its
+            // schema is the pending one (`schema_stmt::PENDING_USER_SCHEMA`).
             let name = match name.as_str() {
                 "pg_temp" => {
                     match self.temp_namespace.filter(|_| self.in_migration) {
@@ -316,14 +426,26 @@ impl PgCatalog {
                     }
                     continue;
                 }
-                "$user" => match self.session_identity.current_user() {
-                    Some(user) if self.in_migration => user,
-                    _ => continue,
+                "$user" => match self
+                    .session_identity
+                    .current_user()
+                    .filter(|_| self.in_migration)
+                    .or(self.session_identity.connecting_user())
+                    .or(self
+                        .session_identity
+                        .pending_user_schema
+                        .then_some(super::schema_stmt::PENDING_USER_SCHEMA))
+                {
+                    Some(user) => user,
+                    None => continue,
                 },
                 other => other,
             };
             if let Some(oid) = self.namespace_oid(name)
                 && !resolved.contains(&oid)
+                && restricted.as_deref().is_none_or(|role| {
+                    self.has_schema_privilege(role, oid, super::acl::Privilege::Usage)
+                })
             {
                 resolved.push(oid);
             }
@@ -353,6 +475,10 @@ impl PgCatalog {
         self.allow_system_table_mods.local = None;
         self.row_security_guc.local = None;
         self.timezone_utc.local = None;
+        self.timezone.local = None;
+        self.datestyle.local = None;
+        self.intervalstyle.local = None;
+        self.custom_settings.local.clear();
         let local_identity = self.session_identity.local.take().is_some();
         if self.search_path_guc.local.take().is_some() || local_identity {
             self.refresh_search_path();
@@ -391,6 +517,24 @@ impl PgCatalog {
         self.search_path_guc.local = Some(names);
         self.refresh_search_path();
         saved
+    }
+
+    /// The end of an extension script's or a routine's `SET search_path`
+    /// scope: its path is reverted, but not a plain `SET` that ran in it,
+    /// which replaced it (AtEOXact_GUC keeps a `GUC_SET` value).
+    /// An `ALTER DATABASE ... SET` the script ran stays too: it is no
+    /// setting of the session.
+    pub(crate) fn restore_scoped_search_path(&mut self, saved: SearchPathGuc) {
+        let database = self.search_path_guc.database.take();
+        let plain_set = self.search_path_guc.local.is_none();
+        let session = self.search_path_guc.session.take();
+        self.search_path_guc = saved;
+        self.search_path_guc.database = database;
+        if plain_set {
+            self.search_path_guc.local = None;
+            self.search_path_guc.session = session;
+        }
+        self.refresh_search_path();
     }
 
     pub(crate) fn restore_search_path(&mut self, saved: SearchPathGuc) {
@@ -475,6 +619,10 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
         interp.check_function_bodies = BoolGuc::new(true);
         interp.allow_system_table_mods = BoolGuc::new(false);
         interp.timezone_utc = BoolGuc::new(true);
+        interp.timezone = Guc::new(crate::tz::TzSetting::Default);
+        interp.datestyle = Guc::new(DEFAULT_DATESTYLE);
+        interp.intervalstyle = Guc::new(IntervalStyle::Postgres);
+        interp.custom_settings = CustomSettings::default();
         return Ok(());
     }
     // The parameter must exist and be settable, and a new value valid.
@@ -499,6 +647,29 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
     {
         interp.planner_settings_changed = true;
     }
+    if CustomSettings::is_custom(&stmt.name) {
+        match kind {
+            VariableSetKind::VarSetValue => {
+                let value = match stmt.args.as_slice() {
+                    [arg] => const_arg_string(arg.as_ref()),
+                    _ => None,
+                };
+                match value {
+                    Some(value) => {
+                        interp
+                            .custom_settings
+                            .set(&stmt.name, Some(value), stmt.is_local)
+                    }
+                    None => interp.roles.uncertain.settings = true,
+                }
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                interp.custom_settings.set(&stmt.name, None, stmt.is_local);
+            }
+            _ => interp.roles.uncertain.settings = true,
+        }
+        return Ok(());
+    }
     // `SET TIME ZONE ...` sets `timezone`; LOCAL / DEFAULT resets it.
     if stmt.name.eq_ignore_ascii_case("timezone") {
         match kind {
@@ -507,10 +678,43 @@ pub(crate) fn variable_set(interp: &mut PgCatalog, stmt: &VariableSetStmt) -> Re
                     interp
                         .timezone_utc
                         .set(Some(timezone_arg_is_utc(arg.as_ref())), stmt.is_local);
+                    interp
+                        .timezone
+                        .set(Some(timezone_setting(arg.as_ref())), stmt.is_local);
+                } else {
+                    interp
+                        .timezone
+                        .set(Some(crate::tz::TzSetting::Unknown), stmt.is_local);
                 }
             }
             VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
                 interp.timezone_utc.set(None, stmt.is_local);
+                interp.timezone.set(None, stmt.is_local);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    if stmt.name.eq_ignore_ascii_case("datestyle")
+        || stmt.name.eq_ignore_ascii_case("intervalstyle")
+    {
+        match kind {
+            VariableSetKind::VarSetValue => {
+                let value: Option<Vec<String>> = stmt
+                    .args
+                    .iter()
+                    .map(|a| const_arg_string(a.as_ref()))
+                    .collect();
+                // A value not known here: printed styles are not known either.
+                let value = value.map(|v| v.join(","));
+                set_output_style(interp, &stmt.name, value.as_deref(), stmt.is_local);
+            }
+            VariableSetKind::VarSetDefault | VariableSetKind::VarReset => {
+                if stmt.name.eq_ignore_ascii_case("datestyle") {
+                    interp.datestyle.set(None, stmt.is_local);
+                } else {
+                    interp.intervalstyle.set(None, stmt.is_local);
+                }
             }
             _ => {}
         }
@@ -676,6 +880,10 @@ pub(crate) fn select_side_effects(
             continue;
         };
         super::cluster::large_object_calls(interp, fc);
+        if postgis_add_to_search_path(interp, fc) {
+            continue;
+        }
+        super::do_block::select_call(interp, fc)?;
         if let Some((setting, value, is_local)) = constant_identity_set_config(fc) {
             set_identity(interp, &setting, Some(&value), is_local)?;
             continue;
@@ -697,6 +905,9 @@ pub(crate) fn select_side_effects(
                 .collect();
             super::guc::constant_call_error(interp, proname, &args)?;
         }
+        if let Some((setting, value, is_local)) = constant_custom_set_config(fc) {
+            interp.custom_settings.set(&setting, Some(value), is_local);
+        }
         if let Some((value, is_local)) = constant_named_set_config(fc, "search_path") {
             interp.set_search_path(Some(split_identifier_string(&value)), is_local);
         }
@@ -704,6 +915,20 @@ pub(crate) fn select_side_effects(
             interp
                 .timezone_utc
                 .set(Some(timezone_is_utc(&value)), is_local);
+            let setting = if value
+                .get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("interval"))
+            {
+                crate::tz::TzSetting::Unknown
+            } else {
+                crate::tz::TzSetting::Text(value)
+            };
+            interp.timezone.set(Some(setting), is_local);
+        }
+        for name in ["DateStyle", "IntervalStyle"] {
+            if let Some((value, is_local)) = constant_named_set_config(fc, name) {
+                set_output_style(interp, name, Some(&value), is_local);
+            }
         }
         for name in ["check_function_bodies", "allow_system_table_mods"] {
             if let Some((value, is_local)) = constant_named_set_config(fc, name)
@@ -715,6 +940,70 @@ pub(crate) fn select_side_effects(
         }
     }
     Ok(())
+}
+
+/// PostGIS topology's `topology.AddToSearchPath(schema)`, which its
+/// installation script calls with `'topology'`: a PL/pgSQL function reading
+/// the server's settings, modeled as it behaves (postgis_topology 3.7.0).
+/// The search path it starts from is the database's (`ALTER DATABASE ...
+/// SET`), else the configuration file's — taken as not setting one — else
+/// the built-in `"$user", public`. Unless that text already contains the
+/// quoted schema name, the schema is appended and the database set to the
+/// result; either way the session's path becomes it (a plain `SET`, which
+/// outlasts the function's own `SET search_path` and the extension
+/// script's). `false` when `fc` is no such call over a constant.
+fn postgis_add_to_search_path(interp: &mut PgCatalog, fc: &FuncCall) -> bool {
+    let name: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    let (schema, proname) = match name.as_slice() {
+        [schema, proname] => (Some(*schema), *proname),
+        [proname] => (None, *proname),
+        _ => return false,
+    };
+    if proname != "addtosearchpath" {
+        return false;
+    }
+    let [arg] = fc.args.as_slice() else {
+        return false;
+    };
+    let arg = match arg.as_ref() {
+        Some(ast::Node::TypeCast(tc)) => tc.arg.as_ref(),
+        other => other,
+    };
+    let Some(target) = const_arg_string(arg) else {
+        return false;
+    };
+    // The extension's own script calls it before its members are recorded.
+    let installing = interp.installing_extension.as_deref() == Some("postgis_topology");
+    let from_topology = interp
+        .find_functions(schema, proname)
+        .into_iter()
+        .filter(|p| p.proargtypes.len() == 1)
+        .any(|p| installing || interp.extension_of_proc(p.oid) == Some("postgis_topology"));
+    if !from_topology {
+        return false;
+    }
+    let render = |names: &[String]| {
+        names
+            .iter()
+            .map(|n| typedpg_core::quote_identifier(n))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut current = match &interp.search_path_guc.database {
+        Some(names) => render(names),
+        // pg_settings.boot_val.
+        None => "\"$user\", public".to_owned(),
+    };
+    if !current.contains(&typedpg_core::quote_identifier(&target)) {
+        current = format!("{current}, {}", typedpg_core::quote_identifier(&target));
+        interp.search_path_guc.database = Some(split_identifier_string(&current));
+    }
+    interp.set_search_path(Some(split_identifier_string(&current)), false);
+    true
 }
 
 /// A `SET TIME ZONE` / `SET timezone` value: a number of hours, an
@@ -840,6 +1129,156 @@ fn constant_identity_set_config(fc: &FuncCall) -> Option<(String, String, bool)>
     Some((setting.sval, value.sval, is_local))
 }
 
+/// `SET DateStyle` / `SET IntervalStyle` to `value` (`None`: not known).
+fn set_output_style(interp: &mut PgCatalog, name: &str, value: Option<&str>, is_local: bool) {
+    if name.eq_ignore_ascii_case("datestyle") {
+        let style = match value {
+            Some(v) => parse_datestyle(v, interp.datestyle.get()),
+            None => (DateStyle::Unknown, interp.datestyle.get().1),
+        };
+        interp.datestyle.set(Some(style), is_local);
+    } else {
+        let style = match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("postgres") => IntervalStyle::Postgres,
+            Some("postgres_verbose") => IntervalStyle::PostgresVerbose,
+            Some("sql_standard") => IntervalStyle::SqlStandard,
+            Some("iso_8601") => IntervalStyle::Iso8601,
+            _ => IntervalStyle::Unknown,
+        };
+        interp.intervalstyle.set(Some(style), is_local);
+    }
+}
+
+/// check_datestyle: the style and field order `value` sets over `current`
+/// (a value naming only one of them keeps the other; GERMAN also sets DMY
+/// unless an order is named).
+fn parse_datestyle(
+    value: &str,
+    current: (DateStyle, crate::datetime_input::DateOrder),
+) -> (DateStyle, crate::datetime_input::DateOrder) {
+    use crate::datetime_input::DateOrder;
+    let (mut style, mut order) = current;
+    let (mut have_style, mut have_order) = (false, false);
+    for token in split_identifier_string(value) {
+        let t = token.to_ascii_lowercase();
+        if t == "iso" {
+            style = DateStyle::Iso;
+            have_style = true;
+        } else if t == "sql" {
+            style = DateStyle::Sql;
+            have_style = true;
+        } else if t.starts_with("postgres") {
+            style = DateStyle::Postgres;
+            have_style = true;
+        } else if t == "german" {
+            style = DateStyle::German;
+            have_style = true;
+            if !have_order {
+                order = DateOrder::Dmy;
+            }
+        } else if t == "ymd" {
+            order = DateOrder::Ymd;
+            have_order = true;
+        } else if t == "dmy" || t.starts_with("euro") {
+            order = DateOrder::Dmy;
+            have_order = true;
+        } else if t == "mdy" || t == "us" || t.starts_with("noneuro") {
+            order = DateOrder::Mdy;
+            have_order = true;
+        } else if t == "default" {
+            if !have_style {
+                style = DEFAULT_DATESTYLE.0;
+            }
+            if !have_order {
+                order = DEFAULT_DATESTYLE.1;
+            }
+        }
+    }
+    (style, order)
+}
+
+/// How `DateStyle` prints dates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DateStyle {
+    Iso,
+    Sql,
+    Postgres,
+    German,
+    /// Set to a value not known here.
+    Unknown,
+}
+
+/// The server's `DateStyle`, `ISO, MDY`.
+pub(crate) const DEFAULT_DATESTYLE: (DateStyle, crate::datetime_input::DateOrder) =
+    (DateStyle::Iso, crate::datetime_input::DateOrder::Mdy);
+
+/// `IntervalStyle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntervalStyle {
+    Postgres,
+    PostgresVerbose,
+    SqlStandard,
+    Iso8601,
+    /// Set to a value not known here.
+    Unknown,
+}
+
+/// A setting the session tracks: its boot / RESET value, the session's,
+/// and a `SET LOCAL` one until the transaction ends.
+#[derive(Clone, Debug)]
+pub(crate) struct Guc<T> {
+    default: T,
+    session: T,
+    pub(crate) local: Option<T>,
+}
+
+impl<T: Clone> Guc<T> {
+    pub(crate) fn new(default: T) -> Self {
+        Self {
+            session: default.clone(),
+            default,
+            local: None,
+        }
+    }
+
+    /// The value in effect.
+    pub(crate) fn get(&self) -> T {
+        self.local.clone().unwrap_or_else(|| self.session.clone())
+    }
+
+    /// `SET [LOCAL]` (`value`), or `SET ... TO DEFAULT` / `RESET` (`None`).
+    fn set(&mut self, value: Option<T>, is_local: bool) {
+        let value = value.unwrap_or_else(|| self.default.clone());
+        if is_local {
+            self.local = Some(value);
+        } else {
+            self.local = None;
+            self.session = value;
+        }
+    }
+}
+
+/// The TimeZone a `SET TIME ZONE` argument sets.
+fn timezone_setting(arg: Option<&typedpg_pg_query::ast::Node>) -> crate::tz::TzSetting {
+    use crate::tz::TzSetting;
+    match arg {
+        // `INTERVAL '…' [HOUR TO MINUTE]`: its time, in SQL's sign
+        // convention (months and days are refused).
+        Some(ast::Node::TypeCast(tc)) => match const_arg_string(tc.arg.as_ref())
+            .and_then(|v| crate::datetime_input::interval_value(&v, false))
+        {
+            Some(crate::datetime_input::IntervalValue::Finite(0, 0, usec)) => {
+                TzSetting::Interval(usec / 1_000_000)
+            }
+            _ => TzSetting::Unknown,
+        },
+        _ => match const_arg_string(arg) {
+            Some(v) => TzSetting::Text(v),
+            None => TzSetting::Unknown,
+        },
+    }
+}
+
 /// `set_config('<setting>', '<value>', <is_local>)` with constant
 /// arguments.
 fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(String, bool)> {
@@ -875,6 +1314,46 @@ fn constant_named_set_config(fc: &FuncCall, setting_name: &str) -> Option<(Strin
         _ => return None,
     };
     Some((value.sval, is_local))
+}
+
+/// `set_config(name, value, is_local)` of a custom setting, all constants.
+fn constant_custom_set_config(fc: &FuncCall) -> Option<(String, String, bool)> {
+    let name: Vec<&str> = fc
+        .funcname
+        .iter()
+        .filter_map(|n| super::util::node_string(n.as_ref()))
+        .collect();
+    if !matches!(
+        name.as_slice(),
+        ["set_config"] | ["pg_catalog", "set_config"]
+    ) {
+        return None;
+    }
+    let [setting, value, is_local] = fc.args.as_slice() else {
+        return None;
+    };
+    let as_const = |n: Option<&typedpg_pg_query::ast::Node>| match n {
+        Some(ast::Node::AConst(c)) => c.val.clone(),
+        Some(ast::Node::TypeCast(tc)) => match tc.arg.as_ref() {
+            Some(ast::Node::AConst(c)) => c.val.clone(),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(ast::AConstValue::String(setting)) = as_const(setting.as_ref()) else {
+        return None;
+    };
+    if !CustomSettings::is_custom(&setting.sval) {
+        return None;
+    }
+    let Some(ast::AConstValue::String(value)) = as_const(value.as_ref()) else {
+        return None;
+    };
+    let is_local = match as_const(is_local.as_ref())? {
+        ast::AConstValue::Boolean(b) => b.boolval,
+        _ => return None,
+    };
+    Some((setting.sval, value.sval, is_local))
 }
 
 /// PG's `SplitIdentifierString(value, ',')` (`varlena.c`): split a GUC list

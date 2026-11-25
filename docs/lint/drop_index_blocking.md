@@ -2,9 +2,9 @@
 
 `DROP INDEX` without `CONCURRENTLY` on a table that already has rows.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | migrations | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| locking | warning | migrations | — |
 
 ## Example
 
@@ -18,7 +18,7 @@ DROP INDEX users_email_idx;
 ```
 
 ```
-warning[drop_index_blocking]: DROP INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on public.users, blocking every query on the table
+warning[locking/drop_index_blocking]: DROP INDEX without CONCURRENTLY takes an ACCESS EXCLUSIVE lock on public.users, blocking every query on the table
    ╭─[migrations/0002_drop_index.sql:1:1]
  1 │ DROP INDEX users_email_idx;
    · ──────────────────────────
@@ -26,7 +26,7 @@ warning[drop_index_blocking]: DROP INDEX without CONCURRENTLY takes an ACCESS EX
   help: use DROP INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction
 ```
 
-The statement also gets a [`missing_lock_timeout`](missing_lock_timeout.md)
+The statement also gets a [`lock_without_timeout`](lock_without_timeout.md)
 finding. The fix:
 
 ```sql
@@ -75,5 +75,5 @@ See [Configuring rules](README.md#configuring-rules).
 - [`create_index_blocking`](create_index_blocking.md): the `CREATE INDEX`
   counterpart.
 - [`redundant_index`](redundant_index.md): an index worth dropping.
-- [`missing_lock_timeout`](missing_lock_timeout.md): the same statement
+- [`lock_without_timeout`](lock_without_timeout.md): the same statement
   waiting for its lock with no timeout.

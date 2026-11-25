@@ -3,9 +3,9 @@
 A `LIMIT` or `FETCH FIRST` (with a count or without: `FETCH FIRST ROW ONLY`) on
 a query that returns at most one row anyway.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the clause |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the clause |
 
 ## Example
 
@@ -18,7 +18,7 @@ SELECT count(*) AS n FROM posts FETCH FIRST 1 ROWS ONLY;
 ```
 
 ```
-info[redundant_limit]: LIMIT 1 has no effect: the query returns at most one row
+info[redundant/redundant_limit]: LIMIT 1 has no effect: the query returns at most one row
    ╭─[queries.sql:2:44]
  2 │ SELECT id, email FROM users WHERE id = $id LIMIT 1;
    ·                                            ───────
@@ -40,7 +40,11 @@ model.
 The query is known to return at most one row through:
 
 - a primary or unique key fully equated to constants, parameters or columns
-  of other such rows (also across joins);
+  of other such rows (also across joins), or through a cast to `text` that
+  tells the key's values apart (`WHERE id::text = $id`, see
+  [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported)); an
+  outer join onto a side whose every relation is pinned that way is one row
+  too ([`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported));
 - an aggregate without `GROUP BY`, or `GROUP BY` columns pinned by `WHERE`;
 - no `FROM`, or a one-row `VALUES`.
 
@@ -48,7 +52,9 @@ The query is known to return at most one row through:
 
 - `LIMIT` with `OFFSET`, a parameter count, `0`, `ALL`, `NULL`, or
   `FETCH … WITH TIES`.
-- The `LIMIT` of a `UNION`/`INTERSECT`/`EXCEPT`.
+- The `LIMIT` of a `UNION`/`INTERSECT`/`EXCEPT`, except a `UNION ALL` of
+  two one-row queries that can't both return a row (see
+  [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported)).
 - Queries over views (other than `pg_catalog` ones), inheritance parents,
   foreign tables, set-returning functions or `FULL JOIN`.
 
@@ -56,7 +62,10 @@ The query is known to return at most one row through:
 
 When a filter or output expression can raise an error on some rows, e.g.
 `WHERE id = $id AND 100 / views > 1 LIMIT 1`: the `LIMIT` can stop the
-scan before a row that would divide by zero.
+scan before a row that would divide by zero. For the `LIMIT` of a subquery,
+also when an expression of the query around it can raise: without the
+`LIMIT` the subquery is merged into it, and a value it outputs folded into
+those expressions before any row is read.
 
 ## Configuration
 

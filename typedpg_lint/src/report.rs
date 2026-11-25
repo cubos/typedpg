@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use typedpg_analyzer::UserObjectCounts;
 
-use crate::{Finding, LintOptions, Rule, Severity};
+use crate::{Category, Finding, LintOptions, Rule, Severity};
 
 /// A 1-based line and a 1-based column, counted in Unicode code points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -132,14 +132,28 @@ impl Report {
         }
     }
 
-    /// Sort the failures and findings by path, position and rule.
+    /// Sort the failures and findings by path, position and rule, then by
+    /// where a finding ends and its message: findings of one rule at one
+    /// position come in whatever order the rules produced them, which isn't
+    /// stable from run to run.
     pub fn sort(&mut self) {
         self.entries.sort_by(|a, b| {
-            (a.path.as_str(), a.start, a.finding.rule).cmp(&(
-                b.path.as_str(),
-                b.start,
-                b.finding.rule,
-            ))
+            (
+                a.path.as_str(),
+                a.start,
+                a.finding.rule,
+                a.end,
+                &a.finding.message,
+                &a.finding.help,
+            )
+                .cmp(&(
+                    b.path.as_str(),
+                    b.start,
+                    b.finding.rule,
+                    b.end,
+                    &b.finding.message,
+                    &b.finding.help,
+                ))
         });
         self.failures
             .sort_by(|a, b| (&a.path, a.start, &a.message).cmp(&(&b.path, b.start, &b.message)));
@@ -154,6 +168,33 @@ impl Report {
                 .entries
                 .iter()
                 .any(|entry| entry.finding.severity >= options.fail_on())
+    }
+
+    /// How many findings each category has, in [`Category::ALL`]'s order,
+    /// with the rules that have no category (`invalid_allow`,
+    /// `internal_error`) last. Categories without findings are left out.
+    fn category_counts(&self) -> Vec<(&'static str, usize)> {
+        let mut counts: Vec<(&'static str, usize)> = Category::ALL
+            .into_iter()
+            .map(|category| {
+                let count = self
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.finding.rule.category() == Some(category))
+                    .count();
+                (category.name(), count)
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        let uncategorized = self
+            .entries
+            .iter()
+            .filter(|entry| entry.finding.rule.category().is_none())
+            .count();
+        if uncategorized > 0 {
+            counts.push(("uncategorized", uncategorized));
+        }
+        counts
     }
 
     /// The document printed to stdout in `format`, uncolored, with the
@@ -229,6 +270,17 @@ impl Report {
             ));
         }
         out.push_str(&format!(" in {}", format_duration(self.elapsed)));
+        let categories = self.category_counts();
+        if !categories.is_empty() {
+            out.push_str(&format!(
+                "\n  by category: {}",
+                categories
+                    .iter()
+                    .map(|(name, count)| format!("{name} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if self.schemas.len() == 1 {
             out.push_str(&format!(
                 "\n  schema: {}",
@@ -304,6 +356,11 @@ impl Report {
                 column: entry.start.column,
                 end_line: entry.end.line,
                 end_column: entry.end.column,
+                category: entry
+                    .finding
+                    .rule
+                    .category()
+                    .map(|category| category.name()),
                 rule: entry.finding.rule.name(),
                 severity: entry.finding.severity.name(),
                 message: &entry.finding.message,
@@ -354,6 +411,10 @@ impl Report {
             .into_iter()
             .chain([Rule::InvalidAllow, Rule::InternalError])
         {
+            let tags: Vec<&str> = rule
+                .category()
+                .map(|category| vec![category.name()])
+                .unwrap_or_default();
             rules.push(serde_json::json!({
                 "id": rule.name(),
                 "shortDescription": { "text": rule.description() },
@@ -361,6 +422,7 @@ impl Report {
                 "defaultConfiguration": {
                     "level": rule.default_level().map_or("none", sarif_level)
                 },
+                "properties": { "tags": tags },
             }));
         }
         rules.push(serde_json::json!({
@@ -848,6 +910,8 @@ struct JsonFinding<'a> {
     end_line: u32,
     #[serde(rename = "endColumn")]
     end_column: u32,
+    /// The rule's category; `null` for the two meta rules.
+    category: Option<&'static str>,
     rule: &'static str,
     severity: &'static str,
     message: &'a str,
@@ -963,6 +1027,31 @@ mod tests {
     }
 
     #[test]
+    fn findings_of_one_rule_at_one_position_sort_by_message() {
+        let at = |message: &'static str| {
+            entry(
+                "a.rs",
+                1,
+                1,
+                finding(Rule::NullComparison, Severity::Error, message, None),
+            )
+        };
+        for entries in [vec![at("y"), at("x")], vec![at("x"), at("y")]] {
+            let mut report = Report {
+                entries,
+                ..Report::default()
+            };
+            report.sort();
+            let order: Vec<&str> = report
+                .entries
+                .iter()
+                .map(|entry| entry.finding.message.as_str())
+                .collect();
+            assert_eq!(order, ["x", "y"]);
+        }
+    }
+
+    #[test]
     fn json_is_one_document_with_the_pinned_keys() {
         let report = Report {
             entries: vec![entry(
@@ -1007,6 +1096,7 @@ mod tests {
       "column": 2,
       "endLine": 1,
       "endColumn": 3,
+      "category": "correctness",
       "rule": "null_comparison",
       "severity": "error",
       "message": "comparison with NULL is never true",
@@ -1270,7 +1360,7 @@ mod tests {
         );
         assert_eq!(
             report.render(Format::Human),
-            "warning[create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build\n   ╭─[migrations/0002_hazards.sql:3:1]\n 3 │ CREATE INDEX users_name_idx ON users (name);\n   · ────────────────────────────────────────────\n   ╰────\n  help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
+            "warning[locking/create_index_blocking]: CREATE INDEX without CONCURRENTLY blocks writes on public.users for the whole build\n   ╭─[migrations/0002_hazards.sql:3:1]\n 3 │ CREATE INDEX users_name_idx ON users (name);\n   · ────────────────────────────────────────────\n   ╰────\n  help: use CREATE INDEX CONCURRENTLY, in a migration whose first line is -- no-transaction"
         );
     }
 
@@ -1288,7 +1378,7 @@ mod tests {
         source(&mut report, "a.sql", "x = NULL");
         assert_eq!(
             report.render_with(Format::Human, &LintOptions::default(), true),
-            "\x1b[1;31merror[null_comparison]\x1b[0m: bad\n\x1b[2;36m   ╭─[a.sql:1:1]\x1b[0m\n\x1b[2;36m 1 │\x1b[0m x = NULL\n\x1b[2;36m   · ─\x1b[0m\n\x1b[2;36m   ╰────\x1b[0m\n  \x1b[32mhelp\x1b[0m: fix it"
+            "\x1b[1;31merror[correctness/null_comparison]\x1b[0m: bad\n\x1b[2;36m   ╭─[a.sql:1:1]\x1b[0m\n\x1b[2;36m 1 │\x1b[0m x = NULL\n\x1b[2;36m   · ─\x1b[0m\n\x1b[2;36m   ╰────\x1b[0m\n  \x1b[32mhelp\x1b[0m: fix it"
         );
     }
 
@@ -1334,14 +1424,19 @@ mod tests {
                 path: "m.sql".to_owned(),
                 start: Position { line: 1, column: 3 },
                 end: Position { line: 2, column: 4 },
-                finding: finding(Rule::TableRewrite, Severity::Warning, "two lines", None),
+                finding: finding(
+                    Rule::AlterTableRewrite,
+                    Severity::Warning,
+                    "two lines",
+                    None,
+                ),
             }],
             ..Report::default()
         };
         source(&mut report, "m.sql", "aaaaa\nbbbb\ncccc");
         assert_eq!(
             report.render(Format::Human),
-            "warning[table_rewrite]: two lines\n   ╭─[m.sql:1:3]\n 1 │ aaaaa\n   ·   ───\n 2 │ bbbb\n   · ───\n   ╰────"
+            "warning[locking/alter_table_rewrite]: two lines\n   ╭─[m.sql:1:3]\n 1 │ aaaaa\n   ·   ───\n 2 │ bbbb\n   · ───\n   ╰────"
         );
 
         let mut report = Report {
@@ -1349,14 +1444,19 @@ mod tests {
                 path: "m.sql".to_owned(),
                 start: Position { line: 1, column: 1 },
                 end: Position { line: 7, column: 2 },
-                finding: finding(Rule::TableRewrite, Severity::Warning, "many lines", None),
+                finding: finding(
+                    Rule::AlterTableRewrite,
+                    Severity::Warning,
+                    "many lines",
+                    None,
+                ),
             }],
             ..Report::default()
         };
         source(&mut report, "m.sql", "a\nb\nc\nd\ne\nf\ng");
         assert_eq!(
             report.render(Format::Human),
-            "warning[table_rewrite]: many lines\n   ╭─[m.sql:1:1]\n 1 │ a\n   · ─\n 2 │ b\n   · ─\n 3 │ c\n   · ─\n   · …\n   ╰────"
+            "warning[locking/alter_table_rewrite]: many lines\n   ╭─[m.sql:1:1]\n 1 │ a\n   · ─\n 2 │ b\n   · ─\n 3 │ c\n   · ─\n   · …\n   ╰────"
         );
     }
 
@@ -1374,7 +1474,7 @@ mod tests {
         source(&mut report, "t.sql", "\tx");
         assert_eq!(
             report.render(Format::Human),
-            "error[null_comparison]: tab\n   ╭─[t.sql:1:2]\n 1 │     x\n   ·     ─\n   ╰────"
+            "error[correctness/null_comparison]: tab\n   ╭─[t.sql:1:2]\n 1 │     x\n   ·     ─\n   ╰────"
         );
     }
 
@@ -1411,7 +1511,7 @@ mod tests {
         };
         assert_eq!(
             report.summary(),
-            "typedpg lint: 1 error\n  checked 8 queries and 2 migrations in 0.42s\n  schema: 3 tables, 1 view, 6 indexes, 1 type, 2 functions\n  ✖ failed: 1 finding at or above fail_on (error)"
+            "typedpg lint: 1 error\n  checked 8 queries and 2 migrations in 0.42s\n  by category: correctness 1\n  schema: 3 tables, 1 view, 6 indexes, 1 type, 2 functions\n  ✖ failed: 1 finding at or above fail_on (error)"
         );
     }
 

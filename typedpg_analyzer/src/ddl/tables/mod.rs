@@ -163,6 +163,7 @@ fn check_columns(
             };
             let name = match selections.iter().find(|(r, _)| std::ptr::eq(*r, cr)) {
                 Some((_, field)) => Some(*field),
+                None if whole_row_reference(interp, relid, cr) => Some(""),
                 None => cr
                     .fields
                     .last()
@@ -176,13 +177,35 @@ fn check_columns(
     refs.sort_by_key(|&(location, _)| location);
     let mut columns: Vec<(String, i16)> = Vec::new();
     for (_, name) in refs {
-        if let Some(attnum) = check_column_attnum(interp, relid, name)
+        // A whole-row reference is a Var of attno 0.
+        let attnum = if name.is_empty() {
+            Some(0)
+        } else {
+            check_column_attnum(interp, relid, name)
+        };
+        if let Some(attnum) = attnum
             && !columns.iter().any(|(_, a)| *a == attnum)
         {
             columns.push((name.to_owned(), attnum));
         }
     }
     columns
+}
+
+/// Whether a column reference of a CHECK expression of `relid` is the
+/// relation's whole row: `t` (no column of that name) or `t.*`.
+fn whole_row_reference(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    cr: &typedpg_pg_query::ast::ColumnRef,
+) -> bool {
+    let relname = relname_of(interp, relid);
+    match cr.fields.as_slice() {
+        [only] => super::util::node_string(only.as_ref())
+            .is_some_and(|n| n == relname && interp.attribute_by_name(relid, n).is_none()),
+        [.., star] => matches!(star, Some(typedpg_pg_query::ast::Node::AStar(_))),
+        [] => false,
+    }
 }
 
 /// The attnum of the column `name` a CHECK expression of `relid` reads: a
@@ -207,8 +230,9 @@ fn check_name_addition(
     relid: PgClassOid,
     expr: Option<&typedpg_pg_query::ast::Node>,
 ) -> String {
+    // A whole-row reference has no name (get_attname of attno 0).
     match check_columns(interp, relid, expr).as_slice() {
-        [(one, _)] => one.clone(),
+        [(one, attnum)] if *attnum != 0 => one.clone(),
         _ => String::new(),
     }
 }
@@ -569,6 +593,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     // Array type for the composite (makeArrayTypeName: `_<name>`, unless
@@ -595,6 +620,7 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         typalign: phys.typalign,
         typsubscript: phys.typsubscript,
         typisdefined: true,
+        typdelim: ',',
     });
 
     // Default expressions carried over from parents / LIKE sources (a
@@ -637,6 +663,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                 let mapped: Vec<i16> = refs
                     .iter()
                     .filter_map(|&r| {
+                        // A system column is the same one everywhere.
+                        if r < 0 {
+                            return Some(r);
+                        }
                         let name = interp
                             .attributes_of(src)
                             .iter()
@@ -648,9 +678,10 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                     .collect();
                 interp.generated_refs.insert((class_oid, attnum), mapped);
             }
-            // The copied default expression names the same sequences.
+            // The copied default expression depends on what the source's
+            // does (its sequences, routines, types…).
             let src_obj = crate::oid::PgGenericOid::from_nonzero(src.into_nonzero());
-            let sequences: Vec<PgClassOid> = interp
+            let copied: Vec<crate::pg_catalog::PgDepend> = interp
                 .iter_pg_depend()
                 .filter(|d| {
                     d.classid == crate::pg_catalog::PG_CLASS_RELID
@@ -658,10 +689,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
                         && d.objsubid == src_attnum
                         && d.deptype == crate::pg_catalog::DepType::Normal
                 })
-                .filter_map(|d| PgClassOid::new(d.refobjid.get()))
+                .map(|d| crate::pg_catalog::PgDepend {
+                    objid: crate::oid::PgGenericOid::from_nonzero(class_oid.into_nonzero()),
+                    objsubid: attnum,
+                    ..d.clone()
+                })
                 .collect();
-            for seq in sequences {
-                super::defaults::record_default_sequence(interp, class_oid, attnum, seq);
+            for row in copied {
+                interp.add_dependency(row);
             }
         }
     }
@@ -963,13 +998,6 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
     // expression must be assignable to the column's declared type.
     validate_constraint_expressions(interp, class_oid, &name, stmt)?;
 
-    // CloneForeignKeyConstraints: a partition gets its parent's foreign
-    // keys before its own constraints are added.
-    if stmt.partbound.is_some()
-        && let Some(&parent) = parents.first()
-    {
-        foreign_keys::clone_parent_fks(interp, parent, class_oid)?;
-    }
     // DefineRelation: a partition gets copies of its parent's indexes
     // before its own are created (so a PRIMARY KEY of its own is a second
     // one).
@@ -981,6 +1009,14 @@ pub fn create_table(interp: &mut PgCatalog, stmt: &CreateStmt) -> Result<(), Ddl
         .filter(|_| stmt.partbound.is_some());
     if let Some(parent) = partition_parent {
         partidx::clone_parent_indexes(interp, parent, class_oid)?;
+    }
+    // CloneForeignKeyConstraints: a partition gets its parent's foreign
+    // keys before its own constraints are added — after its indexes, which
+    // the rows for a referenced partition depend on.
+    if stmt.partbound.is_some()
+        && let Some(&parent) = parents.first()
+    {
+        foreign_keys::clone_parent_fks(interp, parent, class_oid)?;
     }
     // Emit pg_constraint rows so ON CONFLICT, DROP CASCADE, and FK
     // dependency checks can consult them later. FK validation runs here.
@@ -1465,12 +1501,21 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
     cmds.sort_by_key(|cmd| alter_table_pass(cmd));
     // ATExecAlterColumnType: a column's type changes once per statement.
     let mut retyped: Vec<String> = Vec::new();
+    // The ALTER TYPE pass: its subcommands' dependents are rebuilt together
+    // once it ends.
+    let mut batch: Option<columns::RetypeBatch> = None;
     for cmd in cmds {
         let rec = inherit::Recursion {
             recurse,
             recursing: false,
         };
         let retype = cmd.subtype == AlterTableType::AtAlterColumnType;
+        if retype && batch.is_none() {
+            batch = Some(columns::RetypeBatch::begin());
+        }
+        if !retype && let Some(b) = batch.take() {
+            b.finish(interp)?;
+        }
         let before = interp
             .attribute_by_name(class_oid, &cmd.name)
             .map(|a| (a.atttypid, a.atttypmod));
@@ -1489,6 +1534,9 @@ pub fn alter_table(interp: &mut PgCatalog, stmt: &AlterTableStmt) -> Result<(), 
         {
             retyped.push(cmd.name.clone());
         }
+    }
+    if let Some(b) = batch {
+        b.finish(interp)?;
     }
 
     Ok(())
@@ -2244,7 +2292,9 @@ pub(crate) mod partidx;
 pub(crate) mod typed;
 
 use columns::*;
-pub(crate) use columns::{column_collation, domain_has_constraints, drop_column, type_collation};
+pub(crate) use columns::{
+    check_not_setof, column_collation, domain_has_constraints, drop_column, type_collation,
+};
 use constraints::*;
 pub(crate) use constraints::{check_unique_covers_partition_key, fold_constraint_attrs};
 

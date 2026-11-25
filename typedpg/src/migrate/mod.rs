@@ -42,7 +42,7 @@
 //!
 //! # Concurrency safety
 //!
-//! The [`run`], [`revert`] and [`accept`] functions acquire a PostgreSQL advisory lock
+//! The [`run`], [`revert`], [`revert_last`] and [`accept`] functions acquire a PostgreSQL advisory lock
 //! before applying changes, preventing concurrent migration runs from conflicting.
 //!
 //! # Drift
@@ -82,7 +82,7 @@
 mod runner;
 mod source;
 
-pub use runner::{MigrationStatus, accept, revert, run, status};
+pub use runner::{MigrationStatus, accept, revert, revert_last, run, status};
 pub use source::{Migration, MigrationSource};
 
 /// Migration runner settings (tracking table, advisory lock id, transaction

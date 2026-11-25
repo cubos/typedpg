@@ -1365,23 +1365,50 @@ fn array_agg_of_composite_column_returns_array_of_composite() {
 #[test]
 fn array_agg_of_row_constructor() {
     let db = setup();
-    // array_agg of an inline ROW: PG reports `record[]`. The analyzer's
-    // polymorphic resolver currently can't fabricate the array OID for the
-    // pseudo `record` element type, so the result is left as the array's
-    // element type itself (a record). Document that quirk so a future fix
-    // doesn't silently change the surface.
+    // array_agg of an inline ROW: PG reports `record[]`, and the analyzer
+    // carries the row's shape into the elements (see records_nested.rs).
     let s = db
         .analyze("SELECT array_agg(ROW(u.id, u.name)) AS rs FROM users u")
         .unwrap();
-    let rs = &col(&s, "rs").pg_type;
-    // Today: analyzer surfaces the row's anonymous record (no array wrap).
-    // Acceptable proxy for now — the field types are intact.
-    assert!(
-        matches!(
-            rs,
-            Type::Array { .. } | Type::AnonymousRecord { .. } | Type::Basic { .. }
-        ),
-        "got: {rs:?}"
+    assert_cols(
+        &s,
+        vec![cn(
+            "rs",
+            array_of(anon_record(vec![rf("f1", int8()), rf("f2", text())])),
+        )],
+    );
+}
+
+/// An array field of a record knows whether its elements can be NULL as
+/// an array column does: `ROW(ARRAY[1, NULL])`'s field holds a NULL
+/// element, which a `Vec<i32>` could not read.
+#[test]
+fn array_field_of_a_record_keeps_its_element_nullability() {
+    let db = setup();
+    let field_elems = |sql: &str| {
+        let s = db.analyze(sql).unwrap();
+        match &s.columns[0].pg_type {
+            Type::AnonymousRecord { fields } => match &fields[0].ty {
+                Type::Array {
+                    element_nullable, ..
+                } => *element_nullable,
+                other => panic!("expected an array field, got {other:?}"),
+            },
+            other => panic!("expected a record, got {other:?}"),
+        }
+    };
+    assert_eq!(field_elems("SELECT ROW(ARRAY[1, NULL]) AS r"), Some(true));
+    assert_eq!(
+        field_elems("SELECT ROW(ARRAY[1, NULL]::int8[]) AS r"),
+        Some(true)
+    );
+    assert_eq!(
+        field_elems("SELECT ROW(array_agg(u.name)) AS r FROM users u"),
+        Some(false)
+    );
+    assert_eq!(
+        field_elems("SELECT ROW(array_agg(u.age)) AS r FROM users u"),
+        Some(true)
     );
 }
 

@@ -483,3 +483,53 @@ fn identity_sequence_options_once_and_persistence() {
         ),
     ]);
 }
+
+#[test]
+fn sequence_relation_lookups_report_what_pg_reports() {
+    // PG 19: RangeVarGetRelidExtended names a missing schema, then the
+    // relation as written; process_owned_by takes `[catalog.]schema.rel`;
+    // an identity's SEQUENCE NAME in another schema makes
+    // generateSerialExtraStmts link the sequence to that schema's table of
+    // the same name.
+    assert_ddl_rejections(&[
+        (
+            "",
+            "ALTER SEQUENCE nos.s RESTART;",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "ALTER SEQUENCE public.s RESTART;",
+            "relation \"public.s\" does not exist",
+        ),
+        (
+            "",
+            "CREATE SEQUENCE s OWNED BY nos.t.id;",
+            "schema \"nos\" does not exist",
+        ),
+        (
+            "",
+            "CREATE SEQUENCE s OWNED BY public.t.id;",
+            "relation \"public.t\" does not exist",
+        ),
+        (
+            "CREATE SEQUENCE s;",
+            "ALTER SEQUENCE s OWNED BY a.b.c.d.e;",
+            "improper relation name (too many dotted names): a.b.c.d",
+        ),
+        (
+            "CREATE SCHEMA s;",
+            "CREATE TABLE ti (id int GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME s.myseq));",
+            "relation \"s.ti\" does not exist",
+        ),
+    ]);
+    build(&[(
+        "0001.sql",
+        "CREATE TABLE t (id int);
+         CREATE SEQUENCE s OWNED BY public.t.id;
+         ALTER SEQUENCE IF EXISTS nos.s RESTART;
+         CREATE SCHEMA s;
+         CREATE TABLE s.ti (id int);
+         CREATE TABLE ti (id int GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME s.myseq));",
+    )]);
+}

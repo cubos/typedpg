@@ -3,9 +3,9 @@
 An `IS [NOT] NULL` test or `COALESCE` on a value that is never `NULL`, and
 an `IS [NOT] NULL` test the rest of its condition already settles.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| warning | queries | `COALESCE` only: drops the unused arguments |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | `COALESCE` only: drops the unused arguments |
 
 ## Example
 
@@ -21,14 +21,14 @@ SELECT id FROM posts WHERE user_id = $user_id AND user_id IS NULL;
 ```
 
 ```
-warning[redundant_null_check]: `title` IS NOT NULL is always true: it is never NULL
+info[redundant/redundant_null_check]: `title` IS NOT NULL is always true: it is never NULL
    ╭─[queries.sql:2:28]
  2 │ SELECT id FROM posts WHERE title IS NOT NULL;
    ·                            ─────────────────
    ╰────
   help: remove the check, or find why the value was expected to be NULL (an outer join?)
 
-warning[redundant_null_check]: `user_id` IS NULL makes the condition never true: the rest of it is never true when `user_id` is NULL
+info[redundant/redundant_null_check]: `user_id` IS NULL makes the condition never true: the rest of it is never true when `user_id` is NULL
     ╭─[queries.sql:10:51]
  10 │ SELECT id FROM posts WHERE user_id = $user_id AND user_id IS NULL;
     ·                                                   ───────────────
@@ -74,12 +74,14 @@ The fix deletes the arguments after the first never-`NULL` one; when that is
 the first, the call goes: `COALESCE(views + 1, 0) * 2` becomes
 `(views + 1) * 2`. It is withheld when:
 
-- the kept argument doesn't have the call's result type:
-  `COALESCE('1', views)` is `integer`, `'1'` alone is `text`;
+- the kept argument doesn't have the call's result type, type modifier
+  included: `COALESCE('1', views)` is `integer`, `'1'` alone is `text`;
+  `COALESCE(code, 'x')` of a `varchar(10)` is a plain `varchar`;
 - a dropped argument contains a parameter (`COALESCE(id, $fallback)`), a
   column reference, a `COLLATE`, or a function call outside a subquery;
 - the `COALESCE` is a whole output column without an alias, named
-  `coalesce`: `SELECT id, COALESCE(title, 'untitled') FROM posts`.
+  `coalesce`: `SELECT id, COALESCE(title, 'untitled') FROM posts`, also
+  under a cast or as a `CASE`'s `ELSE`: `COALESCE(title, 'untitled')::varchar`.
 
 ## Configuration
 
@@ -101,7 +103,7 @@ text. See [Configuring rules](README.md#configuring-rules).
 - [`null_comparison`](null_comparison.md): comparing with a `NULL` literal.
 - [`left_join_nullified`](left_join_nullified.md): a `WHERE` that rejects an
   outer join's null-extended rows.
-- [`count_not_null`](count_not_null.md): `count(expr)` over a never-`NULL`
+- [`redundant_count_argument`](redundant_count_argument.md): `count(expr)` over a never-`NULL`
   value.
 - [`simplifiable_case`](simplifiable_case.md): a `CASE` that is a
   `COALESCE`.

@@ -1,4 +1,4 @@
-//! The `breaks_deployed_queries` rule: a migration that breaks a query of
+//! The `deployed_query_breakage` rule: a migration that breaks a query of
 //! the code already deployed.
 //!
 //! A deploy applies the new migrations while the code of the previous
@@ -54,6 +54,16 @@
 //! its length or precision. A deployed `copy_in!` is also checked for the
 //! columns it copies, their types and nullability.
 //!
+//! What the bodies a deployed query runs do is checked too ([`body_changes`]):
+//! a statement of a function it calls, or of a trigger its writes fire, that
+//! analyzed against the deployed schema and no longer does; a trigger whose
+//! function may now raise an error ([`trigger_changes`]). So are foreign
+//! keys: a new one on the columns a write writes ([`referencing`]), or one
+//! that now rejects a `DELETE` or a key `UPDATE` of the table it references
+//! ([`referenced`]). A result column whose type gains or loses a domain over
+//! the same type, mapped to the same application type, changes nothing for
+//! the deployed code ([`Decoding::same_client_type`]).
+//!
 //! A query runs as the roles the deployed code runs it as (a call site's
 //! `role = "..."`, or the database's configured `roles`): it is analyzed as
 //! each, so a privilege a migration revokes is reported, and so is a table
@@ -71,9 +81,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
 use typedpg_analyzer::{
-    AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, CheckReading, IntRange, MigrationObserver,
-    MigrationStatement, PartOutcome, PgCatalog, PgClassOid, QualifiedName, QueryView, Refinement,
-    Type, WriteCommand, WrittenValue,
+    AnalyzedColumn, AnalyzedCopyIn, AnalyzedQuery, BodyFailure, BodyReach, CheckReading, IntRange,
+    LintForeignKey, MigrationObserver, MigrationStatement, PartOutcome, PgCatalog, PgClassOid,
+    QualifiedName, QueryView, Refinement, Type, WriteCommand, WrittenValue,
 };
 use typedpg_core::quote_identifier;
 
@@ -134,21 +144,33 @@ pub enum Decoding<'a> {
     Rust {
         types: &'a HashMap<QualifiedName, String>,
     },
-    /// TypeScript: the generated module types a value the analysis narrows
-    /// (an enum's labels, a CHECK's values) as their literal union, while
-    /// the runtime passes the text through unchecked — a value outside the
-    /// union reaches code compiled never to see it.
-    TypeScript,
+    /// TypeScript, with the deployed configuration's type overrides
+    /// (`types` in `typedpg.config.json`: PG type → the TypeScript type
+    /// name the generated module imports, keys as Rust's): the generated
+    /// module types a value the analysis narrows (an enum's labels, a
+    /// CHECK's values) as their literal union, while the runtime passes the
+    /// text through unchecked — a value outside the union reaches code
+    /// compiled never to see it.
+    TypeScript {
+        types: &'a HashMap<QualifiedName, String>,
+    },
 }
 
 impl Decoding<'_> {
     /// The application type the deployed code decodes a value of `ty` into
-    /// when `[types]` maps it (as the `sql!` macro looks it up: a domain,
-    /// else what it is over; an array's element).
+    /// when `[types]` maps it (Rust only: see [`Self::mapped_type`]).
     fn rust_type(&self, ty: &Type) -> Option<&str> {
-        let Decoding::Rust { types } = self else {
-            return None;
-        };
+        match self {
+            Decoding::Rust { .. } => self.mapped_type(ty),
+            Decoding::TypeScript { .. } => None,
+        }
+    }
+
+    /// The application type a type mapping (`[types]`, or the TypeScript
+    /// `types` overrides) gives a value of `ty`, as the generated code looks
+    /// it up: a domain's own, else what it is over's; an array's element's.
+    fn mapped_type(&self, ty: &Type) -> Option<&str> {
+        let (Decoding::Rust { types } | Decoding::TypeScript { types }) = self;
         let lookup = |schema: &str, name: &str| {
             types
                 .get(&QualifiedName::new(schema.to_owned(), name.to_owned()))
@@ -157,8 +179,8 @@ impl Decoding<'_> {
         match ty {
             Type::Domain {
                 schema, name, base, ..
-            } => lookup(schema, name).or_else(|| self.rust_type(base)),
-            Type::Array { element, .. } => self.rust_type(element),
+            } => lookup(schema, name).or_else(|| self.mapped_type(base)),
+            Type::Array { element, .. } => self.mapped_type(element),
             Type::Composite { schema, name, .. }
             | Type::Enum { schema, name, .. }
             | Type::Basic { schema, name, .. }
@@ -179,7 +201,7 @@ impl Decoding<'_> {
                     quoted(added)
                 )
             }),
-            Decoding::TypeScript => Some(format!(
+            Decoding::TypeScript { .. } => Some(format!(
                 "may now be {}, a value the deployed code does not know",
                 quoted(added)
             )),
@@ -195,8 +217,24 @@ impl Decoding<'_> {
     pub(crate) fn narrows_values(&self, ty: &Type) -> bool {
         match self {
             Decoding::Rust { .. } => self.rust_type(ty).is_some() && !is_enum(ty),
-            Decoding::TypeScript => true,
+            Decoding::TypeScript { .. } => true,
         }
+    }
+
+    /// Whether the deployed code decodes a value of type `new` as it did one
+    /// of `old`, the two types differing ([`shape`]) only by a domain added
+    /// or removed over the same type: PostgreSQL describes a domain's
+    /// result column as its base type, and the type a mapping gives it
+    /// ([`Self::mapped_type`]) is the same on both sides — so is the type
+    /// the generated code has for it.
+    fn same_client_type(&self, old: &Type, new: &Type) -> bool {
+        fn wire(ty: &Type) -> &Type {
+            match ty {
+                Type::Domain { base, .. } => wire(base),
+                _ => ty,
+            }
+        }
+        shape(wire(old)) == shape(wire(new)) && self.mapped_type(old) == self.mapped_type(new)
     }
 }
 
@@ -250,15 +288,15 @@ struct Change {
     text: String,
 }
 
-/// The findings of `breaks_deployed_queries`: every deployed query that
+/// The findings of `deployed_query_breakage`: every deployed query that
 /// analyzed against the deployed schema and breaks against the new one,
 /// placed on the statement of `schema.files` that breaks it.
-pub fn breaks_deployed_queries(
+pub fn deployed_query_breakage(
     deployment: &Deployment<'_>,
     schema: &NewSchema<'_>,
     options: &LintOptions,
 ) -> Vec<MigrationFinding> {
-    let rule = Rule::BreaksDeployedQueries;
+    let rule = Rule::DeployedQueryBreakage;
     let Some(severity) = options.level(rule) else {
         return Vec::new();
     };
@@ -477,7 +515,7 @@ impl MigrationObserver for Replay<'_, '_> {
         let suppressed = self.comments.iter().any(|(range, rules)| {
             range.start >= lead_in.start
                 && range.end <= lead_in.end
-                && rules.contains(&Rule::BreaksDeployedQueries)
+                && rules.contains(&Rule::DeployedQueryBreakage)
         });
         let placement = Placement {
             file: self.file,
@@ -584,6 +622,14 @@ fn query_changes(
             }
         }
     }
+    // What the bodies it runs do is the same whoever runs it.
+    let mut bodies = Vec::new();
+    body_changes(query, deployment.catalog, new_catalog, &mut bodies);
+    for change in bodies {
+        if !out.iter().any(|c| c.subject == change.subject) {
+            out.push(change);
+        }
+    }
     out
 }
 
@@ -681,7 +727,7 @@ fn statement_changes(
     // are read off the analysis as the role: its search path resolves the
     // names, a CTE named like a table is the CTE.
     let lower = sql.to_ascii_lowercase();
-    let writes_rows = ["insert", "update", "merge"]
+    let writes_rows = ["insert", "update", "merge", "delete"]
         .iter()
         .any(|word| lower.contains(word));
     if !writes_rows && role.is_none() {
@@ -699,6 +745,7 @@ fn statement_changes(
         None => old_catalog.query_view(sql),
     };
     writes(&view, old_view.as_ref().ok(), old_catalog, new_catalog, out);
+    referenced(&view, old_catalog, new_catalog, out);
     if let Some(role) = role {
         row_security(&view, role, old_catalog, new_catalog, out);
         row_security_writes(&view, role, old_catalog, new_catalog, out);
@@ -793,6 +840,21 @@ fn copy_changes(
         row.insert(column.clone(), value);
     }
     let defaulted: Vec<String> = defaults.iter().map(|(c, _)| c.clone()).collect();
+    // The row a COPY writes: each field it sends, and the defaults.
+    let field = WrittenValue::Inside;
+    let mut copied = row.clone();
+    for column in &new.columns {
+        copied.insert(column.name.clone(), &field);
+    }
+    referencing(
+        &statement,
+        &name,
+        (old_table.oid, new.relid),
+        &[(false, copied)],
+        old_catalog,
+        new_catalog,
+        out,
+    );
     narrowed(
         &Written {
             statement: &statement,
@@ -1066,7 +1128,9 @@ fn output(
 ) {
     let name = &old.name;
     let subject = |what: &str| format!("column {name} {what}");
-    if shape(&old.pg_type) != shape(&new.pg_type) {
+    if shape(&old.pg_type) != shape(&new.pg_type)
+        && !decoding.same_client_type(&old.pg_type, &new.pg_type)
+    {
         out.push(Change {
             subject: subject("type"),
             text: format!(
@@ -1693,6 +1757,7 @@ fn writes(
             new_catalog,
             out,
         );
+        referencing(&text, &name, relids, &rows, old_catalog, new_catalog, out);
     }
 }
 
@@ -2417,9 +2482,10 @@ fn shape(ty: &Type) -> Type {
             typmod: None,
             collation: None,
         },
-        Type::Array { element, .. } => Type::Array {
+        Type::Array { element, name, .. } => Type::Array {
             element: Box::new(shape(element)),
             element_nullable: None,
+            name: name.clone(),
         },
         Type::Enum {
             schema,
@@ -2478,7 +2544,7 @@ fn shape_fields(fields: &[typedpg_analyzer::RecordField]) -> Vec<typedpg_analyze
 }
 
 /// The enum labels `new` has that `old` doesn't, of an enum, an array of
-/// one, or a domain over either.
+/// one, or a domain over either (on one side or both).
 fn added_labels(old: &Type, new: &Type) -> BTreeSet<String> {
     match (old, new) {
         (Type::Enum { labels: a, .. }, Type::Enum { labels: b, .. }) => b
@@ -2488,6 +2554,8 @@ fn added_labels(old: &Type, new: &Type) -> BTreeSet<String> {
             .collect(),
         (Type::Array { element: a, .. }, Type::Array { element: b, .. }) => added_labels(a, b),
         (Type::Domain { base: a, .. }, Type::Domain { base: b, .. }) => added_labels(a, b),
+        (Type::Domain { base, .. }, other) => added_labels(base, other),
+        (other, Type::Domain { base, .. }) => added_labels(other, base),
         _ => BTreeSet::new(),
     }
 }
@@ -2498,6 +2566,7 @@ fn array_element(ty: &Type) -> Option<(&Type, Option<bool>)> {
         Type::Array {
             element,
             element_nullable,
+            ..
         } => Some((element, *element_nullable)),
         Type::Domain { base, .. } => array_element(base),
         _ => None,
@@ -2561,6 +2630,550 @@ fn quoted(values: &BTreeSet<String>) -> String {
         .join(", ")
 }
 
+/// A routine's signature as a message says it: unqualified in `public`.
+fn routine_display(signature: &str) -> &str {
+    signature.strip_prefix("public.").unwrap_or(signature)
+}
+
+/// A relation's name as a message says it, by its OID in `catalog`.
+fn relation_display(catalog: &PgCatalog, relid: PgClassOid) -> Option<String> {
+    relation_name(catalog, relid).map(|(schema, relname)| display_name(&schema, &relname))
+}
+
+/// What changes in the bodies a deployed query runs — the routines it
+/// calls, the triggers its writes fire (see
+/// [`PgCatalog::lint_body_diagnostics`]): a body statement that analyzed
+/// against the deployed schema and no longer does (a table it reads
+/// renamed, a column dropped: PostgreSQL fails it when it runs), and a
+/// trigger whose function may now raise an error where it didn't
+/// ([`trigger_changes`]).
+fn body_changes(
+    query: &DeployedQuery,
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    let diagnostics = |catalog: &PgCatalog| match query.kind {
+        DeployedKind::Query => catalog.lint_body_diagnostics(&query.sql),
+        DeployedKind::CopyIn => catalog.lint_copy_in_body_diagnostics(&query.sql),
+    };
+    let (Some(old), Some(new)) = (diagnostics(old_catalog), diagnostics(new_catalog)) else {
+        return;
+    };
+    let verb = |event: char| match (query.kind, event) {
+        (DeployedKind::CopyIn, _) => "COPY",
+        (_, 'a') => "INSERT",
+        (_, 'w') => "UPDATE",
+        (_, 'd') => "DELETE",
+        _ => "TRUNCATE",
+    };
+    // What a body is reached through, as a key the same in both catalogs
+    // and as the message says it.
+    let reach = |catalog: &PgCatalog, reach: &BodyReach| -> (String, String) {
+        match reach {
+            BodyReach::Function { signature } => (
+                format!("function {signature}"),
+                format!("it calls function {}", routine_display(signature)),
+            ),
+            BodyReach::Trigger {
+                name,
+                relid,
+                event,
+                signature,
+            } => {
+                let relation = relation_display(catalog, *relid).unwrap_or_default();
+                (
+                    format!("trigger {name} {relation} {event} {signature}"),
+                    format!(
+                        "its {} fires trigger \"{name}\" on {relation} (function {})",
+                        verb(*event),
+                        routine_display(signature)
+                    ),
+                )
+            }
+        }
+    };
+    let key = |catalog: &PgCatalog, failure: &BodyFailure| {
+        format!(
+            "{} {:?} {}",
+            reach(catalog, &failure.reach).0,
+            failure.inner,
+            failure.message
+        )
+    };
+    let known: HashSet<String> = old
+        .failures
+        .iter()
+        .map(|failure| key(old_catalog, failure))
+        .collect();
+    for failure in &new.failures {
+        let subject = key(new_catalog, failure);
+        if known.contains(&subject) {
+            continue;
+        }
+        let (_, through) = reach(new_catalog, &failure.reach);
+        let body = match &failure.inner {
+            Some(inner) => format!(
+                "whose body calls {}, a statement of which now fails",
+                routine_display(inner)
+            ),
+            None => "a statement of whose body now fails".to_owned(),
+        };
+        out.push(Change {
+            subject: format!("body {subject}"),
+            text: format!("{through}, {body}: {}", failure.message),
+        });
+    }
+    trigger_changes(query, &old, &new, old_catalog, new_catalog, &verb, out);
+}
+
+/// The triggers a deployed query's writes fire (`new`, against the new
+/// schema; `old`, against the deployed one) whose function may now raise an
+/// error where the deployed one didn't: a `RAISE EXCEPTION`, `ASSERT`,
+/// `INTO STRICT` or dynamic `EXECUTE` the deployed trigger (one of the same
+/// name, relation and event the deployed query fired) doesn't have — a new
+/// trigger, or a function replaced — "may fail"; and one that fails every
+/// time it runs (see [`PgCatalog::lint_trigger_function_failures`]),
+/// certain where it fires for every row a plain `INSERT`, `UPDATE`,
+/// `DELETE` or COPY of the deployed query writes into its own relation (no
+/// `WHEN`, not fired by another body): a row trigger then fails every row
+/// written, a statement trigger every run.
+fn trigger_changes(
+    query: &DeployedQuery,
+    old: &typedpg_analyzer::BodyDiagnostics,
+    new: &typedpg_analyzer::BodyDiagnostics,
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    verb: &dyn Fn(char) -> &'static str,
+    out: &mut Vec<Change>,
+) {
+    for trigger in &new.triggers {
+        let Some((always, sites)) = new_catalog.lint_trigger_function_failures(trigger.function)
+        else {
+            continue;
+        };
+        let relation = relation_name(new_catalog, trigger.relid);
+        let deployed = old
+            .triggers
+            .iter()
+            .filter(|o| {
+                o.name == trigger.name
+                    && o.event == trigger.event
+                    && relation_name(old_catalog, o.relid) == relation
+            })
+            .find_map(|o| old_catalog.lint_trigger_function_failures(o.function));
+        let (old_always, old_sites) = deployed.unwrap_or_default();
+        let always = always.filter(|_| old_always.is_none());
+        if always.is_none() && sites.is_subset(&old_sites) {
+            continue;
+        }
+        let name = relation
+            .as_ref()
+            .map(|(schema, relname)| display_name(schema, relname))
+            .unwrap_or_default();
+        let fires = format!(
+            "its {} fires trigger \"{}\" on {name} (function {})",
+            verb(trigger.event),
+            trigger.name,
+            routine_display(&trigger.signature)
+        );
+        let certain = !trigger.nested
+            && !trigger.conditional
+            && writes_every_row_into(query, trigger.relid, trigger.event, new_catalog);
+        let text = match always {
+            Some(message) if certain && trigger.row => {
+                format!("{fires}, which now fails for every row it writes: {message}")
+            }
+            Some(message) if certain => {
+                format!("{fires}, which now fails every time it runs: {message}")
+            }
+            _ => format!("{fires}, which may now raise an error: a row it rejects fails"),
+        };
+        out.push(Change {
+            subject: format!("trigger {name} {} {}", trigger.name, trigger.event),
+            text,
+        });
+    }
+}
+
+/// Whether deployed query `query` is a plain write — an `INSERT` without
+/// `ON CONFLICT`, an `UPDATE` or a `DELETE` (no `WITH`), or a COPY — whose
+/// command is `event` and whose rows are stored in relation `relid` itself
+/// (not routed to a partition, nor taken over by a rule or an `INSTEAD
+/// OF` trigger): every row it writes fires the row triggers of `relid`
+/// for `event`, and every run its statement triggers.
+fn writes_every_row_into(
+    query: &DeployedQuery,
+    relid: PgClassOid,
+    event: char,
+    catalog: &PgCatalog,
+) -> bool {
+    use typedpg_pg_query::ast::Node as N;
+    if query.kind == DeployedKind::CopyIn {
+        return event == 'a'
+            && catalog
+                .analyze_copy_in_located(&query.sql)
+                .is_ok_and(|copy| copy.relid == relid);
+    }
+    let Ok(view) = catalog.query_view(&query.sql) else {
+        return false;
+    };
+    let [statement] = view.tree.stmts.as_slice() else {
+        return false;
+    };
+    let stored = |command: WriteCommand| {
+        view.writes().iter().any(|w| {
+            w.command == command && w.base.as_ref().map_or(w.relid, |base| base.relid) == relid
+        })
+    };
+    match statement.stmt.as_ref() {
+        Some(N::InsertStmt(s)) => {
+            event == 'a'
+                && s.with_clause.is_none()
+                && s.on_conflict_clause.is_none()
+                && stored(WriteCommand::Insert)
+        }
+        Some(N::UpdateStmt(s)) => {
+            event == 'w' && s.with_clause.is_none() && stored(WriteCommand::Update)
+        }
+        Some(N::DeleteStmt(s)) => {
+            event == 'd'
+                && s.with_clause.is_none()
+                && view
+                    .relation_uses()
+                    .iter()
+                    .any(|&(r, c)| c == 'd' && view.delete_base(r).unwrap_or(r) == relid)
+        }
+        _ => false,
+    }
+}
+
+/// A foreign key as what it checks, the same in both catalogs: the
+/// referencing relation and columns, the referenced ones, the match type.
+type FkKey = (String, Vec<String>, String, Vec<String>, bool);
+
+fn fk_key(catalog: &PgCatalog, fk: &LintForeignKey) -> Option<FkKey> {
+    Some((
+        relation_display(catalog, fk.relid)?,
+        fk.columns.clone(),
+        relation_display(catalog, fk.referenced)?,
+        fk.referenced_columns.clone(),
+        fk.match_full,
+    ))
+}
+
+/// The foreign keys of the relation `statement` (`its INSERT into t`)
+/// writes rows into — `relids`: its OID in the old and the new catalog —
+/// that the deployed schema doesn't enforce (new, or `NOT ENFORCED`
+/// before; a `NOT VALID` one already checks every row written, so
+/// validating it changes nothing for a write), and that one of the target
+/// lists `rows` may break: PostgreSQL checks an inserted row, and an
+/// updated one whose key columns the statement writes
+/// (`RI_FKey_fk_upd_check_required`), unless a key column is certainly NULL
+/// (`MATCH SIMPLE`; all of them for `MATCH FULL`) — a NULL written, a
+/// column an insert leaves out without a default. A row whose key has no
+/// match in the referenced table fails: whether one does depends on the
+/// data, so it "may fail".
+fn referencing(
+    statement: &str,
+    name: &str,
+    relids: (PgClassOid, PgClassOid),
+    rows: &[Row<'_>],
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    let known: HashSet<FkKey> = old_catalog
+        .lint_foreign_keys()
+        .iter()
+        .filter(|fk| fk.relid == relids.0)
+        .filter_map(|fk| fk_key(old_catalog, fk))
+        .collect();
+    for fk in new_catalog.lint_foreign_keys() {
+        // A foreign key referencing a partitioned table has a row per
+        // partition too: the table's says it.
+        if fk.relid != relids.1 || fk.derived {
+            continue;
+        }
+        let Some(key) = fk_key(new_catalog, &fk) else {
+            continue;
+        };
+        if known.contains(&key)
+            || !rows
+                .iter()
+                .any(|(update, values)| fk_checks(&fk, *update, values, relids.1, new_catalog))
+        {
+            continue;
+        }
+        let columns: Vec<String> = fk.columns.iter().map(|c| quote_identifier(c)).collect();
+        out.push(Change {
+            subject: format!("foreign key {name} {}", fk.name),
+            text: format!(
+                "{statement} may fail: foreign key \"{}\" now requires {} {} to match a row of \
+                 {}, and a row with no match fails",
+                fk.name,
+                if columns.len() == 1 {
+                    "column"
+                } else {
+                    "columns"
+                },
+                columns.join(", "),
+                key.2
+            ),
+        });
+    }
+}
+
+/// Whether foreign key `fk` of relation `relid` checks a row of the target
+/// list `values` (an UPDATE's when `update`) — see [`referencing`].
+fn fk_checks(
+    fk: &LintForeignKey,
+    update: bool,
+    values: &HashMap<String, &WrittenValue>,
+    relid: PgClassOid,
+    catalog: &PgCatalog,
+) -> bool {
+    // Each key column: `None` when the row doesn't write it, else whether
+    // it is certainly NULL.
+    let nulls: Vec<Option<bool>> = fk
+        .columns
+        .iter()
+        .map(|column| match values.get(column) {
+            Some(WrittenValue::Default) => Some(!catalog.lint_column_has_default(relid, column)),
+            Some(WrittenValue::Expression {
+                type_oid,
+                refinement,
+                ..
+            }) => Some(*type_oid == UNKNOWN && refinement.values.is_none()),
+            Some(_) => Some(false),
+            // An UPDATE keeps the stored value.
+            None if update => None,
+            // An inserted row stores the default: NULL without one.
+            None => Some(!catalog.lint_column_has_default(relid, column)),
+        })
+        .collect();
+    if update && nulls.iter().all(Option::is_none) {
+        return false;
+    }
+    let null = |n: &Option<bool>| n.unwrap_or(false);
+    if fk.match_full {
+        !nulls.iter().all(null)
+    } else {
+        !nulls.iter().any(null)
+    }
+}
+
+/// A foreign key a deployed `DELETE` or key `UPDATE` of its referenced
+/// table meets, with the action that makes it fail on a row still
+/// referenced (see [`restricting`]).
+struct Restriction {
+    fk: LintForeignKey,
+    action: char,
+    /// Reached through an `ON DELETE` / `ON UPDATE CASCADE` of another
+    /// foreign key.
+    cascaded: bool,
+}
+
+/// The foreign keys referencing relation `relid` of `catalog` that a
+/// `DELETE` (`delete`) or an `UPDATE` writing `columns` of it fails on for a
+/// row still referenced: `NO ACTION` and `RESTRICT`; `SET NULL` into a
+/// column that holds no NULL; `SET DEFAULT` (unless every key column's
+/// default is NULL, then as `SET NULL`) — the default must match a row
+/// too. A `CASCADE` deletes (updates) the referencing rows, whose own
+/// referencing foreign keys are followed. An UPDATE that writes none of
+/// the referenced columns is not checked (`RI_FKey_pk_upd_check_required`).
+fn restricting(
+    catalog: &PgCatalog,
+    relid: PgClassOid,
+    delete: bool,
+    columns: &[String],
+    cascaded: bool,
+    seen: &mut HashSet<(PgClassOid, bool)>,
+    out: &mut Vec<Restriction>,
+) {
+    if !seen.insert((relid, delete)) {
+        return;
+    }
+    for fk in catalog.lint_foreign_keys() {
+        if fk.referenced != relid
+            || !delete && !fk.referenced_columns.iter().any(|c| columns.contains(c))
+        {
+            continue;
+        }
+        let action = if delete { fk.on_delete } else { fk.on_update };
+        let holds_no_null = || {
+            fk.columns
+                .iter()
+                .any(|c| attribute(catalog, fk.relid, c).is_some_and(|a| not_null(catalog, &a)))
+        };
+        let fails = match action {
+            'a' | 'r' => true,
+            'n' => holds_no_null(),
+            'd' => {
+                fk.columns
+                    .iter()
+                    .any(|c| catalog.lint_column_has_default(fk.relid, c))
+                    || holds_no_null()
+            }
+            'c' => {
+                let child_columns = if delete {
+                    Vec::new()
+                } else {
+                    fk.columns.clone()
+                };
+                restricting(catalog, fk.relid, delete, &child_columns, true, seen, out);
+                false
+            }
+            _ => false,
+        };
+        if fails {
+            out.push(Restriction {
+                fk,
+                action,
+                cascaded,
+            });
+        }
+    }
+}
+
+/// The foreign keys a deployed `DELETE`, or `UPDATE` (an `ON CONFLICT DO
+/// UPDATE`, a MERGE's `UPDATE`) writing a referenced column, of a table now
+/// fails on for a row still referenced, where the deployed schema's didn't
+/// (see [`restricting`]): a new foreign key referencing the table, or one
+/// whose action now rejects the change. Whether a row is still referenced
+/// depends on the data: it "may fail".
+fn referenced(
+    view: &QueryView,
+    old_catalog: &PgCatalog,
+    new_catalog: &PgCatalog,
+    out: &mut Vec<Change>,
+) {
+    // The relation each change is made to, whether it deletes rows, the
+    // columns it writes, and the statement as the message says it.
+    let mut changes: Vec<(PgClassOid, bool, Vec<String>, String)> = Vec::new();
+    for &(relid, command) in view.relation_uses() {
+        if command != 'd' {
+            continue;
+        }
+        // Through an automatically updatable view, the rows deleted are
+        // the base table's.
+        let relid = view.delete_base(relid).unwrap_or(relid);
+        if let Some(name) = relation_display(new_catalog, relid) {
+            changes.push((relid, true, Vec::new(), format!("its DELETE from {name}")));
+        }
+    }
+    for statement in view.writes() {
+        let stored = statement
+            .base
+            .as_ref()
+            .map_or(statement.relid, |base| base.relid);
+        let columns: Vec<String> = statement
+            .columns
+            .iter()
+            .filter(|c| c.update)
+            .filter_map(|c| match &statement.base {
+                Some(base) => base
+                    .columns
+                    .iter()
+                    .find(|(v, _)| *v == c.column)
+                    .map(|(_, b)| b.clone()),
+                None => Some(c.column.clone()),
+            })
+            .collect();
+        if columns.is_empty() {
+            continue;
+        }
+        let Some(name) = relation_display(new_catalog, stored) else {
+            continue;
+        };
+        let text = match statement.command {
+            WriteCommand::Merge => format!("its MERGE into {name}"),
+            WriteCommand::Insert => format!("its INSERT into {name}"),
+            WriteCommand::Update => format!("its UPDATE of {name}"),
+        };
+        changes.push((stored, false, columns, text));
+    }
+    for (relid, delete, columns, text) in changes {
+        let Some((schema, relname)) = relation_name(new_catalog, relid) else {
+            continue;
+        };
+        let Some(old_table) = old_catalog.resolve_table(Some(&schema), &relname) else {
+            continue;
+        };
+        let key = |catalog: &PgCatalog, r: &Restriction| {
+            fk_key(catalog, &r.fk).map(|key| (key, r.action))
+        };
+        let mut old = Vec::new();
+        restricting(
+            old_catalog,
+            old_table.oid,
+            delete,
+            &columns,
+            false,
+            &mut HashSet::new(),
+            &mut old,
+        );
+        let known: HashSet<(FkKey, char)> =
+            old.iter().filter_map(|r| key(old_catalog, r)).collect();
+        let mut new = Vec::new();
+        restricting(
+            new_catalog,
+            relid,
+            delete,
+            &columns,
+            false,
+            &mut HashSet::new(),
+            &mut new,
+        );
+        for restriction in &new {
+            let Some(key) = key(new_catalog, restriction) else {
+                continue;
+            };
+            if known.contains(&key) {
+                continue;
+            }
+            let action = match restriction.action {
+                'a' => "NO ACTION",
+                'r' => "RESTRICT",
+                'n' => "SET NULL",
+                _ => "SET DEFAULT",
+            };
+            let (event, change) = if delete {
+                ("DELETE", "deleting a row".to_owned())
+            } else {
+                let written: Vec<String> = restriction
+                    .fk
+                    .referenced_columns
+                    .iter()
+                    .filter(|c| columns.contains(c) || restriction.cascaded)
+                    .map(|c| quote_identifier(c))
+                    .collect();
+                (
+                    "UPDATE",
+                    format!("changing the key ({}) of a row", written.join(", ")),
+                )
+            };
+            out.push(Change {
+                subject: format!(
+                    "foreign key of {} {} {}",
+                    key.0.2, restriction.fk.name, delete
+                ),
+                text: format!(
+                    "{text} may fail: foreign key \"{}\" of {} (ON {event} {action}{}) now \
+                     rejects {change} still referenced",
+                    restriction.fk.name,
+                    key.0.0,
+                    if restriction.cascaded {
+                        ", reached through a cascade"
+                    } else {
+                        ""
+                    },
+                ),
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2602,8 +3215,19 @@ mod tests {
         roles: &[&str],
         kind: DeployedKind,
     ) -> Vec<MigrationFinding> {
-        check_decoded(old, new, queries, roles, kind, Decoding::TypeScript)
+        check_decoded(
+            old,
+            new,
+            queries,
+            roles,
+            kind,
+            Decoding::TypeScript { types: &NO_TYPES },
+        )
     }
+
+    /// No type mapping.
+    static NO_TYPES: std::sync::LazyLock<HashMap<QualifiedName, String>> =
+        std::sync::LazyLock::new(HashMap::new);
 
     /// [`check`], for deployed code that decodes as `decoding` says.
     fn check_decoded(
@@ -2636,7 +3260,7 @@ mod tests {
                 kind,
             })
             .collect();
-        let findings = breaks_deployed_queries(
+        let findings = deployed_query_breakage(
             &Deployment {
                 reference: "origin/main",
                 catalog: &old_catalog,
@@ -2691,7 +3315,7 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         let finding = &findings[0];
         assert_eq!(finding.file, 1);
-        assert_eq!(finding.finding.rule, Rule::BreaksDeployedQueries);
+        assert_eq!(finding.finding.rule, Rule::DeployedQueryBreakage);
         // Placed on the statement that drops it, not the first one.
         assert_eq!(
             &"SELECT 1;\nALTER TABLE users DROP COLUMN email;"[finding.finding.span.clone()],
@@ -2875,7 +3499,7 @@ mod tests {
         let findings = check(
             &[USERS],
             &[
-                "-- typedpg-lint: allow(breaks_deployed_queries)\nALTER TABLE users DROP COLUMN email;",
+                "-- typedpg-lint: allow(deployed_query_breakage)\nALTER TABLE users DROP COLUMN email;",
             ],
             &["SELECT email FROM users"],
         );
@@ -2883,7 +3507,7 @@ mod tests {
         let findings = check(
             &[USERS],
             &["ALTER TABLE users DROP COLUMN email;"],
-            &["-- typedpg-lint: allow(breaks_deployed_queries)\nSELECT email FROM users"],
+            &["-- typedpg-lint: allow(deployed_query_breakage)\nSELECT email FROM users"],
         );
         assert!(findings.is_empty(), "{findings:?}");
     }
@@ -3246,7 +3870,7 @@ mod tests {
             ]
         );
         // TypeScript: both literal unions.
-        let all = decoded(Decoding::TypeScript).join("\n");
+        let all = decoded(Decoding::TypeScript { types: &NO_TYPES }).join("\n");
         assert!(
             all.contains(
                 "result column \"status\" may now be 'deleted', a value the deployed code does \
@@ -4708,5 +5332,515 @@ mod tests {
         }
         // Without a role, nothing is checked as one.
         assert!(check(&[old], &checked, &[insert]).is_empty());
+    }
+
+    const ACCOUNTS: &str = "CREATE TABLE accounts (
+            id integer PRIMARY KEY,
+            name text NOT NULL,
+            status text NOT NULL DEFAULT 'active'
+        );
+        CREATE TABLE audit (id integer, at timestamptz NOT NULL DEFAULT now());";
+
+    #[test]
+    fn a_function_body_a_migration_breaks() {
+        let functions = "CREATE FUNCTION account_name(i integer) RETURNS text LANGUAGE sql STABLE
+                 AS $$ SELECT name FROM accounts WHERE id = i $$;
+             CREATE FUNCTION account_status(i integer) RETURNS text LANGUAGE plpgsql STABLE AS $$
+                 DECLARE s text;
+                 BEGIN
+                     SELECT status INTO s FROM accounts WHERE id = i;
+                     RETURN s;
+                 END $$;
+             CREATE FUNCTION account_label(i integer) RETURNS text LANGUAGE sql STABLE
+                 AS $$ SELECT account_name(i) || '!' $$;";
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS, functions],
+                &["ALTER TABLE accounts RENAME COLUMN name TO full_name;"],
+                &["SELECT account_name($id) AS n"],
+            )),
+            "it calls function account_name(integer), a statement of whose body now fails: \
+             column \"name\" does not exist"
+        );
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS, functions],
+                &["ALTER TABLE accounts DROP COLUMN status;"],
+                &["SELECT account_status($id) AS s"],
+            )),
+            "it calls function account_status(integer), a statement of whose body now fails: \
+             column \"status\" does not exist"
+        );
+        // Through another function: the one the query calls is named.
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS, functions],
+                &["ALTER TABLE accounts RENAME TO users;"],
+                &["SELECT account_label($id) AS l"],
+            )),
+            "it calls function account_label(integer), whose body calls account_name(integer), a \
+             statement of which now fails: relation \"accounts\" does not exist"
+        );
+        // A body broken already at the ref, or one the change leaves
+        // working, is not reported.
+        assert!(
+            check(
+                &[ACCOUNTS, functions],
+                &["ALTER TABLE accounts ADD COLUMN email text;"],
+                &[
+                    "SELECT account_name($id) AS n",
+                    "SELECT account_status($id) AS s"
+                ],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_trigger_body_a_migration_breaks() {
+        let trigger = "CREATE FUNCTION audit_account() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN INSERT INTO audit (id) VALUES (NEW.id); RETURN NEW; END $$;
+             CREATE TRIGGER accounts_audit AFTER INSERT OR UPDATE ON accounts
+                 FOR EACH ROW EXECUTE FUNCTION audit_account();";
+        let findings = check(
+            &[ACCOUNTS, trigger],
+            &["ALTER TABLE audit RENAME COLUMN id TO account_id;"],
+            &[
+                "INSERT INTO accounts (id, name) VALUES ($id, $name)",
+                "UPDATE accounts SET name = $name WHERE id = $id",
+                "SELECT name FROM accounts WHERE id = $id",
+            ],
+        );
+        assert_eq!(
+            messages(&findings),
+            [
+                "this migration breaks the deployed query at src/q.rs:1 (origin/main): its INSERT \
+                 fires trigger \"accounts_audit\" on accounts (function audit_account()), a \
+                 statement of whose body now fails: column \"id\" of relation \"audit\" does not \
+                 exist",
+                "this migration breaks the deployed query at src/q.rs:2 (origin/main): its UPDATE \
+                 fires trigger \"accounts_audit\" on accounts (function audit_account()), a \
+                 statement of whose body now fails: column \"id\" of relation \"audit\" does not \
+                 exist",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_trigger_that_raises() {
+        let read_only = "CREATE FUNCTION read_only() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN RAISE EXCEPTION 'accounts are read-only'; END $$;";
+        let insert = "INSERT INTO accounts (id, name) VALUES ($id, $name)";
+        let update = "UPDATE accounts SET name = $name WHERE id = $id";
+        let delete = "DELETE FROM accounts WHERE id = $id";
+        // Raised on every row a plain write writes: certain.
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS],
+                &[&format!(
+                    "{read_only} CREATE TRIGGER accounts_ro BEFORE UPDATE ON accounts
+                         FOR EACH ROW EXECUTE FUNCTION read_only();"
+                )],
+                &[update],
+            )),
+            "its UPDATE fires trigger \"accounts_ro\" on accounts (function read_only()), which \
+             now fails for every row it writes: accounts are read-only"
+        );
+        // A statement trigger fails every run.
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS],
+                &[&format!(
+                    "{read_only} CREATE TRIGGER accounts_ro BEFORE DELETE ON accounts
+                         FOR EACH STATEMENT EXECUTE FUNCTION read_only();"
+                )],
+                &[delete],
+            )),
+            "its DELETE fires trigger \"accounts_ro\" on accounts (function read_only()), which \
+             now fails every time it runs: accounts are read-only"
+        );
+        // Under a WHEN, or for an INSERT … ON CONFLICT, the trigger may not
+        // fire for every row: it may fail.
+        let may = "its INSERT fires trigger \"accounts_ro\" on accounts (function read_only()), \
+                   which may now raise an error: a row it rejects fails";
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS],
+                &[&format!(
+                    "{read_only} CREATE TRIGGER accounts_ro BEFORE INSERT ON accounts
+                         FOR EACH ROW WHEN (NEW.status <> 'active')
+                         EXECUTE FUNCTION read_only();"
+                )],
+                &[insert],
+            )),
+            may
+        );
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS],
+                &[&format!(
+                    "{read_only} CREATE TRIGGER accounts_ro AFTER INSERT ON accounts
+                         FOR EACH ROW EXECUTE FUNCTION read_only();"
+                )],
+                &[
+                    "INSERT INTO accounts (id, name) VALUES ($id, $name) ON CONFLICT (id) DO NOTHING"
+                ],
+            )),
+            may
+        );
+        // A body raising depending on the row.
+        let rejects = "CREATE FUNCTION no_long() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                     IF length(NEW.name) > 15 THEN RAISE EXCEPTION 'too long'; END IF;
+                     RETURN NEW;
+                 END $$;
+             CREATE TRIGGER no_long BEFORE INSERT OR UPDATE ON accounts
+                 FOR EACH ROW EXECUTE FUNCTION no_long();";
+        assert_eq!(
+            only(&check(&[ACCOUNTS], &[rejects], &[insert])),
+            "its INSERT fires trigger \"no_long\" on accounts (function no_long()), which may now \
+             raise an error: a row it rejects fails"
+        );
+        // A function replaced with one that raises.
+        assert_eq!(
+            only(&check(
+                &[ACCOUNTS, "CREATE FUNCTION check_account() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN RETURN NEW; END $$;
+                 CREATE TRIGGER accounts_check BEFORE INSERT ON accounts
+                     FOR EACH ROW EXECUTE FUNCTION check_account();"],
+                &["CREATE OR REPLACE FUNCTION check_account() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                         IF NEW.name = '' THEN RAISE EXCEPTION 'empty name'; END IF;
+                         RETURN NEW;
+                     END $$;"],
+                &[insert],
+            )),
+            "its INSERT fires trigger \"accounts_check\" on accounts (function check_account()), \
+             which may now raise an error: a row it rejects fails"
+        );
+        // Not reported: a trigger that can't raise, one already raising the
+        // same way at the ref, another command's, a read.
+        let on = |event: &str| {
+            format!(
+                "{read_only} CREATE TRIGGER accounts_ro BEFORE {event} ON accounts
+                     FOR EACH ROW EXECUTE FUNCTION read_only();"
+            )
+        };
+        for (old, new, sql) in [
+            (
+                ACCOUNTS.to_owned(),
+                "CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN NEW.status := 'active'; RETURN NEW; END $$;
+                 CREATE TRIGGER accounts_stamp BEFORE INSERT ON accounts
+                     FOR EACH ROW EXECUTE FUNCTION stamp();"
+                    .to_owned(),
+                insert,
+            ),
+            (
+                format!("{ACCOUNTS} {rejects}"),
+                "SELECT 1;".to_owned(),
+                insert,
+            ),
+            (ACCOUNTS.to_owned(), on("DELETE"), insert),
+            (
+                ACCOUNTS.to_owned(),
+                on("UPDATE"),
+                "SELECT name FROM accounts",
+            ),
+        ] {
+            let findings = check(&[&old], &[&new], &[sql]);
+            assert!(findings.is_empty(), "{new}: {findings:?}");
+        }
+    }
+
+    const ORDERS: &str = "CREATE TABLE customers (id integer PRIMARY KEY, name text NOT NULL);
+        CREATE TABLE orders (
+            id integer PRIMARY KEY,
+            customer_id integer,
+            note text
+        );";
+
+    #[test]
+    fn a_new_foreign_key_meets_the_rows_written() {
+        let fk = "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                      FOREIGN KEY (customer_id) REFERENCES customers NOT VALID;";
+        let may = |statement: &str| {
+            format!(
+                "{statement} may fail: foreign key \"orders_customer_fk\" now requires column \
+                 customer_id to match a row of customers, and a row with no match fails"
+            )
+        };
+        for (sql, statement) in [
+            (
+                "INSERT INTO orders (id, customer_id) VALUES ($id, $customer)",
+                "its INSERT into orders",
+            ),
+            (
+                "UPDATE orders SET customer_id = $customer WHERE id = $id",
+                "its UPDATE of orders",
+            ),
+            (
+                "INSERT INTO orders (id, customer_id) VALUES ($id, 1)",
+                "its INSERT into orders",
+            ),
+        ] {
+            assert_eq!(only(&check(&[ORDERS], &[fk], &[sql])), may(statement));
+        }
+        assert_eq!(
+            only(&check_copy(&[ORDERS], &[fk], &["orders (id, customer_id)"])),
+            may("its COPY into orders")
+        );
+        // Referencing a partitioned table: said once, of the table.
+        assert_eq!(
+            only(&check(
+                &[
+                    "CREATE TABLE customers (id integer PRIMARY KEY) PARTITION BY RANGE (id);
+                   CREATE TABLE customers_1 PARTITION OF customers FOR VALUES FROM (0) TO (100);
+                   CREATE TABLE customers_2 PARTITION OF customers FOR VALUES FROM (100) TO (200);
+                   CREATE TABLE orders (id integer PRIMARY KEY, customer_id integer);"
+                ],
+                &["ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                       FOREIGN KEY (customer_id) REFERENCES customers;"],
+                &["INSERT INTO orders (id, customer_id) VALUES ($id, $customer)"],
+            )),
+            may("its INSERT into orders")
+        );
+        // One not enforced at the ref checked nothing.
+        assert_eq!(
+            only(&check(
+                &[
+                    ORDERS,
+                    "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                     FOREIGN KEY (customer_id) REFERENCES customers NOT ENFORCED;"
+                ],
+                &["ALTER TABLE orders ALTER CONSTRAINT orders_customer_fk ENFORCED;"],
+                &["INSERT INTO orders (id, customer_id) VALUES ($id, $customer)"],
+            )),
+            may("its INSERT into orders")
+        );
+        // A row whose key is NULL isn't checked (MATCH SIMPLE), nor an
+        // UPDATE that doesn't write it; a foreign key validated (it checked
+        // every row written already) or enforced at the ref is no change.
+        for (old, new, sql) in [
+            (
+                ORDERS,
+                fk,
+                "INSERT INTO orders (id, note) VALUES ($id, $note)",
+            ),
+            (
+                ORDERS,
+                fk,
+                "INSERT INTO orders (id, customer_id) VALUES ($id, NULL)",
+            ),
+            (ORDERS, fk, "UPDATE orders SET note = $note WHERE id = $id"),
+            (
+                "CREATE TABLE customers (id integer PRIMARY KEY);
+                 CREATE TABLE orders (id integer PRIMARY KEY, customer_id integer,
+                     CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers
+                         NOT VALID);",
+                "ALTER TABLE orders VALIDATE CONSTRAINT orders_customer_fk;",
+                "INSERT INTO orders (id, customer_id) VALUES ($id, $customer)",
+            ),
+        ] {
+            let findings = check(&[old], &[new], &[sql]);
+            assert!(findings.is_empty(), "{new} / {sql}: {findings:?}");
+        }
+        // MATCH FULL checks a row with a NULL among non-NULL key columns.
+        let pairs = "CREATE TABLE p (a integer, b integer, PRIMARY KEY (a, b));
+                     CREATE TABLE c (id integer PRIMARY KEY, a integer, b integer);";
+        let full = "ALTER TABLE c ADD CONSTRAINT c_p FOREIGN KEY (a, b) REFERENCES p MATCH FULL;";
+        assert_eq!(
+            only(&check(
+                &[pairs],
+                &[full],
+                &["INSERT INTO c (id, a, b) VALUES ($id, $a, NULL)"]
+            )),
+            "its INSERT into c may fail: foreign key \"c_p\" now requires columns a, b to match a \
+             row of p, and a row with no match fails"
+        );
+        assert!(
+            check(
+                &[pairs],
+                &[full],
+                &["INSERT INTO c (id, a, b) VALUES ($id, NULL, NULL)"]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_new_foreign_key_meets_a_delete_of_its_referenced_rows() {
+        let fk = |action: &str| {
+            format!(
+                "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                     FOREIGN KEY (customer_id) REFERENCES customers {action} NOT VALID;"
+            )
+        };
+        let delete = "DELETE FROM customers WHERE id = $id";
+        let update_key = "UPDATE customers SET id = $new WHERE id = $id";
+        assert_eq!(
+            only(&check(&[ORDERS], &[&fk("")], &[delete])),
+            "its DELETE from customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
+             DELETE NO ACTION) now rejects deleting a row still referenced"
+        );
+        assert_eq!(
+            only(&check(
+                &[ORDERS],
+                &[&fk("ON UPDATE RESTRICT")],
+                &[update_key]
+            )),
+            "its UPDATE of customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
+             UPDATE RESTRICT) now rejects changing the key (id) of a row still referenced"
+        );
+        // An action that changes to one rejecting the delete.
+        assert_eq!(
+            only(&check(
+                &[ORDERS, &fk("ON DELETE CASCADE")],
+                &[
+                    "ALTER TABLE orders DROP CONSTRAINT orders_customer_fk;",
+                    &fk("ON DELETE RESTRICT")
+                ],
+                &[delete],
+            )),
+            "its DELETE from customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
+             DELETE RESTRICT) now rejects deleting a row still referenced"
+        );
+        // Not reported: a cascade, SET NULL into a nullable column, an
+        // UPDATE that doesn't change the key.
+        for (new, sql) in [
+            (fk("ON DELETE CASCADE"), delete),
+            (fk("ON DELETE SET NULL"), delete),
+            (fk(""), "UPDATE customers SET name = $name WHERE id = $id"),
+        ] {
+            let findings = check(&[ORDERS], &[&new], &[sql]);
+            assert!(findings.is_empty(), "{new} / {sql}: {findings:?}");
+        }
+        // SET NULL into a NOT NULL column fails.
+        assert_eq!(
+            only(&check(
+                &[
+                    ORDERS,
+                    "UPDATE orders SET customer_id = 0 WHERE customer_id IS NULL;
+                           ALTER TABLE orders ALTER COLUMN customer_id SET NOT NULL;"
+                ],
+                &[&fk("ON DELETE SET NULL")],
+                &[delete],
+            )),
+            "its DELETE from customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
+             DELETE SET NULL) now rejects deleting a row still referenced"
+        );
+    }
+
+    #[test]
+    fn a_new_foreign_key_meets_a_delete_through_a_view() {
+        // The rows a DELETE (or a MERGE's DELETE) through an automatically
+        // updatable view deletes — through a chain of them — are the base
+        // table's, and so are the keys an UPDATE through it changes.
+        let views = "CREATE VIEW vip AS SELECT id, name FROM customers WHERE id > 10;
+                     CREATE VIEW top_vip AS SELECT * FROM vip WHERE id < 1000;";
+        let fk = "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk
+                      FOREIGN KEY (customer_id) REFERENCES customers NOT VALID;";
+        let message = "its DELETE from customers may fail: foreign key \"orders_customer_fk\" of \
+                       orders (ON DELETE NO ACTION) now rejects deleting a row still referenced";
+        for delete in [
+            "DELETE FROM vip WHERE id = $id",
+            "DELETE FROM top_vip WHERE id = $id",
+            "MERGE INTO top_vip v USING (SELECT $id::int AS id) s ON v.id = s.id \
+             WHEN MATCHED THEN DELETE",
+        ] {
+            assert_eq!(
+                only(&check(&[ORDERS, views], &[fk], &[delete])),
+                message,
+                "{delete}"
+            );
+        }
+        assert_eq!(
+            only(&check(
+                &[ORDERS, views],
+                &[fk],
+                &["UPDATE top_vip SET id = $new WHERE id = $id"]
+            )),
+            "its UPDATE of customers may fail: foreign key \"orders_customer_fk\" of orders (ON \
+             UPDATE NO ACTION) now rejects changing the key (id) of a row still referenced"
+        );
+        // A view whose deletes an INSTEAD OF trigger takes over deletes
+        // nothing of the table itself.
+        let instead = "CREATE FUNCTION skip() RETURNS trigger LANGUAGE plpgsql
+                           AS $$ BEGIN RETURN NULL; END $$;
+                       CREATE TRIGGER skip INSTEAD OF DELETE ON vip
+                           FOR EACH ROW EXECUTE FUNCTION skip();";
+        let findings = check(
+            &[ORDERS, views, instead],
+            &[fk],
+            &["DELETE FROM top_vip WHERE id = $id"],
+        );
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_domain_over_the_same_type_changes_no_client_type() {
+        let old = "CREATE DOMAIN shortname AS text;
+                   CREATE TABLE people (id integer PRIMARY KEY, name varchar(20) NOT NULL);";
+        let new = "ALTER TABLE people ALTER COLUMN name TYPE shortname;";
+        let queries = &["SELECT name FROM people"];
+        let types = HashMap::new();
+        // The same wire type and the same mapped (here: none) type on both
+        // sides: nothing changes for the deployed code.
+        let same = "CREATE DOMAIN short20 AS varchar(20);";
+        for decoding in [
+            Decoding::Rust { types: &types },
+            Decoding::TypeScript { types: &types },
+        ] {
+            let findings = check_decoded(
+                &[old, same],
+                &["ALTER TABLE people ALTER COLUMN name TYPE short20;"],
+                queries,
+                &[],
+                DeployedKind::Query,
+                decoding,
+            );
+            assert!(findings.is_empty(), "{findings:?}");
+            // Removing it again neither.
+            let findings = check_decoded(
+                &[
+                    old,
+                    same,
+                    "ALTER TABLE people ALTER COLUMN name TYPE short20;",
+                ],
+                &["ALTER TABLE people ALTER COLUMN name TYPE varchar(20);"],
+                queries,
+                &[],
+                DeployedKind::Query,
+                decoding,
+            );
+            assert!(findings.is_empty(), "{findings:?}");
+        }
+        // Over another type (text, not varchar): reported.
+        assert_eq!(
+            only(&check(&[old], &[new], queries)),
+            "result column \"name\" changes from character varying(20) to public.shortname"
+        );
+        // A domain a type mapping names: the generated type changes.
+        let mapped = HashMap::from([(
+            QualifiedName::new("public".to_owned(), "short20".to_owned()),
+            "ShortName".to_owned(),
+        )]);
+        for decoding in [
+            Decoding::Rust { types: &mapped },
+            Decoding::TypeScript { types: &mapped },
+        ] {
+            let findings = check_decoded(
+                &[old, same],
+                &["ALTER TABLE people ALTER COLUMN name TYPE short20;"],
+                queries,
+                &[],
+                DeployedKind::Query,
+                decoding,
+            );
+            assert_eq!(
+                only(&findings),
+                "result column \"name\" changes from character varying(20) to public.short20"
+            );
+        }
     }
 }

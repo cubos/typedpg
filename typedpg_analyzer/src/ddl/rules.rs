@@ -61,12 +61,12 @@ pub(crate) struct ActionPlanError {
 /// to, as their analysis found it — what InsertRule records the rule's
 /// dependencies on (recordDependencyOnExpr over the transformed queries:
 /// an INSERT's target columns after `*` expansion, the columns ON CONFLICT
-/// reads, ...).
+/// reads, ...): the condition's, then the actions'.
 pub(crate) fn create_rule(
     interp: &mut PgCatalog,
     stmt: &RuleStmt,
-) -> Result<Vec<super::depend::Reference>, DdlError> {
-    let mut references = Vec::new();
+) -> Result<(Vec<super::depend::Reference>, Vec<super::depend::Reference>), DdlError> {
+    let mut references = (Vec::new(), Vec::new());
     define_rule(interp, stmt, &mut references)?;
     Ok(references)
 }
@@ -74,7 +74,10 @@ pub(crate) fn create_rule(
 fn define_rule(
     interp: &mut PgCatalog,
     stmt: &RuleStmt,
-    references: &mut Vec<super::depend::Reference>,
+    (references, action_references): &mut (
+        Vec<super::depend::Reference>,
+        Vec<super::depend::Reference>,
+    ),
 ) -> Result<(), DdlError> {
     let Some(rv) = stmt.relation.as_ref() else {
         return Ok(());
@@ -112,6 +115,95 @@ fn define_rule(
         )));
     }
 
+    let rule = analyze_rule(interp, relid, stmt, (references, action_references))?;
+    if event == CmdType::CmdSelect {
+        // CREATE OR REPLACE RULE "_RETURN": the view's new query, producing
+        // the same columns.
+        let view = typedpg_pg_query::ast::RangeVar {
+            schemaname: interp
+                .pg_class
+                .get(&relid)
+                .and_then(|c| interp.namespace_name(c.relnamespace))
+                .unwrap_or_default()
+                .to_owned(),
+            relname: rv.relname.clone(),
+            inh: true,
+            relpersistence: "p".into(),
+            ..Default::default()
+        };
+        super::views::create_view(
+            interp,
+            &typedpg_pg_query::ast::ViewStmt {
+                view: Some(view.into()),
+                query: stmt.actions.first().cloned().flatten(),
+                replace: true,
+                ..Default::default()
+            },
+        )?;
+        // transformRuleStmt: the action's range table holds OLD and NEW,
+        // the view itself, which its `_RETURN` rule then depends on — what
+        // CREATE VIEW's query doesn't. (No DROP consults the row: the rule
+        // goes with the view.)
+        if let Some(rule) = interp
+            .pg_rewrite_of(relid, VIEW_SELECT_RULE_NAME)
+            .map(|r| r.oid)
+        {
+            let view_obj = crate::oid::PgGenericOid::from_nonzero(relid.into_nonzero());
+            interp.add_dependency(crate::pg_catalog::PgDepend {
+                classid: crate::ddl::depend::PG_REWRITE_RELID,
+                objid: crate::oid::PgGenericOid::from_nonzero(rule.into_nonzero()),
+                objsubid: 0,
+                refclassid: crate::pg_catalog::PG_CLASS_RELID,
+                refobjid: view_obj,
+                refobjsubid: 0,
+                deptype: crate::pg_catalog::DepType::Normal,
+            });
+        }
+        return Ok(());
+    }
+
+    let relname = rv.relname.clone();
+    let rules = interp.rules.entry(relid).or_default();
+    if let Some(existing) = rules.iter_mut().find(|r| r.name == stmt.rulename) {
+        if stmt.replace {
+            // DefineQueryRewrite replaces the definition; ev_enabled stays.
+            *existing = Rule {
+                oid: existing.oid,
+                enabled: existing.enabled,
+                ..rule
+            };
+            return Ok(());
+        }
+        return Err(DdlError::DuplicateObject(format!(
+            "rule \"{}\" for relation \"{relname}\" already exists",
+            stmt.rulename
+        )));
+    }
+    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
+    interp
+        .rules
+        .entry(relid)
+        .or_default()
+        .push(Rule { oid, ..rule });
+    Ok(())
+}
+
+/// What CREATE RULE `stmt` on relation `relid` defines, as the rewriter
+/// sees it (transformRuleStmt, DefineQueryRewrite's checks), with what its
+/// condition and its actions refer to added to `references` and
+/// `action_references` — the rule's catalog row aside (its OID is pending,
+/// it fires). The catalog oracle builds one from PostgreSQL's
+/// `pg_get_ruledef` to compare with the stored one.
+pub(crate) fn analyze_rule(
+    interp: &PgCatalog,
+    relid: PgClassOid,
+    stmt: &RuleStmt,
+    (references, action_references): (
+        &mut Vec<super::depend::Reference>,
+        &mut Vec<super::depend::Reference>,
+    ),
+) -> Result<Rule, DdlError> {
+    let event = stmt.event;
     // transformRuleStmt: NEW exists except for DELETE, OLD except for
     // INSERT.
     let (has_old, has_new) = match event {
@@ -179,7 +271,7 @@ fn define_rule(
             })
         });
         outputs.push(checked?);
-        references.extend(refs);
+        action_references.extend(refs);
         actions.extend(rewrites);
         // transformRuleStmt: a conditional rule's action must be a query
         // (the condition is added to it); NOTIFY is a utility statement.
@@ -200,33 +292,6 @@ fn define_rule(
         ));
     }
     define_query_rewrite(interp, relid, stmt, event, &outputs)?;
-    if event == CmdType::CmdSelect {
-        // CREATE OR REPLACE RULE "_RETURN": the view's new query, producing
-        // the same columns.
-        let view = typedpg_pg_query::ast::RangeVar {
-            schemaname: interp
-                .pg_class
-                .get(&relid)
-                .and_then(|c| interp.namespace_name(c.relnamespace))
-                .unwrap_or_default()
-                .to_owned(),
-            relname: rv.relname.clone(),
-            inh: true,
-            relpersistence: "p".into(),
-            ..Default::default()
-        };
-        return super::views::create_view(
-            interp,
-            &typedpg_pg_query::ast::ViewStmt {
-                view: Some(view.into()),
-                query: stmt.actions.first().cloned().flatten(),
-                replace: true,
-                ..Default::default()
-            },
-        );
-    }
-
-    let relname = rv.relname.clone();
     let returning = stmt.actions.iter().any(|a| match a.as_ref() {
         Some(ast::Node::InsertStmt(s)) => s
             .returning_clause
@@ -242,7 +307,7 @@ fn define_rule(
             .is_some_and(|r| !r.exprs.is_empty()),
         _ => false,
     });
-    let rule = Rule {
+    Ok(Rule {
         oid: crate::ddl::depend::PENDING_OID,
         name: stmt.rulename.clone(),
         event,
@@ -264,30 +329,7 @@ fn define_rule(
             })
             .collect(),
         plan_errors,
-    };
-    let rules = interp.rules.entry(relid).or_default();
-    if let Some(existing) = rules.iter_mut().find(|r| r.name == stmt.rulename) {
-        if stmt.replace {
-            // DefineQueryRewrite replaces the definition; ev_enabled stays.
-            *existing = Rule {
-                oid: existing.oid,
-                enabled: existing.enabled,
-                ..rule
-            };
-            return Ok(());
-        }
-        return Err(DdlError::DuplicateObject(format!(
-            "rule \"{}\" for relation \"{relname}\" already exists",
-            stmt.rulename
-        )));
-    }
-    let oid = crate::oid::PgGenericOid::from_nonzero(interp.alloc_oid()?);
-    interp
-        .rules
-        .entry(relid)
-        .or_default()
-        .push(Rule { oid, ..rule });
-    Ok(())
+    })
 }
 
 /// ViewSelectRuleName.
@@ -758,6 +800,42 @@ pub(crate) fn has_rule(interp: &PgCatalog, relid: PgClassOid, name: &str) -> boo
             .rules
             .get(&relid)
             .is_some_and(|rs| rs.iter().any(|r| r.name == name))
+}
+
+/// ALTER TABLE ... RENAME COLUMN `old` TO `new` of relation `relid`: the
+/// rule actions writing the relation name the column by its new name (PG's
+/// keep its attnum).
+pub(crate) fn rename_action_columns(
+    interp: &mut PgCatalog,
+    relid: PgClassOid,
+    old: &str,
+    new: &str,
+) {
+    let writes = |rule: &Rule| rule.actions.iter().any(|(target, _)| *target == relid);
+    if !interp.rules.values().flatten().any(writes) {
+        return;
+    }
+    let rename = |column: &mut String| {
+        if column == old {
+            new.clone_into(column);
+        }
+    };
+    for rule in interp.rules.values_mut().flatten() {
+        for (target, rewrite) in &mut rule.actions {
+            if *target != relid {
+                continue;
+            }
+            rewrite.listed.iter_mut().for_each(rename);
+            for assign in rewrite
+                .actions
+                .iter_mut()
+                .flat_map(|a| a.assigns.iter_mut())
+                .chain(rewrite.on_conflict.iter_mut().flatten().flatten())
+            {
+                rename(&mut assign.column);
+            }
+        }
+    }
 }
 
 /// `ALTER TABLE ... ENABLE / DISABLE [ALWAYS | REPLICA] RULE name`

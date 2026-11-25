@@ -2,9 +2,9 @@
 
 An output column alias that is the name PostgreSQL already gives the column.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | queries | removes the alias |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | queries | removes the alias |
 
 ## Example
 
@@ -18,7 +18,7 @@ UPDATE posts SET views = views + 1 WHERE id = $id RETURNING views AS views;
 ```
 
 ```
-info[redundant_alias]: alias email is the name the column already has
+info[redundant/redundant_alias]: alias email is the name the column already has
    ╭─[queries.sql:2:16]
  2 │ SELECT u.email AS email FROM users u;
    ·                ────────

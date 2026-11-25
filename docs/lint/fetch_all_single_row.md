@@ -3,9 +3,9 @@
 `fetch_all` (`fetchAll` in TypeScript) on a query that returns at most one
 row.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| info | call sites | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| redundant | info | call sites | — |
 
 ## Example
 
@@ -25,7 +25,7 @@ pub async fn user_by_id(pool: &typedpg::Pool, id: i64) -> typedpg::Result<()> {
 ```
 
 ```
-info[fetch_all_single_row]: `.fetch_all()` on a query that returns at most one row
+info[redundant/fetch_all_single_row]: `.fetch_all()` on a query that returns at most one row
    ╭─[src/users.rs:5:10]
  5 │         .fetch_all()
    ·          ─────────
@@ -50,7 +50,7 @@ with the wrong filter.
 returns at most one row: a unique key fully pinned by the `WHERE`, an
 aggregate without `GROUP BY`, `LIMIT 1`, a one-row `INSERT … VALUES`, an
 `UPDATE` / `DELETE` by key, and the other cases listed in
-[`fetch_may_return_many`](fetch_may_return_many.md#not-reported).
+[`fetch_one_multiple_rows`](fetch_one_multiple_rows.md#not-reported).
 
 Each call is reported at its method name.
 
@@ -82,7 +82,7 @@ See [Configuring rules](README.md#configuring-rules).
 
 ## Related
 
-- [`fetch_may_return_many`](fetch_may_return_many.md): the opposite
+- [`fetch_one_multiple_rows`](fetch_one_multiple_rows.md): the opposite
   mismatch.
 - [`redundant_limit`](redundant_limit.md): a `LIMIT` on a query that
   already returns at most one row.

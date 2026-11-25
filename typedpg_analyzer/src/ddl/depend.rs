@@ -252,9 +252,12 @@ impl ObjectAddress {
 /// initdb's later objects (plpgsql, information_schema) are not pinned.
 pub(crate) const FIRST_UNPINNED_OBJECT_ID: u32 = 12000;
 
-/// `recordDependencyOn` for each of `referenced` (deduplicated, like
-/// `record_object_address_dependencies`), skipping pinned objects and the
-/// depender itself.
+/// `recordDependencyOn` for each of `referenced`, skipping pinned objects
+/// and the depender itself — deduplicated as
+/// `record_object_address_dependencies` and `recordDependencyOnExpr` do
+/// (eliminate_duplicate_dependencies): a whole object referenced along
+/// with a part of it (a relation and one of its columns) is recorded only
+/// as the part.
 pub(crate) fn record(
     interp: &mut PgCatalog,
     depender: ObjectAddress,
@@ -268,6 +271,12 @@ pub(crate) fn record(
         .collect();
     refs.sort();
     refs.dedup();
+    let parts: std::collections::HashSet<(PgClassOid, PgGenericOid)> = refs
+        .iter()
+        .filter(|r| r.objsubid != 0)
+        .map(|r| (r.classid, r.objid))
+        .collect();
+    refs.retain(|r| r.objsubid != 0 || !parts.contains(&(r.classid, r.objid)));
     for r in refs {
         interp.add_dependency(PgDepend {
             classid: depender.classid,
@@ -389,6 +398,20 @@ pub(crate) fn record_references(
     record(interp, depender, addrs, deptype);
 }
 
+/// The attnum of system column `name` (sysattr.h), which an expression
+/// reading it depends on like on any column.
+pub(crate) fn system_attnum(name: &str) -> Option<i16> {
+    Some(match name {
+        "ctid" => -1,
+        "xmin" => -2,
+        "cmin" => -3,
+        "xmax" => -4,
+        "cmax" => -5,
+        "tableoid" => -6,
+        _ => return None,
+    })
+}
+
 /// The objects `refs` name, as they are now.
 pub(crate) fn reference_addresses(interp: &PgCatalog, refs: &[Reference]) -> Vec<ObjectAddress> {
     let mut addrs: Vec<ObjectAddress> = Vec::new();
@@ -398,7 +421,9 @@ pub(crate) fn reference_addresses(interp: &PgCatalog, refs: &[Reference]) -> Vec
             Reference::Column(relid, name) => addrs.extend(
                 interp
                     .attribute_by_name(*relid, name)
-                    .map(|a| ObjectAddress::column(*relid, a.attnum)),
+                    .map(|a| a.attnum)
+                    .or_else(|| system_attnum(name))
+                    .map(|attnum| ObjectAddress::column(*relid, attnum)),
             ),
             Reference::Named(object) => addrs.extend(named_address_of(interp, object)),
         }
@@ -436,6 +461,8 @@ pub(crate) const PG_TS_TEMPLATE_RELID: PgClassOid = PgClassOid::from_raw(3764);
 pub(crate) const PG_AM_RELID: PgClassOid = PgClassOid::from_raw(2601);
 /// `pg_foreign_data_wrapper`.
 pub(crate) const PG_FOREIGN_DATA_WRAPPER_RELID: PgClassOid = PgClassOid::from_raw(2328);
+/// `pg_transform`.
+pub(crate) const PG_TRANSFORM_RELID: PgClassOid = PgClassOid::from_raw(3576);
 
 /// The catalog of a text search object of `kind` (`c`, `d`, `p`, `t`).
 fn ts_classid(kind: &str) -> PgClassOid {
@@ -509,6 +536,11 @@ pub(crate) enum NamedObject {
         name: String,
         namespace: crate::oid::PgNamespaceOid,
     },
+    /// A transform (`pg_transform`), by type and language.
+    Transform {
+        typ: PgTypeOid,
+        lang: String,
+    },
 }
 
 impl NamedObject {
@@ -525,6 +557,7 @@ impl NamedObject {
             NamedObject::AccessMethod { .. } => PG_AM_RELID,
             NamedObject::ForeignDataWrapper { .. } => PG_FOREIGN_DATA_WRAPPER_RELID,
             NamedObject::Statistics { .. } => PG_STATISTIC_EXT_RELID,
+            NamedObject::Transform { .. } => PG_TRANSFORM_RELID,
         }
     }
 
@@ -598,6 +631,9 @@ impl NamedObject {
                 .iter()
                 .find(|s| &s.name == name && s.namespace == *namespace)
                 .map(|s| s.oid),
+            NamedObject::Transform { typ, lang } => {
+                super::languages::transform_oid(interp, *typ, lang)
+            }
         }
     }
 }
@@ -692,6 +728,16 @@ pub(crate) fn named_object_at(interp: &PgCatalog, addr: ObjectAddress) -> Option
             .foreign_data
             .wrapper_named(oid)
             .map(|name| NamedObject::ForeignDataWrapper { name }),
+        c if c == PG_TRANSFORM_RELID => {
+            interp
+                .transforms
+                .iter()
+                .find(|(_, _, o)| *o == oid)
+                .map(|(typ, lang, _)| NamedObject::Transform {
+                    typ: *typ,
+                    lang: lang.clone(),
+                })
+        }
         c if c == PG_STATISTIC_EXT_RELID => {
             interp
                 .statistics
@@ -1127,6 +1173,10 @@ pub(crate) fn describe(interp: &PgCatalog, addr: ObjectAddress) -> String {
                     "statistics object {}",
                     qualify_unless_visible(interp, namespace, &name, visible)
                 )
+            }
+            // getObjectDescription: "transform for %s language %s".
+            Some(NamedObject::Transform { typ, lang }) => {
+                format!("transform for {} language {lang}", type_name(typ))
             }
             _ => "object".into(),
         },
@@ -1874,6 +1924,9 @@ fn delete_named(interp: &mut PgCatalog, object: &NamedObject) {
         NamedObject::Statistics { name, namespace } => interp
             .statistics
             .retain(|s| !(&s.name == name && s.namespace == *namespace)),
+        NamedObject::Transform { typ, lang } => interp
+            .transforms
+            .retain(|(t, l, _)| !(t == typ && l == lang)),
     }
 }
 
@@ -1896,7 +1949,7 @@ pub(crate) fn delete_member(interp: &mut PgCatalog, classid: PgClassOid, objid: 
 
 /// The objects the analyzer keeps in collections of their own, as named
 /// now: what an extension's scripts may create besides `pg_class`,
-/// `pg_proc`, ... rows.
+/// `pg_proc`, ... rows (a transform, `bool_plperl`'s, too).
 pub(crate) fn named_objects(interp: &PgCatalog) -> Vec<NamedObject> {
     let mut objects: Vec<NamedObject> = interp
         .pg_opfamily
@@ -1928,6 +1981,15 @@ pub(crate) fn named_objects(interp: &PgCatalog) -> Vec<NamedObject> {
             .foreign_data
             .wrapper_names()
             .map(|name| NamedObject::ForeignDataWrapper { name }),
+    );
+    objects.extend(
+        interp
+            .transforms
+            .iter()
+            .map(|(typ, lang, _)| NamedObject::Transform {
+                typ: *typ,
+                lang: lang.clone(),
+            }),
     );
     objects
 }
@@ -2023,6 +2085,36 @@ pub(crate) fn expression_references(
     expr: Option<&typedpg_pg_query::ast::Node>,
     relid: Option<PgClassOid>,
 ) -> Vec<Reference> {
+    expression_references_as(interp, expr, relid, None, None)
+}
+
+/// [`expression_references`] of a trigger's WHEN condition, over its
+/// relation's row as `old` and `new`, coerced to boolean.
+pub(crate) fn trigger_when_references(
+    interp: &PgCatalog,
+    expr: Option<&typedpg_pg_query::ast::Node>,
+    relid: PgClassOid,
+) -> Vec<Reference> {
+    expression_references_as(
+        interp,
+        expr,
+        Some(relid),
+        Some(crate::pg_catalog::oid::BOOL),
+        Some(&["old", "new"]),
+    )
+}
+
+/// [`expression_references`] of an expression coerced to `target`
+/// (COERCION_ASSIGNMENT) as it is stored: an untyped literal becomes a
+/// constant of `target`, another type reaches it through its cast
+/// function, or as a relabeling to it (coerce_to_target_type).
+fn expression_references_as(
+    interp: &PgCatalog,
+    expr: Option<&typedpg_pg_query::ast::Node>,
+    relid: Option<PgClassOid>,
+    target: Option<crate::oid::PgTypeOid>,
+    aliases: Option<&[&str]>,
+) -> Vec<Reference> {
     let mut scope = crate::scope::Scope::default();
     if let Some(relid) = relid
         && let Some(class) = interp.pg_class.get(&relid)
@@ -2031,24 +2123,75 @@ pub(crate) fn expression_references(
             .namespace_name(class.relnamespace)
             .unwrap_or_default();
         let attrs = interp.attributes_of(relid).to_vec();
-        scope.add_dml_target(
-            interp,
-            &class.relname,
-            crate::qualified_name::QualifiedName::new(schema, &class.relname),
-            &attrs,
-        );
+        let own = [class.relname.as_str()];
+        for alias in aliases.unwrap_or(&own) {
+            scope.add_dml_target(
+                interp,
+                alias,
+                crate::qualified_name::QualifiedName::new(schema, &class.relname),
+                &attrs,
+            );
+        }
     }
+    // A column reference reads the relation's column whatever relation name
+    // qualifies it (a stored expression written before a rename).
+    // (Not over NEW and OLD, which name the relation.)
+    let over_row = relid.filter(|_| aliases.is_none());
+    let own_row = over_row.and_then(|rel| super::stored_exprs::over_own_row(interp, rel, expr));
+    let expr = if over_row.is_some() {
+        own_row.as_ref()
+    } else {
+        expr
+    };
     let null_ctx = crate::nullability::NullabilityContext::default();
     let mut params = crate::param_collector::ParamCollector::default();
     let (_, refs) = collect(|| {
-        crate::expr::infer_expr(
+        let goal = target.map_or(
+            crate::expr::TypeGoal::NONE,
+            crate::expr::TypeGoal::assignment,
+        );
+        let result = crate::expr::infer_expr(
             expr,
             crate::expr::Ctx::new(&scope, &null_ctx, interp),
             &mut params,
-            crate::expr::TypeGoal::NONE,
-        )
+            goal,
+        );
+        if let (Ok(r), Some(target)) = (&result, target) {
+            note_coercion(interp, r.type_oid, target);
+        }
     });
     refs
+}
+
+/// The coercion of a value of type `from` to type `to` (coerce_type): a
+/// cast function is a `FuncExpr` of it, a binary-coercible or I/O
+/// conversion a node of the result type, a domain a `CoerceToDomain` —
+/// what a stored expression depends on (find_expr_references_walker).
+pub(crate) fn note_coercion(
+    interp: &PgCatalog,
+    from: crate::oid::PgTypeOid,
+    to: crate::oid::PgTypeOid,
+) {
+    use crate::pg_catalog::oid;
+    if from == to || from == oid::UNKNOWN || to == oid::UNKNOWN {
+        return;
+    }
+    let key = (interp.unwrap_domain(from), interp.unwrap_domain(to));
+    let castfunc = interp
+        .cast_by_pair
+        .get(&key)
+        .and_then(|c| interp.pg_cast.get(c))
+        .and_then(|c| c.castfunc);
+    if let Some(f) = castfunc {
+        note(ObjectAddress::proc(f));
+    }
+    let to_domain = interp
+        .pg_type
+        .get(&to)
+        .is_some_and(|t| t.typtype == crate::pg_catalog::TypType::Domain);
+    if castfunc.is_none() || to_domain {
+        note(ObjectAddress::type_(to));
+    }
 }
 
 /// What an expression stored as a value of type `target` (a column or
@@ -2062,7 +2205,7 @@ pub(crate) fn coerced_expression_references(
     target: Option<crate::oid::PgTypeOid>,
 ) -> Vec<Reference> {
     use typedpg_pg_query::ast;
-    let mut refs = expression_references(interp, expr, relid);
+    let mut refs = expression_references_as(interp, expr, relid, target, None);
     if let Some(target) = target
         && let Some(ast::Node::AConst(ac)) = expr
         && !ac.isnull
@@ -2208,8 +2351,16 @@ pub(crate) fn record_check_constraint(interp: &mut PgCatalog, oid: crate::oid::P
     };
     let addr = ObjectAddress::new(PG_CONSTRAINT_RELID, oid.into_nonzero(), 0);
     forget_dependencies_of(interp, addr);
-    // (Its result, boolean, is pinned.)
-    record_expressions(interp, addr, &[(*expr).as_ref()], Some(relid), &[]);
+    // Coerced to boolean (coerce_to_boolean: a cast function it runs is
+    // part of it); its result, boolean, is pinned.
+    record_coerced_expressions(
+        interp,
+        addr,
+        &[(*expr).as_ref()],
+        Some(relid),
+        Some(crate::pg_catalog::oid::BOOL),
+        &[],
+    );
 }
 
 /// A column default or generation expression (`attr_default_exprs`)
@@ -2269,6 +2420,16 @@ pub(crate) fn record_partition_key_expressions(
 /// An index depends on what its expressions and predicate refer to
 /// (index_create → recordDependencyOnSingleRelExpr).
 pub(crate) fn record_index_expressions(interp: &mut PgCatalog, index: PgClassOid) {
+    // What it recorded before (a rebuilt index's), but its operator
+    // classes (record_index_opclasses) and extension marks.
+    let index_obj = PgGenericOid::from_nonzero(index.into_nonzero());
+    interp.pg_depend.retain(|d| {
+        !(d.classid == PG_CLASS_RELID
+            && d.objid == index_obj
+            && d.objsubid == 0
+            && d.refclassid != PG_OPCLASS_RELID
+            && matches!(d.deptype, DepType::Normal | DepType::Auto))
+    });
     let Some(row) = interp.pg_index.get(&index) else {
         return;
     };
@@ -2335,11 +2496,30 @@ pub(crate) fn record_publication_rel(
         .map(|c| Reference::Column(relid, c.to_owned()))
         .collect();
     if table.where_clause.is_some() {
-        refs.extend(expression_references(
-            interp,
-            table.where_clause.as_ref(),
-            Some(relid),
-        ));
+        // The stored row filter has its virtual generated columns expanded
+        // (publication_add_relation: expand_generated_columns_in_expr): it
+        // refers to what their expressions do, not to them.
+        for reference in expression_references(interp, table.where_clause.as_ref(), Some(relid)) {
+            let generation = match &reference {
+                Reference::Column(rel, name) if *rel == relid => interp
+                    .attribute_by_name(relid, name)
+                    .filter(|a| a.attgenerated == Some(crate::pg_catalog::AttGenerated::Virtual))
+                    .and_then(|a| interp.attr_default_exprs.get(&(relid, a.attnum)))
+                    .and_then(|e| match e {
+                        super::tables::check_inherit::StoredExpr::Written(expr) => {
+                            Some((**expr).clone())
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            match generation {
+                Some(expr) => {
+                    refs.extend(expression_references(interp, expr.as_ref(), Some(relid)));
+                }
+                None => refs.push(reference),
+            }
+        }
     }
     let addr = named_object(
         interp,
@@ -2348,6 +2528,14 @@ pub(crate) fn record_publication_rel(
             relid,
         },
     )?;
+    // The table itself is an automatic dependency: dropping the table drops
+    // its membership, whatever the columns the membership names.
+    record(
+        interp,
+        addr,
+        [ObjectAddress::relation(relid)],
+        DepType::Auto,
+    );
     // The table's own columns matter here (unlike a table's expressions).
     record_references(interp, addr, &refs, DepType::Normal);
     Ok(())

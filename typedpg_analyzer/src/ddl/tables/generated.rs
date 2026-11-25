@@ -307,6 +307,12 @@ pub(crate) fn cook_generation_expr(
             continue;
         };
         let Some(attr) = interp.attribute_by_name(relid, name) else {
+            // A system column it may read (`tableoid`), a dependency too.
+            if let Some(attnum) = crate::ddl::depend::system_attnum(name)
+                && !refs.contains(&attnum)
+            {
+                refs.push(attnum);
+            }
             continue;
         };
         if !refs.contains(&attr.attnum) {

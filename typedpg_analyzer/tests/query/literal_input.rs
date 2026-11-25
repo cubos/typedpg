@@ -1085,6 +1085,38 @@ fn array_literal_box_elements_use_semicolon_delimiter() {
 }
 
 #[test]
+fn array_literal_elements_use_their_types_delimiter() {
+    // A domain over box separates its arrays' elements with `;` too, and a
+    // base type created with a DELIMITER with that one (`pg_type.typdelim`,
+    // which a domain over it inherits).
+    let mut db = PgCatalog::new().unwrap();
+    db.apply_sql(
+        "CREATE DOMAIN frame AS box;
+         CREATE TYPE semi;
+         CREATE FUNCTION semi_in(cstring) RETURNS semi
+             LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+         CREATE FUNCTION semi_out(semi) RETURNS cstring
+             LANGUAGE internal IMMUTABLE STRICT AS 'textout';
+         CREATE TYPE semi (INPUT = semi_in, OUTPUT = semi_out, DELIMITER = '|');
+         CREATE DOMAIN nn_semi AS semi NOT NULL;",
+    )
+    .unwrap();
+    db.analyze("SELECT '{(1,2),(3,4);(5,6),(7,8)}'::frame[] AS v")
+        .unwrap();
+    assert_first_line!(
+        db.analyze("SELECT '{(1,2),(3,4),(5,6),(7,8)}'::frame[]"),
+        "invalid input syntax for type box: \"(1,2),(3,4),(5,6),(7,8)\""
+    );
+    // `a|NULL` is two elements, the second NULL; `a,NULL` is one.
+    assert_first_line!(
+        db.analyze("SELECT '{a|NULL}'::nn_semi[]"),
+        "domain nn_semi does not allow null values"
+    );
+    db.analyze("SELECT '{a,NULL}'::nn_semi[] AS v").unwrap();
+    db.analyze("SELECT '{a|b}'::semi[] AS v").unwrap();
+}
+
+#[test]
 fn array_literal_null_element_of_not_null_domain_rejected() {
     let mut db = PgCatalog::new().unwrap();
     db.apply_sql("CREATE DOMAIN nn AS int NOT NULL; CREATE DOMAIN nn2 AS nn;")

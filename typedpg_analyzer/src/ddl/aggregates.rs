@@ -610,6 +610,11 @@ fn lookup_agg_function(
         [n] => (None, n.as_str()),
         _ => return Err(not_found()),
     };
+    // func_get_detail → FuncnameGetCandidates: a qualified name's schema
+    // must exist.
+    if let Some(schema) = schema {
+        super::util::existing_namespace(interp, schema)?;
+    }
     let resolved = crate::functions::resolve_function(
         interp,
         schema,

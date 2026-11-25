@@ -2,9 +2,9 @@
 
 A `varchar(n)` or `char(n)` column instead of `text`.
 
-| Level | Applies to | Fix |
-|---|---|---|
-| off | the final schema | — |
+| Category | Level | Applies to | Fix |
+|---|---|---|---|
+| pedantic | off | the final schema | — |
 
 ## Example
 
@@ -19,7 +19,7 @@ CREATE TABLE users (
 ```
 
 ```
-info[prefer_text]: public.users.email is varchar(255)
+info[pedantic/prefer_text]: public.users.email is varchar(255)
    ╭─[migrations/003_users.sql:1:1]
  1 │ CREATE TABLE users (
    · ────────────────────

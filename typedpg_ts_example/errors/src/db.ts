@@ -4,6 +4,9 @@
 import { createCopyIn, createSql } from "@cubos/typedpg";
 import type * as typedpg from "@cubos/typedpg";
 
+export type Color = "red" | "green" | "with space" | "quo\"te" | "back\\slash" | "NULL";
+export type Mood = "happy" | "sad" | "neutral";
+
 export interface Queries {
   "SELECT $r::record AS r": { error: "anonymous record-typed query parameters are not supported — pass the fields individually using a ROW(...) constructor in SQL" };
   "SELECT id FROM things WHERE day = $day": {
@@ -37,7 +40,7 @@ export interface Queries {
   "SELECT id FROM users WHERE id IN $..ids AND name = $ids": { error: "duplicate parameter name \"ids\": a parameter and a spread can't share one name" };
   "SELECT id FROM users WHERE mood = $mood": {
     params: {
-      mood: "happy" | "sad" | "neutral";
+      mood: Mood;
     };
     row: {
       id: number;

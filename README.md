@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-typedpg = "0.7"
+typedpg = "0.8"
 deadpool-postgres = "0.14"
 tokio-postgres = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -83,16 +83,16 @@ sql!(pool, "SELECT nonexistent FROM users").fetch_all().await?;
 
 // Wrong type in WHERE → compile error
 sql!(pool, "SELECT id FROM users WHERE name").fetch_all().await?;
-//  error: type mismatch: text cannot be coerced to bool
+//  error: argument of WHERE must be type boolean, not type text
 
 // Wrong type in LIMIT → compile error
 sql!(pool, "SELECT id FROM users LIMIT true").fetch_all().await?;
-//  error: type mismatch: bool cannot be coerced to int8
+//  error: argument of LIMIT must be type bigint, not type boolean
 
 // Parameter type mismatch → compile error (expects i32 for age column)
 let flag: bool = true;
 sql!(pool, "UPDATE users SET age = $flag").execute().await?;
-//  error: type mismatch: bool cannot be coerced to int4
+//  error[E0277]: `$flag` expects a value for SQL type integer, not `bool`
 ```
 
 ## Linting
@@ -105,69 +105,73 @@ and lints the migrations themselves. Each rule has a page in
 [`docs/lint`](docs/lint/README.md) with its motivation, what it proves,
 examples and configuration:
 
-| Rule | Default | What it reports |
-|---|---|---|
-| [`null_comparison`](docs/lint/null_comparison.md) | error | A comparison with a `NULL` literal, which is never true. |
-| [`unbounded_write`](docs/lint/unbounded_write.md) | error | An `UPDATE` or `DELETE` with no `WHERE`. |
-| [`not_in_nullable`](docs/lint/not_in_nullable.md) | warning | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
-| [`create_index_blocking`](docs/lint/create_index_blocking.md) | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
-| [`constraint_validating`](docs/lint/constraint_validating.md) | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
-| [`set_not_null_scan`](docs/lint/set_not_null_scan.md) | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
-| [`table_rewrite`](docs/lint/table_rewrite.md) | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
-| [`fk_without_index`](docs/lint/fk_without_index.md) | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
-| [`redundant_index`](docs/lint/redundant_index.md) | info | An index another index on the table already covers. |
-| [`redundant_binding`](docs/lint/redundant_binding.md) | warning | A `sql!` binding `x = x` (or a bare `x`): the parameter captures the variable without it. |
-| [`renaming_binding`](docs/lint/renaming_binding.md) | info | A `sql!` binding `p = v` that only renames the variable `v`; write `$v` in the SQL instead. |
-| [`redundant_null_check`](docs/lint/redundant_null_check.md) | warning | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
-| [`limit_without_order`](docs/lint/limit_without_order.md) | warning | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
-| [`redundant_limit`](docs/lint/redundant_limit.md) | info | A `LIMIT` on a query that returns at most one row. |
-| [`redundant_distinct`](docs/lint/redundant_distinct.md) | info | A `DISTINCT` on rows that are already distinct. |
-| [`constant_condition`](docs/lint/constant_condition.md) | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
-| [`unreachable_case_branch`](docs/lint/unreachable_case_branch.md) | warning | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
-| [`case_without_else`](docs/lint/case_without_else.md) | warning | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
-| [`redundant_cast`](docs/lint/redundant_cast.md) | info | A cast to the type (and type modifier) its operand already has. |
-| [`redundant_alias`](docs/lint/redundant_alias.md) | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
-| [`outer_reference_in_subquery`](docs/lint/outer_reference_in_subquery.md) | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
-| [`cartesian_join`](docs/lint/cartesian_join.md) | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
-| [`insert_without_columns`](docs/lint/insert_without_columns.md) | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
-| [`self_assignment`](docs/lint/self_assignment.md) | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
-| [`unused_cte`](docs/lint/unused_cte.md) | warning | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
-| [`simplifiable_case`](docs/lint/simplifiable_case.md) | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
-| [`like_unescaped_param`](docs/lint/like_unescaped_param.md) | off | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
-| [`redundant_join`](docs/lint/redundant_join.md) | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
-| [`scalar_subquery_may_return_many`](docs/lint/scalar_subquery_may_return_many.md) | warning | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
-| [`timestamp_timezone_mix`](docs/lint/timestamp_timezone_mix.md) | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
-| [`integer_division`](docs/lint/integer_division.md) | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
-| [`left_join_nullified`](docs/lint/left_join_nullified.md) | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
-| [`check_violation`](docs/lint/check_violation.md) | warning | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
-| [`unstable_order`](docs/lint/unstable_order.md) | warning | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
-| [`redundant_order_by`](docs/lint/redundant_order_by.md) | info | `ORDER BY` keys that can't change the order: a key after keys that already determine a unique row (the proof `unstable_order` uses), a column `WHERE` pins to a constant or parameter (`WHERE status = 'a' ORDER BY status, id`), a column an earlier key already sorts by, and the whole `ORDER BY` of a query returning at most one row or of an `EXISTS` / `IN` / `ANY` / `ALL` subquery (without `LIMIT`, `OFFSET`, `DISTINCT ON` or a locking clause), whose order nothing observes. `FROM` subqueries, CTEs and `ARRAY(…)` are not judged, nor a `DISTINCT ON`'s leading keys, nor a last key under `LIMIT` / `OFFSET` (that is `unstable_order`'s). The fix removes plain-column, output-name and ordinal keys (the whole clause when all go). |
-| [`redundant_group_by`](docs/lint/redundant_group_by.md) | info | `GROUP BY` keys that can't split a group: a column of a table whose other grouped columns cover a unique NOT NULL key of it, or one `WHERE` pins to a constant or parameter. A key the select list, `HAVING`, `ORDER BY` or a window reads is only reported when the table's primary key stays grouped (PostgreSQL accepts nothing else for an ungrouped column), one key always stays, and `GROUPING SETS` / `ROLLUP` / `CUBE` are never touched. The fix removes the keys. |
-| [`count_not_null`](docs/lint/count_not_null.md) | info | `count(expr)` over a value never NULL — a NOT NULL column no outer join null-extends, a literal (`count(1)`), a column the call's `FILTER` proves non-NULL — which counts every row like `count(*)`. `DISTINCT`, row values and parameters are not reported, nor an aggregate of outer columns (evaluated in the outer query). The fix writes `count(*)` when the argument is a plain column or constant. |
-| [`non_sargable_predicate`](docs/lint/non_sargable_predicate.md) | info | A `WHERE` / `JOIN … ON` comparison (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `= ANY`) that wraps an indexed column so no index can serve it: a converting cast (`created_at::date = $1`, `id::text = $1`), a function (`lower(email) = $1`, `date_trunc('day', ts) = $1`), arithmetic (`id + 1 = $1`) or an implicit conversion the other side's type forces (an `int4` column compared with a `numeric` value). Reported only when the column leads a non-partial btree index and its table has no expression index; the help names the range rewrite for `::date` and `date_trunc`. |
-| [`float_equality`](docs/lint/float_equality.md) | warning | An `=`, `<>`, `IN` or `NOT IN` comparison made between `real` / `double precision` values (after implicit conversions), which rarely holds for computed values (`0.1 + 0.2 = 0.3` is false). A comparison with a value exact in binary floating point — an integer or decimal literal the type holds exactly (`0`, `0.5`, `1e3`; up to 2^24 for `real`), `'NaN'`, `'Infinity'` — is not reported; columns, parameters and joins (`a.f = b.f`) are. |
-| [`fk_type_mismatch`](docs/lint/fk_type_mismatch.md) | warning | A foreign key whose column types differ from the referenced columns. |
-| [`missing_lock_timeout`](docs/lint/missing_lock_timeout.md) | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
-| [`drop_index_blocking`](docs/lint/drop_index_blocking.md) | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
-| [`blocking_rebuild`](docs/lint/blocking_rebuild.md) | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
-| [`detach_partition_blocking`](docs/lint/detach_partition_blocking.md) | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
-| [`validate_in_same_transaction`](docs/lint/validate_in_same_transaction.md) | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
-| [`attach_partition_scan`](docs/lint/attach_partition_scan.md) | warning | `ATTACH PARTITION` of an existing table whose validated `CHECK` and `NOT NULL` constraints don't imply the partition bound (proven as PostgreSQL proves it; a `CHECK` alone doesn't make the key `NOT NULL`), so PostgreSQL scans it under lock to check the bound; also the scan of an existing default partition. |
-| [`missing_primary_key`](docs/lint/missing_primary_key.md) | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
-| [`rls_policy_not_enforced`](docs/lint/rls_policy_not_enforced.md) | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
-| [`rls_no_policy`](docs/lint/rls_no_policy.md) | info | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
-| [`security_definer_search_path`](docs/lint/security_definer_search_path.md) | warning | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
-| [`prefer_timestamptz`](docs/lint/prefer_timestamptz.md) | off | A `timestamp without time zone` column. |
-| [`prefer_identity`](docs/lint/prefer_identity.md) | off | A `serial` column instead of an identity column. |
-| [`prefer_text`](docs/lint/prefer_text.md) | off | A `varchar(n)` or `char(n)` column instead of `text`. |
-| [`prefer_bigint_pk`](docs/lint/prefer_bigint_pk.md) | off | An `int2` or `int4` primary key. |
-| [`prefer_jsonb`](docs/lint/prefer_jsonb.md) | off | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
-| [`fetch_may_return_many`](docs/lint/fetch_may_return_many.md) | warning | `fetch_one` / `fetch_one_as` / `fetch_value` / `fetch_optional` / `fetch_optional_as` / `fetch_value_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
-| [`fetch_all_single_row`](docs/lint/fetch_all_single_row.md) | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
-| [`unused_returning`](docs/lint/unused_returning.md) | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
-| [`breaks_deployed_queries`](docs/lint/breaks_deployed_queries.md) | warning | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
+| Rule | Category | Default | What it reports |
+|---|---|---|---|
+| [`null_comparison`](docs/lint/null_comparison.md) | correctness | error | A comparison with a `NULL` literal, which is never true. |
+| [`unbounded_write`](docs/lint/unbounded_write.md) | suspicious | warning | An `UPDATE` or `DELETE` with no `WHERE`. |
+| [`not_in_nullable`](docs/lint/not_in_nullable.md) | correctness | error | `NOT IN (SELECT …)` where either side may be NULL, which returns no rows. |
+| [`create_index_blocking`](docs/lint/create_index_blocking.md) | locking | warning | `CREATE INDEX` without `CONCURRENTLY` on a table that already has rows. |
+| [`add_constraint_scan`](docs/lint/add_constraint_scan.md) | locking | warning | `ADD CONSTRAINT` / `ADD COLUMN` validating every row under a lock. |
+| [`set_not_null_scan`](docs/lint/set_not_null_scan.md) | locking | warning | `ALTER COLUMN … SET NOT NULL` scanning the table. |
+| [`alter_table_rewrite`](docs/lint/alter_table_rewrite.md) | locking | warning | `ALTER TABLE` rewriting every row under an ACCESS EXCLUSIVE lock. |
+| [`fk_without_index`](docs/lint/fk_without_index.md) | performance | warning | A foreign key whose referencing columns have no index. A partial index over exactly those columns `WHERE col IS NOT NULL` counts: the foreign-key lookup's equality implies the predicate. |
+| [`redundant_index`](docs/lint/redundant_index.md) | performance | warning | An index another index on the table already covers. |
+| [`redundant_binding`](docs/lint/redundant_binding.md) | redundant | info | A `sql!` binding `x = x` (or a bare `x`): the parameter captures the variable without it. |
+| [`renaming_binding`](docs/lint/renaming_binding.md) | redundant | info | A `sql!` binding `p = v` that only renames the variable `v`; write `$v` in the SQL instead. |
+| [`redundant_null_check`](docs/lint/redundant_null_check.md) | redundant | info | `IS [NOT] NULL` or `COALESCE` on a value that is never NULL. |
+| [`limit_without_order`](docs/lint/limit_without_order.md) | correctness | error | `LIMIT`, `OFFSET` or `DISTINCT ON` without `ORDER BY`, which picks arbitrary rows. |
+| [`redundant_limit`](docs/lint/redundant_limit.md) | redundant | info | A `LIMIT` on a query that returns at most one row. |
+| [`redundant_distinct`](docs/lint/redundant_distinct.md) | redundant | info | A `DISTINCT` on rows that are already distinct. |
+| [`constant_condition`](docs/lint/constant_condition.md) | suspicious | warning | A `WHERE`, `JOIN … ON`, `HAVING` or `FILTER` condition — or an `AND` / `OR` / `NOT` part of one, or of a `CASE WHEN` — that is always true or never true: one the planner folds to a constant (`1 = 1`), or one what the analyzer knows decides — a column's `CHECK` constraints, domain or enum and the conditions before it (`status = 'actve'` when `status` is `CHECK (status IN ('active', 'inactive'))`, `n < 0` under `CHECK (n >= 0)`, `a = 2` after `a = 1 AND`, `x = x` on a column never NULL, an `EXISTS` whose subquery always returns a row). The message says why; a column of a table with a `NOT VALID` `CHECK` is not judged. The fix removes a `WHERE` the planner folds to true from a `SELECT`. |
+| [`unreachable_case_branch`](docs/lint/unreachable_case_branch.md) | redundant | info | A `CASE` branch that is never taken: a `WHEN` that is never true, or what follows one that always is — folded by the planner, or decided by what the analyzer knows there (the constraints, the conditions around the `CASE`, the `WHEN`s before it). |
+| [`case_without_else`](docs/lint/case_without_else.md) | style | info | A `CASE` without `ELSE` whose `WHEN`s may all fail, so it is NULL then; a `CASE` the constraints prove exhaustive is not reported. The fix writes `ELSE NULL`. |
+| [`redundant_cast`](docs/lint/redundant_cast.md) | redundant | info | A cast to the type (and type modifier) its operand already has. |
+| [`redundant_alias`](docs/lint/redundant_alias.md) | redundant | info | An output column alias that is the name the column already has (`SELECT name AS name`). |
+| [`outer_reference_in_subquery`](docs/lint/outer_reference_in_subquery.md) | suspicious | warning | An unqualified column in a subquery that no relation of the subquery has, so it is the outer query's (`WHERE id IN (SELECT id FROM b)` with no `b.id`). |
+| [`cartesian_join`](docs/lint/cartesian_join.md) | suspicious | warning | FROM items no `WHERE` / `ON` condition connects, directly or through other items, so every row pairs with every row; an explicit `CROSS JOIN`, a function in FROM, a `LATERAL` item referencing its left and an item of at most one row are not reported. |
+| [`insert_without_columns`](docs/lint/insert_without_columns.md) | suspicious | warning | An `INSERT INTO t VALUES …` / `SELECT …` without a column list, which depends on the table's column order. The fix writes the columns it targets now. |
+| [`self_assignment`](docs/lint/self_assignment.md) | suspicious | warning | An `UPDATE … SET a = a`, which changes nothing. The fix removes it when another assignment remains and no `UPDATE OF a` trigger fires on it. |
+| [`unused_cte`](docs/lint/unused_cte.md) | redundant | info | A `WITH` query (not a data-modifying one) nothing references. The fix removes it. |
+| [`simplifiable_case`](docs/lint/simplifiable_case.md) | redundant | info | `CASE WHEN x IS NULL THEN y ELSE x END`, which is `COALESCE(x, y)`, and `CASE WHEN c THEN true ELSE false END`, which is `c` when `c` is never NULL. The fix rewrites it. |
+| [`like_unescaped_param`](docs/lint/like_unescaped_param.md) | correctness | error | A `LIKE` pattern built from a parameter whose `%` and `_` are not escaped. |
+| [`redundant_join`](docs/lint/redundant_join.md) | redundant | info | A join that can't change the rows and whose table nothing else reads: a `LEFT JOIN` whose `ON` equates every column of a full unique key of the joined table with columns of the same type (each row matches at most one row), or an inner `JOIN` over exactly a NOT NULL, validated, `NOT DEFERRABLE` foreign key into a parent without row-level security (each row matches exactly one). Only a plain `SELECT`'s joins to a table are read; a join whose removal would change a column's refinement is kept. The fix deletes the join. |
+| [`scalar_subquery_multiple_rows`](docs/lint/scalar_subquery_multiple_rows.md) | correctness | error | A subquery used as a value (`(SELECT x FROM t WHERE …)` in a select list, a comparison, a `SET`, a function argument) that may return more than one row, which fails at run time with "more than one row returned by a subquery used as an expression". A subquery proven to return at most one row (an aggregate without `GROUP BY`, a unique key pinned by its `WHERE`, outer references included, `LIMIT 1`) is not reported, nor are `IN`, `EXISTS`, `ANY` / `ALL` and `ARRAY(…)` subqueries, nor a subquery over a view, a CTE, a function, a FROM subquery or a table with an expression or partial unique index, which the proof can't see through. |
+| [`timestamp_timezone_mix`](docs/lint/timestamp_timezone_mix.md) | suspicious | warning | An implicit conversion between `timestamp` (or `date`) and `timestamptz` — a comparison (`created_at > now()` over a `timestamp` column), arithmetic, a function argument, a `CASE` / `COALESCE` / `UNION` type resolution, a value assigned to a column of the other type — whose result depends on the session's `TimeZone`. An explicit cast or `AT TIME ZONE`, a parameter and an untyped literal are not reported. |
+| [`integer_division`](docs/lint/integer_division.md) | suspicious | warning | An integer division, which truncates, whose result is then used as a `numeric` or floating-point value: `(done / total)::numeric`, `done / total * 100.0`, `done / total > 0.5`, `round(done / total, 2)`, or an integer product of it so used (`(done / total * 100)::numeric`). Convert an operand first: `done::numeric / total`. |
+| [`left_join_nullified`](docs/lint/left_join_nullified.md) | suspicious | warning | A `WHERE` condition never true for the null-extended rows of an outer join's nullable side (`LEFT JOIN b … WHERE b.status = 'x'`, `b.id IS NOT NULL`), so the join behaves as an inner join; `b.id IS NULL` (the anti-join), non-strict tests like `COALESCE(b.x, 0) = 0`, an `OR` with an arm keeping the rows and a join that never null-extends (a foreign key's parent) are not reported. |
+| [`check_violation`](docs/lint/check_violation.md) | correctness | error | An `INSERT … VALUES`, `UPDATE … SET` or `ON CONFLICT DO UPDATE SET` storing a constant a `CHECK` constraint (`NOT VALID` ones included) or the column's domain rejects whatever the rest of the row, so the statement fails for every row it writes; not reported when a `BEFORE` row trigger or a rule may change the row. |
+| [`unstable_order`](docs/lint/unstable_order.md) | correctness | error | An `ORDER BY` under `LIMIT`, `OFFSET` / `FETCH` or `DISTINCT ON` whose keys don't determine a unique row — no unique key (NOT NULL, or `NULLS NOT DISTINCT`) of every table is covered, counting columns `WHERE` pins to a constant, tables joined on their key and grouping keys — so tied rows come back in an arbitrary order and pages may skip or repeat rows. The help names the primary key to add as a tiebreaker. Queries returning at most one row, `WITH TIES`, `SKIP LOCKED` queues and FROM clauses the proof can't see through (subqueries, CTEs, partial or expression unique indexes) are not reported. |
+| [`redundant_order_by`](docs/lint/redundant_order_by.md) | redundant | info | `ORDER BY` keys that can't change the order: a key after keys that already determine a unique row (the proof `unstable_order` uses), a column `WHERE` pins to a constant or parameter (`WHERE status = 'a' ORDER BY status, id`), a column an earlier key already sorts by, and the whole `ORDER BY` of a query returning at most one row or of an `EXISTS` / `IN` / `ANY` / `ALL` subquery (without `LIMIT`, `OFFSET`, `DISTINCT ON` or a locking clause), whose order nothing observes. `FROM` subqueries, CTEs and `ARRAY(…)` are not judged, nor a `DISTINCT ON`'s leading keys, nor a last key under `LIMIT` / `OFFSET` (that is `unstable_order`'s). The fix removes plain-column, output-name and ordinal keys (the whole clause when all go). |
+| [`redundant_group_by`](docs/lint/redundant_group_by.md) | redundant | info | `GROUP BY` keys that can't split a group: a column of a table whose other grouped columns cover a unique NOT NULL key of it, or one `WHERE` pins to a constant or parameter. A key the select list, `HAVING`, `ORDER BY` or a window reads is only reported when the table's primary key stays grouped (PostgreSQL accepts nothing else for an ungrouped column), one key always stays, and `GROUPING SETS` / `ROLLUP` / `CUBE` are never touched. The fix removes the keys. |
+| [`redundant_count_argument`](docs/lint/redundant_count_argument.md) | redundant | info | `count(expr)` over a value never NULL — a NOT NULL column no outer join null-extends, a literal (`count(1)`), a column the call's `FILTER` proves non-NULL — which counts every row like `count(*)`. `DISTINCT`, row values and parameters are not reported, nor an aggregate of outer columns (evaluated in the outer query). The fix writes `count(*)` when the argument is a plain column or constant. |
+| [`non_sargable_predicate`](docs/lint/non_sargable_predicate.md) | performance | warning | A `WHERE` / `JOIN … ON` comparison (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `= ANY`) that wraps an indexed column so no index can serve it: a converting cast (`created_at::date = $1`, `id::text = $1`), a function (`lower(email) = $1`, `date_trunc('day', ts) = $1`), arithmetic (`id + 1 = $1`) or an implicit conversion the other side's type forces (an `int4` column compared with a `numeric` value). Reported only when the column leads a non-partial btree index and its table has no expression index; the help names the range rewrite for `::date` and `date_trunc`. |
+| [`float_equality`](docs/lint/float_equality.md) | suspicious | warning | An `=`, `<>`, `IN` or `NOT IN` comparison made between `real` / `double precision` values (after implicit conversions), which rarely holds for computed values (`0.1 + 0.2 = 0.3` is false). A comparison with a value exact in binary floating point — an integer or decimal literal the type holds exactly (`0`, `0.5`, `1e3`; up to 2^24 for `real`), `'NaN'`, `'Infinity'` — is not reported; columns, parameters and joins (`a.f = b.f`) are. |
+| [`fk_type_mismatch`](docs/lint/fk_type_mismatch.md) | performance | warning | A foreign key whose column types differ from the referenced columns. |
+| [`lock_without_timeout`](docs/lint/lock_without_timeout.md) | locking | warning | A migration taking a blocking lock on an existing table without `SET lock_timeout`. |
+| [`drop_index_blocking`](docs/lint/drop_index_blocking.md) | locking | warning | `DROP INDEX` without `CONCURRENTLY` on an existing table, which takes an ACCESS EXCLUSIVE lock on it. |
+| [`rebuild_blocking`](docs/lint/rebuild_blocking.md) | locking | warning | `REINDEX` without `CONCURRENTLY`, `VACUUM FULL`, `CLUSTER` or `REPACK` without `CONCURRENTLY` on an existing table, which hold their lock for the whole rebuild. |
+| [`detach_partition_blocking`](docs/lint/detach_partition_blocking.md) | locking | warning | `DETACH PARTITION` without `CONCURRENTLY` on an existing partitioned table. |
+| [`validate_constraint_blocking`](docs/lint/validate_constraint_blocking.md) | locking | warning | `VALIDATE CONSTRAINT` in the transaction that added the constraint `NOT VALID`, while `ADD CONSTRAINT`'s lock is still held. |
+| [`attach_partition_scan`](docs/lint/attach_partition_scan.md) | locking | warning | `ATTACH PARTITION` of an existing table whose validated `CHECK` and `NOT NULL` constraints don't imply the partition bound (proven as PostgreSQL proves it; a `CHECK` alone doesn't make the key `NOT NULL`), so PostgreSQL scans it under lock to check the bound; also the scan of an existing default partition. |
+| [`table_without_primary_key`](docs/lint/table_without_primary_key.md) | suspicious | warning | A table without a primary key; partitions (which get their parent's) and temporary tables are skipped. |
+| [`policy_without_rls`](docs/lint/policy_without_rls.md) | security | error | Row-level security policies on a table whose row-level security is not enabled: they do nothing. |
+| [`rls_without_policy`](docs/lint/rls_without_policy.md) | security | error | Row-level security enabled on a table with no policy, which denies every role but the owner, superusers and `BYPASSRLS` roles. |
+| [`security_definer_without_search_path`](docs/lint/security_definer_without_search_path.md) | security | error | A `SECURITY DEFINER` function or procedure without `SET search_path`, which resolves names along the caller's search path; a SQL-standard (`BEGIN ATOMIC`) body, resolved at creation, is not reported. |
+| [`prefer_timestamptz`](docs/lint/prefer_timestamptz.md) | pedantic | off | A `timestamp without time zone` column. |
+| [`prefer_identity`](docs/lint/prefer_identity.md) | pedantic | off | A `serial` column instead of an identity column. |
+| [`prefer_text`](docs/lint/prefer_text.md) | pedantic | off | A `varchar(n)` or `char(n)` column instead of `text`. |
+| [`prefer_bigint_pk`](docs/lint/prefer_bigint_pk.md) | pedantic | off | An `int2` or `int4` primary key. |
+| [`prefer_jsonb`](docs/lint/prefer_jsonb.md) | performance | warning | A `json` column, which has no equality operator (`DISTINCT`, `GROUP BY`, `UNION` fail), instead of `jsonb`. |
+| [`fetch_one_multiple_rows`](docs/lint/fetch_one_multiple_rows.md) | correctness | error | `fetch_one` / `fetch_one_as` / `fetch_value` / `fetch_optional` / `fetch_optional_as` / `fetch_value_optional` (`fetchOne` / `fetchValue` / `fetchOptional` / `fetchValueOptional` in TypeScript) on a query not proven to return at most one row. |
+| [`fetch_all_single_row`](docs/lint/fetch_all_single_row.md) | redundant | info | `fetch_all` / `fetch_all_as` (`fetchAll` in TypeScript) on a query that returns at most one row. |
+| [`unused_returning`](docs/lint/unused_returning.md) | redundant | info | `execute()` on a statement whose `RETURNING` rows are discarded. |
+| [`json_stringify_param`](docs/lint/json_stringify_param.md) | correctness | error | TypeScript only: `JSON.stringify(…)` passed as a `json` / `jsonb` parameter's value, which stores a JSON string instead of the value. |
+| [`deployed_query_breakage`](docs/lint/deployed_query_breakage.md) | correctness | error | With `--previous-deployment <ref>` only: a migration that breaks a query of the code at that ref, which keeps running while the migration is applied. See below. |
+| [`comma_join`](docs/lint/comma_join.md) | style | info | A `FROM` list joining relations with commas instead of `JOIN … ON` (`FROM a, b WHERE a.id = b.a_id`); a function's or a `LATERAL` subquery's comma is not reported. |
+| [`ordinal_reference`](docs/lint/ordinal_reference.md) | style | info | `ORDER BY`, `GROUP BY` or `DISTINCT ON` by an output column's position; the fix names the column or expression when that is provably the same. |
+| [`boolean_comparison`](docs/lint/boolean_comparison.md) | style | info | A comparison of a boolean with the literal `true` or `false` (`x = true`, `x <> false`); the fix writes the expression, or `NOT` it, without changing a select list's column name. |
 
-The call-site rules (`fetch_may_return_many`, `fetch_all_single_row` and
+The call-site rules (`fetch_one_multiple_rows`, `fetch_all_single_row` and
 `unused_returning`) run in both CLIs: a query can be called directly on the
 `sql!(…)` / `sql(…)` expression, through a local binding, or — in TypeScript
 — through an exported query of a `.sql` file or another source. Their findings
@@ -178,11 +182,16 @@ only `cargo typedpg lint` reports them (the TypeScript CLI has no bindings),
 and only `[package.metadata.typedpg.lint]` accepts their keys.
 
 The `lint` table sets each rule's level (`"error"`, `"warning"`, `"info"` or
-`"off"`) and `fail_on`, the severity the run fails on (default `"error"`):
+`"off"`) and `fail_on`, the severity the run fails on (default `"error"`).
+Every rule belongs to a category, and its default level is the category's;
+a category key sets every rule of the category, and a rule's own key wins:
 
 ```toml
 [package.metadata.typedpg.lint]
 fail_on = "warning"
+style = "off"             # a category: correctness, security, suspicious,
+                          # locking, performance, redundant, style, pedantic
+correctness = "error"
 null_comparison = "off"
 redundant_index = "warning"
 ignore = ["tests/**"]   # paths whose statement findings are not reported
@@ -227,7 +236,7 @@ statement rules, e.g.
 (`--ignore-migrations-from`, its former name, still works.)
 
 A deploy applies the new migrations while the code at the ref keeps running,
-and it keeps running until the rollout ends. `breaks_deployed_queries`
+and it keeps running until the rollout ends. `deployed_query_breakage`
 analyzes that code's queries — read from the ref, so a query the branch
 changed or removed is still checked — against both schemas, and reports each
 one that analyzed against the old schema but breaks against the new: it no
@@ -259,7 +268,7 @@ ones the analysis resolves, along the role's search path. The finding is placed 
 statement that makes the change and names the query's file and line at the
 ref. The fix is expand/contract: first deploy code that works with both
 schemas, then the migration. A `-- typedpg-lint:
-allow(breaks_deployed_queries)` comment on the statement, or in the deployed
+allow(deployed_query_breakage)` comment on the statement, or in the deployed
 query, suppresses it.
 
 Findings go to stdout, the summary to stderr, and the run exits non-zero when
@@ -705,7 +714,7 @@ sql!(pool, "SELECT name FROM users WHERE id IN $..ids")   // WHERE id IN ($1, $2
 
 An empty list is written `(SELECT NULL::<type> WHERE false)` — PostgreSQL has no syntax for one — and the query runs: `x IN` it is false, `x NOT IN` it true.
 
-Above 1000 items, a spread is bound as arrays where that is provably the same query — the analyzer analyzes the array form and offers it only if the columns and parameters come out identical: `x IN $..ids` is written `(x = ANY($1::type[]))` (`NOT IN`: `<> ALL`), and a `VALUES` made of one rows spread `SELECT * FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)`. Large lists and batches then take a parameter per field instead of one per value — faster, and past PostgreSQL's 65535-parameter limit. Not offered where the form would differ: a field that is an array (unnest would flatten it) or a composite, a `VALUES` with written rows, a column whose nullability the array would change, an enum or JSON-domain field whose values may be `None`.
+Above 1000 items — or fewer, when their placeholders would pass the spread's share of the 65535 parameters a query can bind — a spread is bound as arrays where that is provably the same query — the analyzer analyzes the array form and offers it only if the columns and parameters come out identical: `x IN $..ids` is written `(x = ANY($1::type[]))` (`NOT IN`: `<> ALL`), and a `VALUES` made of one rows spread `SELECT * FROM unnest($1::type1[], …) AS __typedpg_rows (column1, …)`. Large lists and batches then take a parameter per field instead of one per value — faster, and past PostgreSQL's 65535-parameter limit. Not offered where the form would differ: a field that is an array (unnest would flatten it) or a composite, a `VALUES` with written rows, a column whose nullability the array would change, an enum or JSON-domain field whose values may be `None`.
 
 `id = ANY($ids)`, with an array parameter, is the same filter as a single placeholder, whatever the list's length. `sql!` prepares each query anew, never reusing a statement, so PostgreSQL plans it with the values and the two plan alike. They differ only under a generic plan — a statement prepared once and executed repeatedly, as an executor of your own might — where PostgreSQL prunes the partitions of a partitioned table only for an `IN` list, and estimates its rows from the list's length instead of assuming 10 elements. An `IN` list is one statement text per length, and at most 65535 parameters.
 
@@ -760,7 +769,9 @@ To get type-safe enum values instead of raw strings, map them in `Cargo.toml`:
 user_role = "crate::UserRole"
 ```
 
-The macro will use your Rust type for serialization/deserialization. Your type must convert to/from `String`.
+The macro will use your Rust type for serialization/deserialization: it binds a value as its `Display` text and reads one with `FromStr`, so both must spell the labels exactly as PostgreSQL does.
+
+A type read in a row (a mapped enum, JSONB domain or composite) must also implement `Debug` and `Clone`: the row struct `sql!` generates derives both.
 
 ## Domain types (JSONB)
 
@@ -791,7 +802,7 @@ user_preferences = "crate::domains::UserPreferences"
 ```
 
 ```rust
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserPreferences { theme: String, lang: String }
 
 // preferences: Option<UserPreferences> -- automatic deserialization
@@ -812,7 +823,17 @@ Non-JSONB domains (e.g. `CREATE DOMAIN positive_int AS INT CHECK (VALUE > 0)`) a
 
 ## PostgreSQL extensions
 
-`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, `vector` (pgvector), and the rest of the contrib bundle all work without extra setup.
+`CREATE EXTENSION` is processed by the DDL interpreter — the types, operators, and functions an extension installs become visible to the analyzer immediately. `citext`, `hstore`, `pg_trgm`, `uuid-ossp`, `btree_gin`, and the rest of the contrib bundle all work without extra setup — the procedural languages built apart from the server, `plperl`, `plperlu` and `plpython3u`, and their transforms (`hstore_plperl`, `jsonb_plpython3u`, …) too — and so do these third-party extensions, each at the version below and the update chain shown:
+
+| Extension | Version |
+|-----------|---------|
+| `vector` (pgvector) | 0.8.7 |
+| `postgis`, `postgis_raster`, `postgis_topology`, `postgis_sfcgal` | 3.7.0 |
+| `pg_cron` | 1.6 (from 1.0) |
+| `pgmq` | 1.13.2 |
+| `pg_jsonschema` | 0.3.4 |
+
+An extension costs nothing until a migration installs it: PostGIS's 7.5 MB script is only parsed by a `CREATE EXTENSION postgis`.
 
 For pgvector specifically, the macro auto-routes `vector` / `halfvec` / `sparsevec` columns to the [`pgvector`](https://docs.rs/pgvector) crate:
 
@@ -858,6 +879,8 @@ For extension types without a built-in mapping (e.g. `citext`, `hstore`), point 
 "public.citext" = "String"
 "public.hstore" = "::std::collections::HashMap<String, Option<String>>"
 ```
+
+PostGIS's `geometry` and `geography` have no built-in mapping either: map them to a type implementing `tokio-postgres`'s `FromSql` / `ToSql` for them (the `geozero` and `postgis` crates have some), or convert in the query — `ST_AsText(geom)`, `ST_AsGeoJSON(geom)` or `geom::text` (hex EWKB) read as `String`. Their modifiers are checked as PostGIS checks them (`geometry(Point, 4326)`, `geography(Polygon)`), and functions such as `ST_DWithin(geog, ST_MakePoint($lon, $lat)::geography, $meters)` infer their parameters (`f64` here).
 
 ## Transactions
 
@@ -991,6 +1014,8 @@ let recent = sql!(db = analytics, role = "reporting", warehouse_pool,
 
 Only roles the migrations create can be checked: typedpg's catalog knows what those roles own and were granted, and nothing about the rest of the cluster. Naming another one is the compile error `role "x" does not exist (typedpg can check only the roles the migrations create)`.
 
+The migrations themselves are checked the same way once they switch to such a role (`SET ROLE`, `SET SESSION AUTHORIZATION`, `CREATE SCHEMA … AUTHORIZATION`): creating needs CREATE on the schema (on the database for a schema), `ALTER`, `DROP`, `COMMENT ON` and `CREATE INDEX` need ownership, the names a statement uses need USAGE on their schemas and types, a foreign key needs REFERENCES, and `OWNER TO` needs to be able to become the new owner, who needs CREATE on the schema — each with PostgreSQL's error, such as `permission denied for schema public` for a `CREATE TABLE` in `public` without a grant. The migrations' own user is taken to be a superuser, so nothing is checked before the switch.
+
 ### Keeping crates out of each other's tables
 
 The same check keeps a workspace split by domain honest, even when every crate connects as one database role in production: give each crate a role of its own that exists only for the analysis. Put the roles and their grants in a directory the crates list in `extra_migrations` — files there build the compile-time schema but are never applied by the migration runner — and configure each crate's `roles`. Files from `migrations` and every `extra_migrations` directory are merged and applied in one order — by numeric prefix, then file name (what `typedpg_core::migrations::compare_migration_names` defines, and how the runner orders its own migrations) — so the role file is numbered after the migrations that create the tables it grants on:
@@ -1092,7 +1117,8 @@ use typedpg::migrate::{MigrationsConfig, run};
 
 // Path is resolved relative to the invoking crate's CARGO_MANIFEST_DIR,
 // like `include_str!`. The SQL contents land in the final binary as &'static str;
-// editing a migration file re-triggers a rebuild automatically.
+// editing a migration file re-triggers a rebuild automatically (adding one
+// needs the `build.rs` above, or the new file is not embedded).
 let source = typedpg::embed_migrations!("./migrations");
 let config = MigrationsConfig::default();
 let applied = run(&mut client, &source, &config).await?;
@@ -1106,7 +1132,8 @@ All configuration lives in your `Cargo.toml`:
 
 ```toml
 [package.metadata.typedpg.database]
-migrations = "./migrations"        # required — path to migration files
+migrations = "./migrations"        # optional — path to migration files
+                                   # (the default)
 extra_migrations = ["../shared/migrations"]  # optional — extra migration dirs
                                              # included in the compile-time
                                              # schema only (NOT applied at

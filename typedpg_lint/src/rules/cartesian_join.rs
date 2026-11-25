@@ -458,7 +458,7 @@ fn from_item<'a>(
 
 /// The first byte of a parenthesized subquery: the `(` before its
 /// `SELECT`, `VALUES`, `WITH` or `TABLE`.
-fn subquery_start(ctx: &Ctx<'_>, body: &Node) -> Option<usize> {
+pub(super) fn subquery_start(ctx: &Ctx<'_>, body: &Node) -> Option<usize> {
     let first = body
         .nodes()
         .filter_map(|(node, _)| node.location())

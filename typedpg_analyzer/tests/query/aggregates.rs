@@ -70,7 +70,7 @@ fn types_match_group_by_multiple_aggregates() {
 }
 
 #[test]
-fn count_not_null() {
+fn redundant_count_argument() {
     let db = setup();
     let sql = "SELECT COUNT(*) as cnt FROM users";
     let info = db.analyze(sql).unwrap();
@@ -344,6 +344,59 @@ fn call_no_aggregate_matches_is_a_missing_function_not_a_misplaced_aggregate() {
             "aggregate functions are not allowed in WHERE"
         );
     }
+}
+
+/// transformAggregateCall checks where the aggregate is as soon as the call
+/// is resolved: a misplaced aggregate is reported before the function,
+/// operator or clause around it fails on its result.
+#[test]
+fn misplaced_aggregate_is_reported_before_the_expression_around_it() {
+    let db = setup();
+    for (sql, msg) in [
+        (
+            "SELECT 1 FROM users WHERE upper(min(id))",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT 1 FROM users WHERE abs(min(name))",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT 1 FROM users WHERE CASE WHEN min(id) THEN 1 END",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT 1 FROM users WHERE 'x' + avg(id)",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT 1 FROM users u JOIN posts p ON upper(count(*))",
+            "aggregate functions are not allowed in JOIN conditions",
+        ),
+        (
+            "SELECT 1 FROM users WHERE EXISTS (SELECT 1 FROM posts WHERE upper(max(users.age)) = 'x')",
+            "aggregate functions are not allowed in WHERE",
+        ),
+        (
+            "SELECT 1 FROM users LIMIT upper(count(*))",
+            "aggregate functions are not allowed in LIMIT",
+        ),
+        (
+            "SELECT * FROM generate_series(1, upper(count(*)))",
+            "aggregate functions are not allowed in functions in FROM",
+        ),
+        (
+            "SELECT * FROM users, LATERAL (SELECT upper(max(users.age))) s",
+            "aggregate functions are not allowed in FROM clause of their own query level",
+        ),
+    ] {
+        assert_err_prefix!(db.analyze(sql), AnalyzeError::GroupingError(_), msg);
+    }
+    // An aggregate of the sublink's own level is the sublink's business.
+    db.analyze(
+        "SELECT 1 FROM users WHERE EXISTS (SELECT 1 FROM posts HAVING upper(max(posts.title)) = 'x')",
+    )
+    .unwrap();
 }
 
 #[test]
